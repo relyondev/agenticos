@@ -18,6 +18,7 @@ import {
   titles,
 } from "@/lib/project-planning";
 import type { PlaneLink, Section } from "@/lib/project-planning";
+import { WorkItems } from "./work-items";
 
 type Stored = { link: PlaneLink; revision: string } | null;
 
@@ -31,6 +32,19 @@ async function load(id: string): Promise<Stored> {
 }
 
 export function ProjectPlanning({
+  id,
+  section,
+  writable,
+}: {
+  id: string;
+  section: Section;
+  writable: boolean;
+}) {
+  if (section === "work-items") return <WorkItems project={id} writable={writable} />;
+  return <PlaneSection id={id} section={section} writable={writable} />;
+}
+
+function PlaneSection({
   id,
   section,
   writable,
@@ -55,7 +69,12 @@ export function ProjectPlanning({
     );
   }
   if (query.isLoading) return <p className="p-4">Loading…</p>;
-  if (query.error) return <p role="alert" className="p-4">{query.error.message}</p>;
+  if (query.error)
+    return (
+      <p role="alert" className="p-4">
+        {query.error.message}
+      </p>
+    );
 
   const stored = query.data ?? null;
 
@@ -64,7 +83,9 @@ export function ProjectPlanning({
     if (!planeUrl || busy) return;
     const link = parsePlaneProjectUrl(address, planeUrl);
     if (!link) {
-      setError(`Paste a Plane project address on ${planeUrl}, e.g. ${planeUrl}/workspace/projects/<id>/issues`);
+      setError(
+        `Paste a Plane project address on ${planeUrl}, e.g. ${planeUrl}/workspace/projects/<id>/issues`,
+      );
       return;
     }
     setBusy(true);

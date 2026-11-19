@@ -5,7 +5,7 @@ name: Relyon frontend image
 on:
   workflow_dispatch:
   push:
-    branches: [relyon/project-planning]
+    branches: [relyon/project-planning, relyon/native-planning]
     paths: ["frontend/**", ".github/workflows/relyon-frontend-image.yml"]
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
           context: frontend
           push: true
           tags: |
-            ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.2
+            ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.3
             ghcr.io/relyondev/agenticos-frontend:planning-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -25,7 +25,9 @@ vi.mock("@/lib/projects-api", () => ({
 
 function mount(writable: boolean) {
   render(
-    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
       <ProjectPlanning id="project" section="cycles" writable={writable} />
     </QueryClientProvider>,
   );

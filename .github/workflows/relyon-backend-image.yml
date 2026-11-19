@@ -1,0 +1,35 @@
+name: Relyon backend image
+
+# Builds the backend with native project planning (work items) for the Relyon VPS.
+# Manual or on pushes to the native planning branch only.
+on:
+  workflow_dispatch:
+  push:
+    branches: [relyon/native-planning]
+    paths: ["backend/**", "emails/**", ".github/workflows/relyon-backend-image.yml"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/relyondev/agenticos-backend:1.38.2-planning.1
+            ghcr.io/relyondev/agenticos-backend:planning-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
