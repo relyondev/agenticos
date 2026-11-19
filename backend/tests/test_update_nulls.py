@@ -54,7 +54,7 @@ from app.db.models.memory import AgentMemoryFile
 from app.db.models.organization import Organization, OrganizationMember
 from app.db.models.organization_assistant import OrganizationAssistant
 from app.db.models.organization_secret import OrganizationSecret
-from app.db.models.planning import Cycle, Module
+from app.db.models.planning import Cycle, IntakeRequest, Module, ProjectView
 from app.db.models.project import Project
 from app.db.models.sandbox_connection import SandboxConnection
 from app.db.models.session import Session
@@ -89,6 +89,7 @@ from app.schemas.conversation import ConversationUpdate
 from app.schemas.dashboard_layout import DashboardLayoutUpdate
 from app.schemas.deployment_settings import DeploymentSettingsUpdate
 from app.schemas.group import GroupLeadUpdate, GroupUpdate
+from app.schemas.intake import IntakeUpdate
 from app.schemas.knowledge_base import KnowledgeBaseUpdate
 from app.schemas.local_service import LocalServiceUpdate
 from app.schemas.mcp_connection import (
@@ -102,6 +103,7 @@ from app.schemas.notification import NotificationPreferenceUpdate
 from app.schemas.organization import OrganizationMemberUpdate, OrganizationUpdate
 from app.schemas.planning import CycleUpdate, ModuleUpdate
 from app.schemas.project import ProjectUpdate
+from app.schemas.project_view import ProjectViewUpdate
 from app.schemas.push import ApnsKeyUpdate, PushFocusUpdate, PushPreferencesUpdate
 from app.schemas.resource_grant import VisibilityUpdate
 from app.schemas.retention import RetentionUpdate
@@ -167,6 +169,8 @@ UPDATE_TARGETS: dict[type[BaseModel], type[DeclarativeBase] | None] = {
     PortalPollIntervalUpdate: McpConnection,
     ProjectUpdate: Project,
     CycleUpdate: Cycle,
+    IntakeUpdate: IntakeRequest,
+    ProjectViewUpdate: ProjectView,
     ModuleUpdate: Module,
     WorkItemUpdate: WorkItem,
     RecordUpdate: None,

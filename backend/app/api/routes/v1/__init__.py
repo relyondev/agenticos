@@ -74,6 +74,7 @@ from app.api.routes.v1 import (
     mattermost_webhook,
     planning,
     projects,
+    views_intake,
     work_items,
 )
 from app.api.routes.v1 import teams_webhook
@@ -279,6 +280,7 @@ v1_router.include_router(
 v1_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 v1_router.include_router(work_items.router, prefix="/projects", tags=["work-items"])
 v1_router.include_router(planning.router, prefix="/projects", tags=["planning"])
+v1_router.include_router(views_intake.router, prefix="/projects", tags=["views-intake"])
 v1_router.include_router(
     sharing.project_sharing_router, prefix="/projects", tags=["projects:sharing"]
 )
