@@ -1,7 +1,9 @@
 "use client";
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui";
+import { getErrorMessage } from "@/lib/api-error";
 import { usePublicConfig } from "@/components/public-config/public-config-provider";
 import {
   listProjectFiles,
@@ -63,6 +65,7 @@ function PlaneSection({
 }) {
   const { planeUrl } = usePublicConfig();
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const query = useQuery({ queryKey: ["project-plane-link", tenant, id], queryFn: () => load(id) });
   const [address, setAddress] = useState("");
   const [editing, setEditing] = useState(false);
@@ -80,7 +83,7 @@ function PlaneSection({
   if (query.error)
     return (
       <p role="alert" className="p-4">
-        {query.error.message}
+        {getErrorMessage(query.error, tErrors)}
       </p>
     );
 
@@ -111,7 +114,7 @@ function PlaneSection({
       setAddress("");
       await query.refetch();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Save failed");
+      setError(getErrorMessage(e, tErrors, "Save failed"));
     } finally {
       setBusy(false);
     }

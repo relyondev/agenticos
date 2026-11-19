@@ -1,7 +1,9 @@
 "use client";
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui";
+import { getErrorMessage } from "@/lib/api-error";
 import { useTenantId } from "@/hooks/use-organizations";
 import { createCycle, deleteCycle, listCycles, updateCycle } from "@/lib/planning-api";
 import type { Cycle } from "@/lib/planning-api";
@@ -27,6 +29,7 @@ function CycleDetail({
   onClose: () => void;
 }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const client = useQueryClient();
   const [draft, setDraft] = useState(cycle);
   const [error, setError] = useState("");
@@ -47,7 +50,7 @@ function CycleDetail({
         end_date: draft.end_date,
       }),
     onSuccess: done,
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const remove = useMutation({
     mutationFn: () => deleteCycle(project, cycle.id),
@@ -55,7 +58,7 @@ function CycleDetail({
       await client.invalidateQueries({ queryKey: ["work-items", tenant, project] });
       await done();
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   return (
     <div className="space-y-3 rounded border p-3">
@@ -137,6 +140,7 @@ function CycleDetail({
 
 export function Cycles({ project, writable }: { project: string; writable: boolean }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const client = useQueryClient();
   const [name, setName] = useState("");
   const [open, setOpen] = useState<Cycle | null>(null);
@@ -152,7 +156,7 @@ export function Cycles({ project, writable }: { project: string; writable: boole
       setError("");
       await client.invalidateQueries({ queryKey: ["cycles", tenant, project] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   if (open)
     return (
@@ -189,7 +193,7 @@ export function Cycles({ project, writable }: { project: string; writable: boole
       )}
       {error && <p role="alert">{error}</p>}
       {query.isLoading && <p>Loading…</p>}
-      {query.error && <p role="alert">{query.error.message}</p>}
+      {query.error && <p role="alert">{getErrorMessage(query.error, tErrors)}</p>}
       {(query.data ?? []).map((c) => (
         <button
           key={c.id}

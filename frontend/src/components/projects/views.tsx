@@ -1,7 +1,9 @@
 "use client";
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui";
+import { getErrorMessage } from "@/lib/api-error";
 import { useTenantId } from "@/hooks/use-organizations";
 import { createView, deleteView, listViewItems, listViews, updateView } from "@/lib/planning-api";
 import type { ProjectView, ViewFilters } from "@/lib/planning-api";
@@ -102,6 +104,7 @@ function ViewDetail({
   onClose: () => void;
 }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const client = useQueryClient();
   const [name, setName] = useState(view.name);
   const [filters, setFilters] = useState<ViewFilters>(view.filters);
@@ -117,12 +120,12 @@ function ViewDetail({
   const save = useMutation({
     mutationFn: () => updateView(project, view.id, { name, filters }),
     onSuccess: done,
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const remove = useMutation({
     mutationFn: () => deleteView(project, view.id),
     onSuccess: done,
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   return (
     <div className="space-y-3 rounded border p-3">
@@ -174,6 +177,7 @@ function ViewDetail({
 
 export function Views({ project, writable }: { project: string; writable: boolean }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const client = useQueryClient();
   const [name, setName] = useState("");
   const [filters, setFilters] = useState<ViewFilters>({});
@@ -191,7 +195,7 @@ export function Views({ project, writable }: { project: string; writable: boolea
       setError("");
       await client.invalidateQueries({ queryKey: ["views", tenant, project] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   if (open)
     return (
@@ -230,7 +234,7 @@ export function Views({ project, writable }: { project: string; writable: boolea
       )}
       {error && <p role="alert">{error}</p>}
       {query.isLoading && <p>Loading…</p>}
-      {query.error && <p role="alert">{query.error.message}</p>}
+      {query.error && <p role="alert">{getErrorMessage(query.error, tErrors)}</p>}
       {(query.data ?? []).map((v) => (
         <button
           key={v.id}

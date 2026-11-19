@@ -1,7 +1,9 @@
 "use client";
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui";
+import { getErrorMessage } from "@/lib/api-error";
 import { useTenantId } from "@/hooks/use-organizations";
 import {
   INTAKE_STATUSES,
@@ -33,6 +35,7 @@ function IntakeDetail({
   onClose: () => void;
 }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const client = useQueryClient();
   const [draft, setDraft] = useState(request);
   const [acceptPriority, setAcceptPriority] = useState<WorkItemPriority>(request.priority);
@@ -55,7 +58,7 @@ function IntakeDetail({
       await refresh();
       onClose();
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   return (
     <div className="space-y-3 rounded border p-3">
@@ -215,6 +218,7 @@ function IntakeDetail({
 
 export function Intake({ project, writable }: { project: string; writable: boolean }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const client = useQueryClient();
   const [status, setStatus] = useState<IntakeStatus | "">("pending");
   const [title, setTitle] = useState("");
@@ -231,7 +235,7 @@ export function Intake({ project, writable }: { project: string; writable: boole
       setError("");
       await client.invalidateQueries({ queryKey: ["intake", tenant, project] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   if (open)
     return (
@@ -283,7 +287,7 @@ export function Intake({ project, writable }: { project: string; writable: boole
       )}
       {error && <p role="alert">{error}</p>}
       {query.isLoading && <p>Loading…</p>}
-      {query.error && <p role="alert">{query.error.message}</p>}
+      {query.error && <p role="alert">{getErrorMessage(query.error, tErrors)}</p>}
       {(query.data ?? []).map((r) => (
         <button
           key={r.id}

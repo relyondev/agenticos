@@ -1,8 +1,10 @@
 "use client";
 /* eslint-disable jsx-a11y/no-static-element-interactions -- board drag is a mouse shortcut; the keyboard path is the State field in the item view. */
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui";
+import { getErrorMessage } from "@/lib/api-error";
 import { useMembers } from "@/hooks/use-members";
 import { useTenantId } from "@/hooks/use-organizations";
 import {
@@ -45,6 +47,7 @@ function WorkItemDetail({
   onClose: () => void;
 }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const { members } = useMembers(tenant ?? "");
   const client = useQueryClient();
   const [draft, setDraft] = useState<WorkItem>(item);
@@ -71,7 +74,7 @@ function WorkItemDetail({
       await refresh();
       await client.invalidateQueries({ queryKey: ["modules", tenant, project] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const comments = useQuery({
     queryKey: ["work-item-comments", item.id],
@@ -101,7 +104,7 @@ function WorkItemDetail({
       await activity.refetch();
       onClose();
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const remove = useMutation({
     mutationFn: () => deleteWorkItem(project, item.id),
@@ -109,7 +112,7 @@ function WorkItemDetail({
       await refresh();
       onClose();
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const post = useMutation({
     mutationFn: () => addComment(project, item.id, comment),
@@ -117,7 +120,7 @@ function WorkItemDetail({
       setComment("");
       await comments.refetch();
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const set = <K extends keyof WorkItem>(key: K, value: WorkItem[K]) =>
     setDraft((d) => ({ ...d, [key]: value }));
@@ -325,6 +328,7 @@ function WorkItemDetail({
 
 export function WorkItems({ project, writable }: { project: string; writable: boolean }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const client = useQueryClient();
   const [state, setState] = useState<WorkItemState | "">("");
   const [priority, setPriority] = useState<WorkItemPriority | "">("");
@@ -346,7 +350,7 @@ export function WorkItems({ project, writable }: { project: string; writable: bo
       setError("");
       await client.invalidateQueries({ queryKey: ["work-items", tenant, project] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const saveView = useMutation({
     mutationFn: () =>
@@ -359,13 +363,13 @@ export function WorkItems({ project, writable }: { project: string; writable: bo
       setViewName("");
       await client.invalidateQueries({ queryKey: ["views", tenant, project] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const move = useMutation({
     mutationFn: ({ id, next }: { id: string; next: WorkItemState }) =>
       updateWorkItem(project, id, { state: next }),
     onSuccess: () => client.invalidateQueries({ queryKey: ["work-items", tenant, project] }),
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const items = query.data?.items ?? [];
 
@@ -484,7 +488,7 @@ export function WorkItems({ project, writable }: { project: string; writable: bo
       )}
       {error && <p role="alert">{error}</p>}
       {query.isLoading && <p>Loading…</p>}
-      {query.error && <p role="alert">{query.error.message}</p>}
+      {query.error && <p role="alert">{getErrorMessage(query.error, tErrors)}</p>}
       {layout === "list" ? (
         <div className="space-y-2">{items.map(row)}</div>
       ) : (

@@ -1,7 +1,9 @@
 "use client";
 import { useState } from "react";
+import { useTranslations } from "next-intl";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui";
+import { getErrorMessage } from "@/lib/api-error";
 import { useMembers } from "@/hooks/use-members";
 import { useTenantId } from "@/hooks/use-organizations";
 import {
@@ -31,6 +33,7 @@ function ModuleDetail({
   onClose: () => void;
 }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const { members } = useMembers(tenant ?? "");
   const client = useQueryClient();
   const [draft, setDraft] = useState(module);
@@ -62,7 +65,7 @@ function ModuleDetail({
       await refresh();
       onClose();
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const remove = useMutation({
     mutationFn: () => deleteModule(project, module.id),
@@ -70,7 +73,7 @@ function ModuleDetail({
       await refresh();
       onClose();
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const add = useMutation({
     mutationFn: (item: string) => addToModule(project, module.id, item),
@@ -78,12 +81,12 @@ function ModuleDetail({
       setPick("");
       await refresh();
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const drop = useMutation({
     mutationFn: (item: string) => removeFromModule(project, module.id, item),
     onSuccess: refresh,
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   const inModule = new Set((members_.data?.items ?? []).map((i) => i.id));
   const candidates = (all.data?.items ?? []).filter((i) => !inModule.has(i.id));
@@ -230,6 +233,7 @@ function ModuleDetail({
 
 export function Modules({ project, writable }: { project: string; writable: boolean }) {
   const tenant = useTenantId();
+  const tErrors = useTranslations("errors");
   const client = useQueryClient();
   const [name, setName] = useState("");
   const [open, setOpen] = useState<Module | null>(null);
@@ -245,7 +249,7 @@ export function Modules({ project, writable }: { project: string; writable: bool
       setError("");
       await client.invalidateQueries({ queryKey: ["modules", tenant, project] });
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: unknown) => setError(getErrorMessage(e, tErrors)),
   });
   if (open)
     return (
@@ -282,7 +286,7 @@ export function Modules({ project, writable }: { project: string; writable: bool
       )}
       {error && <p role="alert">{error}</p>}
       {query.isLoading && <p>Loading…</p>}
-      {query.error && <p role="alert">{query.error.message}</p>}
+      {query.error && <p role="alert">{getErrorMessage(query.error, tErrors)}</p>}
       {(query.data ?? []).map((m) => (
         <button
           key={m.id}

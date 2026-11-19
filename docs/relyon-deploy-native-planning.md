@@ -6,7 +6,7 @@ backend and the frontend image. Do the backup first.
 Images (both built by GitHub Actions on branch `relyon/native-planning`):
 
 - `ghcr.io/relyondev/agenticos-backend:1.38.2-planning.3`
-- `ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.5`
+- `ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.6`
 
 ## 1. Back up the database
 
@@ -45,7 +45,7 @@ docker logs relios-agenticos-migrate-1 2>&1 | tail -3   # expect "Running upgrad
 
 ```bash
 cp docker-compose-prod.frontend.yml docker-compose-prod.frontend.yml.bak2
-sed -i 's#agenticos-frontend:1.38.2-planning.[0-9]*#agenticos-frontend:1.38.2-planning.5#' docker-compose-prod.frontend.yml
+sed -i 's#agenticos-frontend:1.38.2-planning.[0-9]*#agenticos-frontend:1.38.2-planning.6#' docker-compose-prod.frontend.yml
 docker compose -p relios-agenticos-frontend --env-file backend/.env \
   -f docker-compose-prod.frontend.yml -f docker-compose-prod.frontend.traefik.yml \
   -f docker-compose-prod.frontend.plane.yml pull
