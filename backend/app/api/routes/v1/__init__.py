@@ -73,6 +73,7 @@ from app.api.routes.v1 import (
     external_agents,
     mattermost_webhook,
     planning,
+    project_pages,
     projects,
     views_intake,
     work_items,
@@ -281,6 +282,7 @@ v1_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 v1_router.include_router(work_items.router, prefix="/projects", tags=["work-items"])
 v1_router.include_router(planning.router, prefix="/projects", tags=["planning"])
 v1_router.include_router(views_intake.router, prefix="/projects", tags=["views-intake"])
+v1_router.include_router(project_pages.router, prefix="/projects", tags=["pages"])
 v1_router.include_router(
     sharing.project_sharing_router, prefix="/projects", tags=["projects:sharing"]
 )

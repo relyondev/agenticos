@@ -86,6 +86,8 @@ from app.db.models.planning import (
     IntakeRequest,
     Module,
     ModuleWorkItem,
+    ProjectPage,
+    ProjectPageVersion,
     ProjectView,
 )
 from app.db.models.work_item import WorkItem, WorkItemActivity, WorkItemComment
@@ -236,6 +238,8 @@ __all__ = [
     "Project",
     "Cycle",
     "IntakeRequest",
+    "ProjectPage",
+    "ProjectPageVersion",
     "ProjectView",
     "Module",
     "ModuleWorkItem",

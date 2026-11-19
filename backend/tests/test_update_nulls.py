@@ -54,7 +54,7 @@ from app.db.models.memory import AgentMemoryFile
 from app.db.models.organization import Organization, OrganizationMember
 from app.db.models.organization_assistant import OrganizationAssistant
 from app.db.models.organization_secret import OrganizationSecret
-from app.db.models.planning import Cycle, IntakeRequest, Module, ProjectView
+from app.db.models.planning import Cycle, IntakeRequest, Module, ProjectPage, ProjectView
 from app.db.models.project import Project
 from app.db.models.sandbox_connection import SandboxConnection
 from app.db.models.session import Session
@@ -103,6 +103,7 @@ from app.schemas.notification import NotificationPreferenceUpdate
 from app.schemas.organization import OrganizationMemberUpdate, OrganizationUpdate
 from app.schemas.planning import CycleUpdate, ModuleUpdate
 from app.schemas.project import ProjectUpdate
+from app.schemas.project_page import PageUpdate
 from app.schemas.project_view import ProjectViewUpdate
 from app.schemas.push import ApnsKeyUpdate, PushFocusUpdate, PushPreferencesUpdate
 from app.schemas.resource_grant import VisibilityUpdate
@@ -169,6 +170,7 @@ UPDATE_TARGETS: dict[type[BaseModel], type[DeclarativeBase] | None] = {
     PortalPollIntervalUpdate: McpConnection,
     ProjectUpdate: Project,
     CycleUpdate: Cycle,
+    PageUpdate: ProjectPage,
     IntakeUpdate: IntakeRequest,
     ProjectViewUpdate: ProjectView,
     ModuleUpdate: Module,
