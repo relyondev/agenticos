@@ -41,6 +41,7 @@ const planning = vi.hoisted(() => ({
   listModules: vi.fn(async () => [{ id: "m1", name: "Auth" }]),
   addToModule: vi.fn(async () => undefined),
   removeFromModule: vi.fn(async () => undefined),
+  createView: vi.fn(async () => ({})),
 }));
 vi.mock("@/lib/planning-api", () => planning);
 vi.mock("@/hooks/use-organizations", () => ({ useTenantId: () => "org" }));
@@ -125,4 +126,19 @@ it("moves an item into a cycle and a module from its detail view", async () => {
       expect.objectContaining({ cycle_id: "c1" }),
     ),
   );
+});
+
+it("saves the current filters as a view", async () => {
+  mount(true);
+  await screen.findByText(/#3/);
+  fireEvent.change(screen.getByLabelText("Filter by priority"), { target: { value: "urgent" } });
+  fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Urgent" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save as view" }));
+  await waitFor(() =>
+    expect(planning.createView).toHaveBeenCalledWith("p", {
+      name: "Urgent",
+      filters: { state: null, priority: "urgent", q: null },
+    }),
+  );
+  expect(await screen.findByRole("status")).toHaveTextContent("Saved view");
 });

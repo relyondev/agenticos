@@ -28,7 +28,7 @@ function mount(writable: boolean) {
     <QueryClientProvider
       client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
     >
-      <ProjectPlanning id="project" section="views" writable={writable} />
+      <ProjectPlanning id="project" section="pages" writable={writable} />
     </QueryClientProvider>,
   );
 }
@@ -41,8 +41,8 @@ beforeEach(() => {
 it("frames the linked Plane project on the section's own route", async () => {
   state.files = [{ path: "Project Planning/plane.json" }];
   mount(false);
-  const frame = await screen.findByTitle("Plane Views");
-  expect(frame).toHaveAttribute("src", `https://plane.example.com/acme/projects/${id}/views/`);
+  const frame = await screen.findByTitle("Plane Pages");
+  expect(frame).toHaveAttribute("src", `https://plane.example.com/acme/projects/${id}/pages/`);
 });
 
 it("lets a writer link a Plane project and saves the pointer", async () => {

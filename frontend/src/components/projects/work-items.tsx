@@ -17,7 +17,13 @@ import {
   listWorkItems,
   updateWorkItem,
 } from "@/lib/work-items-api";
-import { addToModule, listCycles, listModules, removeFromModule } from "@/lib/planning-api";
+import {
+  addToModule,
+  createView,
+  listCycles,
+  listModules,
+  removeFromModule,
+} from "@/lib/planning-api";
 import type {
   WorkItem,
   WorkItemInput,
@@ -323,6 +329,8 @@ export function WorkItems({ project, writable }: { project: string; writable: bo
   const [state, setState] = useState<WorkItemState | "">("");
   const [priority, setPriority] = useState<WorkItemPriority | "">("");
   const [q, setQ] = useState("");
+  const [viewName, setViewName] = useState("");
+  const [saved, setSaved] = useState("");
   const [layout, setLayout] = useState<"list" | "board">("list");
   const [title, setTitle] = useState("");
   const [open, setOpen] = useState<WorkItem | null>(null);
@@ -337,6 +345,19 @@ export function WorkItems({ project, writable }: { project: string; writable: bo
       setTitle("");
       setError("");
       await client.invalidateQueries({ queryKey: ["work-items", tenant, project] });
+    },
+    onError: (e: Error) => setError(e.message),
+  });
+  const saveView = useMutation({
+    mutationFn: () =>
+      createView(project, {
+        name: viewName.trim(),
+        filters: { state: state || null, priority: priority || null, q: q.trim() || null },
+      }),
+    onSuccess: async () => {
+      setSaved(`Saved view “${viewName.trim()}”`);
+      setViewName("");
+      await client.invalidateQueries({ queryKey: ["views", tenant, project] });
     },
     onError: (e: Error) => setError(e.message),
   });
@@ -418,6 +439,28 @@ export function WorkItems({ project, writable }: { project: string; writable: bo
           {layout === "list" ? "Board" : "List"}
         </Button>
       </div>
+      {writable && (
+        <form
+          className="flex gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (viewName.trim()) saveView.mutate();
+          }}
+        >
+          <input
+            aria-label="View name"
+            className="bg-background rounded border p-2"
+            placeholder="Save these filters as a view"
+            maxLength={255}
+            value={viewName}
+            onChange={(e) => setViewName(e.target.value)}
+          />
+          <Button type="submit" variant="outline" disabled={saveView.isPending || !viewName.trim()}>
+            Save as view
+          </Button>
+        </form>
+      )}
+      {saved && <p role="status">{saved}</p>}
       {writable && (
         <form
           className="flex gap-2"
