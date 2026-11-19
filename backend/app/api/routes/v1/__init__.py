@@ -68,7 +68,7 @@ from app.api.routes.v1 import browser_sign_ins
 from app.api.routes.v1 import permissions
 from app.api.routes.v1 import telegram_webhook
 from app.api.routes.v1 import slack_webhook
-from app.api.routes.v1 import a2a, external_agents, mattermost_webhook, projects
+from app.api.routes.v1 import a2a, external_agents, mattermost_webhook, projects, work_items
 from app.api.routes.v1 import teams_webhook
 from app.api.routes.v1 import embed as embed_widget
 from app.api.routes.v1 import embed_generated_media
@@ -270,6 +270,7 @@ v1_router.include_router(
     external_agents.router, prefix="/external-agents", tags=["external-agents"]
 )
 v1_router.include_router(projects.router, prefix="/projects", tags=["projects"])
+v1_router.include_router(work_items.router, prefix="/projects", tags=["work-items"])
 v1_router.include_router(
     sharing.project_sharing_router, prefix="/projects", tags=["projects:sharing"]
 )

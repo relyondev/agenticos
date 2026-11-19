@@ -81,6 +81,7 @@ from app.db.models.organization_assistant import OrganizationAssistant
 from app.db.models.channel_prompt import ChannelPrompt
 from app.db.models.external_agent import ExternalAgent
 from app.db.models.project import Project
+from app.db.models.work_item import WorkItem, WorkItemActivity, WorkItemComment
 from app.db.models.suggestion import Suggestion
 from app.db.models.watch import Watch
 from app.db.models.teams_conversation import TeamsConversation
@@ -226,6 +227,9 @@ __all__ = [
     "BackgroundTaskKind",
     "BackgroundWorker",
     "Project",
+    "WorkItem",
+    "WorkItemActivity",
+    "WorkItemComment",
     "ContextFile",
     "ContextMode",
     "AgentMemoryFile",
