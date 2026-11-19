@@ -26,5 +26,5 @@ mv docker-compose-prod.frontend.yml.bak docker-compose-prod.frontend.yml
 docker compose -p relios-agenticos-frontend --env-file backend/.env -f docker-compose-prod.frontend.yml up -d
 ```
 
-Always pass `-p relios-agenticos-frontend`; without it Compose reports the backend stack as orphans.
+Always pass `-p relios-agenticos-frontend` (the existing project name on this VPS). A different name creates a second project that fights for port 3000.
 Only the frontend container is recreated; backend, database and Plane are untouched.
