@@ -54,6 +54,7 @@ from app.db.models.memory import AgentMemoryFile
 from app.db.models.organization import Organization, OrganizationMember
 from app.db.models.organization_assistant import OrganizationAssistant
 from app.db.models.organization_secret import OrganizationSecret
+from app.db.models.planning import Cycle, Module
 from app.db.models.project import Project
 from app.db.models.sandbox_connection import SandboxConnection
 from app.db.models.session import Session
@@ -65,6 +66,7 @@ from app.db.models.user_slash_command import UserSlashCommand
 from app.db.models.virtual_table import VirtualTable
 from app.db.models.virtual_table_trigger import VirtualTableTrigger
 from app.db.models.watch import Watch
+from app.db.models.work_item import WorkItem
 from app.db.models.workflow import Workflow
 from app.db.models.workflow_exposure import WorkflowExposure
 from app.db.models.workflow_log_alert import WorkflowLogAlertRule
@@ -98,6 +100,7 @@ from app.schemas.memory import MemoryNoteUpdate
 from app.schemas.model_profile import ModelProfileUpdate
 from app.schemas.notification import NotificationPreferenceUpdate
 from app.schemas.organization import OrganizationMemberUpdate, OrganizationUpdate
+from app.schemas.planning import CycleUpdate, ModuleUpdate
 from app.schemas.project import ProjectUpdate
 from app.schemas.push import ApnsKeyUpdate, PushFocusUpdate, PushPreferencesUpdate
 from app.schemas.resource_grant import VisibilityUpdate
@@ -113,6 +116,7 @@ from app.schemas.user_slash_command import UserSlashCommandUpdate
 from app.schemas.virtual_table import RecordUpdate, SchemaUpdate, TableUpdate
 from app.schemas.virtual_table_trigger import TableTriggerUpdate
 from app.schemas.watch import WatchUpdate
+from app.schemas.work_item import WorkItemUpdate
 from app.schemas.workflow import WorkflowActiveUpdate, WorkflowDraftUpdate, WorkflowUpdate
 from app.schemas.workflow_exposure import WorkflowExposureUpdate
 from app.schemas.workflow_log_alert import WorkflowLogAlertUpdate
@@ -162,6 +166,9 @@ UPDATE_TARGETS: dict[type[BaseModel], type[DeclarativeBase] | None] = {
     OrganizationUpdate: Organization,
     PortalPollIntervalUpdate: McpConnection,
     ProjectUpdate: Project,
+    CycleUpdate: Cycle,
+    ModuleUpdate: Module,
+    WorkItemUpdate: WorkItem,
     RecordUpdate: None,
     # Both patch keys within Session.push_preferences JSONB, not columns by name.
     PushFocusUpdate: None,

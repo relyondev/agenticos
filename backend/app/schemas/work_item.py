@@ -31,6 +31,7 @@ class WorkItemCreate(_Dated):
     start_date: date | None = None
     target_date: date | None = None
     labels: list[str] = Field(default_factory=list, max_length=50)
+    cycle_id: UUID | None = None
 
 
 class WorkItemUpdate(BaseSchema):
@@ -42,6 +43,7 @@ class WorkItemUpdate(BaseSchema):
     start_date: date | None = None
     target_date: date | None = None
     labels: list[str] | None = Field(default=None, max_length=50)
+    cycle_id: UUID | None = None
 
 
 class WorkItemRead(BaseSchema):
@@ -57,6 +59,8 @@ class WorkItemRead(BaseSchema):
     start_date: date | None
     target_date: date | None
     labels: list[str]
+    cycle_id: UUID | None
+    module_ids: list[UUID] = Field(default_factory=list)
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime | None

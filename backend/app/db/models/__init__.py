@@ -81,6 +81,7 @@ from app.db.models.organization_assistant import OrganizationAssistant
 from app.db.models.channel_prompt import ChannelPrompt
 from app.db.models.external_agent import ExternalAgent
 from app.db.models.project import Project
+from app.db.models.planning import Cycle, Module, ModuleWorkItem
 from app.db.models.work_item import WorkItem, WorkItemActivity, WorkItemComment
 from app.db.models.suggestion import Suggestion
 from app.db.models.watch import Watch
@@ -227,6 +228,9 @@ __all__ = [
     "BackgroundTaskKind",
     "BackgroundWorker",
     "Project",
+    "Cycle",
+    "Module",
+    "ModuleWorkItem",
     "WorkItem",
     "WorkItemActivity",
     "WorkItemComment",

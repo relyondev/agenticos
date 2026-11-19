@@ -65,6 +65,13 @@ class WorkItem(Base, TimestampMixin):
     )
     start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    cycle_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("cycles.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    """The cycle the item sits in, if any: at most one, as in Plane."""
     labels: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     sort_order: Mapped[float] = mapped_column(Float, nullable=False, default=65535.0)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

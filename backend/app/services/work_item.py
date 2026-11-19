@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import NotFoundError
 from app.core.permissions import AuthContext, Perm
 from app.db.models.work_item import WorkItem, WorkItemActivity, WorkItemComment
+from app.db.updates import writable
+from app.repositories import planning as planning_repo
 from app.repositories import work_item as repo
 from app.schemas.work_item import CommentCreate, WorkItemCreate, WorkItemUpdate
 from app.services.project import ProjectService
@@ -26,6 +28,7 @@ _TRACKED = (
     "start_date",
     "target_date",
     "labels",
+    "cycle_id",
 )
 
 
@@ -46,17 +49,33 @@ class WorkItemService:
             raise NotFoundError(message="Work item not found", details={"work_item_id": item_id})
         return item
 
+    async def _check_cycle(self, project_id: UUID, cycle_id: UUID | None) -> None:
+        if (
+            cycle_id is not None
+            and await planning_repo.get_cycle(self.db, project_id, cycle_id) is None
+        ):
+            raise NotFoundError(message="Cycle not found", details={"cycle_id": cycle_id})
+
+    async def _with_modules(self, items: list[WorkItem]) -> list[WorkItem]:
+        found = await planning_repo.module_ids_for(self.db, [i.id for i in items])
+        for item in items:
+            item.module_ids = found.get(item.id, [])  # ty: ignore[unresolved-attribute]
+        return items
+
     async def list(self, ctx: AuthContext, project_id: UUID, **filters):
         await self.projects.get(ctx, project_id, perm=Perm.PROJECTS_VIEW)
-        return await repo.list_items(self.db, project_id, **filters)
+        items, total = await repo.list_items(self.db, project_id, **filters)
+        return await self._with_modules(items), total
 
     async def get(self, ctx: AuthContext, project_id: UUID, item_id: UUID) -> WorkItem:
         await self.projects.get(ctx, project_id, perm=Perm.PROJECTS_VIEW)
-        return await self._item(project_id, item_id)
+        (item,) = await self._with_modules([await self._item(project_id, item_id)])
+        return item
 
     async def create(self, ctx: AuthContext, project_id: UUID, data: WorkItemCreate) -> WorkItem:
         # The project row lock taken by a `use` read serialises numbering.
         await self.projects.get(ctx, project_id, perm=Perm.PROJECTS_USE)
+        await self._check_cycle(project_id, data.cycle_id)
         item = WorkItem(
             organization_id=ctx.organization_id,
             project_id=project_id,
@@ -83,7 +102,9 @@ class WorkItemService:
     ) -> WorkItem:
         await self.projects.get(ctx, project_id, perm=Perm.PROJECTS_USE)
         item = await self._item(project_id, item_id)
-        changes = data.model_dump(exclude_unset=True)
+        changes = writable(data, over=WorkItem)
+        if "cycle_id" in changes:
+            await self._check_cycle(project_id, changes["cycle_id"])
         for field in _TRACKED:
             if field not in changes:
                 continue
@@ -107,6 +128,7 @@ class WorkItemService:
 
             raise BadRequestError(message="target_date precedes start_date")
         await self.db.flush()
+        (item,) = await self._with_modules([item])
         return item
 
     async def delete(self, ctx: AuthContext, project_id: UUID, item_id: UUID) -> None:

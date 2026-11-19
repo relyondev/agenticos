@@ -6,6 +6,7 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models.planning import ModuleWorkItem
 from app.db.models.work_item import WorkItem, WorkItemActivity, WorkItemComment
 
 
@@ -34,6 +35,8 @@ async def list_items(
     priority: str | None = None,
     assignee_user_id: UUID | None = None,
     label: str | None = None,
+    cycle_id: UUID | None = None,
+    module_id: UUID | None = None,
     due_before: date | None = None,
     search: str | None = None,
     skip: int = 0,
@@ -48,6 +51,14 @@ async def list_items(
         conditions.append(WorkItem.assignee_user_id == assignee_user_id)
     if label:
         conditions.append(WorkItem.labels.contains([label]))
+    if cycle_id:
+        conditions.append(WorkItem.cycle_id == cycle_id)
+    if module_id:
+        conditions.append(
+            WorkItem.id.in_(
+                select(ModuleWorkItem.work_item_id).where(ModuleWorkItem.module_id == module_id)
+            )
+        )
     if due_before:
         conditions.append(WorkItem.target_date <= due_before)
     if search:

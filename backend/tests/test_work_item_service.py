@@ -17,6 +17,13 @@ pytestmark = pytest.mark.anyio
 ORG, PROJECT = uuid.uuid4(), uuid.uuid4()
 
 
+@pytest.fixture(autouse=True)
+def _no_modules():
+    """Module membership is read through the planning repository; these tests are about the item."""
+    with patch.object(module.planning_repo, "module_ids_for", AsyncMock(return_value={})):
+        yield
+
+
 def _ctx() -> AuthContext:
     return AuthContext(user_id=uuid.uuid4(), organization_id=ORG, role=OrgRoleName.OWNER)
 
@@ -111,3 +118,25 @@ def test_create_rejects_reversed_dates() -> None:
 
     with pytest.raises(ValueError, match="precedes"):
         WorkItemCreate(name="x", start_date=date(2026, 12, 10), target_date=date(2026, 12, 1))
+
+
+async def test_an_explicit_null_never_reaches_a_required_column_but_unassigns() -> None:
+    service, _ = _service()
+    user = uuid.uuid4()
+    item = WorkItem(
+        project_id=PROJECT,
+        name="Keep",
+        state="todo",
+        priority="none",
+        labels=[],
+        assignee_user_id=user,
+    )
+    with patch.object(module.repo, "get", AsyncMock(return_value=item)):
+        await service.update(
+            _ctx(),
+            PROJECT,
+            uuid.uuid4(),
+            WorkItemUpdate.model_validate({"name": None, "assignee_user_id": None}),
+        )
+    assert item.name == "Keep"
+    assert item.assignee_user_id is None
