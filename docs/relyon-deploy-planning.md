@@ -13,8 +13,8 @@ On the VPS:
 cd /opt/relios-agenticos
 cp docker-compose-prod.frontend.yml docker-compose-prod.frontend.yml.bak
 sed -i 's#ghcr.io/vstorm-co/agenticos-frontend:${AGENTICOS_VERSION:-latest}#ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.1#' docker-compose-prod.frontend.yml
-docker compose -p agenticos-frontend --env-file backend/.env -f docker-compose-prod.frontend.yml pull
-docker compose -p agenticos-frontend --env-file backend/.env -f docker-compose-prod.frontend.yml up -d
+docker compose -p relios-agenticos-frontend --env-file backend/.env -f docker-compose-prod.frontend.yml pull
+docker compose -p relios-agenticos-frontend --env-file backend/.env -f docker-compose-prod.frontend.yml up -d
 docker ps --filter name=frontend --format '{{.Names}} {{.Image}} {{.Status}}'
 ```
 
@@ -23,8 +23,8 @@ Roll back:
 ```bash
 cd /opt/relios-agenticos
 mv docker-compose-prod.frontend.yml.bak docker-compose-prod.frontend.yml
-docker compose -p agenticos-frontend --env-file backend/.env -f docker-compose-prod.frontend.yml up -d
+docker compose -p relios-agenticos-frontend --env-file backend/.env -f docker-compose-prod.frontend.yml up -d
 ```
 
-Always pass `-p agenticos-frontend`; without it Compose reports the backend stack as orphans.
+Always pass `-p relios-agenticos-frontend`; without it Compose reports the backend stack as orphans.
 Only the frontend container is recreated; backend, database and Plane are untouched.
