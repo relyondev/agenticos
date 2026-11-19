@@ -5,7 +5,7 @@ Nothing is copied: the data lives in Plane, so features match Plane exactly.
 
 ## 0. Prerequisites (once)
 
-- Plane reachable over HTTPS at one address, e.g. `https://plane.relyonhub.cloud`
+- Plane reachable over HTTPS at one address, e.g. `https://project.relyonhub.cloud`
   (needs a DNS A record to the VPS and a Traefik router for it). It must be on the
   same registrable domain as AgenticOS so login cookies work inside the frame.
 - Plane must allow being framed by AgenticOS. Check:
@@ -29,7 +29,7 @@ Fetch the new overlay (or copy it from the repo) and set the Plane address:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/relyondev/agenticos/relyon/project-planning/docker-compose-prod.frontend.plane.yml -o docker-compose-prod.frontend.plane.yml
-echo 'PLANE_URL=https://plane.relyonhub.cloud' >> backend/.env
+echo 'PLANE_URL=https://project.relyonhub.cloud' >> backend/.env
 sed -i 's#ghcr.io/vstorm-co/agenticos-frontend:${AGENTICOS_VERSION:-latest}#ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.2#' docker-compose-prod.frontend.yml
 ```
 
