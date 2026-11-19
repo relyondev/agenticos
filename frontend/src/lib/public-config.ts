@@ -28,6 +28,11 @@ const UNBRANDED: readonly SignInProvider[] = ["oidc", "ldap", "kerberos"];
 export interface PublicConfig {
   /** Optional collector origin for signed presence, never a credential. */
   diagnosticsUrl?: string;
+  /**
+   * Where the team's Plane lives (`PLANE_URL`), or undefined when none is
+   * configured. Project planning tabs frame it, so `frame-src` names it.
+   */
+  planeUrl?: string;
   /** The API origin the browser calls directly: OAuth login, embed uploads, `/docs`. */
   apiUrl: string;
   /** The WebSocket origin the browser opens for chat and the hosted embed. */
@@ -109,6 +114,18 @@ function origin(value: string | undefined, fallback: string): string {
   return trimmed ? trimmed.replace(/\/+$/, "") : fallback;
 }
 
+/** An http(s) origin, or undefined for anything else: a bad value disables the embed. */
+function httpOrigin(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.origin : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function megabytes(value: string | undefined, fallback: number): number {
   const parsed = Number(value?.trim());
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -146,6 +163,7 @@ export function readPublicConfig(env: Readonly<Record<string, string | undefined
     )
       ? undefined
       : origin(env.DIAGNOSTICS_PUBLIC_URL, "https://analytics-agenticos.testapp.ovh"),
+    planeUrl: httpOrigin(env.PLANE_URL),
     apiUrl: origin(env.PUBLIC_API_URL, DEFAULT_PUBLIC_CONFIG.apiUrl),
     wsUrl: origin(env.PUBLIC_WS_URL, DEFAULT_PUBLIC_CONFIG.wsUrl),
     artifactUrl: origin(

@@ -1,36 +1,33 @@
 import { describe, it, expect } from "vitest";
-import { createRecord, isWorkItem, related, recordSchema } from "./project-planning";
-describe("project planning", () => {
-  it("accepts an intake in place so links keep the same id", () => {
-    const request = createRecord("intake");
-    for (const intake of ["Pending", "Rejected", "Duplicate", "Snoozed"] as const)
-      expect(isWorkItem({ ...request, intake })).toBe(false);
-    expect(isWorkItem({ ...request, intake: "Accepted" })).toBe(true);
+import { parsePlaneProjectUrl, planeSectionUrl, sections } from "./project-planning";
+
+const origin = "https://plane.example.com";
+const id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+describe("plane link", () => {
+  it("reads workspace and project from a project address", () => {
+    expect(parsePlaneProjectUrl(`${origin}/acme/projects/${id}/issues/`, origin)).toEqual({
+      workspace: "acme",
+      project: id,
+    });
   });
-  it("resolves cycle, module and combined saved filters", () => {
-    const cycle = createRecord("cycles"),
-      module = createRecord("modules");
-    const issue = {
-      ...createRecord("work-items"),
-      cycle: cycle.id,
-      modules: [module.id],
-      priority: "urgent" as const,
-    };
-    expect(related(cycle, issue)).toBe(true);
-    expect(related(module, issue)).toBe(true);
-    const view = { ...createRecord("views"), priorityFilter: "urgent" as const };
-    expect(related(view, issue)).toBe(true);
-    expect(related({ ...view, stateFilter: "Done" }, issue)).toBe(false);
-    expect(related(view, { ...issue, kind: "intake" })).toBe(false);
+  it("rejects another origin, a non-project path and a bad id", () => {
+    expect(parsePlaneProjectUrl(`https://evil.test/acme/projects/${id}/`, origin)).toBeNull();
+    expect(parsePlaneProjectUrl(`${origin}/acme/issues`, origin)).toBeNull();
+    expect(parsePlaneProjectUrl(`${origin}/acme/projects/not-a-uuid/`, origin)).toBeNull();
+    expect(parsePlaneProjectUrl("nonsense", origin)).toBeNull();
   });
-  it("rejects reversed cycle dates", () => {
-    expect(
-      recordSchema.safeParse({
-        ...createRecord("cycles"),
-        title: "Sprint",
-        start: "2026-12-02",
-        end: "2026-12-01",
-      }).success,
-    ).toBe(false);
+  it("builds Plane's own route for every section", () => {
+    const link = { workspace: "acme", project: id };
+    const urls = sections.map((s) => planeSectionUrl(origin, link, s));
+    expect(urls[0]).toBe(`${origin}/acme/projects/${id}/issues/`);
+    expect(urls.map((u) => u.split("/").at(-2))).toEqual([
+      "issues",
+      "cycles",
+      "modules",
+      "views",
+      "pages",
+      "intake",
+    ]);
   });
 });

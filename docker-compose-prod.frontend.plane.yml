@@ -1,0 +1,11 @@
+# Overlay: tells the frontend where the team's Plane is, so project planning tabs
+# can frame it and `frame-src` allows exactly that origin.
+#
+#   -f docker-compose-prod.frontend.yml -f docker-compose-prod.frontend.traefik.yml \
+#   -f docker-compose-prod.frontend.plane.yml
+#
+# Set PLANE_URL in backend/.env (e.g. https://plane.example.com, no path).
+services:
+  frontend:
+    environment:
+      - PLANE_URL=${PLANE_URL:-}

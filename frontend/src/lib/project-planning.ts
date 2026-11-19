@@ -1,7 +1,6 @@
-// Adapted from makeplane/plane v1.5.0, db/models/{issue,intake,module,cycle,page,view}.py.
-// Copyright (c) 2023-present Plane Software, Inc. and contributors.
-// SPDX-License-Identifier: AGPL-3.0-only
-// Relyon adaptation: project-scoped workspace records, November 2026.
+// Project planning is the team's real Plane, framed inside the project. Which
+// Plane project a Relyon project shows is a small link file in the project's own
+// workspace, so the agent and the team read the same pointer.
 import { z } from "zod";
 
 export const sections = ["work-items", "cycles", "modules", "views", "pages", "intake"] as const;
@@ -14,64 +13,48 @@ export const titles: Record<Section, string> = {
   pages: "Pages",
   intake: "Intake",
 };
-export const priorities = ["none", "urgent", "high", "medium", "low"] as const;
-export const states = ["Backlog", "Todo", "In Progress", "Done", "Cancelled"] as const;
-export const decisions = ["Pending", "Accepted", "Rejected", "Duplicate", "Snoozed"] as const;
-export const recordSchema = z
-  .object({
-    id: z.string().uuid(),
-    kind: z.enum(sections),
-    title: z.string().trim().min(1).max(255),
-    body: z.string(),
-    status: z.enum(states),
-    priority: z.enum(priorities),
-    cycle: z.string(),
-    modules: z.array(z.string()),
-    owner: z.string(),
-    start: z.string(),
-    end: z.string(),
-    intake: z.enum(decisions),
-    stateFilter: z.union([z.literal(""), z.enum(states)]),
-    priorityFilter: z.union([z.literal(""), z.enum(priorities)]),
-  })
-  .refine((r) => !r.start || !r.end || r.start <= r.end, "End date precedes start date");
-export type PlanningRecord = z.infer<typeof recordSchema>;
-export function createRecord(kind: Section): PlanningRecord {
-  return {
-    id: crypto.randomUUID(),
-    kind,
-    title: "",
-    body: "",
-    status: "Backlog",
-    priority: "none",
-    cycle: "",
-    modules: [],
-    owner: "",
-    start: "",
-    end: "",
-    intake: "Pending",
-    stateFilter: "",
-    priorityFilter: "",
-  };
-}
-export function isWorkItem(r: PlanningRecord) {
-  return r.kind === "work-items" || (r.kind === "intake" && r.intake === "Accepted");
-}
-export function related(group: PlanningRecord, item: PlanningRecord) {
-  if (!isWorkItem(item)) return false;
-  if (group.kind === "cycles") return item.cycle === group.id;
-  if (group.kind === "modules") return item.modules.includes(group.id);
-  return (
-    group.kind === "views" &&
-    (!group.stateFilter || group.stateFilter === item.status) &&
-    (!group.priorityFilter || group.priorityFilter === item.priority)
-  );
+
+/** Plane's own route segment for each section. */
+const segments: Record<Section, string> = {
+  "work-items": "issues",
+  cycles: "cycles",
+  modules: "modules",
+  views: "views",
+  pages: "pages",
+  intake: "intake",
+};
+
+export const linkPath = "Project Planning/plane.json";
+
+const SLUG = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const linkSchema = z.object({
+  workspace: z.string().regex(SLUG),
+  project: z.string().regex(UUID),
+});
+export type PlaneLink = z.infer<typeof linkSchema>;
+
+/**
+ * Read a Plane project address such as
+ * `https://plane.example.com/acme/projects/<uuid>/issues/`. Null unless it is on
+ * the configured Plane origin and names a workspace and a project.
+ */
+export function parsePlaneProjectUrl(input: string, planeOrigin: string): PlaneLink | null {
+  let url: URL;
+  try {
+    url = new URL(input.trim());
+  } catch {
+    return null;
+  }
+  if (url.origin !== planeOrigin) return null;
+  const [workspace, projects, project] = url.pathname.split("/").filter(Boolean);
+  if (projects !== "projects") return null;
+  const parsed = linkSchema.safeParse({ workspace, project });
+  return parsed.success ? parsed.data : null;
 }
 
-// Adapted from Plane's cycle queryset annotation in app/views/cycle/base.py.
-export function cycleStatus(record: PlanningRecord, today: string) {
-  if (record.start && record.end && record.start <= today && today <= record.end) return "Current";
-  if (record.start && record.start > today) return "Upcoming";
-  if (record.end && record.end < today) return "Completed";
-  return "Draft";
+export function planeSectionUrl(planeOrigin: string, link: PlaneLink, section: Section): string {
+  const { workspace, project } = link;
+  return `${planeOrigin}/${encodeURIComponent(workspace)}/projects/${project}/${segments[section]}/`;
 }
