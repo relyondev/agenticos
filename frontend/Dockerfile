@@ -24,6 +24,7 @@ COPY . .
 
 # Build the application
 ENV NEXT_TELEMETRY_DISABLED=1
+RUN tar -czf /tmp/planning-source.tar.gz src public messages scripts licenses package.json bun.lock tsconfig.json next.config.ts postcss.config.mjs Dockerfile NOTICE && mv /tmp/planning-source.tar.gz public/planning-source.tar.gz
 RUN bun run build
 
 # Every package's own licence file, kept under the package's path, a NOTICE and

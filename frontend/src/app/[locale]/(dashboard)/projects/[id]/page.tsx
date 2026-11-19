@@ -6,6 +6,8 @@ import { FolderKanban, Plus, Files, MessageSquare, AppWindow, FileText } from "l
 import { useTranslations } from "next-intl";
 
 import { PageHeader } from "@/components/dashboard/page-header";
+import { sections, titles } from "@/lib/project-planning";
+import { ProjectPlanning } from "@/components/projects/project-planning";
 import { ProjectApps } from "@/components/projects/project-apps";
 import { ProjectChats } from "@/components/projects/project-chats";
 import { FileExplorer } from "@/components/sandboxes/workspace-explorer";
@@ -23,7 +25,7 @@ import { ROUTES } from "@/lib/constants";
 
 // Files first: a project is the work kept in it, and its chats are how the work
 // was done.
-const TABS = ["files", "chats", "apps", "instructions"] as const;
+const TABS = ["files", "chats", "apps", "instructions", ...sections] as const;
 type Tab = (typeof TABS)[number];
 
 /**
@@ -106,7 +108,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
         onValueChange={(value) => setTabParam(value === "files" ? null : value)}
         className="flex min-h-0 flex-1 flex-col"
       >
-        <TabsList data-tour="project-tabs" className="shrink-0">
+        <TabsList data-tour="project-tabs" className="h-auto shrink-0 flex-wrap">
           <TabsTrigger disabled={isLoading} value="files">
             <Files className="mr-1.5 size-4 shrink-0" aria-hidden />
             {t("files")}
@@ -123,7 +125,24 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             <FileText className="mr-1.5 size-4 shrink-0" aria-hidden />
             {t("instructions")}
           </TabsTrigger>
+          {sections.map((s) => (
+            <TabsTrigger key={s} value={s} disabled={isLoading}>
+              {titles[s]}
+            </TabsTrigger>
+          ))}
         </TabsList>
+        {sections.map((s) => (
+          <TabsContent key={s} value={s} className="min-h-0 flex-1 overflow-auto">
+            {project && tab === s && (
+              <ProjectPlanning
+                key={project.id}
+                id={project.id}
+                section={s}
+                writable={project.can_use}
+              />
+            )}
+          </TabsContent>
+        ))}
         <TabsContent value="files" className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {project ? (
             <ProjectFiles project={project} />

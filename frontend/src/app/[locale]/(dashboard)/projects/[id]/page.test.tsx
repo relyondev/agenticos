@@ -50,17 +50,25 @@ beforeEach(() => {
 });
 
 describe("project loading layout", () => {
-  it.each(["files", "chats", "apps", "instructions"])(
-    "keeps the selected %s tab while the project loads",
-    async (selected) => {
-      tab = selected;
-      await mount(<ProjectPage params={Promise.resolve({ id: "p-1" })} />);
-      const active = await screen.findByRole("tab", { selected: true });
-      expect(active).toBeDisabled();
-      expect(active).toHaveAttribute("data-state", "active");
-      expect(screen.getAllByRole("tab")).toHaveLength(4);
-    },
-  );
+  it.each([
+    "files",
+    "chats",
+    "apps",
+    "instructions",
+    "work-items",
+    "cycles",
+    "modules",
+    "views",
+    "pages",
+    "intake",
+  ])("keeps the selected %s tab while the project loads", async (selected) => {
+    tab = selected;
+    await mount(<ProjectPage params={Promise.resolve({ id: "p-1" })} />);
+    const active = await screen.findByRole("tab", { selected: true });
+    expect(active).toBeDisabled();
+    expect(active).toHaveAttribute("data-state", "active");
+    expect(screen.getAllByRole("tab")).toHaveLength(10);
+  });
 
   it("preserves the header and tabs while the files fill the same two-pane grid", async () => {
     const params = Promise.resolve({ id: "p-1" });
