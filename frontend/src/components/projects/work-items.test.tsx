@@ -17,6 +17,8 @@ const item: WorkItem = {
   start_date: null,
   target_date: null,
   labels: [],
+  cycle_id: null,
+  module_ids: [],
   completed_at: null,
   created_at: "2026-11-20T00:00:00Z",
   updated_at: null,
@@ -34,6 +36,13 @@ vi.mock("@/lib/work-items-api", async (orig) => ({
   ...(await orig<typeof import("@/lib/work-items-api")>()),
   ...api,
 }));
+const planning = vi.hoisted(() => ({
+  listCycles: vi.fn(async () => [{ id: "c1", name: "Sprint 1" }]),
+  listModules: vi.fn(async () => [{ id: "m1", name: "Auth" }]),
+  addToModule: vi.fn(async () => undefined),
+  removeFromModule: vi.fn(async () => undefined),
+}));
+vi.mock("@/lib/planning-api", () => planning);
 vi.mock("@/hooks/use-organizations", () => ({ useTenantId: () => "org" }));
 vi.mock("@/hooks/use-members", () => ({ useMembers: () => ({ members: [] }) }));
 
@@ -99,4 +108,21 @@ it("is read-only for a viewer", async () => {
   fireEvent.click(await screen.findByText(/#3 Write brief/));
   expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   expect(screen.getByLabelText("State")).toBeDisabled();
+});
+
+it("moves an item into a cycle and a module from its detail view", async () => {
+  mount(true);
+  fireEvent.click(await screen.findByText(/#3 Write brief/));
+  await screen.findByRole("option", { name: "Sprint 1" });
+  fireEvent.change(screen.getByLabelText("Cycle"), { target: { value: "c1" } });
+  fireEvent.click(await screen.findByLabelText("Auth"));
+  await waitFor(() => expect(planning.addToModule).toHaveBeenCalledWith("p", "m1", "i1"));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() =>
+    expect(api.updateWorkItem).toHaveBeenCalledWith(
+      "p",
+      "i1",
+      expect.objectContaining({ cycle_id: "c1" }),
+    ),
+  );
 });

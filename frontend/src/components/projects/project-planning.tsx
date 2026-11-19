@@ -18,6 +18,8 @@ import {
   titles,
 } from "@/lib/project-planning";
 import type { PlaneLink, Section } from "@/lib/project-planning";
+import { Cycles } from "./cycles";
+import { Modules } from "./modules";
 import { WorkItems } from "./work-items";
 
 type Stored = { link: PlaneLink; revision: string } | null;
@@ -41,6 +43,8 @@ export function ProjectPlanning({
   writable: boolean;
 }) {
   if (section === "work-items") return <WorkItems project={id} writable={writable} />;
+  if (section === "cycles") return <Cycles project={id} writable={writable} />;
+  if (section === "modules") return <Modules project={id} writable={writable} />;
   return <PlaneSection id={id} section={section} writable={writable} />;
 }
 

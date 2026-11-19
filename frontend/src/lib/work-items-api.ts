@@ -30,6 +30,8 @@ export interface WorkItem {
   start_date: string | null;
   target_date: string | null;
   labels: string[];
+  cycle_id: string | null;
+  module_ids: string[];
   completed_at: string | null;
   created_at: string;
   updated_at: string | null;
@@ -49,6 +51,7 @@ export interface WorkItemInput {
   start_date: string | null;
   target_date: string | null;
   labels: string[];
+  cycle_id: string | null;
 }
 
 export interface WorkItemComment {
@@ -72,6 +75,8 @@ export interface WorkItemFilters {
   state?: WorkItemState | "";
   priority?: WorkItemPriority | "";
   q?: string;
+  cycle_id?: string;
+  module_id?: string;
 }
 
 const root = (project: string) => `/projects/${project}/work-items`;
@@ -80,6 +85,8 @@ export function listWorkItems(project: string, filters: WorkItemFilters = {}) {
   const query = new URLSearchParams({ limit: "200" });
   if (filters.state) query.set("state", filters.state);
   if (filters.priority) query.set("priority", filters.priority);
+  if (filters.cycle_id) query.set("cycle_id", filters.cycle_id);
+  if (filters.module_id) query.set("module_id", filters.module_id);
   if (filters.q?.trim()) query.set("q", filters.q.trim());
   return apiClient.get<WorkItemList>(`${root(project)}?${query}`);
 }

@@ -17,6 +17,7 @@ import {
   listWorkItems,
   updateWorkItem,
 } from "@/lib/work-items-api";
+import { addToModule, listCycles, listModules, removeFromModule } from "@/lib/planning-api";
 import type {
   WorkItem,
   WorkItemInput,
@@ -43,7 +44,29 @@ function WorkItemDetail({
   const [draft, setDraft] = useState<WorkItem>(item);
   const [comment, setComment] = useState("");
   const [error, setError] = useState("");
+  const [moduleIds, setModuleIds] = useState<string[]>(item.module_ids);
   const refresh = () => client.invalidateQueries({ queryKey: ["work-items", tenant, project] });
+  const cycles = useQuery({
+    queryKey: ["cycles", tenant, project],
+    queryFn: () => listCycles(project),
+  });
+  const modules = useQuery({
+    queryKey: ["modules", tenant, project],
+    queryFn: () => listModules(project),
+  });
+  const toggle = useMutation({
+    mutationFn: async ({ id, on }: { id: string; on: boolean }) => {
+      if (on) await addToModule(project, id, item.id);
+      else await removeFromModule(project, id, item.id);
+      return { id, on };
+    },
+    onSuccess: async ({ id, on }) => {
+      setModuleIds((ids) => (on ? [...ids, id] : ids.filter((m) => m !== id)));
+      await refresh();
+      await client.invalidateQueries({ queryKey: ["modules", tenant, project] });
+    },
+    onError: (e: Error) => setError(e.message),
+  });
   const comments = useQuery({
     queryKey: ["work-item-comments", item.id],
     queryFn: () => listComments(project, item.id),
@@ -63,6 +86,7 @@ function WorkItemDetail({
         start_date: draft.start_date,
         target_date: draft.target_date,
         labels: draft.labels,
+        cycle_id: draft.cycle_id,
       };
       return updateWorkItem(project, item.id, input);
     },
@@ -183,6 +207,21 @@ function WorkItemDetail({
             />
           </label>
           <label>
+            Cycle
+            <select
+              className={field}
+              value={draft.cycle_id ?? ""}
+              onChange={(e) => set("cycle_id", e.target.value || null)}
+            >
+              <option value="">No cycle</option>
+              {(cycles.data ?? []).map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
             Start date
             <input
               type="date"
@@ -202,6 +241,21 @@ function WorkItemDetail({
           </label>
         </div>
       </fieldset>
+      {(modules.data ?? []).length > 0 && (
+        <fieldset disabled={!writable || toggle.isPending}>
+          <legend>Modules</legend>
+          {(modules.data ?? []).map((m) => (
+            <label key={m.id} className="mr-4">
+              <input
+                type="checkbox"
+                checked={moduleIds.includes(m.id)}
+                onChange={(e) => toggle.mutate({ id: m.id, on: e.target.checked })}
+              />{" "}
+              {m.name}
+            </label>
+          ))}
+        </fieldset>
+      )}
       {error && <p role="alert">{error}</p>}
       {writable && (
         <div className="flex gap-2">

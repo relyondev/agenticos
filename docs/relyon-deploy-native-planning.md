@@ -1,12 +1,12 @@
-# Deploy native project planning (Work Items) to the Relyon VPS
+# Deploy native project planning (Work Items, Cycles, Modules) to the Relyon VPS
 
-This changes the database (migration `0251_work_items`) and replaces BOTH the
+This changes the database (migrations `0251_work_items` and `0252_cycles_modules`) and replaces BOTH the
 backend and the frontend image. Do the backup first.
 
 Images (both built by GitHub Actions on branch `relyon/native-planning`):
 
-- `ghcr.io/relyondev/agenticos-backend:1.38.2-planning.1`
-- `ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.3`
+- `ghcr.io/relyondev/agenticos-backend:1.38.2-planning.2`
+- `ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.4`
 
 ## 1. Back up the database
 
@@ -31,21 +31,21 @@ Back up and edit the image of the `app`, `worker` and `migrate` services
 
 ```bash
 cp docker-compose-prod.yml docker-compose-prod.yml.bak
-sed -i 's#ghcr.io/vstorm-co/agenticos-backend:${AGENTICOS_VERSION:-latest}#ghcr.io/relyondev/agenticos-backend:1.38.2-planning.1#' docker-compose-prod.yml
+sed -i 's#ghcr.io/vstorm-co/agenticos-backend:${AGENTICOS_VERSION:-latest}#ghcr.io/relyondev/agenticos-backend:1.38.2-planning.2#' docker-compose-prod.yml
 grep -c 'relyondev/agenticos-backend' docker-compose-prod.yml   # expect 3
 ```
 
 ```bash
 docker compose -p relios-agenticos --env-file backend/.env -f docker-compose-prod.yml [-f ...others from step 2] pull
 docker compose -p relios-agenticos --env-file backend/.env -f docker-compose-prod.yml [-f ...others from step 2] up -d
-docker logs relios-agenticos-migrate-1 2>&1 | tail -3   # expect "Running upgrade 0250... -> 0251_work_items"
+docker logs relios-agenticos-migrate-1 2>&1 | tail -3   # expect "Running upgrade 0251_work_items -> 0252_cycles_modules"
 ```
 
 ## 4. Frontend
 
 ```bash
 cp docker-compose-prod.frontend.yml docker-compose-prod.frontend.yml.bak2
-sed -i 's#agenticos-frontend:1.38.2-planning.[0-9]*#agenticos-frontend:1.38.2-planning.3#' docker-compose-prod.frontend.yml
+sed -i 's#agenticos-frontend:1.38.2-planning.[0-9]*#agenticos-frontend:1.38.2-planning.4#' docker-compose-prod.frontend.yml
 docker compose -p relios-agenticos-frontend --env-file backend/.env \
   -f docker-compose-prod.frontend.yml -f docker-compose-prod.frontend.traefik.yml \
   -f docker-compose-prod.frontend.plane.yml pull
