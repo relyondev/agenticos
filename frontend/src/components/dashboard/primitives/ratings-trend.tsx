@@ -1,0 +1,94 @@
+"use client";
+
+import dynamic from "next/dynamic";
+import { useTranslations } from "next-intl";
+
+import { CHART_MIN_HEIGHT } from "@/lib/dashboard/system";
+import { cn } from "@/lib/utils";
+import type { RatingsByDay } from "@/types/stats";
+
+const RatingsTrendImpl = dynamic(
+  () => import("./ratings-trend.impl").then((m) => m.RatingsTrendImpl),
+  {
+    ssr: false,
+    loading: () => <div className="bg-muted h-full w-full animate-pulse rounded-md" />,
+  },
+);
+
+/** Fewer rated days than this is no trend to draw - one bar on an empty axis read as broken. */
+const MIN_TREND_DAYS = 3;
+
+/**
+ * The quality block: the headline share of positive answers, then how the
+ * thumbs moved day by day - where quality stands and where it is going.
+ */
+export function RatingsTrend({
+  positivePercent,
+  subline,
+  data,
+}: {
+  positivePercent: number;
+  subline: string;
+  data: RatingsByDay[];
+}) {
+  const t = useTranslations("dashboard");
+  return (
+    <div className="flex h-full flex-col gap-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <div>
+          <span className="text-foreground text-2xl font-semibold tabular-nums">
+            {positivePercent}%
+          </span>
+          <p className="text-muted-foreground text-xs">{subline}</p>
+        </div>
+        {/* Two series and no key was a chart that could not be read at all -
+            and the swatches are the marks themselves, so the legend cannot
+            name a colour the bars do not draw. */}
+        <ul className="text-muted-foreground flex shrink-0 items-center gap-3 text-xs">
+          {(
+            [
+              ["likes", "var(--series-2)"],
+              ["dislikes", "var(--series-4)"],
+            ] as const
+          ).map(([key, color]) => (
+            <li key={key} className="flex items-center gap-1.5">
+              <span
+                className="size-2.5 shrink-0 rounded-[3px]"
+                style={{ background: color }}
+                aria-hidden
+              />
+              {t(`ratings.${key}`)}
+            </li>
+          ))}
+        </ul>
+      </div>
+      {data.length < MIN_TREND_DAYS ? (
+        <RatingsSplit data={data} />
+      ) : (
+        <div className={cn(CHART_MIN_HEIGHT, "flex-1")}>
+          <RatingsTrendImpl data={data} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A handful of ratings as what they are: one bar split helpful against not, with the counts. */
+function RatingsSplit({ data }: { data: RatingsByDay[] }) {
+  const t = useTranslations("dashboard.ratings");
+  const likes = data.reduce((sum, day) => sum + day.likes, 0);
+  const dislikes = data.reduce((sum, day) => sum + day.dislikes, 0);
+  const total = Math.max(likes + dislikes, 1);
+  return (
+    <div className="mt-auto space-y-2">
+      <div className="bg-muted flex h-2.5 overflow-hidden rounded-full">
+        <span style={{ width: `${(likes / total) * 100}%`, background: "var(--series-2)" }} />
+        <span style={{ width: `${(dislikes / total) * 100}%`, background: "var(--series-4)" }} />
+      </div>
+      <p className="text-muted-foreground flex justify-between text-xs tabular-nums">
+        <span>{t("likesCount", { count: likes })}</span>
+        <span>{t("dislikesCount", { count: dislikes })}</span>
+      </p>
+    </div>
+  );
+}

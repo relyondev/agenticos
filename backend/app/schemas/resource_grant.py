@@ -1,0 +1,197 @@
+"""Schemas for per-resource sharing."""
+
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, Self
+from uuid import UUID
+
+from pydantic import Field, model_validator
+
+from app.db.models.resource_grant import GrantLevelLiteral, Visibility
+from app.schemas.base import BaseSchema
+
+VisibilityLiteral = Literal["private", "team", "org"]
+
+
+def as_visibility(value: str) -> VisibilityLiteral:
+    """One column's string as the vocabulary the API publishes.
+
+    A visibility is a `String` column under a check constraint, so what comes
+    back from the database is `str` as far as anything reading it can tell. This
+    is where that becomes the three values the schema promises - and where a row
+    holding anything else fails loudly, rather than being serialized into a
+    response whose own OpenAPI schema forbids it.
+    """
+    match value:
+        case "private" | "team" | "org":
+            return value
+        case _:
+            raise ValueError(f"Not a visibility: {value!r}")
+
+
+class ResourceGrantRead(BaseSchema):
+    """One member's or one group's access to one resource.
+
+    Exactly one of `subject_user_id` and `subject_group_id` is set - the
+    database's `ck_resource_grant_one_subject` holds it, so a client can branch
+    on which is present.
+    """
+
+    id: UUID
+    subject_user_id: UUID | None = None
+    subject_email: str | None = None
+    subject_group_id: UUID | None = None
+    subject_group_name: str | None = None
+    resource_type: str
+    resource_id: UUID
+    level: GrantLevelLiteral
+
+    @classmethod
+    def of(
+        cls,
+        grant: Any,
+        *,
+        emails: Mapping[UUID, str | None],
+        group_names: Mapping[UUID, str],
+    ) -> ResourceGrantRead:
+        """One grant row as the API shows it, with its subject's name resolved."""
+        user_id: UUID | None = grant.subject_user_id
+        group_id: UUID | None = grant.subject_group_id
+        return cls(
+            id=grant.id,
+            subject_user_id=user_id,
+            subject_email=emails.get(user_id) if user_id is not None else None,
+            subject_group_id=group_id,
+            subject_group_name=group_names.get(group_id) if group_id is not None else None,
+            resource_type=grant.resource_type,
+            resource_id=grant.resource_id,
+            level=grant.level,
+        )
+
+
+class ResourceGrantUpsert(BaseSchema):
+    """Share a resource with a member or a group, or change the level of an existing share."""
+
+    subject_user_id: UUID | None = None
+    subject_group_id: UUID | None = None
+    level: GrantLevelLiteral = Field(
+        default="read",
+        description=(
+            "read sees the configuration, use also runs it, edit also changes it; "
+            "edit_data, for pages only, is an edit whose republishes the owner has "
+            "consented to in advance"
+        ),
+    )
+    confirmed: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Granting or raising to edit_data: the id of the text the person confirmed, "
+            "as the console names it. Recorded in the audit entry"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def one_subject(self) -> ResourceGrantUpsert:
+        """A share has one subject: a person or a group, named by exactly one field."""
+        if (self.subject_user_id is None) == (self.subject_group_id is None):
+            raise ValueError("Name exactly one of subject_user_id and subject_group_id")
+        return self
+
+
+class SharingDeferred(BaseSchema):
+    """The answer to a share that a resource type's guard turned into a request, and did
+    not apply."""
+
+    status: Literal["requested"] = "requested"
+    request_id: UUID
+    waiting_for: str | None = Field(
+        default=None, description="Who decides it, by name; null when it has nobody left to"
+    )
+
+
+class ResourceSharing(BaseSchema):
+    """The whole sharing state of one resource: who owns it, how visible it is, who it is shared with."""
+
+    resource_type: str
+    resource_id: UUID
+    owner_user_id: UUID | None
+    visibility: VisibilityLiteral
+    grants: list[ResourceGrantRead]
+
+    @classmethod
+    def of(
+        cls,
+        resource: Any,
+        *,
+        resource_type: str,
+        grants: Sequence[Any],
+        emails: Mapping[UUID, str | None],
+        group_names: Mapping[UUID, str],
+    ) -> ResourceSharing:
+        """Assemble the response from a row, its grants and the looked-up names.
+
+        On the schema rather than in the route module: turning rows into the
+        response shape is what a schema is for, and the route that had it was
+        the only thing standing between three resource types and a fourth
+        copying it.
+
+        `emails` and `group_names` are separate lookups because a grant stores
+        an id and the UI shows a name; a grant for somebody no longer in the
+        organization resolves to `None` rather than dropping the row, so an
+        admin can still see - and revoke - access nobody can explain.
+        """
+        return cls(
+            resource_type=resource_type,
+            resource_id=resource.id,
+            owner_user_id=resource.owner_user_id,
+            visibility=resource.visibility,
+            grants=[
+                ResourceGrantRead.of(grant, emails=emails, group_names=group_names)
+                for grant in grants
+            ],
+        )
+
+
+class VisibilityUpdate(BaseSchema):
+    """Change how widely a resource is exposed within its organization."""
+
+    visibility: VisibilityLiteral
+
+
+class AudienceChoice(BaseSchema):
+    """Who a new resource reaches, chosen in the control that creates it (#2072).
+
+    The whole organization by default, because a company's agents and knowledge are
+    for the company. Naming groups or people narrows it to them: the resource is
+    created private and shared with each, so a department's skills, knowledge and
+    agents stay the department's.
+    """
+
+    visibility: Visibility = Field(
+        default=Visibility.ORG,
+        description=(
+            "`org` - the default - is everyone in the organization; `private` is the "
+            "creator and whoever they share it with. Naming `group_ids` or `user_ids` "
+            "makes it private."
+        ),
+    )
+    group_ids: list[UUID] = Field(
+        default_factory=list,
+        max_length=50,
+        description=(
+            "Limit it to these groups: it is created private and shared with each at "
+            "`use`, so their members find it, run it and attach it to their agents."
+        ),
+    )
+
+    user_ids: list[UUID] = Field(
+        default_factory=list,
+        max_length=50,
+        description=("Limit it to these members as well, or instead: each gets it at `use`."),
+    )
+
+    @model_validator(mode="after")
+    def _an_audience_narrows_it(self) -> Self:
+        if self.group_ids or self.user_ids:
+            self.visibility = Visibility.PRIVATE
+        return self

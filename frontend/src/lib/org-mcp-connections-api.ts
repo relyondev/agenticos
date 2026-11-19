@@ -1,0 +1,138 @@
+/**
+ * API client for the organization's MCP servers.
+ *
+ * The sibling of `mcp-connections-api.ts`, and the difference between them is
+ * the difference the whole feature turns on. That one talks to
+ * `/me/mcp-connections`: a person's own servers, their own credentials, only
+ * their own assistant. This one talks to `/mcp-connections`: servers the
+ * organization owns, gated on `connections:manage`, and the only ones an agent
+ * can be built on - a published agent that reached different tools depending on
+ * who ran it would be neither reviewable nor reproducible.
+ *
+ * The credential is write-only here as it is there: it goes in, it is sealed
+ * for the organization, and no response ever carries it back.
+ */
+
+import type { AudiencePayload } from "@/types/sharing";
+import { apiClient } from "./api-client";
+import type {
+  McpConnectionRecord,
+  McpConnectionTestResult,
+  McpToolCall,
+  McpToolInfo,
+} from "./mcp-connections-api";
+
+/**
+ * One organization server.
+ *
+ * Adds `catalog_key` to the personal shape: the backend records which curated
+ * entry a server came from, so the Builder can show a real name instead of
+ * guessing one from the URL. Null for a server added by raw URL.
+ *
+ * `auth_type` is always `"bearer"` - an OAuth grant is one human's consent at a
+ * consent screen, and storing it as the organization's would attribute one
+ * member's access to everybody and revoke it the day they left. There is no
+ * endpoint to start an OAuth flow for an organization server.
+ */
+export interface OrgMcpConnectionRecord extends McpConnectionRecord {
+  /**
+   * The OAuth scopes the connected account consented to, or null for a bearer
+   * connection (which holds no consent). What a portal checks to decide whether
+   * the account can auto-register a webhook, or must be re-authorized first.
+   */
+  granted_scopes: string[] | null;
+}
+
+/**
+ * An organization server as a workflow editor picks it: what `GET
+ * /workflows/{id}/mcp-connections` returns, which needs the right to edit that
+ * workflow and not `mcp:manage`. Never the URL, the credential, the consent or the last error -
+ * those stay with a manager.
+ */
+export interface UsableMcpConnectionRecord {
+  id: string;
+  name: string;
+  label: string | null;
+  catalog_key: string | null;
+  is_enabled: boolean;
+  /** null = every tool the server offers. */
+  allowed_tools: string[] | null;
+  /** What the last test recorded; null when nothing has tested it, which is not "offers none". */
+  last_tools: McpToolInfo[] | null;
+  last_checked_at: string | null;
+}
+
+interface OrgMcpConnectionList {
+  items: OrgMcpConnectionRecord[];
+  total: number;
+}
+
+/** Narrowing it to groups or people is optional; left out, the organization sees it (#2072). */
+export interface OrgMcpConnectionInput extends Partial<AudiencePayload> {
+  name: string;
+  url: string;
+  auth_token?: string;
+  allowed_tools?: string[] | null;
+  is_enabled?: boolean;
+  catalog_key?: string | null;
+  label?: string;
+}
+
+export interface OrgMcpConnectionPatch {
+  name?: string;
+  url?: string;
+  /** `""` clears the stored credential. Omit to leave it alone. */
+  auth_token?: string;
+  allowed_tools?: string[];
+  clear_allowed_tools?: boolean;
+  is_enabled?: boolean;
+  include_instructions?: boolean;
+  /** `""` clears it, back to showing the slug. */
+  label?: string;
+}
+
+const ROOT = "/mcp-connections";
+
+export async function listOrgMcpConnections(): Promise<OrgMcpConnectionRecord[]> {
+  const data = await apiClient.get<OrgMcpConnectionList>(ROOT);
+  return data.items;
+}
+
+export async function createOrgMcpConnection(
+  input: OrgMcpConnectionInput,
+): Promise<OrgMcpConnectionRecord> {
+  return apiClient.post<OrgMcpConnectionRecord>(ROOT, input);
+}
+
+export async function updateOrgMcpConnection(
+  id: string,
+  patch: OrgMcpConnectionPatch,
+): Promise<OrgMcpConnectionRecord> {
+  return apiClient.patch<OrgMcpConnectionRecord>(`${ROOT}/${id}`, patch);
+}
+
+export async function deleteOrgMcpConnection(id: string): Promise<void> {
+  await apiClient.delete(`${ROOT}/${id}`);
+}
+
+/** What agents asked one organization server to do, newest first (#2072). */
+export async function listOrgMcpToolCalls(id: string): Promise<McpToolCall[]> {
+  return (await apiClient.get<{ items: McpToolCall[] }>(`${ROOT}/${id}/calls`)).items;
+}
+
+export async function testOrgMcpConnection(id: string): Promise<McpConnectionTestResult> {
+  return apiClient.post<McpConnectionTestResult>(`${ROOT}/${id}/test`);
+}
+
+/** The minutes a connected mailbox may be left between checks. */
+export const POLL_INTERVAL_MINUTES = [1, 5, 15, 30, 60] as const;
+
+/** Set how often the organization's connected mailbox is checked, for every trigger on it. */
+export async function setPortalPollInterval(
+  connectionId: string,
+  minutes: number,
+): Promise<{ connection_id: string; poll_interval_minutes: number }> {
+  return apiClient.put(`/mcp-connections/portals/${connectionId}/poll-interval`, {
+    poll_interval_minutes: minutes,
+  });
+}

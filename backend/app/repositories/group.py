@@ -1,0 +1,282 @@
+"""Group and GroupMember repository (PostgreSQL async)."""
+
+from collections.abc import Sequence
+from decimal import Decimal
+from typing import NamedTuple
+from uuid import UUID
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models.group import Group, GroupMember
+from app.db.models.organization import MembershipSource
+from app.db.models.user import User
+
+
+async def create(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    name: str,
+    description: str | None,
+    created_by_user_id: UUID | None,
+    icon: str | None = None,
+    monthly_budget_usd: Decimal | None = None,
+) -> Group:
+    group = Group(
+        organization_id=organization_id,
+        name=name,
+        description=description,
+        icon=icon,
+        monthly_budget_usd=monthly_budget_usd,
+        created_by_user_id=created_by_user_id,
+    )
+    db.add(group)
+    await db.flush()
+    await db.refresh(group)
+    return group
+
+
+async def get(db: AsyncSession, *, organization_id: UUID, group_id: UUID) -> Group | None:
+    """One group, only when it belongs to `organization_id`.
+
+    The organization is part of the lookup rather than checked afterwards, so a
+    group id from another tenant reads exactly like one that does not exist.
+    """
+    result = await db.execute(
+        select(Group).where(Group.id == group_id, Group.organization_id == organization_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_by_name(db: AsyncSession, *, organization_id: UUID, name: str) -> Group | None:
+    result = await db.execute(
+        select(Group).where(Group.organization_id == organization_id, Group.name == name)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_for_org(db: AsyncSession, organization_id: UUID) -> list[tuple[Group, int]]:
+    """Every group in the organization with how many members it has, by name.
+
+    Unpaged: a group is created by hand, so an organization has tens of them,
+    and the sharing picker needs all of them at once.
+    """
+    members = (
+        select(GroupMember.group_id, func.count(GroupMember.id).label("members"))
+        .group_by(GroupMember.group_id)
+        .subquery()
+    )
+    result = await db.execute(
+        select(Group, func.coalesce(members.c.members, 0))
+        .outerjoin(members, members.c.group_id == Group.id)
+        .where(Group.organization_id == organization_id)
+        .order_by(Group.name, Group.id)
+    )
+    return [(row[0], int(row[1])) for row in result.all()]
+
+
+async def get_names(
+    db: AsyncSession, *, organization_id: UUID, group_ids: list[UUID]
+) -> dict[UUID, str]:
+    """Group names by id, for a listing that stores ids and shows names."""
+    if not group_ids:
+        return {}
+    result = await db.execute(
+        select(Group.id, Group.name).where(
+            Group.organization_id == organization_id, Group.id.in_(group_ids)
+        )
+    )
+    return dict(result.all())
+
+
+async def update(
+    db: AsyncSession,
+    group: Group,
+    *,
+    name: str,
+    description: str | None,
+    icon: str | None,
+    monthly_budget_usd: Decimal | None,
+) -> Group:
+    group.name = name
+    group.description = description
+    group.icon = icon
+    group.monthly_budget_usd = monthly_budget_usd
+    await db.flush()
+    await db.refresh(group)
+    return group
+
+
+async def delete_group(db: AsyncSession, group: Group) -> None:
+    await db.delete(group)
+    await db.flush()
+
+
+async def lead_ids(db: AsyncSession, group_ids: Sequence[UUID]) -> list[UUID]:
+    """Whoever leads any of these groups, once each."""
+    result = await db.execute(
+        select(GroupMember.user_id)
+        .where(GroupMember.group_id.in_(group_ids), GroupMember.is_lead.is_(True))
+        .distinct()
+    )
+    return list(result.scalars().all())
+
+
+class CappedGroup(NamedTuple):
+    """A group with a monthly budget - the column is not null here, by the query."""
+
+    id: UUID
+    name: str
+    monthly_budget_usd: Decimal
+
+
+async def capped_groups_for_member(
+    db: AsyncSession, *, organization_id: UUID, user_id: UUID
+) -> list[CappedGroup]:
+    """The groups one person is in that carry a monthly budget, by name (#2072)."""
+    result = await db.execute(
+        select(Group.id, Group.name, Group.monthly_budget_usd)
+        .join(GroupMember, GroupMember.group_id == Group.id)
+        .where(
+            Group.organization_id == organization_id,
+            GroupMember.user_id == user_id,
+            Group.monthly_budget_usd.is_not(None),
+        )
+        .order_by(Group.name)
+    )
+    # The `is not None` only narrows the type; the `WHERE` already did it.
+    return [CappedGroup(gid, name, cap) for gid, name, cap in result.all() if cap is not None]
+
+
+async def count_members(db: AsyncSession, group_id: UUID) -> int:
+    result = await db.execute(
+        select(func.count(GroupMember.id)).where(GroupMember.group_id == group_id)
+    )
+    return int(result.scalar_one())
+
+
+async def list_members(
+    db: AsyncSession, group_id: UUID
+) -> list[tuple[GroupMember, str, str | None]]:
+    """(membership, email, full name) for every member of one group, by address."""
+    result = await db.execute(
+        select(GroupMember, User.email, User.full_name)
+        .join(User, User.id == GroupMember.user_id)
+        .where(GroupMember.group_id == group_id)
+        .order_by(User.email, GroupMember.id)
+    )
+    return [(row[0], row[1], row[2]) for row in result.all()]
+
+
+async def get_member_row(
+    db: AsyncSession, *, group_id: UUID, user_id: UUID
+) -> tuple[GroupMember, str, str | None] | None:
+    """One (membership, email, full name) row, the shape `list_members` returns."""
+    result = await db.execute(
+        select(GroupMember, User.email, User.full_name)
+        .join(User, User.id == GroupMember.user_id)
+        .where(GroupMember.group_id == group_id, GroupMember.user_id == user_id)
+    )
+    row = result.one_or_none()
+    return (row[0], row[1], row[2]) if row is not None else None
+
+
+async def get_member(db: AsyncSession, *, group_id: UUID, user_id: UUID) -> GroupMember | None:
+    result = await db.execute(
+        select(GroupMember).where(GroupMember.group_id == group_id, GroupMember.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def add_member(
+    db: AsyncSession,
+    *,
+    group_id: UUID,
+    user_id: UUID,
+    source: MembershipSource,
+    added_by_user_id: UUID | None,
+) -> GroupMember:
+    member = GroupMember(
+        group_id=group_id,
+        user_id=user_id,
+        source=source.value,
+        added_by_user_id=added_by_user_id,
+    )
+    db.add(member)
+    await db.flush()
+    await db.refresh(member)
+    return member
+
+
+async def set_member_source(
+    db: AsyncSession, member: GroupMember, *, source: MembershipSource
+) -> GroupMember:
+    member.source = source.value
+    await db.flush()
+    await db.refresh(member)
+    return member
+
+
+async def set_member_lead(db: AsyncSession, member: GroupMember, *, is_lead: bool) -> GroupMember:
+    member.is_lead = is_lead
+    await db.flush()
+    await db.refresh(member)
+    return member
+
+
+async def remove_member(db: AsyncSession, member: GroupMember) -> None:
+    await db.delete(member)
+    await db.flush()
+
+
+async def list_memberships_in_org(
+    db: AsyncSession, *, organization_id: UUID, user_id: UUID
+) -> list[GroupMember]:
+    """Every group membership this person holds inside one organization."""
+    result = await db.execute(
+        select(GroupMember)
+        .join(Group, Group.id == GroupMember.group_id)
+        .where(Group.organization_id == organization_id, GroupMember.user_id == user_id)
+    )
+    return list(result.scalars().all())
+
+
+async def names_for_member(db: AsyncSession, *, organization_id: UUID, user_id: UUID) -> list[str]:
+    """The names of the groups this person is in inside one organization, in name order."""
+    result = await db.execute(
+        select(Group.name)
+        .join(GroupMember, GroupMember.group_id == Group.id)
+        .where(Group.organization_id == organization_id, GroupMember.user_id == user_id)
+        .order_by(Group.name)
+    )
+    return list(result.scalars().all())
+
+
+async def organizations_with_directory_groups(db: AsyncSession, *, user_id: UUID) -> list[UUID]:
+    """The organizations in which the directory sync put this person in some group."""
+    result = await db.execute(
+        select(Group.organization_id)
+        .join(GroupMember, GroupMember.group_id == Group.id)
+        .where(
+            GroupMember.user_id == user_id,
+            GroupMember.source == MembershipSource.DIRECTORY.value,
+        )
+        .distinct()
+    )
+    return list(result.scalars().all())
+
+
+async def delete_memberships_in_org(
+    db: AsyncSession, *, organization_id: UUID, user_id: UUID
+) -> None:
+    """Take a person out of every group in an organization they are leaving.
+
+    The groups belong to the organization and the membership row to the person,
+    so neither foreign key cascades when only the membership between them ends.
+    """
+    in_org = select(Group.id).where(Group.organization_id == organization_id)
+    await db.execute(
+        delete(GroupMember).where(GroupMember.user_id == user_id, GroupMember.group_id.in_(in_org))
+    )
+    await db.flush()

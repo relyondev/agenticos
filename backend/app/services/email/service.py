@@ -1,0 +1,215 @@
+import enum
+import logging
+from typing import Any
+
+from app.core.config import settings
+from app.services.email import get_email_provider
+from app.services.email.providers.base import EmailMessage, EmailProvider, SendResult
+from app.services.email.templates import render_email
+
+logger = logging.getLogger(__name__)
+
+
+class EmailKey(enum.StrEnum):
+    WELCOME = "welcome"
+    EMAIL_VERIFICATION = "email_verification"
+    # Proving a *changed* address, and telling the old one it was asked for
+    # (#1772). Two keys rather than one: they go to two different addresses
+    # and say opposite things - "confirm this" and "somebody asked to move
+    # your account away from here".
+    EMAIL_CHANGE_VERIFICATION = "email_change_verification"
+    EMAIL_CHANGE_NOTICE = "email_change_notice"
+    MAGIC_LINK = "magic_link"
+    PASSWORD_RESET = "password_reset"
+    INVITATION = "invitation"
+    NEWSLETTER_WELCOME = "newsletter_welcome"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_PENDING = "approval_pending"
+    USAGE_REPORT = "usage_report"
+    IMPERSONATION_NOTICE = "impersonation_notice"
+    # The notification center's fallback (#1598): every event type without a
+    # bespoke template renders through this one, off `summary`/`context_url`
+    # alone - a template per event type is not scope that feature takes on.
+    NOTIFICATION = "notification"
+    # A workflow's `email.send` step: the subject and body are the workflow's
+    # own, to an address it chose - often somebody outside the organization.
+    WORKFLOW_MESSAGE = "workflow_message"
+
+
+class EmailCategory(enum.StrEnum):
+    TRANSACTIONAL = "transactional"
+    LIFECYCLE = "lifecycle"
+    MARKETING = "marketing"
+
+
+_CATEGORIES: dict[EmailKey, EmailCategory] = {
+    EmailKey.WELCOME: EmailCategory.TRANSACTIONAL,
+    EmailKey.EMAIL_VERIFICATION: EmailCategory.TRANSACTIONAL,
+    EmailKey.EMAIL_CHANGE_VERIFICATION: EmailCategory.TRANSACTIONAL,
+    EmailKey.EMAIL_CHANGE_NOTICE: EmailCategory.TRANSACTIONAL,
+    EmailKey.MAGIC_LINK: EmailCategory.TRANSACTIONAL,
+    EmailKey.PASSWORD_RESET: EmailCategory.TRANSACTIONAL,
+    EmailKey.INVITATION: EmailCategory.TRANSACTIONAL,
+    EmailKey.NEWSLETTER_WELCOME: EmailCategory.MARKETING,
+    # Lifecycle, not marketing: each one reports a state the recipient's own
+    # agent is in. Each maps to one preference on the user (the `notify_*`
+    # columns), consulted where recipients are resolved, in NotificationService.
+    EmailKey.BUDGET_EXCEEDED: EmailCategory.LIFECYCLE,
+    EmailKey.APPROVAL_REQUESTED: EmailCategory.LIFECYCLE,
+    EmailKey.APPROVAL_PENDING: EmailCategory.LIFECYCLE,
+    EmailKey.USAGE_REPORT: EmailCategory.LIFECYCLE,
+    EmailKey.NOTIFICATION: EmailCategory.LIFECYCLE,
+    # Transactional, not lifecycle: whether it is sent at all is the deployment's
+    # `notify_impersonated_users` policy, not a preference of the recipient - a
+    # person cannot opt out of being told an administrator acted as them.
+    EmailKey.IMPERSONATION_NOTICE: EmailCategory.TRANSACTIONAL,
+    # Transactional: the recipient is whoever the workflow addressed, usually
+    # with no account here and no preference to consult.
+    EmailKey.WORKFLOW_MESSAGE: EmailCategory.TRANSACTIONAL,
+}
+
+
+class EmailService:
+    """Render transactional mail through a provider and its selected sender.
+
+    `app_name` is a **required** argument on every send rather than a constant in
+    here, and that is the point of it: the name is what the administrator sets on
+    `/admin/settings`, so a default would be a second answer to "what is this
+    product called" and the first email after a rename would be the one that
+    disagrees. It was three hardcoded `"agenticos"` literals before #914. Callers
+    resolve it through `DeploymentSettingsService.effective_app_name`, which has no
+    session here to read it with.
+    """
+
+    def __init__(
+        self,
+        provider: EmailProvider,
+        *,
+        from_email: str | None = None,
+        from_name: str | None = None,
+    ) -> None:
+        self.provider = provider
+        self.reply_to = getattr(settings, "EMAIL_REPLY_TO", None) if from_email is None else None
+        self.from_email = from_email or settings.EMAIL_FROM
+        self.from_name = settings.EMAIL_FROM_NAME if from_email is None else from_name
+
+    @property
+    def delivers(self) -> bool:
+        """Whether an accepted message actually leaves this deployment.
+
+        Read beside `SendResult.accepted` rather than instead of it: the pair is
+        "the provider took it" and "the provider is one that sends", and only both
+        together mean an address was mailed. See `EmailProvider.delivers`.
+        """
+        return self.provider.delivers
+
+    async def send(
+        self,
+        *,
+        key: EmailKey,
+        to: str,
+        context: dict[str, Any],
+        reply_to: str | None = None,
+    ) -> SendResult:
+        """Render and send one email.
+
+        There is deliberately no opt-out check here: this method holds an
+        address, not a user, and cannot ask the database what its owner wants.
+        The lifecycle keys (budget exceeded, approval requested, usage report)
+        are declinable, and their check lives in NotificationService, where
+        recipients are resolved - an address that reaches this method has
+        already passed it. The transactional keys have no preference at all.
+
+        `reply_to` replaces the deployment's own reply address for this one
+        message - a workflow's mail is answered to whoever runs that process.
+        """
+        subject, html, text = render_email(key.value, context)
+
+        message = EmailMessage(
+            to=[to],
+            from_email=self.from_email,
+            from_name=self.from_name,
+            subject=subject,
+            html=html,
+            text=text,
+            reply_to=reply_to or self.reply_to,
+            tags=[_CATEGORIES[key].value, key.value],
+        )
+
+        result = await self.provider.send(message)
+        if not result.accepted:
+            logger.error(
+                "email_not_accepted",
+                extra={"key": key.value, "to": to, "error": result.error},
+            )
+        return result
+
+    async def send_welcome(
+        self, *, to: str, name: str, login_url: str, app_name: str
+    ) -> SendResult:
+        return await self.send(
+            key=EmailKey.WELCOME,
+            to=to,
+            context={"name": name, "login_url": login_url, "app_name": app_name},
+        )
+
+    async def send_password_reset(
+        self, *, to: str, name: str, reset_url: str, app_name: str
+    ) -> SendResult:
+        return await self.send(
+            key=EmailKey.PASSWORD_RESET,
+            to=to,
+            context={
+                "name": name,
+                "reset_url": reset_url,
+                "expires_in": "1 hour",
+                "app_name": app_name,
+            },
+        )
+
+    async def send_email_change_verification(
+        self, *, to: str, name: str, confirm_url: str, app_name: str
+    ) -> SendResult:
+        return await self.send(
+            key=EmailKey.EMAIL_CHANGE_VERIFICATION,
+            to=to,
+            context={
+                "name": name,
+                "confirm_url": confirm_url,
+                "expires_in": "1 hour",
+                "app_name": app_name,
+            },
+        )
+
+    async def send_email_change_notice(
+        self, *, to: str, name: str, new_email: str, app_name: str
+    ) -> SendResult:
+        """To the address being moved away from, never to the new one.
+
+        A takeover is only visible to the person losing the account if the
+        address that still receives their mail is told it was asked for (#1772).
+        """
+        return await self.send(
+            key=EmailKey.EMAIL_CHANGE_NOTICE,
+            to=to,
+            context={"name": name, "new_email": new_email, "app_name": app_name},
+        )
+
+    async def send_invitation(
+        self, *, to: str, inviter_name: str, org_name: str, accept_url: str, app_name: str
+    ) -> SendResult:
+        return await self.send(
+            key=EmailKey.INVITATION,
+            to=to,
+            context={
+                "inviter_name": inviter_name,
+                "org_name": org_name,
+                "accept_url": accept_url,
+                "app_name": app_name,
+            },
+        )
+
+
+def get_email_service() -> EmailService:
+    return EmailService(provider=get_email_provider())

@@ -1,0 +1,84 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AgenticOS",
+  "version": "0.2.0",
+  "identifier": "co.vstorm.agenticos",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "Chat, call and work with your AI agents",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "publisher": "Vstorm",
+    "macOS": {
+      "dmg": {
+        "background": "installers/mac-background.png",
+        "windowSize": {
+          "width": 660,
+          "height": 420
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 180
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 180
+        }
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "English",
+          "Polish",
+          "German",
+          "Spanish"
+        ],
+        "displayLanguageSelector": false,
+        "startMenuFolder": "AgenticOS",
+        "sidebarImage": "installers/windows-sidebar.bmp",
+        "headerImage": "installers/windows-header.bmp",
+        "installerIcon": "icons/icon.ico",
+        "compression": "lzma"
+      },
+      "wix": {
+        "bannerPath": "installers/windows-banner.bmp",
+        "dialogImagePath": "installers/windows-dialog.bmp"
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "agenticos"
+        ]
+      }
+    },
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/vstorm-co/agenticos/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

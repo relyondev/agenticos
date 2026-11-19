@@ -1,0 +1,493 @@
+"""Tests for expiring a tool call nobody decided.
+
+An approval waits on a person, so nothing in a request path can end one: the
+whole point is that no request is coming. That leaves a schedule, and a schedule
+is the one caller here with no tenant and no actor - which is what most of these
+tests are about. What it writes has to be a denial by timeout on the *run*, in
+the row's own organization, saying plainly that nobody decided.
+"""
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.core.config import settings
+from app.core.exceptions import BadRequestError
+from app.core.permissions import AuthContext, OrgRoleName
+from app.db.models.agent_run import ApprovalStatus, RunStatus
+from app.services.approvals import ApprovalService
+from app.worker.tasks.approval_tasks import expire_approvals
+
+pytestmark = [pytest.mark.anyio, pytest.mark.security]
+
+
+def _db() -> MagicMock:
+    return MagicMock(flush=AsyncMock(), refresh=AsyncMock(), add=MagicMock())
+
+
+def _approval(
+    *,
+    run_id: uuid.UUID | None = None,
+    organization_id: uuid.UUID | None = None,
+    status: str = ApprovalStatus.PENDING.value,
+) -> MagicMock:
+    return MagicMock(
+        id=uuid.uuid4(),
+        run_id=run_id or uuid.uuid4(),
+        organization_id=organization_id or uuid.uuid4(),
+        status=status,
+        tool_id="send_email",
+        tool_args={"to": "customer@example.com"},
+    )
+
+
+def _parked_run(
+    status: str = RunStatus.AWAITING_APPROVAL.value,
+    *,
+    paused_state: dict | None = None,
+) -> MagicMock:
+    """A run row as it looks while it waits on a decision."""
+    return MagicMock(
+        id=uuid.uuid4(),
+        status=status,
+        paused_state=(
+            {"messages": [], "tool_call_ids": {str(uuid.uuid4()): "call-1"}}
+            if paused_state is None
+            else paused_state
+        ),
+        input_tokens=1200,
+        output_tokens=340,
+        cost_usd=Decimal("0.0210"),
+        cost_is_partial=False,
+    )
+
+
+class _Sweep:
+    """One `expire_stale` run with the repository stubbed around it.
+
+    Every patch target is on the service's own module, so what is exercised is
+    the service: which rows it asks for, what it writes on each, and which runs
+    it decides to end.
+    """
+
+    def __init__(
+        self,
+        stale: list[MagicMock],
+        *,
+        run: MagicMock | None = None,
+        for_run: list[MagicMock] | None = None,
+        workflow_node_waiting: bool = False,
+    ) -> None:
+        self.stale = stale
+        self.run = run
+        self.for_run = for_run if for_run is not None else stale
+        self.workflow_node_waiting = workflow_node_waiting
+
+    async def __aenter__(self) -> _Sweep:
+        self._patches = {
+            "list_stale_approvals": AsyncMock(return_value=self.stale),
+            "claim_parked_run": AsyncMock(),
+            "get_approval": AsyncMock(
+                side_effect=lambda _db, approval_id, **kwargs: next(
+                    (a for a in self.stale if a.id == approval_id), None
+                )
+            ),
+            "decide_approval": AsyncMock(side_effect=self._decide),
+            "get_run": AsyncMock(return_value=self.run),
+            "list_approvals_for_run": AsyncMock(return_value=self.for_run),
+            "finish_run": AsyncMock(),
+        }
+        self._ctx = patch.multiple("app.services.approvals.agent_run_repo", **self._patches)
+        self._ctx.start()
+        self._audit = patch("app.services.approvals.record_audit", new=AsyncMock())
+        self.audit = self._audit.start()
+        self._waiting = patch(
+            "app.services.approvals.workflow_run_repo.find_node_run_waiting_on_agent_run",
+            new=AsyncMock(return_value=MagicMock() if self.workflow_node_waiting else None),
+        )
+        self._waiting.start()
+        self._spawn = patch("app.services.approvals.spawn_after_commit")
+        self.spawned = self._spawn.start()
+        # The transcript write is the service's own, so it is stubbed at the same
+        # boundary as the repository rather than left to fail into `record`'s
+        # own exception handler - which is what "passing" would have meant.
+        self._transcript = patch("app.services.approvals.TranscriptService")
+        self.record = self._transcript.start().return_value.record = AsyncMock()
+        self.expired = await ApprovalService(_db()).expire_stale()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        for call in self.spawned.call_args_list:
+            call.args[1].close()
+        self._spawn.stop()
+        self._waiting.stop()
+        self._transcript.stop()
+        self._audit.stop()
+        self._ctx.stop()
+        return False
+
+    @staticmethod
+    async def _decide(db, *, approval, status, **kwargs) -> MagicMock:
+        """Write the status onto the row, the way the repository would.
+
+        Without this the row stays `pending` in memory and the run would be
+        settled by a test that had not actually expired anything.
+        """
+        approval.status = status
+        return approval
+
+    def __getattr__(self, name: str) -> AsyncMock:
+        return self._patches[name]
+
+
+class TestWhichApprovalsAreSweptUp:
+    async def test_the_window_moves_with_the_setting(self):
+        """ "Configurable age" is the whole of what the operator controls here."""
+        with patch.object(settings, "APPROVAL_EXPIRY_HOURS", 5):
+            before = datetime.now(UTC)
+            async with _Sweep([]) as sweep:
+                after = datetime.now(UTC)
+
+            cutoff = sweep.list_stale_approvals.await_args.kwargs["older_than"]
+            assert before - timedelta(hours=5) <= cutoff <= after - timedelta(hours=5)
+
+    async def test_a_sweep_that_finds_nothing_writes_nothing(self):
+        """The ordinary case, hourly, for ever. It must not touch a row or a run."""
+        async with _Sweep([]) as sweep:
+            pass
+
+        assert sweep.expired == 0
+        sweep.decide_approval.assert_not_awaited()
+        sweep.finish_run.assert_not_awaited()
+        sweep.audit.assert_not_awaited()
+
+
+class TestWhatAnExpiryRecords:
+    async def test_an_expired_call_names_nobody_as_its_decider(self):
+        """Nobody decided - that is the whole fact. Writing the run's owner here
+        would record a rejection they never made."""
+        approval = _approval()
+
+        async with _Sweep([approval], run=_parked_run()) as sweep:
+            pass
+
+        written = sweep.decide_approval.await_args.kwargs
+        assert written["status"] == ApprovalStatus.EXPIRED.value
+        assert written["decided_by_user_id"] is None
+        assert written["decided_at"] is not None
+
+    async def test_every_expiry_reaches_the_audit_trail_in_its_own_organization(self):
+        """A schedule crosses tenants to find the rows; what it writes must not."""
+        first, second = _approval(), _approval()
+
+        async with _Sweep([first, second], run=_parked_run()) as sweep:
+            pass
+
+        entries = {call.kwargs["target_id"]: call.kwargs for call in sweep.audit.await_args_list}
+        assert set(entries) == {str(first.id), str(second.id)}
+        for approval in (first, second):
+            entry = entries[str(approval.id)]
+            assert entry["organization_id"] == approval.organization_id
+            assert entry["action"] == "approval.expired"
+            assert entry["actor_user_id"] is None
+            assert entry["details"]["tool_args"] == {"to": "customer@example.com"}
+
+
+class TestTheRunBehindIt:
+    """The point of the sweep. A row flipped to `expired` above a run still
+    parked would have moved the problem rather than fixed it."""
+
+    async def test_the_parked_run_is_ended(self):
+        approval = _approval()
+        run = _parked_run()
+
+        async with _Sweep([approval], run=run) as sweep:
+            pass
+
+        ended = sweep.finish_run.await_args.kwargs
+        assert ended["run"] is run
+        assert ended["status"] == RunStatus.CANCELLED.value
+        assert str(settings.APPROVAL_EXPIRY_HOURS) in ended["error"]
+
+    async def test_a_workflow_node_waiting_on_the_ended_run_is_woken(self):
+        """The node must see the run ended and fail, not wait on it for ever."""
+        async with _Sweep([_approval()], run=_parked_run(), workflow_node_waiting=True) as sweep:
+            pass
+
+        sweep.spawned.assert_called_once()
+        assert sweep.spawned.call_args.kwargs["name"] == "workflow-approval-wake"
+
+    async def test_an_ended_run_no_workflow_waits_on_spawns_nothing(self):
+        """A backlog sweep ends hundreds of runs; a wake - and the connection it
+        opens - is only for those a workflow node is parked on."""
+        async with _Sweep([_approval()], run=_parked_run()) as sweep:
+            pass
+
+        sweep.spawned.assert_not_called()
+
+    async def test_the_ended_run_cannot_be_resumed(self):
+        """`paused_state` is what a resume replays from. Left behind, a run
+        expired for want of a decision can still be continued by anyone who
+        knows its id."""
+        async with _Sweep([_approval()], run=_parked_run()) as sweep:
+            pass
+
+        assert sweep.finish_run.await_args.kwargs["paused_state"] is None
+
+    async def test_what_the_run_spent_before_it_parked_stands(self):
+        """It reached a gated tool, so the model requests before it were real.
+        A settle that zeroed them would take money out of the month."""
+        run = _parked_run()
+
+        async with _Sweep([_approval()], run=run) as sweep:
+            pass
+
+        ended = sweep.finish_run.await_args.kwargs
+        assert (ended["input_tokens"], ended["output_tokens"]) == (1200, 340)
+        assert (ended["cost_usd"], ended["cost_is_partial"]) == (Decimal("0.0210"), False)
+
+    async def test_the_step_it_parked_on_stops_looking_like_it_is_running(self):
+        """Every other ending runs the call and records what came back. An expiry
+        runs nothing, so the step written when the run parked stayed *open* - and
+        a reader coming back to the conversation saw a command apparently still
+        executing days after the run was cancelled.
+
+        Written before `finish_run`, which clears the state the ids come from."""
+        async with _Sweep([_approval()], run=_parked_run()) as sweep:
+            pass
+
+        written = sweep.record.await_args.kwargs
+        assert list(written["settled"]) == ["call-1"]
+        assert str(settings.APPROVAL_EXPIRY_HOURS) in written["settled"]["call-1"]
+        # No turn is invented for it: nothing was said and nothing was called.
+        assert (written["prompt"], written["answer"]) == (None, "")
+
+    async def test_a_run_parked_before_the_step_map_existed_settles_nothing(self):
+        """The map from approval to tool call is the only link there is. Without
+        it the step cannot be closed - which is a step left open, not one to
+        guess at."""
+        async with _Sweep([_approval()], run=_parked_run(paused_state={"messages": []})) as sweep:
+            pass
+
+        assert sweep.record.await_args.kwargs["settled"] == {}
+
+    async def test_a_run_with_a_second_call_still_inside_the_window_is_left_parked(self):
+        """A run parks on all of its outstanding calls at once. Ending it while
+        one is still decidable takes the decision away from whoever was going to
+        make it."""
+        run_id = uuid.uuid4()
+        organization_id = uuid.uuid4()
+        stale = _approval(run_id=run_id, organization_id=organization_id)
+        fresh = _approval(run_id=run_id, organization_id=organization_id)
+
+        async with _Sweep([stale], run=_parked_run(), for_run=[stale, fresh]) as sweep:
+            assert sweep.expired == 1
+
+        sweep.finish_run.assert_not_awaited()
+
+    async def test_a_run_that_is_no_longer_parked_is_left_alone(self):
+        """It was resumed between the read and the write - the decision that
+        settled it was somebody's, and the sweep must not write over it."""
+        async with _Sweep(
+            [_approval()], run=_parked_run(status=RunStatus.COMPLETED.value)
+        ) as sweep:
+            pass
+
+        sweep.finish_run.assert_not_awaited()
+
+    async def test_an_approval_whose_run_has_gone_expires_anyway(self):
+        """The row outlives nothing here - a deleted run cascades - but a read
+        that answers `None` must not stop the sweep partway through a batch."""
+        async with _Sweep([_approval()], run=None) as sweep:
+            assert sweep.expired == 1
+
+        sweep.finish_run.assert_not_awaited()
+
+    async def test_two_runs_are_each_settled_once(self):
+        """Two calls on one run must not end it twice, and two runs must both end."""
+        shared = uuid.uuid4()
+        organization_id = uuid.uuid4()
+        together = [
+            _approval(run_id=shared, organization_id=organization_id),
+            _approval(run_id=shared, organization_id=organization_id),
+        ]
+        alone = _approval(organization_id=organization_id)
+
+        async with _Sweep([*together, alone], run=_parked_run()) as sweep:
+            assert sweep.expired == 3
+
+        assert sweep.finish_run.await_count == 2
+
+
+class TestASweptRowIsDecided:
+    async def test_a_person_deciding_a_call_the_sweep_expired_is_refused(self):
+        """The race is real: a decision arriving a second after the sweep. One
+        approval, one outcome - a second decision would make the trail ambiguous
+        about what authorised the action."""
+        ctx = AuthContext(
+            user_id=uuid.uuid4(), organization_id=uuid.uuid4(), role=OrgRoleName.OPERATOR
+        )
+        expired = _approval(status=ApprovalStatus.EXPIRED.value)
+
+        with (
+            patch(
+                "app.services.approvals.agent_run_repo.get_approval",
+                new=AsyncMock(return_value=expired),
+            ),
+            patch(
+                "app.services.approvals.agent_run_repo.decide_approval", new=AsyncMock()
+            ) as decide,
+            pytest.raises(BadRequestError, match="already expired"),
+        ):
+            await ApprovalService(_db()).decide(ctx, expired.id, approved=True)
+
+        decide.assert_not_awaited()
+
+
+class TestTheScheduledSweep:
+    """The flow around the service. Thin on purpose - what it must not do is
+    swallow the count, since that is all a sweep reports."""
+
+    @pytest.mark.parametrize("unanswered", [0, 2])
+    async def test_the_flow_answers_with_what_it_expired(self, unanswered: int):
+        service = MagicMock(
+            expire_stale=AsyncMock(return_value=3),
+            expire_unanswered=AsyncMock(return_value=unanswered),
+        )
+        with (
+            patch("app.worker.tasks.approval_tasks.get_db_context") as db_context,
+            patch("app.worker.tasks.approval_tasks.ApprovalService", return_value=service),
+        ):
+            db_context.return_value.__aenter__ = AsyncMock(return_value=_db())
+            db_context.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            assert await expire_approvals() == 3
+
+        # The unanswered questions are swept in the same pass (#2064).
+        service.expire_unanswered.assert_awaited_once()
+
+
+class TestALiveCallsApproval:
+    """A call's approval is decided by the person on the call, nowhere else (#54)."""
+
+    async def test_the_queue_refuses_an_approval_a_live_call_is_waiting_on(self):
+        approval = _approval()
+        ctx = AuthContext(
+            user_id=uuid.uuid4(), organization_id=approval.organization_id, role=OrgRoleName.OWNER
+        )
+        with (
+            patch(
+                "app.services.approvals.agent_run_repo.get_approval",
+                new=AsyncMock(return_value=approval),
+            ),
+            patch(
+                "app.services.approvals.voice_call_repo.is_live_run",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.services.approvals.agent_run_repo.decide_approval", new=AsyncMock()
+            ) as decided,
+            pytest.raises(BadRequestError, match="decided in the call"),
+        ):
+            await ApprovalService(_db()).decide(ctx, approval.id, approved=True)
+
+        decided.assert_not_awaited()
+
+    async def test_the_call_itself_may_decide_it(self):
+        approval = _approval()
+        ctx = AuthContext(
+            user_id=uuid.uuid4(), organization_id=approval.organization_id, role=OrgRoleName.OWNER
+        )
+        with (
+            patch(
+                "app.services.approvals.agent_run_repo.get_approval",
+                new=AsyncMock(return_value=approval),
+            ),
+            patch(
+                "app.services.approvals.voice_call_repo.is_live_run",
+                new=AsyncMock(return_value=True),
+            ) as live,
+            patch(
+                "app.services.approvals.agent_run_repo.decide_approval", new=AsyncMock()
+            ) as decided,
+            patch.object(ApprovalService, "_record_decision", new=AsyncMock()),
+        ):
+            await ApprovalService(_db()).decide(ctx, approval.id, approved=True, via_call=True)
+
+        live.assert_not_awaited()
+        assert decided.await_args.kwargs["status"] == ApprovalStatus.APPROVED.value
+
+    async def test_an_approval_nobody_decided_in_the_call_expires_with_nobody_named(self):
+        approval = _approval()
+        with (
+            patch(
+                "app.services.approvals.agent_run_repo.get_approval",
+                new=AsyncMock(return_value=approval),
+            ),
+            patch(
+                "app.services.approvals.agent_run_repo.decide_approval", new=AsyncMock()
+            ) as decided,
+            patch.object(ApprovalService, "_record_decision", new=AsyncMock()) as audited,
+        ):
+            await ApprovalService(_db()).expire_now(
+                approval.id, organization_id=approval.organization_id, note="n"
+            )
+
+        kwargs = decided.await_args.kwargs
+        assert (kwargs["status"], kwargs["decided_by_user_id"], kwargs["note"]) == (
+            ApprovalStatus.EXPIRED.value,
+            None,
+            "n",
+        )
+        assert audited.await_args.kwargs["actor_user_id"] is None
+
+    @pytest.mark.parametrize("found", ["missing", "decided"])
+    async def test_expiring_leaves_a_decided_or_missing_row_alone(self, found):
+        approval = None if found == "missing" else _approval(status=ApprovalStatus.APPROVED.value)
+        with (
+            patch(
+                "app.services.approvals.agent_run_repo.get_approval",
+                new=AsyncMock(return_value=approval),
+            ),
+            patch(
+                "app.services.approvals.agent_run_repo.decide_approval", new=AsyncMock()
+            ) as decided,
+        ):
+            await ApprovalService(_db()).expire_now(uuid.uuid4(), organization_id=uuid.uuid4())
+
+        decided.assert_not_awaited()
+
+
+@pytest.mark.parametrize("found", [False, True])
+async def test_the_sweep_locks_runs_first_and_rechecks_approvals_before_expiring(
+    found: bool,
+) -> None:
+    stale = [_approval(run_id=uuid.UUID(int=2)), _approval(run_id=uuid.UUID(int=1))]
+    events = []
+
+    async def claim(_db, run_id, **kwargs):
+        events.append(("run", run_id))
+
+    async def current(_db, approval_id, **kwargs):
+        events.append(("approval", approval_id))
+        assert kwargs["for_update"] is True
+        return _approval(status=ApprovalStatus.APPROVED.value) if found else None
+
+    with (
+        patch(
+            "app.services.approvals.agent_run_repo.list_stale_approvals",
+            AsyncMock(return_value=stale),
+        ),
+        patch(
+            "app.services.approvals.agent_run_repo.claim_parked_run", AsyncMock(side_effect=claim)
+        ),
+        patch("app.services.approvals.agent_run_repo.get_approval", AsyncMock(side_effect=current)),
+        patch("app.services.approvals.agent_run_repo.decide_approval", AsyncMock()) as decide,
+    ):
+        assert await ApprovalService(_db()).expire_stale() == 0
+    assert events[:2] == [("run", uuid.UUID(int=1)), ("run", uuid.UUID(int=2))]
+    assert all(kind == "approval" for kind, _ in events[2:])
+    decide.assert_not_awaited()

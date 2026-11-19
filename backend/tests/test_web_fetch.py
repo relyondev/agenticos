@@ -1,0 +1,574 @@
+"""Tests for reading the page behind a URL.
+
+Two properties carry this capability, and they are the two a rewrite would lose.
+
+The first is the refusal: the URL is chosen by a *model* and dereferenced from
+inside the container, so a link-local, loopback or cloud-metadata address must be
+refused before a socket is opened, and refused as something the model can recover
+from rather than as an answer. Those cases run without a network - every address
+here is an IP literal, so nothing resolves and nothing is dialled.
+
+The second is that the configuration reaches the thing that does the fetching.
+`method` decides who dereferences the URL, and the domain filters have to reach
+both paths - the native tool and the local one - because a filter that only
+applies to one lapses the day somebody switches `method`.
+"""
+
+import re
+
+import httpx2
+import pymupdf
+import pytest
+from pydantic import ValidationError
+from pydantic_ai import Agent, ModelRetry
+from pydantic_ai._run_context import RunContext
+from pydantic_ai.capabilities import WebFetch
+from pydantic_ai.common_tools import web_fetch as web_fetch_module
+from pydantic_ai.messages import (
+    BinaryContent,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.native_tools import WebFetchTool
+from pydantic_ai.tools import Tool
+from pydantic_ai.usage import RunUsage
+
+from app.agents.capabilities._registry import CapabilityBinding, build, get
+from app.agents.capabilities.web_fetch import WebFetchConfig
+from app.agents.capabilities.web_fetch._capability import FETCH_TEXT, TRUNCATION_MARKER
+from app.services import file_upload
+from app.services.agent_registry import DEFAULT_GRANTED_SCOPES
+
+pytestmark = pytest.mark.anyio
+
+
+def _built(**config: object) -> WebFetch[object]:
+    built = build([CapabilityBinding(capability_id="web_fetch", config=config)])
+    capability = built[0]
+    assert isinstance(capability, WebFetch)
+    return capability
+
+
+def _local_tool(capability: WebFetch[object]) -> Tool[object]:
+    """The tool the model is handed when this deployment does the fetching."""
+    local = capability.local
+    assert isinstance(local, Tool)
+    return local
+
+
+async def _fetch(capability: WebFetch[object], url: str, *, last_attempt: bool = False) -> object:
+    """One call of the tool, with an attempt left after it unless `last_attempt`."""
+    ctx = _context()
+    ctx.max_retries = 1
+    ctx.retry = 1 if last_attempt else 0
+    return await _local_tool(capability).function(ctx, url=url)
+
+
+class TestTheRefusal:
+    """What the guard has to stop, and how the model hears about it.
+
+    Each of these is an address a page could name in a redirect or a model could
+    invent from an internal hostname it saw in a document, and each one is a read
+    of somewhere this container can reach and the public cannot.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+        ],
+        ids=["aws-imds", "aws-imds-v6", "alibaba", "gcp-by-name"],
+    )
+    async def test_a_cloud_metadata_endpoint_is_refused(self, url: str):
+        with pytest.raises(ModelRetry):
+            await _fetch(_built(), url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.0.0.1:8000/api/v1/agents",
+            "http://localhost:5432/",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+        ],
+        ids=["loopback", "loopback-by-name", "private-10", "private-192", "private-172"],
+    )
+    async def test_a_private_or_loopback_address_is_refused(self, url: str):
+        with pytest.raises(ModelRetry):
+            await _fetch(_built(), url)
+
+    @pytest.mark.parametrize("url", ["file:///etc/passwd", "gopher://example.com/"])
+    async def test_a_scheme_that_is_not_http_is_refused(self, url: str):
+        with pytest.raises(ModelRetry):
+            await _fetch(_built(), url)
+
+    async def test_a_refusal_reaches_the_model_as_something_it_can_recover_from(self):
+        """`ModelRetry` while the tool has an attempt left, not a returned string
+        and not an unhandled error.
+
+        A refusal shaped like a result is one the model reads as "the page was
+        empty" and answers around, and one that escapes the tool call takes the
+        whole run down over a URL it could simply have stopped asking for.
+        """
+        with pytest.raises(ModelRetry, match=re.escape("169.254.169.254")):
+            await _fetch(_built(), "http://169.254.169.254/")
+
+    async def test_a_refusal_on_the_last_attempt_is_the_result(self):
+        """Raising again would end the run with `UnexpectedModelBehavior`."""
+        fetched = await _fetch(_built(), "http://169.254.169.254/", last_attempt=True)
+
+        assert isinstance(fetched, str)
+        assert "169.254.169.254" in fetched
+
+
+def _forbidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer every fetch with a 403, as a site that refuses bots does."""
+
+    async def download(url: str, **_: object) -> httpx2.Response:
+        request = httpx2.Request("GET", url)
+        response = httpx2.Response(403, request=request)
+        raise httpx2.HTTPStatusError("403 Forbidden", request=request, response=response)
+
+    monkeypatch.setattr(web_fetch_module, "safe_download", download)
+
+
+class TestARunThatMeetsRefusals:
+    """Pydantic AI counts retries per tool, not per URL.
+
+    With the default budget of one, the second site that answered 403 used to end
+    the run with `Tool 'web_fetch' exceeded max retries count of 1`, though the
+    model had asked for two different pages and either refusal was ordinary.
+    """
+
+    async def test_a_second_forbidden_page_does_not_end_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _forbidden(monkeypatch)
+        urls = ["https://a.example.com/", "https://b.example.com/", "https://c.example.com/"]
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            fetched = sum(
+                isinstance(part, ToolReturnPart) for message in messages for part in message.parts
+            )
+            if fetched < len(urls):
+                return ModelResponse(parts=[ToolCallPart("web_fetch", {"url": urls[fetched]})])
+            return ModelResponse(parts=[TextPart("None of them would let me in.")])
+
+        agent = Agent(FunctionModel(model), capabilities=[_built()])
+
+        result = await agent.run("Read these pages.")
+
+        assert result.output == "None of them would let me in."
+        returned = [
+            part
+            for message in result.all_messages()
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        assert returned
+        assert all("403" in str(part.content) for part in returned)
+
+    async def test_forbidden_pages_fetched_in_parallel_do_not_end_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Calls in one response all see the same attempt, and spend one retry between them.
+
+        So two refusals in the first response are both retries, and the two in the
+        next are both results, not a budget the first pair already exhausted.
+        """
+        _forbidden(monkeypatch)
+        batches = [
+            ["https://a.example.com/", "https://b.example.com/"],
+            ["https://c.example.com/", "https://d.example.com/"],
+        ]
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            step = sum(isinstance(message, ModelResponse) for message in messages)
+            if step < len(batches):
+                return ModelResponse(
+                    parts=[ToolCallPart("web_fetch", {"url": url}) for url in batches[step]]
+                )
+            return ModelResponse(parts=[TextPart("None of them would let me in.")])
+
+        agent = Agent(FunctionModel(model), capabilities=[_built()])
+
+        result = await agent.run("Read these pages.")
+
+        assert result.output == "None of them would let me in."
+        answered = [
+            [part.outcome for part in message.parts if isinstance(part, ToolReturnPart)]
+            for message in result.all_messages()
+            if isinstance(message, ModelRequest)
+            and any(isinstance(part, ToolReturnPart) for part in message.parts)
+        ]
+        assert answered == [["retried", "retried"], ["success", "success"]]
+
+
+class TestWhoFetches:
+    """`method` is the whole decision, and all three answers are checked.
+
+    The local tool exists to be the one that behaves identically on every model,
+    so it is the default; the other two are what an author picks when the
+    provider's own fetch is worth the model lock-in.
+    """
+
+    def test_the_default_fetches_through_this_deployment(self):
+        assert WebFetchConfig().method == "local"
+        capability = _built()
+        assert capability.native is False
+        assert isinstance(capability.local, Tool)
+
+    async def test_the_default_offers_the_model_one_fetch_tool(self):
+        toolset = _built().get_toolset()
+        assert toolset is not None
+        assert set(await toolset.get_tools(_context())) == {"web_fetch"}
+
+    def test_native_fetch_hands_the_job_to_the_model_provider(self):
+        """No request of ours, so no toolset of ours either."""
+        capability = _built(method="native")
+        assert isinstance(capability.native, WebFetchTool)
+        assert capability.local is False
+        assert capability.get_toolset() is None
+
+    async def test_auto_offers_ours_only_to_a_model_with_no_native_fetch(self):
+        """Both are configured; `unless_native` is what keeps it to one tool.
+
+        Without the marker a model that fetches natively would be offered two
+        ways to read a URL, pick between them per call, and produce a
+        conversation where half the pages arrived with citations and half did
+        not.
+        """
+        capability = _built(method="auto")
+        assert isinstance(capability.native, WebFetchTool)
+        toolset = capability.get_toolset()
+        assert toolset is not None
+        offered = await toolset.get_tools(_context())
+        assert [tool.tool_def.unless_native for tool in offered.values()] == [WebFetchTool.kind]
+
+
+class TestWhatReachesTheFetch:
+    """Configuration that does not arrive is configuration that does nothing."""
+
+    def test_the_model_reads_this_repositorys_description_of_the_tool(self):
+        """The library ships its own wording, and the Builder shows ours.
+
+        The person choosing what to approve and the model choosing when to call
+        should be reading the same sentence - so the Builder shows the summary
+        that opens what the model reads, and this is what fails if they drift.
+        """
+        declared = next(tool for tool in get("web_fetch").tools if tool.id == "web_fetch")
+        assert declared.description == FETCH_TEXT.summary
+        assert _local_tool(_built()).description == FETCH_TEXT.render()
+        assert _local_tool(_built()).description.startswith(f"<summary>{FETCH_TEXT.summary}")
+
+    def test_the_content_bound_reaches_the_fetching_tool(self):
+        fetcher = _local_tool(_built(max_content_chars=2_000)).function.__self__
+        assert fetcher.max_content_length == 2_000
+
+    def test_a_page_is_never_read_into_memory_without_a_ceiling(self):
+        """The body is buffered before anything measures it, so an unbounded
+        fetch is one tool call able to exhaust the process."""
+        fetcher = _local_tool(_built()).function.__self__
+        assert fetcher.max_download_bytes is not None
+        assert fetcher.allow_local_urls is False
+
+    def test_the_domain_filters_reach_both_the_native_and_the_local_tool(self):
+        """The reason they are passed twice. A filter on one path only is a
+        filter that lapses when somebody switches `method`."""
+        capability = _built(method="auto", allowed_domains=["docs.example.com"])
+        assert isinstance(capability.native, WebFetchTool)
+        assert capability.native.allowed_domains == ["docs.example.com"]
+        assert _local_tool(capability).function.__self__.allowed_domains == ["docs.example.com"]
+
+    def test_a_filter_covers_the_unicode_spelling_of_the_host_it_names(self):
+        """The alias a denylist would otherwise have a hole for.
+
+        `urlparse` hands the comparison whatever the URL spelled, and a URL may
+        spell a host in Unicode - so `https://exämple.com/` reaches an exact
+        match against `xn--exmple-cua.com` and misses. `getaddrinfo` resolves the
+        two identically, so the miss is a fetch, not a failure. Both spellings
+        are handed to both paths for that reason.
+        """
+        capability = _built(method="auto", blocked_domains=["exämple.com"])
+        assert isinstance(capability.native, WebFetchTool)
+        aliases = ["xn--exmple-cua.com", "exämple.com"]
+        assert capability.native.blocked_domains == aliases
+        assert _local_tool(capability).function.__self__.blocked_domains == aliases
+
+    def test_an_ascii_host_is_passed_once(self):
+        """Nothing to alias, so nothing added - the common list stays itself."""
+        capability = _built(blocked_domains=["docs.example.com"])
+        assert _local_tool(capability).function.__self__.blocked_domains == ["docs.example.com"]
+
+    def test_a_host_that_only_looks_like_an_a_label_is_still_built(self):
+        """`xn--a.com` is a hostname somebody may write and punycode cannot
+        decode. It has no Unicode alias to add, and refusing to build an agent
+        that published cleanly is a worse answer than passing it through."""
+        capability = _built(blocked_domains=["xn--a.com"])
+        assert _local_tool(capability).function.__self__.blocked_domains == ["xn--a.com"]
+
+    async def test_a_host_outside_the_allowlist_is_refused(self):
+        capability = _built(allowed_domains=["docs.example.com"])
+        with pytest.raises(ModelRetry):
+            await _fetch(capability, "http://93.184.216.34/")
+
+    async def test_a_blocked_host_is_refused(self):
+        capability = _built(blocked_domains=["93.184.216.34"])
+        with pytest.raises(ModelRetry):
+            await _fetch(capability, "http://93.184.216.34/")
+
+
+class TestTheDomainFilterConfiguration:
+    """A filter entry that cannot match is the failure this validator exists for.
+
+    The comparison is on the hostname, exactly, so every shape below matches
+    nothing - and matching nothing is invisible in one direction and total in the
+    other: a denylist quietly stops denying, an allowlist quietly denies
+    everything.
+    """
+
+    @pytest.mark.parametrize(
+        "domain",
+        ["*.example.com", "https://example.com", "example.com/docs", "example.com:8443", ""],
+        ids=["wildcard", "scheme", "path", "port", "blank"],
+    )
+    def test_an_entry_that_could_never_match_is_refused(self, domain: str):
+        with pytest.raises(ValidationError, match="bare hostnames"):
+            WebFetchConfig(allowed_domains=[domain])
+
+    def test_an_empty_allowlist_is_refused_rather_than_read_as_unrestricted(self):
+        """It would allow nothing, which is a tool that refuses every URL."""
+        with pytest.raises(ValidationError, match="empty list allows nothing"):
+            WebFetchConfig(allowed_domains=[])
+
+    def test_an_empty_denylist_denies_nothing_and_is_read_as_no_denylist(self):
+        """The two fields do not mean the same thing by `[]`.
+
+        An empty allowlist allows nothing; an empty denylist blocks nothing,
+        which is what `null` already says - so a spec imported from YAML or
+        posted by an API client that spells "no denied hosts" as `[]` is saying
+        something true and must publish, not be refused with the allowlist's
+        error.
+        """
+        assert WebFetchConfig(blocked_domains=[]).blocked_domains is None
+
+    def test_a_hostname_is_lower_cased_so_it_can_match_at_all(self):
+        """The comparison is against what `urlparse` read, which is lower case."""
+        assert WebFetchConfig(allowed_domains=[" Docs.Example.COM "]).allowed_domains == [
+            "docs.example.com"
+        ]
+
+    def test_a_root_label_is_stripped_so_the_entry_can_match(self):
+        """`example.com.` and `example.com` are one DNS name.
+
+        The library strips the root label off the requested URL before it
+        compares, so an entry that kept one would match nothing at all - and
+        being refused outright left an author who copied a name out of a zone
+        file with no way to write it.
+        """
+        assert WebFetchConfig(blocked_domains=["example.com."]).blocked_domains == ["example.com"]
+
+    def test_a_unicode_hostname_is_stored_as_the_name_dns_would_be_asked_for(self):
+        """One spelling in the spec, so a stored filter reads the same everywhere."""
+        assert WebFetchConfig(blocked_domains=["Exämple.com"]).blocked_domains == [
+            "xn--exmple-cua.com"
+        ]
+
+    def test_a_hostname_with_no_a_label_is_refused_like_any_other_non_match(self):
+        """An empty label has no IDNA encoding, so nothing could ever match it."""
+        with pytest.raises(ValidationError, match="bare hostnames"):
+            WebFetchConfig(allowed_domains=[".example.com"])
+
+    def test_no_filter_means_no_restriction(self):
+        assert WebFetchConfig().allowed_domains is None
+        assert WebFetchConfig().blocked_domains is None
+
+    def test_an_explicit_null_is_how_a_stored_spec_says_unrestricted(self):
+        """A spec exported to a client's repository writes the field out, so the
+        validator is reached with `null` rather than skipped over a default."""
+        config = WebFetchConfig(allowed_domains=None, blocked_domains=None)
+        assert config.allowed_domains is None
+        assert config.blocked_domains is None
+
+
+def _serving(monkeypatch: pytest.MonkeyPatch, media_type: str, body: bytes) -> None:
+    """Answer every fetch with `body`, as the library's guarded download would."""
+
+    async def download(url: str, **_: object) -> httpx2.Response:
+        return httpx2.Response(200, headers={"content-type": media_type}, content=body)
+
+    monkeypatch.setattr(web_fetch_module, "safe_download", download)
+
+
+def _pdf(text: str) -> bytes:
+    document = pymupdf.open()
+    document.new_page().insert_text((72, 72), text)
+    return document.tobytes()
+
+
+class TestWhatADocumentBecomes:
+    """A fetched document reaches the model as text, the way an attachment does.
+
+    The library hands a PDF back as raw bytes for a model to read natively, and a
+    model served behind an OpenAI-compatible endpoint that cannot refuses the
+    whole request - `Unsupported chat content part type: 'file'` - after which the
+    agent fetched the same PDF again and failed the same way.
+    """
+
+    async def test_a_pdf_comes_back_as_its_text(self, monkeypatch: pytest.MonkeyPatch):
+        _serving(monkeypatch, "application/pdf", _pdf("Mer liv og boliger i bygatene"))
+
+        fetched = await _fetch(_built(), "https://example.com/files/planinitiativ.pdf")
+
+        assert not isinstance(fetched, BinaryContent)
+        assert fetched == {
+            "url": "https://example.com/files/planinitiativ.pdf",
+            "title": "",
+            "content": "Mer liv og boliger i bygatene",
+        }
+
+    async def test_a_long_document_is_cut_at_the_content_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The same rule as a page: a long one arrives shortened, and says so."""
+        _serving(monkeypatch, "application/pdf", _pdf("y" * 80))
+        fetcher = _local_tool(_built()).function.__self__
+        fetcher.max_content_length = 20
+
+        fetched = await fetcher("https://example.com/a.pdf")
+
+        assert isinstance(fetched, dict)
+        assert fetched["content"] == "y" * 20 + TRUNCATION_MARKER
+
+    async def test_a_long_document_is_read_only_as_far_as_the_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The content limit is the parse budget, not a cut after a whole parse: a
+        PDF that inflates past it stops being read at the page that crosses it
+        (#1990)."""
+        document = pymupdf.open()
+        for n in range(50):
+            document.new_page().insert_text((72, 72), f"page {n:02d} " + "x" * 40)
+        _serving(monkeypatch, "application/pdf", document.tobytes())
+        read: list[int] = []
+        get_text = pymupdf.Page.get_text
+
+        def counted(page: pymupdf.Page, *args: object, **kwargs: object) -> object:
+            read.append(page.number)
+            return get_text(page, *args, **kwargs)
+
+        monkeypatch.setattr(pymupdf.Page, "get_text", counted)
+        fetcher = _local_tool(_built()).function.__self__
+        fetcher.max_content_length = 100
+
+        fetched = await fetcher("https://example.com/a.pdf")
+
+        assert isinstance(fetched, dict)
+        assert read == [0, 1, 2]
+        assert fetched["content"].endswith(TRUNCATION_MARKER)
+        assert len(fetched["content"]) == 100 + len(TRUNCATION_MARKER)
+
+    async def test_a_pdf_stopped_by_the_page_cap_says_so(self, monkeypatch: pytest.MonkeyPatch):
+        """Text that exactly fills the content limit is not cut because the page note
+        does not fit: the model is told where the page cap stopped (#1990)."""
+        monkeypatch.setattr(file_upload, "_PDF_MAX_PAGES", 3)
+        document = pymupdf.open()
+        for text in ["a", "b", "c", "d", "e"]:
+            document.new_page().insert_text((72, 72), text)
+        _serving(monkeypatch, "application/pdf", document.tobytes())
+        fetcher = _local_tool(_built()).function.__self__
+        fetcher.max_content_length = 7
+
+        fetched = await fetcher("https://example.com/a.pdf")
+
+        assert isinstance(fetched, dict)
+        assert fetched["content"] == "a\n\nb\n\nc\n\n" + file_upload.PDF_PAGES_CUT_MARKER.format(
+            read=3, total=5
+        )
+
+    async def test_a_pdf_with_no_text_before_the_page_cap_returns_the_note_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Not the no-readable-text retry: the pages after the cap may hold text,
+        and the model is told they were skipped rather than that there is none."""
+        monkeypatch.setattr(file_upload, "_PDF_MAX_PAGES", 2)
+        document = pymupdf.open()
+        for _ in range(4):
+            document.new_page()
+        _serving(monkeypatch, "application/pdf", document.tobytes())
+
+        fetched = await _fetch(_built(), "https://example.com/scan.pdf")
+
+        assert isinstance(fetched, dict)
+        assert fetched["content"] == file_upload.PDF_PAGES_CUT_MARKER.format(read=2, total=4)
+
+    async def test_an_image_stays_an_image(self, monkeypatch: pytest.MonkeyPatch):
+        """A model that reads pictures is the only reason to fetch one."""
+        _serving(monkeypatch, "image/png", b"\x89PNG\r\n\x1a\n")
+
+        fetched = await _fetch(_built(), "https://example.com/chart.png")
+
+        assert isinstance(fetched, BinaryContent)
+        assert fetched.media_type == "image/png"
+
+    async def test_a_binary_with_no_text_is_a_retry_naming_what_came_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _serving(monkeypatch, "application/octet-stream", bytes(range(128, 256)))
+
+        with pytest.raises(
+            ModelRetry, match="application/octet-stream, which has no readable text"
+        ):
+            await _fetch(_built(), "https://example.com/blob")
+
+    async def test_a_binary_with_no_text_on_the_last_attempt_is_the_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        _serving(monkeypatch, "application/octet-stream", bytes(range(128, 256)))
+
+        fetched = await _fetch(_built(), "https://example.com/blob", last_attempt=True)
+
+        assert fetched == (
+            "https://example.com/blob returned application/octet-stream, which has no readable text"
+        )
+
+    async def test_a_page_is_still_markdown(self, monkeypatch: pytest.MonkeyPatch):
+        _serving(
+            monkeypatch, "text/html", b"<html><title>T</title><body><p>Hello</p></body></html>"
+        )
+
+        fetched = await _fetch(_built(), "https://example.com/")
+
+        assert isinstance(fetched, dict)
+        assert fetched["title"] == "T"
+        assert fetched["content"].endswith("Hello")
+
+
+class TestHowItIsSwitchedOn:
+    def test_fetching_is_its_own_scope(self):
+        """Not `web_research`'s `web:read`. Searching reaches one API this
+        deployment chose; fetching dereferences whatever a model asks for, so an
+        operator can allow the first and refuse the second."""
+        assert get("web_fetch").scopes == frozenset({"web:fetch"})
+        assert "web:fetch" in DEFAULT_GRANTED_SCOPES
+
+    def test_it_needs_no_credential(self):
+        assert get("web_fetch").needs_secret(WebFetchConfig()) is False
+
+    def test_a_binding_with_no_configuration_gets_the_defaults(self):
+        assert _built().native is False
+
+
+def _context() -> RunContext[None]:
+    """The least a wrapped toolset needs before it will list its tools."""
+    return RunContext(deps=None, model=TestModel(), usage=RunUsage())

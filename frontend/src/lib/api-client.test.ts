@@ -1,0 +1,702 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ApiError, apiClient } from "./api-client";
+import { markRefreshed } from "./auth-lock";
+import { CONSOLE_TAB, CONSOLE_TAB_HEADER } from "./console-tab";
+import { useAuthStore, useOrgStore } from "@/stores";
+
+/**
+ * Every request the browser makes.
+ *
+ * Four things live here and each one has bitten this app: requests go to
+ * `/api/*` rather than to the platform, so the backend URL never reaches the
+ * browser; the active organization travels on every request, so an org-scoped
+ * endpoint resolves the tenant the UI is showing; a 401 is recovered once by
+ * refreshing, and a burst of them shares one refresh; and a multipart body is
+ * sent without a `Content-Type`, because only the browser knows the boundary.
+ */
+function ok(body: unknown = { ok: true }, status = 200) {
+  return {
+    ok: status < 400,
+    status,
+    json: () => Promise.resolve(body),
+    text: () => Promise.resolve(body === null ? "" : JSON.stringify(body)),
+  } as Response;
+}
+
+function refused(status: number, body: unknown) {
+  return {
+    ok: false,
+    status,
+    json: () => Promise.resolve(body),
+    text: () => Promise.resolve(JSON.stringify(body)),
+  } as Response;
+}
+
+let fetchMock: ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  fetchMock = vi.fn().mockResolvedValue(ok());
+  vi.stubGlobal("fetch", fetchMock);
+  useOrgStore.setState({ activeOrgId: null });
+  useAuthStore.setState({ accessToken: null });
+  // The cross-tab "just refreshed" marker would otherwise carry from one test's
+  // refresh into the next and skip it.
+  localStorage.clear();
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+/** The init object of the nth fetch call. */
+function init(nth = 0): RequestInit {
+  return fetchMock.mock.calls[nth]![1] as RequestInit;
+}
+
+function headers(nth = 0): Record<string, string> {
+  return init(nth).headers as Record<string, string>;
+}
+
+describe("apiClient", () => {
+  it("addresses this app's own proxy, never the platform", () => {
+    // The whole reason the client exists: the backend URL is a server secret.
+    return apiClient.get("/agents").then(() => {
+      expect(fetchMock.mock.calls[0]![0]).toBe("/api/agents");
+    });
+  });
+
+  it("sends each verb with its own body handling", async () => {
+    await apiClient.get("/agents");
+    await apiClient.post("/agents", { name: "Support" });
+    await apiClient.put("/agents/a1/sharing/grants", { level: "read" });
+    await apiClient.patch("/agents/a1", { name: "Sales" });
+    await apiClient.delete("/agents/a1");
+
+    expect(fetchMock.mock.calls.map((call) => (call[1] as RequestInit).method)).toEqual([
+      "GET",
+      "POST",
+      "PUT",
+      "PATCH",
+      "DELETE",
+    ]);
+    expect(init(1).body).toBe(JSON.stringify({ name: "Support" }));
+    expect(init(0).body).toBeUndefined();
+  });
+
+  it("appends query parameters rather than expecting callers to build a URL", async () => {
+    await apiClient.get("/runs", { params: { agent_id: "a1", days: "7" } });
+
+    expect(fetchMock.mock.calls[0]![0]).toBe("/api/runs?agent_id=a1&days=7");
+  });
+
+  it("carries the active organization on every request", async () => {
+    // An org-scoped endpoint resolves the tenant from this header; without it the
+    // request falls back to the caller's personal organization and reads the
+    // wrong rows.
+    useOrgStore.setState({ activeOrgId: "org-7" });
+
+    await apiClient.get("/agents");
+
+    expect(headers()["X-Organization-Id"]).toBe("org-7");
+  });
+
+  it("sends no organization header when none is chosen", async () => {
+    // Rather than an empty one, which the server would try to resolve.
+    await apiClient.get("/agents");
+
+    expect(headers()).not.toHaveProperty("X-Organization-Id");
+  });
+
+  it("lets a caller add headers without losing the ones it sets", async () => {
+    useOrgStore.setState({ activeOrgId: "org-7" });
+
+    await apiClient.get("/agents", { headers: { "X-Trace": "t1" } });
+
+    expect(headers()).toMatchObject({ "X-Trace": "t1", "X-Organization-Id": "org-7" });
+  });
+
+  it("reads an empty body as null rather than failing to parse it", async () => {
+    // A 204 from a DELETE is the common case.
+    fetchMock.mockResolvedValue(ok(null, 204));
+
+    await expect(apiClient.delete("/agents/a1")).resolves.toBeNull();
+  });
+
+  it("raises the server's own sentence, with its status and payload", async () => {
+    fetchMock.mockResolvedValue(
+      refused(409, {
+        error: { code: "ALREADY_EXISTS", message: "That handle is taken", details: { slug: "s" } },
+      }),
+    );
+
+    await expect(apiClient.post("/agents", {})).rejects.toMatchObject({
+      status: 409,
+      message: "That handle is taken",
+      code: "ALREADY_EXISTS",
+      details: { slug: "s" },
+    });
+  });
+
+  it("still raises when the refusal is not JSON at all", async () => {
+    // A proxy timeout answers with HTML; the status is still worth surfacing.
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 504,
+      json: () => Promise.reject(new Error("not json")),
+      text: () => Promise.resolve(""),
+    } as Response);
+
+    const failure = await apiClient.get("/agents").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApiError);
+    expect((failure as ApiError).status).toBe(504);
+  });
+});
+
+describe("recovering from an expired token", () => {
+  it("refreshes once and retries the request", async () => {
+    fetchMock
+      .mockResolvedValueOnce(refused(401, { detail: "Token expired" }))
+      .mockResolvedValueOnce(ok({ access_token: "fresh" }))
+      .mockResolvedValueOnce(ok({ items: [] }));
+
+    await expect(apiClient.get("/agents")).resolves.toEqual({ items: [] });
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/agents",
+      "/api/auth/refresh",
+      "/api/agents",
+    ]);
+  });
+
+  it("does not refresh and retry a password-change 401", async () => {
+    fetchMock.mockResolvedValueOnce(
+      refused(401, { error: { message: "Current password is incorrect" } }),
+    );
+
+    await expect(
+      apiClient.post("/auth/password/change", { current_password: "x", new_password: "y" }),
+    ).rejects.toBeInstanceOf(ApiError);
+
+    // A wrong current password is the answer, not an expired token: the client
+    // must not refresh and resubmit the wrong password (#1517).
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual(["/api/auth/password/change"]);
+  });
+
+  it("keeps the fresh token in memory, which is what the websocket authenticates with", async () => {
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(ok({ access_token: "fresh" }))
+      .mockResolvedValueOnce(ok({}));
+
+    await apiClient.get("/agents");
+
+    expect(useAuthStore.getState().accessToken).toBe("fresh");
+  });
+
+  it("shares one refresh across a burst of concurrent 401s", async () => {
+    // Six panels mount at once on a page load with an expired token. Six
+    // refreshes would rotate the cookie six times and lose five of them.
+    fetchMock.mockImplementation((url: string) => {
+      if (url === "/api/auth/refresh") return Promise.resolve(ok({ access_token: "fresh" }));
+      return Promise.resolve(
+        fetchMock.mock.calls.filter((call) => call[0] !== "/api/auth/refresh").length <= 3
+          ? refused(401, {})
+          : ok({ items: [] }),
+      );
+    });
+
+    await Promise.all([apiClient.get("/a"), apiClient.get("/b"), apiClient.get("/c")]);
+
+    const refreshes = fetchMock.mock.calls.filter((call) => call[0] === "/api/auth/refresh");
+    expect(refreshes).toHaveLength(1);
+  });
+
+  it("surfaces the original 401 when the refresh is itself refused", async () => {
+    fetchMock
+      .mockResolvedValueOnce(refused(401, { detail: "Token expired" }))
+      .mockResolvedValueOnce(refused(401, { detail: "No refresh cookie" }));
+
+    await expect(apiClient.get("/agents")).rejects.toMatchObject({
+      status: 401,
+      message: "Token expired",
+    });
+  });
+
+  it("signs the store out when the refresh is refused, so the guard sends them to sign in", async () => {
+    // Left signed in, the page stayed up with every request answering 401 and
+    // nothing redirecting until a full reload.
+    useAuthStore.setState({ isAuthenticated: true });
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(refused(401, { code: "SESSION_EXPIRED" }));
+
+    await expect(apiClient.get("/agents")).rejects.toMatchObject({ status: 401 });
+
+    expect(useAuthStore.getState().isAuthenticated).toBe(false);
+  });
+
+  it.each(["this tab", "another tab"])(
+    "ends a refused session after a refresh by %s",
+    async (refresher) => {
+      useAuthStore.setState({ isAuthenticated: true });
+      if (refresher === "another tab") markRefreshed();
+      fetchMock.mockResolvedValueOnce(refused(401, {}));
+      if (refresher === "this tab") fetchMock.mockResolvedValueOnce(ok({}));
+      fetchMock.mockResolvedValueOnce(refused(401, { code: "SESSION_EXPIRED" }));
+      await expect(apiClient.get("/agents/a-1")).rejects.toMatchObject({ status: 401 });
+      expect(useAuthStore.getState().isAuthenticated).toBe(false);
+    },
+  );
+
+  it.each([
+    "/auth/login",
+    "/auth/ldap/login?invitation_flow=flow",
+    "/auth/register?invitation_flow=flow",
+    "/auth/password-reset/confirm",
+    "/auth/magic-link/verify",
+    "/auth/email-change/confirm",
+    "/auth/oauth-callback",
+  ])("does not refresh or end the browser session for a credential refusal at %s", async (path) => {
+    useAuthStore.setState({ isAuthenticated: true, sessionOwnerId: "signed-in" });
+    fetchMock.mockResolvedValueOnce(refused(401, { code: "AUTHENTICATION_ERROR" }));
+    await expect(apiClient.post(path, { token: "expired" })).rejects.toMatchObject({ status: 401 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(useAuthStore.getState().isAuthenticated).toBe(true);
+    expect(useAuthStore.getState().sessionOwnerId).toBe("signed-in");
+  });
+
+  it("keeps the impersonation exit when a retried request reports it ended", async () => {
+    useAuthStore.setState({ isAuthenticated: true, impersonationRevoked: false });
+    markRefreshed();
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(refused(401, { code: "IMPERSONATION_ENDED" }));
+    await expect(apiClient.get("/agents/a-1")).rejects.toMatchObject({ status: 401 });
+    expect(useAuthStore.getState().isAuthenticated).toBe(true);
+    expect(useAuthStore.getState().impersonationRevoked).toBe(true);
+  });
+
+  it("keeps the store signed in when the refresh failed for a reason that is not the session", async () => {
+    useAuthStore.setState({ isAuthenticated: true });
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(refused(502, { code: "INTERNAL_SERVER_ERROR" }))
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(refused(429, {}));
+
+    await expect(apiClient.get("/a")).rejects.toMatchObject({ status: 401 });
+    await expect(apiClient.get("/b")).rejects.toMatchObject({ status: 401 });
+
+    expect(useAuthStore.getState().isAuthenticated).toBe(true);
+  });
+
+  it("leaves an ended impersonation to its own exit rather than signing out", async () => {
+    useAuthStore.setState({ isAuthenticated: true, impersonationRevoked: false });
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(refused(401, { code: "IMPERSONATION_ENDED" }));
+
+    await expect(apiClient.get("/agents")).rejects.toMatchObject({ status: 401 });
+
+    expect(useAuthStore.getState().impersonationRevoked).toBe(true);
+    expect(useAuthStore.getState().isAuthenticated).toBe(true);
+  });
+
+  it("survives a refresh whose body is not JSON, because the cookie still rotated", async () => {
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.reject(new Error("not json")),
+        text: () => Promise.resolve(""),
+      } as Response)
+      .mockResolvedValueOnce(ok({ items: [] }));
+
+    await expect(apiClient.get("/agents")).resolves.toEqual({ items: [] });
+  });
+
+  it("survives a refresh that answers with nothing to set", async () => {
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(ok({}))
+      .mockResolvedValueOnce(ok({ items: [] }));
+
+    await apiClient.get("/agents");
+
+    expect(useAuthStore.getState().accessToken).toBeNull();
+  });
+
+  it("treats a refresh that could not be reached as a failed one", async () => {
+    fetchMock
+      .mockResolvedValueOnce(refused(401, { detail: "Token expired" }))
+      .mockRejectedValueOnce(new Error("offline"));
+
+    await expect(apiClient.get("/agents")).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("does not replay the request when the refresh says the impersonation is over", async () => {
+    // The request was made as the account being acted as. Replaying it with the
+    // token a refresh would mint runs it as the administrator (#1044). The 401
+    // surfaces instead, and the store is told so the banner can take the exit.
+    useAuthStore.setState({ impersonationRevoked: false });
+    fetchMock
+      .mockResolvedValueOnce(refused(401, { detail: "Impersonation has ended" }))
+      .mockResolvedValueOnce(refused(401, { code: "IMPERSONATION_ENDED" }));
+
+    await expect(apiClient.post("/agents", { name: "x" })).rejects.toMatchObject({
+      status: 401,
+      message: "Impersonation has ended",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(useAuthStore.getState().impersonationRevoked).toBe(true);
+  });
+
+  it("does not raise the flag for a refusal that is about something else", async () => {
+    useAuthStore.setState({ impersonationRevoked: false });
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(refused(401, { code: "NO_REFRESH_TOKEN" }))
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(refused(503, { code: "IMPERSONATION_ENDED" }))
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        json: () => Promise.reject(new Error("not json")),
+        text: () => Promise.resolve(""),
+      } as Response);
+
+    await expect(apiClient.get("/a")).rejects.toMatchObject({ status: 401 });
+    await expect(apiClient.get("/b")).rejects.toMatchObject({ status: 401 });
+    await expect(apiClient.get("/c")).rejects.toMatchObject({ status: 401 });
+
+    expect(useAuthStore.getState().impersonationRevoked).toBe(false);
+  });
+
+  it("never refreshes in response to the refresh route's own 401", async () => {
+    // Which would recurse until the stack gave out.
+    fetchMock.mockResolvedValue(refused(401, { detail: "No refresh cookie" }));
+
+    await expect(apiClient.post("/auth/refresh")).rejects.toMatchObject({ status: 401 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("refreshing alongside other tabs", () => {
+  // Every tab shares the refresh cookie and the backend rotates it on each use,
+  // so a second tab spending it a moment after the first used to end the session.
+
+  function withLocks() {
+    const request = vi.fn((_name: string, fn: () => Promise<unknown>) => fn());
+    vi.stubGlobal("navigator", { ...navigator, locks: { request } });
+    return request;
+  }
+
+  it("refreshes under the cross-tab lock", async () => {
+    const lock = withLocks();
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(ok({ access_token: "fresh" }))
+      .mockResolvedValueOnce(ok({ id: 1 }));
+
+    await apiClient.get("/agents");
+
+    expect(lock).toHaveBeenCalledWith("agenticos-auth-refresh", expect.any(Function));
+  });
+
+  it("does not spend the refresh cookie again when another tab just refreshed", async () => {
+    // Waiting behind that tab's lock, this one already holds the rotated cookies.
+    localStorage.setItem("agenticos:auth-refreshed-at", String(Date.now()));
+    fetchMock.mockResolvedValueOnce(refused(401, {})).mockResolvedValueOnce(ok({ id: 1 }));
+
+    await expect(apiClient.get("/agents")).resolves.toEqual({ id: 1 });
+
+    const urls = fetchMock.mock.calls.map((call) => call[0]);
+    expect(urls).toEqual(["/api/agents", "/api/agents"]);
+  });
+
+  it("tells the other tabs when it has refreshed", async () => {
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(ok({ access_token: "fresh" }))
+      .mockResolvedValueOnce(ok({ id: 1 }));
+
+    await apiClient.get("/agents");
+
+    expect(Number(localStorage.getItem("agenticos:auth-refreshed-at"))).toBeGreaterThan(0);
+  });
+
+  it("reads the session under the lock, because that route refreshes too", async () => {
+    const lock = withLocks();
+
+    await apiClient.get("/auth/me");
+
+    expect(lock).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves an ordinary request out of the lock", async () => {
+    const lock = withLocks();
+
+    await apiClient.get("/agents");
+
+    expect(lock).not.toHaveBeenCalled();
+  });
+
+  it("recovers a session read's 401 outside the lock, which would otherwise wait on itself", async () => {
+    let held = false;
+    const request = vi.fn(async (_name: string, fn: () => Promise<unknown>) => {
+      expect(held).toBe(false);
+      held = true;
+      try {
+        return await fn();
+      } finally {
+        held = false;
+      }
+    });
+    vi.stubGlobal("navigator", { ...navigator, locks: { request } });
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(ok({ access_token: "fresh" }))
+      .mockResolvedValueOnce(ok({ id: 1 }));
+
+    await expect(apiClient.get("/auth/me")).resolves.toEqual({ id: 1 });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("uploading", () => {
+  it("sends one file as multipart, with no Content-Type of its own", async () => {
+    // Only the browser knows the boundary it generated; setting the header by
+    // hand drops it and FastAPI rejects the body it was just handed.
+    await apiClient.upload("/agents/a1/avatar", new File(["x"], "face.png"));
+
+    expect(headers()).not.toHaveProperty("Content-Type");
+    expect(init().body).toBeInstanceOf(FormData);
+  });
+
+  it("keeps the organization header on an upload, and the 401 recovery with it", async () => {
+    useOrgStore.setState({ activeOrgId: "org-7" });
+    fetchMock
+      .mockResolvedValueOnce(refused(401, {}))
+      .mockResolvedValueOnce(ok({ access_token: "fresh" }))
+      .mockResolvedValueOnce(ok({ id: "a1" }));
+
+    await apiClient.upload("/agents/a1/avatar", new File(["x"], "face.png"));
+
+    expect(headers()["X-Organization-Id"]).toBe("org-7");
+    expect(headers(2)["X-Organization-Id"]).toBe("org-7");
+  });
+
+  it("names every file in a multi-upload, so a folder does not arrive flattened", async () => {
+    // The name is the resource's path on the other side. Appending the bare
+    // `File` would send only the basename and collide `a/x.md` with `b/x.md`.
+    const first = new File(["1"], "x.md");
+    const second = new File(["2"], "x.md");
+
+    await apiClient.uploadMany("/skills/s1/resources", [first, second], (file) =>
+      file === first ? "references/x.md" : "examples/x.md",
+    );
+
+    const names = (init().body as FormData).getAll("files").map((entry) => (entry as File).name);
+    expect(names).toEqual(["references/x.md", "examples/x.md"]);
+  });
+});
+
+/**
+ * An `XMLHttpRequest` that answers when told to: each request takes the next
+ * answer queued in `FakeXhr.answers` the moment it is sent.
+ */
+class FakeXhr {
+  static instances: FakeXhr[] = [];
+  static answers: ((xhr: FakeXhr) => void)[] = [];
+
+  method = "";
+  url = "";
+  headers: Record<string, string> = {};
+  body: unknown = undefined;
+  status = 0;
+  statusText = "";
+  responseText = "";
+  responseHeaders = "";
+  upload: { onprogress: ((event: ProgressEvent) => void) | null; onload: (() => void) | null } = {
+    onprogress: null,
+    onload: null,
+  };
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+
+  constructor() {
+    FakeXhr.instances.push(this);
+  }
+
+  open(method: string, url: string): void {
+    this.method = method;
+    this.url = url;
+  }
+
+  setRequestHeader(name: string, value: string): void {
+    this.headers[name] = value;
+  }
+
+  send(body: unknown): void {
+    this.body = body;
+    FakeXhr.answers.shift()?.(this);
+  }
+
+  abort(): void {
+    this.onabort?.();
+  }
+
+  getAllResponseHeaders(): string {
+    return this.responseHeaders;
+  }
+
+  progress(loaded: number, total: number, lengthComputable = true): void {
+    this.upload.onprogress?.({ loaded, total, lengthComputable } as ProgressEvent);
+  }
+
+  respond(status: number, body: unknown = { ok: true }): void {
+    this.upload.onload?.();
+    this.status = status;
+    this.statusText = status === 200 ? "OK" : "Refused";
+    this.responseText = body === null ? "" : JSON.stringify(body);
+    this.responseHeaders = "content-type: application/json\r\nx-request-id: r1\r\n";
+    this.onload?.();
+  }
+}
+
+describe("uploading with progress", () => {
+  beforeEach(() => {
+    FakeXhr.instances = [];
+    FakeXhr.answers = [];
+    vi.stubGlobal("XMLHttpRequest", FakeXhr);
+  });
+
+  it("goes by XMLHttpRequest, keeps the organization header, and reports each step", async () => {
+    useOrgStore.setState({ activeOrgId: "org-7" });
+    const steps: number[] = [];
+    FakeXhr.answers.push((xhr) => {
+      xhr.progress(0, 0);
+      xhr.progress(25, 100, false);
+      xhr.progress(40, 100);
+      xhr.respond(200, { text: "hi" });
+    });
+    const form = new FormData();
+    form.append("duration", "3");
+
+    const answer = await apiClient.upload("/agents/a1/dictation", form, {
+      onProgress: (fraction) => steps.push(fraction),
+    });
+
+    expect(answer).toEqual({ text: "hi" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    const [xhr] = FakeXhr.instances;
+    expect(xhr!.method).toBe("POST");
+    expect(xhr!.url).toBe("/api/agents/a1/dictation");
+    // The form the caller built, as it is: its other fields ride beside the file.
+    expect(xhr!.body).toBe(form);
+    expect(xhr!.headers).toEqual({
+      "x-organization-id": "org-7",
+      [CONSOLE_TAB_HEADER.toLowerCase()]: CONSOLE_TAB,
+    });
+    // Nothing for a step with no total; 1 once the last byte has left.
+    expect(steps).toEqual([0.4, 1]);
+  });
+
+  it("refreshes once on a 401 and sends the body again from the start", async () => {
+    fetchMock.mockResolvedValueOnce(ok({ access_token: "fresh" }));
+    FakeXhr.answers.push((xhr) => xhr.respond(401, {}));
+    FakeXhr.answers.push((xhr) => {
+      xhr.progress(10, 100);
+      xhr.respond(200, { id: "a1" });
+    });
+    const steps: number[] = [];
+
+    await expect(
+      apiClient.upload("/agents/a1/avatar", new File(["x"], "face.png"), {
+        onProgress: (fraction) => steps.push(fraction),
+      }),
+    ).resolves.toEqual({ id: "a1" });
+
+    expect(fetchMock.mock.calls[0]![0]).toBe("/api/auth/refresh");
+    expect(FakeXhr.instances).toHaveLength(2);
+    expect((FakeXhr.instances[1]!.body as FormData).get("file")).toBeInstanceOf(File);
+    expect(steps).toEqual([1, 0.1, 1]);
+  });
+
+  it("turns a refusal into the same ApiError a fetch would", async () => {
+    FakeXhr.answers.push((xhr) =>
+      xhr.respond(400, { error: { code: "X", message: "No", details: { reason: "empty" } } }),
+    );
+
+    const refused = apiClient.upload("/agents/a1/dictation", new FormData(), {
+      onProgress: () => {},
+    });
+
+    await expect(refused).rejects.toBeInstanceOf(ApiError);
+    await refused.catch((error: ApiError) => {
+      expect(error.status).toBe(400);
+      expect(error.details).toEqual({ reason: "empty" });
+    });
+  });
+
+  it("hands over the response's headers, and no body where a status may not have one", async () => {
+    FakeXhr.answers.push((xhr) => xhr.respond(204, null));
+
+    const response = await apiClient.raw("/things", { method: "POST", onProgress: () => {} });
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("x-request-id")).toBe("r1");
+    expect(FakeXhr.instances[0]!.body).toBeNull();
+    await expect(response.text()).resolves.toBe("");
+  });
+
+  it("sends a JSON body as JSON", async () => {
+    FakeXhr.answers.push((xhr) => xhr.respond(200));
+
+    await apiClient.post("/things", { name: "x" }, { onProgress: () => {} });
+
+    expect(FakeXhr.instances[0]!.body).toBe('{"name":"x"}');
+    expect(FakeXhr.instances[0]!.headers["content-type"]).toBe("application/json");
+  });
+
+  it("fails as fetch does when the request never reached a server: a TypeError", async () => {
+    FakeXhr.answers.push((xhr) => xhr.onerror?.());
+
+    await expect(
+      apiClient.upload("/files/upload", new FormData(), { onProgress: () => {} }),
+    ).rejects.toBeInstanceOf(TypeError);
+  });
+
+  it("aborts on the signal with an AbortError, and stops listening once settled", async () => {
+    const controller = new AbortController();
+    const removed = vi.spyOn(controller.signal, "removeEventListener");
+    FakeXhr.answers.push(() => controller.abort());
+
+    const aborted = apiClient.upload("/files/upload", new FormData(), {
+      onProgress: () => {},
+      signal: controller.signal,
+    });
+
+    await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
+    expect(removed).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("sends nothing for a signal already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      apiClient.upload("/files/upload", new FormData(), {
+        onProgress: () => {},
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(FakeXhr.instances).toHaveLength(0);
+  });
+});

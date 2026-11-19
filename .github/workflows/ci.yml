@@ -1,0 +1,974 @@
+
+name: CI
+
+# Work reaches `main` by pull request from a short-lived branch, so the pull
+# request is where these run. The push trigger covers the merge itself - a
+# branch CI ignores is a branch whose status badge means nothing.
+#
+# **`pull_request` carries no `branches:` filter, and that is the point of #359.**
+# That filter matches on the *base*, so a pull request stacked on another feature
+# branch - which is what two branches touching one file are told to do here - matched
+# no trigger at all and ran nothing. Not red, not pending: `gh pr checks` answered
+# "no checks reported" and the rollup was empty, which reads as "still starting" to
+# anybody who does not go looking. Four pull requests merged that way on 2026-08-06,
+# each verified only on somebody's laptop, and the gap closed only when the child was
+# retargeted to `main` after the parent merged - the moment nobody waits seven minutes
+# for a branch that has looked settled for a day.
+#
+# Two things make this cheap rather than a doubling of the bill. The `changes` job
+# below already skips the three expensive suites a diff cannot affect, and it reads
+# `pulls/{n}/files`, which is the diff against *that* pull request's own base - so a
+# stacked child is classified on its own changes rather than on its parent's. And the
+# `concurrency` group is keyed on `github.ref`, so a stacked branch cancels its own
+# superseded runs like any other.
+#
+# The `push` trigger stays pinned to `main`: a branch push is already covered by its
+# pull request, and widening it would run everything twice.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# One run per branch. `AGENTS.md` asks for a commit and a push per finished piece,
+# which is right - but with nothing cancelling, each push started a fresh 24-minute
+# matrix and left the previous one running to completion, answering a question
+# about a commit nobody was waiting on. 75 of the 369 runs in the first six days of
+# August were superseded while still in flight, about 1,800 billed minutes, and
+# only 2 runs in that window were ever `cancelled`. See #317.
+#
+# `main` is deliberately excluded: the push run is what makes the merge history and
+# the badge mean anything, and a commit whose CI never finished is worse than a
+# minute overspent. `cancel-in-progress: false` is **not** how you exclude it, which
+# is the trap this originally fell into: false means *queue*, and GitHub's rule is
+# that "any existing pending job or workflow in the same concurrency group will be
+# canceled and the new queued job or workflow will take its place". So with one
+# group for `main`, merge A running and B pending, C landing cancels B outright and
+# B's commit gets no CI at all - at fourteen releases in six days plus feature
+# merges, against a ~10 minute `main` run, two merges inside one window is not rare.
+#
+# So `main` is kept out of the group entirely rather than out of the cancelling:
+# `github.run_id` is unique per run, so every push gets a group of its own and
+# neither queues nor cancels. Pull requests all resolve to `-pr` and cancel each
+# other per `github.ref`, which is the whole point.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name == 'push' && github.run_id || 'pr' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege for every job. Nothing in this workflow writes anything back -
+# Codecov uses its own token - and a job that later needs more should declare it
+# on itself, not here. The image build and its Trivy scan used to live here as a
+# `docker` job with `push: false`; they are `images.yml` now, which publishes what
+# it builds (#1545).
+permissions:
+  contents: read
+
+env:
+  # CI deployments and browser sessions must not enter production analytics.
+  DIAGNOSTICS_ENABLED: "false"
+
+# **Every job carries a `timeout-minutes`, and #364 is why.** `changes` was the only
+# one that did, so the other seven inherited GitHub's default of 360 minutes: one
+# stalled job would have held a required status check for six hours with nothing in
+# this repository ending it sooner. Nothing has been observed to stall - this is a
+# bound on the tail, not a fix for something seen.
+#
+# Each is set several times the job's observed worst case rather than just above it.
+# The bound exists to end a stall, and a timeout tight enough to trim a legitimately
+# cold cache is a red build for a reason unrelated to the diff. Measured on run
+# 31116003994, a full matrix on `main`: changes 7s, lint 22s, Security Scan 14s,
+# docs 4m34s, test-frontend 5m08s, test 7m43s, e2e 8m01s (and the image build,
+# since moved to `images.yml`, 2m30s). The suites have since grown substantially.
+# Coverage is now measured once; frontend and E2E work is
+# distributed over four isolated shards. Bounds retain headroom for cold runs.
+#
+# `backend/tests/test_ci_workflow.py` asserts that a job added later carries one too,
+# and that none is so generous it bounds nothing.
+jobs:
+  changes:
+    # Which of the three expensive suites this pull request can provably not
+    # affect. `scripts/ci_changed_scope.py` decides, timidly - a path it does not
+    # recognise runs everything - and its docstring says why that direction is the
+    # only safe one. A skipped job satisfies a required status check (GitHub counts
+    # `success`, `skipped` and `neutral`), which is what makes this legal against
+    # the six contexts `main`'s ruleset requires; a workflow-level `paths:` filter
+    # would instead leave those checks never reporting and block every merge
+    # forever, which is the trap named in #317.
+    #
+    # A job of its own rather than a step inside `lint`, at the cost of the one
+    # billed minute GitHub rounds it up to: folding it into `lint` would be free,
+    # but it would put `test`, `test-frontend` and `e2e` behind `needs: lint`, so a
+    # ruff error would skip all three and hide whatever else was broken until the
+    # next push.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A job-level block *replaces* the workflow-level one rather than adding to it,
+    # so `contents: read` has to be repeated here - this job checks out. Omitting it
+    # works on a public repository, where any token can read public content, and
+    # breaks on the day #317's premise changes and this repository goes private:
+    # a checkout failure that reads like a credentials problem.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      backend: ${{ steps.reused.outputs.backend || steps.scope.outputs.backend }}
+      frontend: ${{ steps.reused.outputs.frontend || steps.scope.outputs.frontend }}
+      e2e: ${{ steps.reused.outputs.e2e || steps.scope.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify release-only changes against a full successful run
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_release_scope.py --workflow ci.yml >> "$GITHUB_OUTPUT"
+
+      - name: Reuse the checked release source
+        if: steps.release.outputs.reuse == 'true'
+        id: reused
+        run: |
+          echo "backend=false" >> "$GITHUB_OUTPUT"
+          echo "frontend=false" >> "$GITHUB_OUTPUT"
+          echo "e2e=false" >> "$GITHUB_OUTPUT"
+
+      - name: Work out which suites the changed paths require
+        id: scope
+        # Pure cuts reuse suites only after the proof above. Other main pushes
+        # emit no scope outputs, so they run every suite.
+        #
+        # That covers a *skipped step*. It does not cover this *job* failing - a 502
+        # from the API, a rate limit, `set -euo pipefail` catching anything - because
+        # a failed `needs` skips its dependents without evaluating their `if:` at
+        # all, and a skipped required check is a pass. `changes` is not itself one of
+        # the six required contexts, so nothing would have blocked: the merge button
+        # would go green on a branch where no suite ran. Hence `!cancelled()` on each
+        # gated job, which is what makes them run when this one fails.
+        if: github.event_name == 'pull_request' && steps.release.outputs.cut != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+            > "$RUNNER_TEMP/files.json"
+          jq -r '.[] | .filename, (.previous_filename // empty)' \
+            < "$RUNNER_TEMP/files.json" > "$RUNNER_TEMP/changed.txt"
+          # Version exemptions belong exclusively to the semantic classifier
+          # above, with full-run evidence; paths alone never exempt manifests.
+          python3 scripts/ci_changed_scope.py \
+            "$RUNNER_TEMP/changed.txt" >> "$GITHUB_OUTPUT"
+
+  lint:
+    # Never gated. It is one billed minute, `make lint-spelling` reads every
+    # tracked file rather than a subtree, and a suite that skips is only defensible
+    # while something still looks at the whole tree.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # `ty check` exits 0 on a warning-level diagnostic by design - template-inherited
+    # code is reported, not gated (`docs/testing.md`) - and its default output is
+    # plain text on stdout, so a run with 61 of them looked identical to one with
+    # zero: green check, no annotation, nothing to click. `ty` reads this env var
+    # itself and switches to GitHub's own `::warning file=…,line=…::` syntax, so the
+    # exact same `make lint-backend` call - unchanged, still zero-gating - surfaces
+    # every diagnostic as an inline annotation on the run and the diff. Unset
+    # locally, where the same command still prints the verbose, human-readable
+    # `full` format `make lint-backend` has always used.
+    env:
+      TY_OUTPUT_FORMAT: github
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "latest"
+          # Caches `~/.cache/uv`, keyed on `**/uv.lock`. Without it every job
+          # re-resolved and re-downloaded all 278 locked packages, five times per
+          # run across this workflow. See #317.
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.15
+
+      - name: Install dependencies
+        run: uv sync --directory backend --dev
+
+      # ruff check, ruff format --check, ty, vulture, deptry and the three guard
+      # scripts - the target, not a second copy of its commands. Every step this job used to
+      # spell out was also spelled out in the Makefile, and the pair drifted: the
+      # i18n guard was in `make lint` and never here, so hardcoded copy failed
+      # locally and passed the build. Calling the target is how the two stay equal
+      # rather than how they are asserted to be equal - and
+      # `backend/tests/test_ci_parity.py` catches whatever this still misses.
+      #
+      # The i18n guard is no longer among them: since #395 it is TypeScript, and it
+      # runs in `test-frontend` as the fourth step of `make lint-frontend`.
+      - name: Lint, format-check and type-check the backend
+        run: make lint-backend
+
+      # codespell over every tracked file. The pre-commit hook reads only the
+      # files a commit touches, so until #188 nothing had ever read the tree: a
+      # misspelling merged with its file, and the next person to touch that file
+      # for an unrelated reason had their commit refused by a word they did not
+      # write. This step is what keeps "the whole tree is clean" true.
+      - name: Spell-check the whole tree
+        run: make lint-spelling
+
+      # yamlfmt, zizmor and the pre-commit basics over the whole tree, not the
+      # files a commit touched. Those hooks are per-file by nature, so a rev bump
+      # that brings a new rule breaks every existing file and nothing notices
+      # until an unrelated edit is refused by it (#203). SKIP inside the target
+      # drops the hooks lint-backend/lint-frontend/lint-spelling already gate.
+      - name: Run the tree-scoped pre-commit hooks over the whole tree
+        run: make lint-precommit
+
+    # The step that used to sit here ran the entire test suite - with no
+    # database, in the lint job - to grep its output for `module-not-imported`.
+    # That warning belongs to `[tool.coverage.run] source`, and this config
+    # selects with `include`, which never emits it: the check could not fail,
+    # and it cost a full suite run to prove nothing.
+    #
+    # `tests/test_coverage_gate.py` asserts what it was reaching for, properly:
+    # every include pattern matches a real file, every platform module is
+    # gated, and the `[[tool.ty.overrides]]` list has not drifted from it. It
+    # runs in the `test` job, where a database exists.
+
+  test:
+    needs: changes
+    # Two mechanisms, deliberately both. `!= 'false'` rather than `== 'true'` because
+    # on a push the `changes` step does not run and the empty output has to mean
+    # *run*; `!cancelled()` because a `changes` job that *failed* would otherwise
+    # skip this one without the `if:` being read at all - and a skipped required
+    # check is a pass, so that is a green merge button over a suite that never ran.
+    if: ${{ !cancelled() && needs.changes.outputs.backend != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        # pgvector, not stock postgres: the RAG store runs
+        # `CREATE EXTENSION IF NOT EXISTS vector` the first time a collection
+        # is written to, and stock postgres answers `extension "vector" is
+        # not available` — so an ingestion test would 500 before asserting
+        # anything, and the E2E upload journey could never run at all.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --tmpfs /var/lib/postgresql/data:rw,size=1g
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    # On the job rather than repeated under each step, which is how the `e2e` job
+    # below already does it. Four identical copies is four places to forget one.
+    env:
+      PYTEST_XDIST_AUTO_NUM_WORKERS: "4"
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: test_db
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.15
+
+      - name: Install dependencies
+        run: uv sync --directory backend --dev
+
+      - name: Configure the disposable test database
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: make ci-test-db-configure
+
+      - name: Cycle the migration chain forwards and back
+        # The only way to know a migration works. Backfills, check constraints
+        # and the loud failures they raise cannot be verified by importing the
+        # module — they need a database with the previous schema in it. And a
+        # downgrade nobody runs is a downgrade that does not work, so the chain
+        # goes to base and back rather than only forwards.
+        #
+        # `make check` does not run this, and that omission is deliberate rather
+        # than drift: it is slow and rarely needed, so `check` leaves it to a hand run.
+        run: make test-migrations
+
+      - name: Verify the models and the migrations still agree
+        # `alembic check` fails if the models declare something no migration
+        # creates - the gate that catches "edited a model, forgot the
+        # migration". `test-migrations` above leaves the database at head, which
+        # is what this needs; it never downgrades, so it is safe to run in
+        # `make check` too, where `test-migrations` is not.
+        run: make db-check
+
+      # The object store the S3 file-storage backend is exercised against
+      # (#1423). A compose profile rather than a service container, because a
+      # service container cannot be given a command and MinIO's image needs one.
+      # Without it `tests/integration/test_s3_file_storage.py` skips itself, the
+      # same bargain the database fixtures make on a laptop - and a suite that
+      # silently skipped that backend in CI is how it would rot.
+      - name: Start the object store
+        run: make docker-minio
+
+      - name: Run tests with the coverage gate
+        # Measure the whole application once; report the platform at 100% and
+        # reuse the same data for the informational inherited-code report.
+        #
+        # `COV_REPORT=xml` is the only difference from what `make test` does on a
+        # laptop, and it is for Codecov below rather than for the gate.
+        #
+        # `PYTEST_ADDOPTS` turns the Makefile's `-v` into one line of dots per
+        # worker. With a line per test (about 25,000 of them, a few of them 50 KB
+        # long) the run stopped three times in a row on this suite: both workers
+        # and the step's own output went silent in the same second, no stack
+        # was dumped, and the job ran into its 90-minute limit. The same suite
+        # finished in 14 to 20 minutes with quiet output, and with its output
+        # sent to a file. Failures still print in full with a short summary, and
+        # `faulthandler_timeout` still names a test that hangs.
+        env:
+          PYTEST_ADDOPTS: "-q -q"
+        run: make test COV_REPORT=xml
+
+      - name: Report coverage of template-inherited code
+        # Informational. Holding code we did not design to the platform bar
+        # would mean mock-heavy tests that buy a number rather than confidence.
+        if: ${{ !cancelled() }}
+        run: make coverage-all REUSE_COVERAGE=1
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ./backend/coverage.xml
+          fail_ci_if_error: false
+
+      - name: Report the security refusal tests
+        # The `security` marker names the refusal tests as a set (#1417). The
+        # target writes the count and the list to the job summary and to
+        # `backend/security-tests.txt`, which the next step uploads, so a security
+        # review can read which refusals the suite holds rather than take the
+        # claim on faith. A report, not a gate - it only lists, and `!cancelled()` so
+        # it still runs when a test above failed. `test_ci_parity.py` exempts it.
+        if: ${{ !cancelled() }}
+        run: make security-report
+
+      - name: Upload the security refusal-test list
+        # Downloadable per build, and the file a release attaches as its evidence
+        # that the refusals are held - the repository cuts releases by hand, so
+        # the attachment is a release-time step rather than an automated one.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-tests
+          path: backend/security-tests.txt
+          retention-days: 90
+
+  lint-frontend:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.frontend != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # Pinned, because unpinned means the action resolves and downloads the
+          # newest bun over the network on every job - and that download is what
+          # answered "socket hang up" three times in one afternoon, taking
+          # `test-frontend` and `e2e` down with it while the code was fine. A pin
+          # uses the action's own cached binary on a repeat run, and it also stops a
+          # bun release from changing this suite's behaviour with no commit behind
+          # it. Matches the major `frontend/Dockerfile` ships.
+          bun-version: 1.3.5
+
+      # `setup-bun` caches the bun binary, not the packages, so
+      # `bun install --frozen-lockfile` re-downloaded every dependency on every
+      # run. Bun's global install cache is what makes the second run cheap; the
+      # key is the lockfile, so a dependency change invalidates it and nothing
+      # else does.
+      - name: Cache the bun install cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: frontend
+
+      - name: Lint, format-check and type-check the frontend
+        run: make lint-frontend
+
+  frontend-shards:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.frontend != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # Pinned, because unpinned means the action resolves and downloads the
+          # newest bun over the network on every job - and that download is what
+          # answered "socket hang up" three times in one afternoon, taking
+          # `test-frontend` and `e2e` down with it while the code was fine. A pin
+          # uses the action's own cached binary on a repeat run, and it also stops a
+          # bun release from changing this suite's behaviour with no commit behind
+          # it. Matches the major `frontend/Dockerfile` ships.
+          bun-version: 1.3.5
+
+      # `setup-bun` caches the bun binary, not the packages, so
+      # `bun install --frozen-lockfile` re-downloaded every dependency on every
+      # run. Bun's global install cache is what makes the second run cheap; the
+      # key is the lockfile, so a dependency change invalidates it and nothing
+      # else does.
+      - name: Cache the bun install cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: frontend
+
+      - name: Run a quarter of the frontend tests
+        run: make test-frontend-cov
+        env:
+          VITEST_ARGS: --shard=${{ matrix.shard }}/4 --reporter=default --reporter=blob --maxWorkers=4
+          VITEST_SHARD: "true"
+      - name: Save test and coverage data for the aggregate gate
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vitest-${{ matrix.shard }}
+          overwrite: true
+          path: frontend/.vitest-reports/*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  build-frontend:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.frontend != 'false' || needs.changes.outputs.e2e != 'false') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # Pinned, because unpinned means the action resolves and downloads the
+          # newest bun over the network on every job - and that download is what
+          # answered "socket hang up" three times in one afternoon, taking
+          # `test-frontend` and `e2e` down with it while the code was fine. A pin
+          # uses the action's own cached binary on a repeat run, and it also stops a
+          # bun release from changing this suite's behaviour with no commit behind
+          # it. Matches the major `frontend/Dockerfile` ships.
+          bun-version: 1.3.5
+
+      # `setup-bun` caches the bun binary, not the packages, so
+      # `bun install --frozen-lockfile` re-downloaded every dependency on every
+      # run. Bun's global install cache is what makes the second run cheap; the
+      # key is the lockfile, so a dependency change invalidates it and nothing
+      # else does.
+      - name: Cache the bun install cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: frontend
+
+      - name: Restore the Next.js build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: frontend/.next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}-${{ github.sha }}
+          restore-keys: next-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}-
+      - name: Build the production frontend
+        run: make build-frontend
+      - name: Pack the build for E2E
+        run: make build-frontend-pack
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-build
+          overwrite: true
+          path: ${{ runner.temp }}/frontend-build.tar.gz
+          retention-days: 1
+
+  test-frontend:
+    needs: [changes, lint-frontend, build-frontend, frontend-shards]
+    if: ${{ !cancelled() && needs.changes.outputs.frontend != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # Pinned, because unpinned means the action resolves and downloads the
+          # newest bun over the network on every job - and that download is what
+          # answered "socket hang up" three times in one afternoon, taking
+          # `test-frontend` and `e2e` down with it while the code was fine. A pin
+          # uses the action's own cached binary on a repeat run, and it also stops a
+          # bun release from changing this suite's behaviour with no commit behind
+          # it. Matches the major `frontend/Dockerfile` ships.
+          bun-version: 1.3.5
+
+      # `setup-bun` caches the bun binary, not the packages, so
+      # `bun install --frozen-lockfile` re-downloaded every dependency on every
+      # run. Bun's global install cache is what makes the second run cheap; the
+      # key is the lockfile, so a dependency change invalidates it and nothing
+      # else does.
+      - name: Cache the bun install cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: frontend
+
+      - name: Require every frontend job to have succeeded
+        env:
+          LINT: ${{ needs.lint-frontend.result }}
+          BUILD: ${{ needs.build-frontend.result }}
+          TESTS: ${{ needs.frontend-shards.result }}
+        run: make test-frontend-jobs-check
+      - name: Download all four shard reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vitest-*
+          path: frontend/.vitest-reports
+          merge-multiple: true
+      - name: Require all shard reports
+        run: make test-frontend-reports-check
+      - name: Apply the coverage gate to the complete suite
+        run: make test-frontend-merge
+
+  e2e-shards:
+    # Each matrix job owns its whole stack. Files remain serial within that
+    # stack so tests mutating sessions or shared rows cannot race each other.
+    needs: [changes, build-frontend]
+    # Exempted from neither half: this job drives the frontend against the
+    # backend, so it is only skippable for a change that touches neither.
+    if: ${{ !cancelled() && needs.changes.outputs.e2e != 'false' && needs.build-frontend.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    services:
+      postgres:
+        # pgvector, not stock postgres: the RAG store runs
+        # `CREATE EXTENSION IF NOT EXISTS vector` the first time a collection
+        # is written to, and stock postgres answers `extension "vector" is
+        # not available` — so an ingestion test would 500 before asserting
+        # anything, and the E2E upload journey could never run at all.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: e2e_db
+        ports:
+          - 5432:5432
+        options: >-
+          --tmpfs /var/lib/postgresql/data:rw,size=1g
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: e2e_db
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      # The browser talks to Next, Next proxies to FastAPI, and the chat
+      # websocket goes to FastAPI directly — so the backend port has to match
+      # what the console tells the browser (read at runtime, #1544). 8000 is
+      # the default for both.
+      BACKEND_URL: http://localhost:8000
+      PUBLIC_WS_URL: ws://localhost:8000
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.15
+
+      - name: Install backend dependencies
+        run: uv sync --directory backend --dev
+
+      - name: Configure the disposable test database
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: make ci-test-db-configure
+
+      - name: Apply migrations
+        run: uv run --directory backend alembic upgrade head
+
+      - name: Seed an organization, a model and a published agent
+        # Idempotent, and the fixture the whole suite asserts against: an owner
+        # to sign in as, an organization to be scoped to, and the published
+        # agent @claude-code-like.
+        #
+        # `BOOTSTRAP_API_KEY` is what makes that last part true, and this step ran
+        # without it - so bootstrap stopped at "No openai key given", created no
+        # `openai default` model profile, and left the starter agent a *draft*.
+        # Thirty-seven specs assert against that profile or against a published
+        # agent, so the job could not pass however good the specs were.
+        #
+        # A placeholder is enough, and it is all that is used: the fixture the
+        # suite needs is a model profile that exists and an agent that published,
+        # not a key that answers. Nothing in this job calls a real provider - the
+        # journey spec runs its agent against the stub model server Playwright
+        # starts - so no secret is in scope here at all.
+        run: uv run --directory backend agenticos cmd bootstrap
+        env:
+          BOOTSTRAP_API_KEY: sk-e2e-fixture-not-a-real-key
+
+      - name: Start the backend
+        # `--ws websockets-sansio` because uvicorn's `auto` picks the legacy
+        # websockets implementation, which fails the handshake against
+        # websockets >= 14 — and the chat specs need that socket up.
+        run: |
+          uv run --directory backend uvicorn app.main:app \
+            --host 127.0.0.1 --port 8000 --ws websockets-sansio \
+            > "$RUNNER_TEMP/backend.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/backend.pid"
+
+      - name: Wait for the backend to be healthy
+        # Polled, not slept. A fixed wait is either too short on a cold runner
+        # or wasted on a warm one, and the failure it produces is a browser
+        # timeout thirty tests later rather than a message saying the backend
+        # never came up.
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -sf http://localhost:8000/api/v1/health > /dev/null; then
+              echo "backend healthy after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "backend did not become healthy"
+          cat "$RUNNER_TEMP/backend.log"
+          exit 1
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # Pinned, because unpinned means the action resolves and downloads the
+          # newest bun over the network on every job - and that download is what
+          # answered "socket hang up" three times in one afternoon, taking
+          # `test-frontend` and `e2e` down with it while the code was fine. A pin
+          # uses the action's own cached binary on a repeat run, and it also stops a
+          # bun release from changing this suite's behaviour with no commit behind
+          # it. Matches the major `frontend/Dockerfile` ships.
+          bun-version: 1.3.5
+
+      - name: Cache the bun install cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+        working-directory: frontend
+
+      - name: Download the production build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: frontend-build
+          path: ${{ runner.temp }}/frontend-build
+      - name: Unpack the production build
+        run: tar -xzf "$RUNNER_TEMP/frontend-build/frontend-build.tar.gz" -C frontend
+
+      # Chromium is ~170 MB downloaded on every run otherwise. Keyed on the
+      # lockfile, because that is what pins the Playwright version the browser
+      # has to match - a browser cached against a different version is the kind
+      # of failure that reads as a flaky spec.
+      - name: Cache the Playwright browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+
+      - name: Install Playwright browsers
+        # **No `--with-deps`, and #879 is why.** It shells out to `apt-get`, which
+        # on a hosted runner resolves through `azure.archive.ubuntu.com` - and when
+        # that mirror is unreachable apt falls back to the public archive and
+        # stalls there with no bound of its own. Fourteen e2e runs between 14 and
+        # 18 August died exactly that way, every one of them in this step, every
+        # one at 25 minutes on the nose: the job's `timeout-minutes` ended it, and
+        # a job ended by its bound is recorded as `cancelled` - which reads as a
+        # superseded run, is not treated as a pass by the ruleset, and blocks the
+        # merge until somebody re-runs the slowest job in CI.
+        #
+        # It was buying nothing. On a healthy run apt reports every library
+        # Chromium links against as "already the newest version" - the runner
+        # image ships all of them - and installs 21 MB of CJK, Cyrillic and emoji
+        # fonts no spec renders. An image that does drop a library fails at
+        # browser launch, with Playwright naming the package, which is louder
+        # than this was. The step keeps a bound of its own so that a stall in the
+        # CDN download fails *this step* by name rather than the job by timeout.
+        run: bunx playwright install chromium
+        timeout-minutes: 10
+        working-directory: frontend
+
+      - name: Run E2E tests
+        # `webServer` in playwright.config.ts starts `next start` and waits for
+        # it. This job used to run with no frontend at all: `webServer` was
+        # disabled under CI, so Playwright drove a closed port.
+        run: bun run test:e2e --shard=${{ matrix.shard }}/4
+        working-directory: frontend
+        env:
+          CI: true
+          # No provider key here, and none needed. The full journey runs an agent
+          # against `e2e/stub-model-server.ts`, an OpenAI-compatible server
+          # Playwright starts beside the app - so the one spec covering the seams
+          # runs on every push instead of skipping itself in every environment
+          # that had no key, which was all of them including this one.
+
+      - name: Upload the Playwright report when a journey fails
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-report-${{ matrix.shard }}
+          overwrite: true
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      # The raw per-test output beside the report: the screenshot at the moment
+      # of failure, the video, the trace `retain-on-failure` kept, and the
+      # `error-context.md` Playwright writes naming the page as it stood. The
+      # report embeds most of it, but only for the runs it managed to finish -
+      # a suite the runner killed leaves `test-results/` and no report at all,
+      # which is the case #162 was diagnosed without.
+      - name: Upload the raw Playwright output when a journey fails
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-results-${{ matrix.shard }}
+          overwrite: true
+          path: frontend/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Show the backend log when a journey fails
+        # Half of an E2E failure is on the other side of the proxy.
+        if: failure()
+        run: cat "$RUNNER_TEMP/backend.log"
+
+  e2e:
+    needs: [changes, build-frontend, e2e-shards]
+    if: ${{ !cancelled() && needs.changes.outputs.e2e != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every isolated E2E shard to have succeeded
+        env:
+          BUILD: ${{ needs.build-frontend.result }}
+          TESTS: ${{ needs.e2e-shards.result }}
+        run: test "$BUILD" = success && test "$TESTS" = success
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.15
+
+      - name: Install dependencies
+        run: uv sync --directory backend --dev
+
+      # This job never audited anything. `uv pip install pip-audit` ran outside a
+      # virtualenv and died with "No virtual environment found", so it reported
+      # red for a reason unrelated to security - and two further errors were
+      # queued behind it: `--require-hashes` is a flag, not a key=value, and
+      # `--locked` wants a PEP 751 `pylock.toml` rather than `uv.lock`.
+      #
+      # What works, and what `make audit` now does: export exactly what the
+      # lockfile resolves - which is what a deployment installs - and audit that.
+      # It ran only here until #143, so a dependency advisory was something a
+      # branch learned about after pushing.
+      - name: Audit the locked dependency set for known vulnerabilities
+        run: make audit
+
+      # The frontend half of the licence inventory reads `node_modules`, so this
+      # job installs it the way `test-frontend` does. Same pin, same cache.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Cache the bun install cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+        working-directory: frontend
+
+      # Stale notices, a component with no readable licence, or a copyleft one
+      # with no recorded decision. Open findings that are tracked pass; the
+      # verdict line counts them.
+      - name: Check the third-party notices against the lockfiles
+        run: make licenses-check
+
+      # The console's own lockfile, which nothing here read until #1415: `bun
+      # audit` was on the `SECURITY.md` checklist and in no job, so the two
+      # unauthenticated-RCE advisories against the pinned `next` were sitting in
+      # a green build. Gates at `high`, and exits non-zero on its own, so it
+      # needs none of the verdict-line machinery `make audit` carries.
+      - name: Audit the frontend lockfile for known vulnerabilities
+        run: make audit-frontend
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.15
+
+      # The runtime too, not just mkdocs: the reference pages are generated from
+      # the application's own docstrings, so a build without it would either fail
+      # to collect them or - worse - quietly render empty pages.
+      - name: Install dependencies
+        run: uv sync --directory backend --group docs
+
+      - name: Build the documentation
+        # `--strict` turns a dead internal link or a page missing from the nav
+        # into a failure. Both are things a reader finds and a lenient build
+        # ships.
+        run: make docs-build
+
+      # The translation guard carries its own copy of the `toc` extension's slug
+      # rule, because it runs under the system interpreter with no virtualenv. A
+      # copy that has drifted fails silently: the gate then compares anchors the
+      # build never emits. Checking it needs the renderer, which only this job
+      # installs - in the `test` job it skips for want of `pymdownx`.
+      - name: Check the slug rule against the real renderer
+        run: make docs-slug-check
+
+  checked-source:
+    name: Record the checked source
+    needs: [test, test-frontend, e2e]
+    if: ${{ !cancelled() && needs.test.result == 'success' && needs.test-frontend.result == 'success' && needs.e2e.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The run API reports the PR head SHA, whereas checkout analyzes the
+      # synthetic merge SHA. Reuse must prove the tree actually checked.
+      - name: Record the checkout commit
+        run: printf '%s\n' "$GITHUB_SHA" > checked-source.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checked-source
+          path: checked-source.txt
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30

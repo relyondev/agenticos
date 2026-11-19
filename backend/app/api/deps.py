@@ -1,0 +1,2117 @@
+"""API dependencies.
+
+Dependency injection factories for services, repositories, and authentication.
+
+**The session aliases below decide when the transaction commits.** A dependency
+with `yield` runs its exit code when the exit stack it was registered on
+unwinds, and FastAPI keeps two of them per request: the *function* stack, which
+unwinds after the path operation returns and **before** the response is sent,
+and the *request* stack, which unwinds **after**. `scope=` on `Depends` chooses
+between them, and `"request"` is the default for a generator dependency - which
+is why every write in this API used to be acknowledged before it was durable
+(#353).
+"""
+# ruff: noqa: I001 - Imports structured for Jinja2 template conditionals
+
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Annotated
+
+from fastapi import Depends
+from fastapi import Header
+from fastapi import Query
+from fastapi import WebSocket, Cookie, WebSocketException
+from fastapi.security import OAuth2PasswordBearer
+
+from app.core.config import settings
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.session import get_db_session
+
+DBSession = Annotated[AsyncSession, Depends(get_db_session, scope="function")]
+"""The request's session, committed before the response leaves the process.
+
+`scope="function"` is load-bearing, not decoration: it puts the commit on the
+exit stack FastAPI unwinds *between* the path operation returning and the
+response being written, so a 2xx means the write is readable rather than merely
+accepted. Without it a client acting on its own 2xx - a browser refetching after
+a mutation, an agent reading back what it just wrote, an E2E fixture - can be
+answered from a database the write has not reached (#353, #230, #335).
+
+A failed request is unaffected in ordering and unchanged in behaviour: the
+exception unwinds this stack too, so the rollback still happens, and it still
+happens before the error response is built.
+"""
+
+StreamingDBSession = Annotated[AsyncSession, Depends(get_db_session, scope="request")]
+"""A session that outlives the response start, for a body produced while sending.
+
+A `StreamingResponse` over a generator is iterated during `await response(...)`,
+which is after the function stack has unwound - so a body that pages through the
+database needs the session to survive that long, and this alias is the only
+supported way to ask for one.
+
+**Read-only.** Its transaction resolves after the client has been answered,
+which is exactly the ordering #353 is about, so a write made through it is a
+write nobody can be told the truth about. One endpoint uses it: the ratings
+export. `tests/api/test_db_session_scope.py` refuses a second without a decision
+being made about it.
+
+Taking this alias costs a second session, because FastAPI's dependency cache
+keys on the computed scope: the export endpoint holds this one *and* the
+function-scoped one its authentication resolves through, on two pool
+connections, in two transactions. Unavoidable while authentication reads the
+database, and free for a read - under `READ COMMITTED` every statement takes a
+fresh snapshot anyway, so one transaction guarantees these two reads no more
+than two do. Do not build on it: a *write* split across the two is two
+transactions that can half-commit.
+"""
+from uuid import UUID
+
+from app.db.session import get_db_context
+from fastapi import Request
+
+from app.clients.redis import RedisClient
+
+
+async def get_redis(request: Request) -> RedisClient:
+    """Get Redis client from lifespan state."""
+    return request.state.redis  # type: ignore[no-any-return]
+
+
+Redis = Annotated[RedisClient, Depends(get_redis)]
+
+
+from app.services.mentions import MentionService
+from app.services.personal_data import PersonalDataService
+from app.services.browser_sign_in import BrowserSignInService
+from app.services.user import UserService
+from app.services.session import SessionService
+from app.services.web_push import WebPushService
+from app.services.apns import ApnsService
+from app.services.push import PushService
+from app.services.impersonation import ImpersonationService
+from app.services.ws_auth import authenticate_socket_key, authenticate_socket_token
+from app.services.device_pairing import DevicePairingService
+from app.services.oauth_exchange import OAuthExchangeService
+from app.services.conversation import ConversationService
+from app.services.visual import VisualService
+from app.services.local_service import LocalServiceService
+from app.services.ml import MLService
+from app.services.sandbox_connection import SandboxConnectionService
+from app.services.sandbox_workspace import SandboxWorkspaceService
+from app.services.conversation_share import ConversationShareService
+
+
+def get_user_service(db: DBSession) -> UserService:
+    """Create UserService instance with database session."""
+    return UserService(db)
+
+
+def get_personal_data_service(db: DBSession) -> PersonalDataService:
+    """What this deployment holds about one person - read out, or removed (#1421)."""
+    return PersonalDataService(db)
+
+
+def get_session_service(db: DBSession) -> SessionService:
+    """Create SessionService instance with database session."""
+    return SessionService(db)
+
+
+def get_impersonation_service(db: DBSession) -> ImpersonationService:
+    """Create ImpersonationService instance with database session."""
+    return ImpersonationService(db)
+
+
+def get_oauth_exchange_service(redis: Redis) -> OAuthExchangeService:
+    """Create OAuthExchangeService instance with the Redis client."""
+    return OAuthExchangeService(redis)
+
+
+def get_device_pairing_service(redis: Redis, db: DBSession) -> DevicePairingService:
+    """Create DevicePairingService over Redis and the request's database session."""
+    return DevicePairingService(redis, UserService(db), SessionService(db))
+
+
+UserSvc = Annotated[UserService, Depends(get_user_service)]
+PersonalDataSvc = Annotated[PersonalDataService, Depends(get_personal_data_service)]
+SessionSvc = Annotated[SessionService, Depends(get_session_service)]
+ImpersonationSvc = Annotated[ImpersonationService, Depends(get_impersonation_service)]
+OAuthExchangeSvc = Annotated[OAuthExchangeService, Depends(get_oauth_exchange_service)]
+DevicePairingSvc = Annotated[DevicePairingService, Depends(get_device_pairing_service)]
+
+
+def get_web_push_service(db: DBSession) -> WebPushService:
+    """Create WebPushService with the request's database session."""
+    return WebPushService(db)
+
+
+WebPushSvc = Annotated[WebPushService, Depends(get_web_push_service)]
+
+
+def get_apns_service(db: DBSession) -> ApnsService:
+    """Create ApnsService with the request's database session."""
+    return ApnsService(db)
+
+
+ApnsSvc = Annotated[ApnsService, Depends(get_apns_service)]
+
+
+def get_push_service(db: DBSession) -> PushService:
+    """Create PushService - Web Push and APNs - with the request's database session."""
+    return PushService(db)
+
+
+PushSvc = Annotated[PushService, Depends(get_push_service)]
+
+
+def get_conversation_service(db: DBSession) -> ConversationService:
+    """Create ConversationService instance with database session."""
+    return ConversationService(db)
+
+
+ConversationSvc = Annotated[ConversationService, Depends(get_conversation_service)]
+
+
+def get_visual_service(db: DBSession) -> VisualService:
+    return VisualService(db)
+
+
+VisualSvc = Annotated[VisualService, Depends(get_visual_service)]
+
+
+def get_sandbox_workspace_service(db: DBSession) -> SandboxWorkspaceService:
+    return SandboxWorkspaceService(db)
+
+
+WorkspaceSvc = Annotated[SandboxWorkspaceService, Depends(get_sandbox_workspace_service)]
+
+
+def get_sandbox_connection_service(db: DBSession) -> SandboxConnectionService:
+    return SandboxConnectionService(db)
+
+
+SandboxConnectionSvc = Annotated[SandboxConnectionService, Depends(get_sandbox_connection_service)]
+
+
+def get_local_service_service(db: DBSession) -> LocalServiceService:
+    return LocalServiceService(db)
+
+
+LocalServiceSvc = Annotated[LocalServiceService, Depends(get_local_service_service)]
+
+
+def get_ml_service(db: DBSession) -> MLService:
+    return MLService(db)
+
+
+MLSvc = Annotated[MLService, Depends(get_ml_service)]
+
+
+def get_conversation_share_service(db: DBSession) -> ConversationShareService:
+    """Create ConversationShareService instance with database session."""
+    return ConversationShareService(db)
+
+
+ConversationShareSvc = Annotated[ConversationShareService, Depends(get_conversation_share_service)]
+from app.services.channel_bot import ChannelBotService
+
+
+def get_channel_bot_service(db: DBSession) -> ChannelBotService:
+    """Unscoped ChannelBotService - inbound webhook dispatch only.
+
+    An inbound request is made by a chat platform, not by a member, so there is
+    no active organization to scope to; the bot row carries it. Management
+    endpoints must use `OrgChannelBotSvc` instead.
+    """
+    return ChannelBotService(db)
+
+
+ChannelBotSvc = Annotated[ChannelBotService, Depends(get_channel_bot_service)]
+
+
+from app.services.channels.feedback import ChannelFeedback
+
+
+def get_channel_feedback_service(db: DBSession) -> ChannelFeedback:
+    """Record a signed channel rating in the callback request's transaction."""
+    return ChannelFeedback(db)
+
+
+ChannelFeedbackSvc = Annotated[ChannelFeedback, Depends(get_channel_feedback_service)]
+
+
+from app.services.channel_link import ChannelLinkService
+
+
+def get_channel_link_service(db: DBSession) -> ChannelLinkService:
+    """Minting and spending the codes that connect a chat account to a person.
+
+    Not organization-scoped: a code names a *user*, and the same person's chat
+    identity is theirs in every organization they belong to.
+    """
+    return ChannelLinkService(db)
+
+
+ChannelLinkSvc = Annotated[ChannelLinkService, Depends(get_channel_link_service)]
+
+from app.services.message_rating import MessageRatingService
+
+
+def get_rating_service(db: DBSession) -> MessageRatingService:
+    """Create MessageRatingService instance with database session."""
+    return MessageRatingService(db)
+
+
+MessageRatingSvc = Annotated[MessageRatingService, Depends(get_rating_service)]
+
+
+def get_streaming_rating_service(db: StreamingDBSession) -> MessageRatingService:
+    """The ratings service for the CSV export, and nothing else.
+
+    `MessageRatingService.export_all_ratings` is an async generator that pages
+    through the database as the CSV is written, so it runs while the response is
+    being sent - after an ordinary `DBSession` has committed and closed. The
+    export writes nothing, which is what makes a request-scoped session
+    acceptable here; see `StreamingDBSession`.
+    """
+    return MessageRatingService(db)
+
+
+StreamingMessageRatingSvc = Annotated[MessageRatingService, Depends(get_streaming_rating_service)]
+from app.services.rag_document import RAGDocumentService
+from app.services.rag_sync import RAGSyncService
+from app.services.sync_source import SyncSourceService
+
+
+def get_rag_document_service(db: DBSession) -> RAGDocumentService:
+    """Create RAGDocumentService instance with database session."""
+    return RAGDocumentService(db)
+
+
+def get_rag_sync_service(db: DBSession) -> RAGSyncService:
+    """Create RAGSyncService instance with database session."""
+    return RAGSyncService(db)
+
+
+def get_sync_source_service(db: DBSession) -> SyncSourceService:
+    """Create SyncSourceService instance with database session."""
+    return SyncSourceService(db)
+
+
+RAGDocumentSvc = Annotated[RAGDocumentService, Depends(get_rag_document_service)]
+RAGSyncSvc = Annotated[RAGSyncService, Depends(get_rag_sync_service)]
+SyncSourceSvc = Annotated[SyncSourceService, Depends(get_sync_source_service)]
+from app.services.knowledge_base import KnowledgeBaseService
+
+
+def get_knowledge_base_service(db: DBSession) -> KnowledgeBaseService:
+    """Create KnowledgeBaseService instance with database session."""
+    return KnowledgeBaseService(db)
+
+
+KnowledgeBaseSvc = Annotated[KnowledgeBaseService, Depends(get_knowledge_base_service)]
+from app.services.collection_access import CollectionAccessService
+
+
+def get_collection_access_service(db: DBSession) -> CollectionAccessService:
+    """Create CollectionAccessService - the tenant boundary for every /rag route."""
+    return CollectionAccessService(db)
+
+
+CollectionAccessSvc = Annotated[CollectionAccessService, Depends(get_collection_access_service)]
+from app.services.file_upload import FileUploadService
+
+
+def get_file_upload_service(db: DBSession) -> FileUploadService:
+    """Create FileUploadService instance with database session."""
+    return FileUploadService(db)
+
+
+FileUploadSvc = Annotated[FileUploadService, Depends(get_file_upload_service)]
+from app.repositories import member_repo
+from app.services.organization import OrganizationService
+from app.services.retention import RetentionService
+from app.services.member import MemberService
+from app.services.invitation import InvitationService
+from app.services.invitation_staging import InvitationStagingService
+
+
+def get_retention_service(db: DBSession) -> RetentionService:
+    """Retention as a request sees it: read and change, never sweep.
+
+    The sweep is the flow's, and it is the flow that injects the vector remover
+    a document purge needs - so a request that somehow reached `sweep()` would
+    report the document class as failed rather than half-purge it.
+    """
+    return RetentionService(db)
+
+
+def get_organization_service(db: DBSession) -> OrganizationService:
+    """Create OrganizationService instance with database session."""
+    return OrganizationService(db)
+
+
+def get_member_service(db: DBSession) -> MemberService:
+    """Create MemberService instance with database session."""
+    return MemberService(db)
+
+
+def get_invitation_service(db: DBSession) -> InvitationService:
+    """Create InvitationService instance with database session."""
+    return InvitationService(db)
+
+
+def get_invitation_staging_service(redis: Redis) -> InvitationStagingService:
+    """Create InvitationStagingService instance with the Redis client."""
+    return InvitationStagingService(redis)
+
+
+OrganizationSvc = Annotated[OrganizationService, Depends(get_organization_service)]
+RetentionSvc = Annotated[RetentionService, Depends(get_retention_service)]
+MemberSvc = Annotated[MemberService, Depends(get_member_service)]
+InvitationSvc = Annotated[InvitationService, Depends(get_invitation_service)]
+InvitationStagingSvc = Annotated[InvitationStagingService, Depends(get_invitation_staging_service)]
+from app.services.group import GroupService
+from app.services.group_sharing import GroupSharingService
+from app.services.group_quality import GroupQualityService
+from app.services.group_spend import GroupSpendService
+from app.services.directory import (
+    DirectoryMappingService,
+    DirectorySignInService,
+    DirectorySyncService,
+    build_directory,
+    build_ticket_acceptor,
+)
+
+
+def get_group_service(db: DBSession) -> GroupService:
+    """Create GroupService instance with database session."""
+    return GroupService(db)
+
+
+def get_group_sharing_service(db: DBSession) -> GroupSharingService:
+    """Sharing several resources with a group from its page (#2072)."""
+    return GroupSharingService(db)
+
+
+def get_group_spend_service(db: DBSession) -> GroupSpendService:
+    """What each department spent this month (#2072)."""
+    return GroupSpendService(db)
+
+
+def get_group_quality_service(db: DBSession) -> GroupQualityService:
+    """How well agents answer each department's people (#2101)."""
+    return GroupQualityService(db)
+
+
+def get_directory_mapping_service(db: DBSession) -> DirectoryMappingService:
+    """Create DirectoryMappingService instance with database session."""
+    return DirectoryMappingService(db)
+
+
+def get_directory_sign_in_service(db: DBSession) -> DirectorySignInService:
+    """The directory sign-in, with whichever adapters the deployment configured.
+
+    Built per request from the settings: constructing the LDAP adapter opens no
+    connection, and a test overriding the settings gets adapters that match.
+    """
+    return DirectorySignInService(
+        db,
+        directory=build_directory(settings),
+        acceptor=build_ticket_acceptor(settings),
+    )
+
+
+def get_directory_sync_service(db: DBSession) -> DirectorySyncService:
+    """Create DirectorySyncService instance with database session."""
+    return DirectorySyncService(db)
+
+
+GroupSvc = Annotated[GroupService, Depends(get_group_service)]
+GroupSharingSvc = Annotated[GroupSharingService, Depends(get_group_sharing_service)]
+GroupSpendSvc = Annotated[GroupSpendService, Depends(get_group_spend_service)]
+GroupQualitySvc = Annotated[GroupQualityService, Depends(get_group_quality_service)]
+DirectorySyncSvc = Annotated[DirectorySyncService, Depends(get_directory_sync_service)]
+DirectoryMappingSvc = Annotated[DirectoryMappingService, Depends(get_directory_mapping_service)]
+DirectorySignInSvc = Annotated[DirectorySignInService, Depends(get_directory_sign_in_service)]
+from app.core.exceptions import (
+    AuthenticationError,
+    AuthorizationError,
+    BadRequestError,
+    NotFoundError,
+    RateLimitError,
+)
+from app.services import rate_limit
+from app.api.embed_cors import allow_embed_origin
+from app.core.audit import set_api_key
+from app.core.security import encode_untrusted, verify_token
+from app.db.models.user import User
+from app.api.public_api import is_public_route
+from app.services.api_key import ApiKeyService, KeyCaller, is_api_key
+from app.services.assistant import AssistantService
+from app.services.oauth_server import OAuthServerService
+from app.services.a2a_server import A2AServerService
+
+
+def get_a2a_server_service(db: DBSession) -> A2AServerService:
+    return A2AServerService(db)
+
+
+A2AServerSvc = Annotated[A2AServerService, Depends(get_a2a_server_service)]
+
+from app.services.external_agent import ExternalAgentService
+
+
+def get_external_agent_service(db: DBSession) -> ExternalAgentService:
+    return ExternalAgentService(db)
+
+
+ExternalAgentSvc = Annotated[ExternalAgentService, Depends(get_external_agent_service)]
+
+from app.services.project import ProjectService
+
+
+def get_project_service(db: DBSession) -> ProjectService:
+    return ProjectService(db)
+
+
+ProjectSvc = Annotated[ProjectService, Depends(get_project_service)]
+from app.services.change_feed import CONSOLE_TAB_HEADER, ChangeOrigin, console_tab
+from app.schemas.change_event import ChangeSurface
+
+
+def get_api_key_service(db: DBSession) -> ApiKeyService:
+    return ApiKeyService(db)
+
+
+ApiKeySvc = Annotated[ApiKeyService, Depends(get_api_key_service)]
+
+
+def get_assistant_service(db: DBSession) -> AssistantService:
+    return AssistantService(db)
+
+
+AssistantSvc = Annotated[AssistantService, Depends(get_assistant_service)]
+
+
+def get_oauth_server_service(db: DBSession) -> OAuthServerService:
+    return OAuthServerService(db)
+
+
+OAuthServerSvc = Annotated[OAuthServerService, Depends(get_oauth_server_service)]
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+oauth2_scheme_optional = OAuth2PasswordBearer(
+    tokenUrl=f"{settings.API_V1_STR}/auth/login", auto_error=False
+)
+
+
+async def _authenticate_api_key(request: Request, token: str, api_keys: ApiKeyService) -> User:
+    """Resolve an organization key to its issuer, on a public route only (#1794).
+
+    The route is checked before the key is looked up: a key presented to a
+    console-only route is refused the same way whether or not it is valid, so the
+    refusal says nothing about the key. What the key may do is carried on the
+    request for :func:`get_auth_context`, which every public route depends on.
+    """
+    route = request.scope.get("route")
+    if not is_public_route(route):
+        raise AuthorizationError(
+            message="API keys are not accepted on this endpoint",
+            details={"path": getattr(route, "path", request.url.path)},
+        )
+    refused = await rate_limit.key_attempt_refused(request, token)
+    if refused is not None:
+        _refuse_if_over(*refused)
+    try:
+        caller = await api_keys.authenticate(token)
+    except AuthenticationError:
+        await rate_limit.count_refused_key(request)
+        raise
+    request.state.api_key_caller = caller
+    set_api_key(caller.api_key_id, caller.prefix)
+    return caller.user
+
+
+def _key_caller(request: Request) -> KeyCaller | None:
+    """The organization key this request authenticated with, if it did."""
+    caller = getattr(request.state, "api_key_caller", None)
+    return caller if isinstance(caller, KeyCaller) else None
+
+
+async def get_current_user(
+    request: Request,
+    token: Annotated[str, Depends(oauth2_scheme)],
+    user_service: UserSvc,
+    impersonation: ImpersonationSvc,
+    session: SessionSvc,
+    api_keys: ApiKeySvc,
+) -> User:
+    """Get current authenticated user from JWT token, or an organization key's issuer.
+
+    An impersonated token - one carrying `act` - is bound to the session row it
+    names before the subject is loaded, so an impersonation that has been ended
+    is refused here rather than served for the rest of its hour (#1044). The
+    check also puts who is really acting on the request's audit context (#943).
+
+    An ordinary token carrying a `sid` is bound to its login's session row the
+    same way, so signing out everywhere refuses it here rather than letting it
+    live to its `exp` (#1501); a token minted before that binding has no `sid`
+    and is left to expire.
+
+    Raises:
+        AuthenticationError: If token is invalid, its session or impersonation has
+            ended, or the user is not found.
+        AuthorizationError: An organization key on a route outside the public API.
+    """
+    if is_api_key(token):
+        return await _authenticate_api_key(request, token, api_keys)
+
+    payload = verify_token(token)
+    if payload is None:
+        raise AuthenticationError(message="Invalid or expired token")
+
+    if payload.get("type") != "access":
+        raise AuthenticationError(message="Invalid token type")
+
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise AuthenticationError(message="Invalid token payload")
+
+    await impersonation.verify(payload=payload, token=token, subject=user_id)
+    await session.verify_access_session(payload=payload, subject=user_id)
+
+    user = await user_service.get_by_id(UUID(user_id))
+    if not user.is_active:
+        raise AuthenticationError(message="User account is disabled")
+
+    return user
+
+
+# There is deliberately no role-based dependency here. Authorization inside an
+# organization is a permission from the catalog, checked with `require(...)` or
+# resolved per row by `resolve_access` - never a role name on a route. The one
+# global privilege is `CurrentAppAdmin` below, which gates the deployment's own
+# administration rather than a tenant's.
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def get_current_session_id(
+    token: Annotated[str | None, Depends(oauth2_scheme_optional)],
+) -> UUID | None:
+    """The session row the caller's access token names, or None.
+
+    Ordinary access tokens carry a `sid` naming their own session (#1439), so a
+    request can spare that session when a password change revokes the account's
+    others. A token minted by a login path that opens no session (OAuth), or
+    before this claim existed, carries none - and the caller then falls back to
+    revoking every session, the safe default. Optional rather than a gate: the
+    route it serves already authenticates through `CurrentUser`, so a missing or
+    unreadable token here is simply no session to spare, not a refusal.
+    """
+    if token is None:
+        return None
+    payload = verify_token(token)
+    if payload is None:
+        return None
+    raw = payload.get("sid")
+    if not raw:
+        return None
+    try:
+        return UUID(str(raw))
+    except ValueError:
+        return None
+
+
+CurrentSessionId = Annotated[UUID | None, Depends(get_current_session_id)]
+from app.db.models.organization import Organization, OrganizationMember, OrgRole
+
+# Module-level alias so tests can patch via `app.api.deps._member_repo`.
+# RequireOrgRole methods reference this alias instead of importing the repo
+# inline; routes using member_repo continue to import via the canonical path.
+from app.repositories import member_repo as _member_repo
+
+
+async def get_active_organization(
+    request: Request,
+    user: CurrentUser,
+    db: DBSession,
+    x_organization_id: UUID | None = Header(None),
+) -> Organization:
+    """Resolve the active Organization for the current request.
+
+    An organization key carries its organization, so a key-authenticated request
+    acts there and nowhere else; an `X-Organization-Id` naming another one is a
+    400 naming the header rather than a silent switch (#1903).
+
+    A session reads the `X-Organization-Id` header. Without it, the request acts
+    in the deployment's default organization when the user belongs to it, then
+    in their personal one, then in their only one; a user with a choice and no
+    header is a 400 asking for it (#2156). Raises 404 if the user is not a member.
+    """
+    caller = _key_caller(request)
+    if caller is not None:
+        organization_id = caller.context.organization_id
+        if x_organization_id is not None and x_organization_id != organization_id:
+            raise BadRequestError(
+                message=(
+                    "An API key acts in its own organization; X-Organization-Id names "
+                    "another one. Leave the header out or send the key's organization."
+                ),
+                details={"header": "X-Organization-Id"},
+            )
+        return caller.organization
+
+    if x_organization_id is None:
+        org = await OrganizationService(db).fallback_for(user.id)
+        if org is None:
+            raise BadRequestError(
+                message=(
+                    "Name the organization this request acts in with the X-Organization-Id header."
+                ),
+                details={"header": "X-Organization-Id"},
+            )
+        return org
+
+    # The membership and the organization in one query, and the membership kept
+    # for `get_auth_context`, which read the same row again on every request
+    # (#2248). A membership names an existing organization - the foreign key
+    # sees to that - so a missing pair is one answer.
+    found = await member_repo.get_with_organization(
+        db, organization_id=x_organization_id, user_id=user.id
+    )
+    if found is None:
+        raise NotFoundError(
+            message="Organization not found or access denied",
+            details={"org_id": str(x_organization_id)},
+        )
+    membership, org = found
+    request.state.active_membership = membership
+    return org
+
+
+ActiveOrg = Annotated[Organization, Depends(get_active_organization)]
+
+
+def get_org_channel_bot_service(db: DBSession, org: ActiveOrg) -> ChannelBotService:
+    """ChannelBotService scoped to the caller's active organization."""
+    return ChannelBotService(db, organization_id=org.id)
+
+
+OrgChannelBotSvc = Annotated[ChannelBotService, Depends(get_org_channel_bot_service)]
+
+from app.services.model_profile import ModelProfileService
+
+
+def get_model_profile_service(db: DBSession) -> ModelProfileService:
+    """Create ModelProfileService instance with database session."""
+    return ModelProfileService(db)
+
+
+ModelProfileSvc = Annotated[ModelProfileService, Depends(get_model_profile_service)]
+
+from app.services.agent_registry import AgentRegistryService
+
+
+def get_agent_registry_service(db: DBSession) -> AgentRegistryService:
+    """Create AgentRegistryService instance with database session."""
+    return AgentRegistryService(db)
+
+
+AgentRegistrySvc = Annotated[AgentRegistryService, Depends(get_agent_registry_service)]
+
+
+from app.services.knowledge_reach import KnowledgeReachService
+
+
+def get_knowledge_reach_service(db: DBSession) -> KnowledgeReachService:
+    return KnowledgeReachService(db)
+
+
+KnowledgeReachSvc = Annotated[KnowledgeReachService, Depends(get_knowledge_reach_service)]
+
+from app.services.agent_exposure import AgentExposureService
+
+
+def get_agent_exposure_service(db: DBSession) -> AgentExposureService:
+    """Create AgentExposureService instance with database session."""
+    return AgentExposureService(db)
+
+
+AgentExposureSvc = Annotated[AgentExposureService, Depends(get_agent_exposure_service)]
+
+from app.services.agent_trigger import AgentTriggerService
+
+
+def get_agent_trigger_service(db: DBSession) -> AgentTriggerService:
+    """Create AgentTriggerService instance with database session."""
+    return AgentTriggerService(db)
+
+
+AgentTriggerSvc = Annotated[AgentTriggerService, Depends(get_agent_trigger_service)]
+
+from app.services.agent_environment import AgentEnvironmentService
+
+
+def get_agent_environment_service(db: DBSession) -> AgentEnvironmentService:
+    """Create AgentEnvironmentService instance with database session."""
+    return AgentEnvironmentService(db)
+
+
+AgentEnvironmentSvc = Annotated[AgentEnvironmentService, Depends(get_agent_environment_service)]
+
+from app.services.agent_embed import AgentEmbedService
+
+
+def get_agent_embed_service(db: DBSession) -> AgentEmbedService:
+    """Create AgentEmbedService instance with database session."""
+    return AgentEmbedService(db)
+
+
+EmbedSvc = Annotated[AgentEmbedService, Depends(get_agent_embed_service)]
+
+from app.services.embed_generated_media import EmbedGeneratedMediaService, token_opens
+
+
+def get_embed_generated_media_service(db: DBSession) -> EmbedGeneratedMediaService:
+    """Create EmbedGeneratedMediaService instance with database session."""
+    return EmbedGeneratedMediaService(db)
+
+
+EmbedGeneratedMediaSvc = Annotated[
+    EmbedGeneratedMediaService, Depends(get_embed_generated_media_service)
+]
+
+from app.services.agent_runner import AgentRunnerService
+from app.services.approvals import ApprovalService
+
+
+def get_agent_runner_service(db: DBSession) -> AgentRunnerService:
+    """Create AgentRunnerService instance with database session."""
+    return AgentRunnerService(db)
+
+
+def get_approval_service(db: DBSession) -> ApprovalService:
+    """Create ApprovalService instance with database session."""
+    return ApprovalService(db)
+
+
+AgentRunnerSvc = Annotated[AgentRunnerService, Depends(get_agent_runner_service)]
+ApprovalSvc = Annotated[ApprovalService, Depends(get_approval_service)]
+
+from app.services.run_export import RunExportService
+
+
+def get_run_export_service(db: DBSession) -> RunExportService:
+    """Create RunExportService instance with database session.
+
+    The function-scoped session on purpose, not `StreamingDBSession`: the row cap
+    bounds the body so it is built in one pass, and this write - the audit entry -
+    has to commit before the response leaves, which the streaming session resolves
+    too late to promise.
+    """
+    return RunExportService(db)
+
+
+RunExportSvc = Annotated[RunExportService, Depends(get_run_export_service)]
+
+from app.services.stats import StatsService
+
+
+def get_stats_service(db: DBSession) -> StatsService:
+    """Create StatsService instance with database session."""
+    return StatsService(db)
+
+
+StatsSvc = Annotated[StatsService, Depends(get_stats_service)]
+
+from app.services.skill_proposal import SkillProposalService
+from app.services.skills import SkillService
+
+
+def get_skill_service(db: DBSession) -> SkillService:
+    """Create SkillService instance with database session."""
+    return SkillService(db)
+
+
+SkillSvc = Annotated[SkillService, Depends(get_skill_service)]
+
+from app.services.context import ContextService
+
+
+def get_context_service(db: DBSession) -> ContextService:
+    """Create ContextService instance with database session."""
+    return ContextService(db)
+
+
+ContextSvc = Annotated[ContextService, Depends(get_context_service)]
+
+from app.services.virtual_tables import VirtualTableService
+
+
+def get_virtual_table_service(db: DBSession) -> VirtualTableService:
+    """Create VirtualTableService instance with database session."""
+    return VirtualTableService(db)
+
+
+VirtualTableSvc = Annotated[VirtualTableService, Depends(get_virtual_table_service)]
+
+
+def get_streaming_virtual_table_service(db: StreamingDBSession) -> VirtualTableService:
+    """The table service for a CSV export, and nothing else.
+
+    The export's lines are read from the database while the response is being
+    sent, after an ordinary `DBSession` has committed and closed. The export
+    writes nothing, which is what makes a request-scoped session acceptable
+    here; see `StreamingDBSession`.
+    """
+    return VirtualTableService(db)
+
+
+StreamingVirtualTableSvc = Annotated[
+    VirtualTableService, Depends(get_streaming_virtual_table_service)
+]
+
+from app.services.virtual_tables import TableViewService
+
+
+def get_table_view_service(db: DBSession) -> TableViewService:
+    """Create TableViewService instance with database session."""
+    return TableViewService(db)
+
+
+TableViewSvc = Annotated[TableViewService, Depends(get_table_view_service)]
+
+from app.services.virtual_tables.triggers import TableTriggerService
+
+
+def get_table_trigger_service(db: DBSession) -> TableTriggerService:
+    """Create TableTriggerService instance with database session."""
+    return TableTriggerService(db)
+
+
+TableTriggerSvc = Annotated[TableTriggerService, Depends(get_table_trigger_service)]
+
+
+def get_mention_service(db: DBSession) -> MentionService:
+    return MentionService(db)
+
+
+MentionSvc = Annotated[MentionService, Depends(get_mention_service)]
+
+from app.services.artifact import ArtifactService
+from app.services.artifact_public_data import ArtifactPublicDataService
+from app.services.artifact_request_service import ArtifactRequestService
+
+
+def get_artifact_service(db: DBSession) -> ArtifactService:
+    """Create ArtifactService instance with database session."""
+    return ArtifactService(db)
+
+
+ArtifactSvc = Annotated[ArtifactService, Depends(get_artifact_service)]
+
+
+def get_artifact_request_service(db: DBSession) -> ArtifactRequestService:
+    """Create ArtifactRequestService instance with database session."""
+    return ArtifactRequestService(db)
+
+
+ArtifactRequestSvc = Annotated[ArtifactRequestService, Depends(get_artifact_request_service)]
+
+
+def get_artifact_public_data_service(db: DBSession) -> ArtifactPublicDataService:
+    """Create ArtifactPublicDataService instance with database session."""
+    return ArtifactPublicDataService(db)
+
+
+ArtifactPublicDataSvc = Annotated[
+    ArtifactPublicDataService, Depends(get_artifact_public_data_service)
+]
+
+from app.services.memory import MemoryService
+
+
+def get_memory_service(db: DBSession) -> MemoryService:
+    """Create MemoryService instance with database session."""
+    return MemoryService(db)
+
+
+MemorySvc = Annotated[MemoryService, Depends(get_memory_service)]
+
+
+def get_browser_sign_in_service(db: DBSession) -> BrowserSignInService:
+    """Create BrowserSignInService instance with database session."""
+    return BrowserSignInService(db)
+
+
+BrowserSignInSvc = Annotated[BrowserSignInService, Depends(get_browser_sign_in_service)]
+
+
+def get_skill_proposal_service(db: DBSession) -> SkillProposalService:
+    return SkillProposalService(db)
+
+
+SkillProposalSvc = Annotated[SkillProposalService, Depends(get_skill_proposal_service)]
+
+from app.services.workflow_registry import WorkflowRegistryService
+
+
+def get_workflow_registry_service(db: DBSession) -> WorkflowRegistryService:
+    """Create WorkflowRegistryService instance with database session."""
+    return WorkflowRegistryService(db)
+
+
+WorkflowRegistrySvc = Annotated[WorkflowRegistryService, Depends(get_workflow_registry_service)]
+
+from app.services.workflow_stats import WorkflowStatsService
+
+
+def get_workflow_stats_service(db: DBSession) -> WorkflowStatsService:
+    """Create WorkflowStatsService instance with database session."""
+    return WorkflowStatsService(db)
+
+
+WorkflowStatsSvc = Annotated[WorkflowStatsService, Depends(get_workflow_stats_service)]
+
+from app.services.workflow_evals import WorkflowEvalService
+
+
+def get_workflow_eval_service(db: DBSession) -> WorkflowEvalService:
+    """Create WorkflowEvalService instance with database session."""
+    return WorkflowEvalService(db)
+
+
+WorkflowEvalSvc = Annotated[WorkflowEvalService, Depends(get_workflow_eval_service)]
+
+from app.services.workflow_log_alerts import WorkflowLogAlertService
+
+
+def get_workflow_log_alert_service(db: DBSession) -> WorkflowLogAlertService:
+    """Create WorkflowLogAlertService instance with database session."""
+    return WorkflowLogAlertService(db)
+
+
+WorkflowLogAlertSvc = Annotated[WorkflowLogAlertService, Depends(get_workflow_log_alert_service)]
+
+from app.services.workflow_portable import WorkflowPortableService
+
+
+def get_workflow_portable_service(db: DBSession) -> WorkflowPortableService:
+    return WorkflowPortableService(db)
+
+
+WorkflowPortableSvc = Annotated[WorkflowPortableService, Depends(get_workflow_portable_service)]
+
+from app.services.workflow_execution import WorkflowExecutionService
+
+
+def get_workflow_execution_service(db: DBSession) -> WorkflowExecutionService:
+    return WorkflowExecutionService(db)
+
+
+WorkflowExecutionSvc = Annotated[WorkflowExecutionService, Depends(get_workflow_execution_service)]
+
+from app.services.workflow_execution.approvals import WorkflowApprovalService
+
+
+def get_workflow_approval_service(db: DBSession) -> WorkflowApprovalService:
+    return WorkflowApprovalService(db)
+
+
+WorkflowApprovalSvc = Annotated[WorkflowApprovalService, Depends(get_workflow_approval_service)]
+
+from app.services.workflow_exposure import WorkflowExposureService
+
+
+def get_workflow_exposure_service(db: DBSession) -> WorkflowExposureService:
+    return WorkflowExposureService(db)
+
+
+WorkflowExposureSvc = Annotated[WorkflowExposureService, Depends(get_workflow_exposure_service)]
+
+from app.services.workflow_execution.resume import WorkflowResumeService
+
+
+def get_workflow_resume_service(db: DBSession) -> WorkflowResumeService:
+    return WorkflowResumeService(db)
+
+
+WorkflowResumeSvc = Annotated[WorkflowResumeService, Depends(get_workflow_resume_service)]
+
+from app.services.workflow_webhook_test import WorkflowWebhookTestService
+
+
+def get_workflow_webhook_test_service(db: DBSession, redis: Redis) -> WorkflowWebhookTestService:
+    return WorkflowWebhookTestService(db, redis)
+
+
+WorkflowWebhookTestSvc = Annotated[
+    WorkflowWebhookTestService, Depends(get_workflow_webhook_test_service)
+]
+
+from app.core.permissions import AuthContext, Perm
+from app.services.sharing import SharingService
+
+
+def get_sharing_service(db: DBSession) -> SharingService:
+    """Create SharingService instance with database session."""
+    return SharingService(db)
+
+
+SharingSvc = Annotated[SharingService, Depends(get_sharing_service)]
+
+
+def _attributed(
+    request: Request, user: User, ctx: AuthContext, surface: ChangeSurface
+) -> AuthContext:
+    """Return `ctx`, recording who a change this request makes is attributed to.
+
+    Read by the change feed once the response is out (#2061).
+    """
+    request.state.change_origin = ChangeOrigin(
+        organization_id=ctx.organization_id,
+        actor_user_id=user.id,
+        actor_name=user.full_name or user.email,
+        surface=surface,
+        tab=console_tab(request.headers.get(CONSOLE_TAB_HEADER)),
+    )
+    return ctx
+
+
+async def get_auth_context(
+    request: Request, user: CurrentUser, org: ActiveOrg, db: DBSession
+) -> AuthContext:
+    """Build the caller's authorization context for the active organization.
+
+    One membership lookup per request; everything downstream reads permissions
+    off the returned context instead of querying roles again. A key-authenticated
+    request already has its context, built from the issuer's current membership
+    and narrowed to the key's scopes, so it is returned as it is.
+    """
+    caller = _key_caller(request)
+    if caller is not None:
+        return _attributed(request, user, caller.context, caller.surface)
+    membership = _membership_read(request, org, user) or await _member_repo.get(
+        db, organization_id=org.id, user_id=user.id
+    )
+    if membership is None and not user.is_app_admin:
+        raise NotFoundError(
+            message="Organization not found or access denied",
+            details={"org_id": str(org.id)},
+        )
+    ctx = AuthContext(
+        user_id=user.id,
+        organization_id=org.id,
+        role=membership.role if membership else "",
+        is_app_admin=user.is_app_admin,
+    )
+    return _attributed(request, user, ctx, "console")
+
+
+def _membership_read(request: Request, org: Organization, user: User) -> OrganizationMember | None:
+    """The membership `get_active_organization` already read for this request, if it is this one."""
+    membership = getattr(request.state, "active_membership", None)
+    if (
+        isinstance(membership, OrganizationMember)
+        and membership.organization_id == org.id
+        and membership.user_id == user.id
+    ):
+        return membership
+    return None
+
+
+Auth = Annotated[AuthContext, Depends(get_auth_context)]
+
+
+async def get_path_org_context(
+    org_id: UUID, request: Request, user: CurrentUser, db: DBSession
+) -> AuthContext:
+    """The caller's context in the organization a `/orgs/{org_id}/...` path names.
+
+    For a session the path decides, the way a console page that names an
+    organization *is* that organization (#1032): the membership is read for
+    `org_id`, not for the `X-Organization-Id` header. An organization key acts
+    in its own organization only, so a path naming another answers as missing,
+    and the key's narrowed context is what comes back (#2057).
+
+    Raises:
+        NotFoundError: Not a member of `org_id`, or a key from another one - the
+            same answer, so an organization id cannot be probed.
+    """
+    caller = _key_caller(request)
+    if caller is not None:
+        if caller.context.organization_id != org_id:
+            raise NotFoundError(
+                message="Organization not found or access denied", details={"org_id": org_id}
+            )
+        return _attributed(request, user, caller.context, caller.surface)
+    membership = await _member_repo.get(db, organization_id=org_id, user_id=user.id)
+    if membership is None and not user.is_app_admin:
+        raise NotFoundError(
+            message="Organization not found or access denied", details={"org_id": org_id}
+        )
+    ctx = AuthContext(
+        user_id=user.id,
+        organization_id=org_id,
+        role=membership.role if membership else "",
+        is_app_admin=user.is_app_admin,
+    )
+    return _attributed(request, user, ctx, "console")
+
+
+PathOrgAuth = Annotated[AuthContext, Depends(get_path_org_context)]
+
+
+def _refuse_missing(ctx: AuthContext, perms: tuple[Perm, ...]) -> AuthContext:
+    missing = [perm.value for perm in perms if not ctx.has(perm)]
+    if missing:
+        raise AuthorizationError(
+            message="Insufficient permissions",
+            details={"required": missing, "org_id": str(ctx.organization_id)},
+        )
+    return ctx
+
+
+def require_in_path_org(*perms: Perm) -> Callable[..., Awaitable[AuthContext]]:
+    """:func:`require`, for a route whose organization is in its path.
+
+    Usage::
+
+        @router.patch("/{org_id}/members/{user_id}",
+                      dependencies=[Depends(require_in_path_org(Perm.MEMBERS_MANAGE))])
+    """
+
+    async def dependency(ctx: PathOrgAuth) -> AuthContext:
+        return _refuse_missing(ctx, perms)
+
+    return dependency
+
+
+def require(*perms: Perm) -> Callable[..., Awaitable[AuthContext]]:
+    """Dependency asserting the caller holds every listed permission.
+
+    Endpoints check permissions, never role names - so re-shaping a role is a
+    change to `ROLE_PERMS` alone. For a resource permission this guards the
+    *kind* of thing; which rows are reachable is
+    :func:`app.services.access.resolve_access`.
+
+    Usage::
+
+        @router.post("/agents", dependencies=[Depends(require(Perm.AGENTS_EDIT))])
+        async def create_agent(...): ...
+    """
+
+    async def dependency(ctx: Auth) -> AuthContext:
+        return _refuse_missing(ctx, perms)
+
+    return dependency
+
+
+def key_needs(perm: Perm) -> Callable[..., Awaitable[None]]:
+    """Admit a key to a public route only when it was issued for `perm`.
+
+    For a route a session uses with no organization permission at all - a chat
+    attachment is the person's own file - but that a key reaches only for what it
+    was issued: uploading a file for an agent run is `agents:run` work.
+    """
+
+    async def dependency(ctx: Auth) -> None:
+        # Through the auth context, as every public route goes: it is the narrowed
+        # one for a key, and `key_allows` is always true for a session.
+        if not ctx.key_allows(perm):
+            raise AuthorizationError(
+                message=f"This API key was not issued for {perm.value}",
+                details={"permission": perm.value},
+            )
+
+    return dependency
+
+
+def _limit_caller(ctx: AuthContext) -> str:
+    """Who a per-caller limit counts: the key when one is used, so each script an
+    issuer runs has its own share instead of draining the issuer's."""
+    if ctx.api_key_id is not None:
+        return f"key:{ctx.api_key_id}"
+    return f"user:{ctx.subject_id}"
+
+
+async def limit_agent_run(ctx: Auth) -> None:
+    """Refuse a caller asking the public run API for more than its share.
+
+    Keyed on the caller and not on their address. The endpoint is
+    authenticated, so there is a subject to count, and an office behind one NAT
+    is not one caller - keying on the address there would be an outage wearing a
+    limit's clothes.
+
+    Only the public surfaces carry one of these. Whether the console's own
+    routes should have a ceiling too is a different product decision, with its
+    own issue if we want it; this is about what a stranger can reach (#39).
+
+    Usage::
+
+        @router.post("/{agent_id}/run", dependencies=[Depends(limit_agent_run)])
+    """
+    decision = await rate_limit.consume(
+        surface="agent_run",
+        caller=_limit_caller(ctx),
+        limit=rate_limit.run_limit(),
+    )
+    _refuse_if_over(decision, "Too many runs in the last minute. Wait and try again.")
+
+
+async def limit_workflow_run(ctx: Auth) -> None:
+    """Refuse a caller starting more workflow runs than its share.
+
+    The same allowance as `limit_agent_run`, counted on a surface of its own:
+    each start queues dispatch work - outbox rows, worker flow runs, events -
+    and a run's nodes can spend the organization's budget.
+
+    Usage::
+
+        @router.post("", dependencies=[Depends(limit_workflow_run)])
+    """
+    decision = await rate_limit.consume(
+        surface="workflow_run",
+        caller=f"user:{ctx.subject_id}",
+        limit=rate_limit.run_limit(),
+    )
+    _refuse_if_over(decision, "Too many workflow runs in the last minute. Wait and try again.")
+
+
+async def limit_ml_call(ctx: Auth) -> None:
+    """Refuse a caller asking the ML services for more than their share.
+
+    Keyed on the caller for the reason the run limit is: this surface is
+    authenticated, so there is a subject to count, and an integration behind one
+    address is not a crowd. What it bounds is different, though - the ML
+    endpoints do their work synchronously, so an unbounded caller occupies the
+    parsing pool and the worker rather than spending a budget.
+
+    Usage::
+
+        @router.post("/documents/ocr", dependencies=[Depends(limit_ml_call)])
+    """
+    decision = await rate_limit.consume(
+        surface="ml_call",
+        caller=_limit_caller(ctx),
+        limit=rate_limit.ml_limit(),
+    )
+    _refuse_if_over(decision, "Too many ML service calls in the last minute. Wait and try again.")
+
+
+async def limit_table_write(ctx: Auth) -> None:
+    """Refuse a member writing to Virtual Tables faster than the deployment allows.
+
+    Keyed on the member and the organization, so one person's loop does not spend
+    another's allowance and the same person in two organizations has two. Unlike the
+    run and ML limits this one also covers the console: a table write from the browser
+    stores exactly what the same write from a script does, so metering only the script
+    would leave the cheap way in open.
+
+    Unlike the run and ML limits this one is a storage boundary, not just a load
+    control: every write stores a history row and, when keyed, a receipt, faster
+    than the retention sweep can remove them if left unbounded. So it keeps a
+    per-process floor when the shared limiter cannot count (Redis down or
+    unconfigured), rather than inheriting the fail-open default that would leave
+    every table write unmetered for the length of a cache outage (#1823).
+
+    Usage::
+
+        @router.post("/{table_id}/records", dependencies=[Depends(limit_table_write)])
+    """
+    decision = await rate_limit.consume_with_local_floor(
+        surface="table_write",
+        caller=f"org:{ctx.organization_id}:user:{ctx.subject_id}",
+        limit=rate_limit.table_write_limit(),
+    )
+    _refuse_if_over(decision, "Too many table writes in the last minute. Wait and try again.")
+
+
+async def limit_artifact_data(ctx: Auth, rows: bool = Query(True)) -> None:
+    """Refuse a member loading live pages' data faster than the deployment allows.
+
+    A read that loads no records (`rows=false`, an editor's strip asking why a source
+    is empty) still runs each page query, so it has an allowance of its own, of the
+    same size, and does not use up the one for loads.
+
+    Keyed on the member and the organization, as table writes are. Every load runs
+    each of the page's bindings as a query, so like table writes it keeps a
+    per-process floor while the shared limiter cannot count, rather than leaving
+    every page unmetered for the length of a cache outage.
+
+    Usage::
+
+        @router.get("/{artifact_id}/versions/{version_id}/data",
+                    dependencies=[Depends(limit_artifact_data)])
+    """
+    decision = await rate_limit.consume_with_local_floor(
+        surface="artifact_data" if rows else "artifact_data_reasons",
+        caller=f"org:{ctx.organization_id}:user:{ctx.subject_id}",
+        limit=rate_limit.artifact_data_limit(),
+    )
+    _refuse_if_over(decision, "Too many data loads in the last minute. Wait and try again.")
+
+
+async def limit_dictation(ctx: Auth) -> None:
+    """Refuse a person dictating more than their share - each one is a paid call.
+
+    Its own bucket rather than `limit_ml_call`'s, so a person dictating into the
+    composer and an integration calling the ML surface do not spend each other's
+    allowance.
+    """
+    decision = await rate_limit.consume(
+        surface="dictation",
+        caller=f"user:{ctx.subject_id}",
+        limit=rate_limit.dictation_limit(),
+    )
+    _refuse_if_over(decision, "Too many dictations in the last minute. Wait and try again.")
+
+
+async def limit_voice_preview(ctx: Auth) -> None:
+    """Refuse a person listening to more voices than their share - each is a paid session."""
+    decision = await rate_limit.consume(
+        surface="voice_preview",
+        caller=f"user:{ctx.subject_id}",
+        limit=rate_limit.voice_preview_limit(),
+    )
+    _refuse_if_over(decision, "Too many voice previews in the last minute. Wait and try again.")
+
+
+def _refuse_if_over(decision: rate_limit.Decision, message: str) -> None:
+    """Turn a rate limiter's refusal into this API's own 429.
+
+    One place, because a 429 has two halves that have to agree and both were being
+    written per route: the envelope and the interval. The embed surface raised a
+    bare `HTTPException`, so it answered `{"detail": ...}` where every other error
+    on this API - including the run route's own 429, thirty lines up - answers
+    `{"error": {"code", "message", "details"}}`, and #516 published that socket as
+    an integration somebody writes a client against. The interval came from a
+    hardcoded `"60"` beside the routes while the limiter was computing one, so a
+    `Limit` with any other window would have made the header a lie.
+
+    `app_exception_handler` is what copies `retry_after_seconds` into `Retry-After`,
+    which is the header a fetch wrapper or a CDN actually backs off on.
+    """
+    if not decision.allowed:
+        raise RateLimitError(
+            message=message,
+            details={"retry_after_seconds": decision.retry_after_seconds},
+        )
+
+
+async def enforce_auth_limit(
+    request: Request, *, surface: str, identifier: str | None = None
+) -> None:
+    """Refuse an auth attempt from a caller who has made too many this minute.
+
+    Called at the top of an `auth.py` route rather than as a `Depends`, because
+    the per-address half needs the parsed body the route has and a dependency
+    does not. Both halves count against `auth_limit()`: the IP first, because it
+    cannot be varied for free and it is what bounds the unauthenticated bcrypt
+    DoS; then the submitted address, where the body carries one, which is what
+    bounds a brute force against a single account. Lower-casing the identifier so
+    two spellings of one address share a bucket.
+    """
+    limit = rate_limit.auth_limit()
+    decision = await rate_limit.consume(
+        surface=surface, caller=f"ip:{rate_limit.caller_ip(request)}", limit=limit
+    )
+    if decision.allowed and identifier:
+        decision = await rate_limit.consume(
+            surface=surface, caller=f"id:{identifier.strip().lower()}", limit=limit
+        )
+    _refuse_if_over(decision, "Too many attempts. Please wait and try again.")
+
+
+async def limit_personal_data_export(ctx: Auth) -> None:
+    """Refuse a caller asking for personal-data exports faster than a person would.
+
+    Keyed on the caller, like the run limit beside it, and for the same reason:
+    the endpoint is authenticated, so there is a subject to count.
+
+    Its own limit rather than the run one, because what is being rationed is
+    different. A run costs money; an export costs almost nothing and hands over
+    everything this deployment holds about somebody in one file. A person does
+    that once. A stolen session walking the deployment's people does it
+    repeatedly, and per *hour* is what makes that slow enough to notice (#1421).
+
+    Usage::
+
+        @router.get("/export", dependencies=[Depends(limit_personal_data_export)])
+    """
+    decision = await rate_limit.consume(
+        surface="personal_data_export",
+        caller=f"user:{ctx.subject_id}",
+        limit=rate_limit.export_limit(),
+    )
+    _refuse_if_over(decision, "Too many export requests. Try again later.")
+
+
+async def limit_embed_script(request: Request) -> None:
+    """Refuse an address asking for a widget's script too often.
+
+    Its own counter rather than admission's - see `rate_limit.embed_script_allowed`
+    for why a page load spending both made the configured number mean a third of
+    itself.
+    """
+    _refuse_if_over(
+        await rate_limit.embed_script_allowed(request), "Too many requests. Try again shortly."
+    )
+
+
+async def limit_embed_admission(request: Request) -> None:
+    """Refuse an address asking to be admitted to a widget too often.
+
+    A dependency rather than a line in the handler so it runs *before* the key is
+    looked up: a database read first would make an unbounded probe for live keys
+    free. The socket handshake cannot use this one - it answers a close code rather
+    than a status - and calls the same helper itself.
+    """
+    _refuse_if_over(
+        await rate_limit.embed_admission_allowed(request), "Too many requests. Try again shortly."
+    )
+
+
+async def limit_hosted_config(public_key: str) -> None:
+    """Refuse a hosted page whose config is being fetched too often.
+
+    Counted per page, not per address, because this route's caller is the frontend
+    server rather than the visitor - `rate_limit.hosted_admission_allowed`.
+    """
+    _refuse_if_over(
+        await rate_limit.hosted_admission_allowed(public_key),
+        "Too many requests. Try again shortly.",
+    )
+
+
+async def limit_public_artifact(public_key: str) -> None:
+    """Refuse a public artifact link opened too often. Per link, not per address."""
+    _refuse_if_over(
+        await rate_limit.public_artifact_allowed(public_key),
+        "Too many requests. Try again shortly.",
+    )
+
+
+async def limit_form_page(token: str) -> None:
+    """Refuse a workflow's public form read too often. Per form, before any read."""
+    _refuse_if_over(
+        await rate_limit.form_page_allowed(token), "Too many requests. Try again shortly."
+    )
+
+
+async def limit_form_submission(token: str) -> None:
+    """Refuse a workflow's public form submitted too often. Per form, before any read."""
+    _refuse_if_over(
+        await rate_limit.form_submission_allowed(token),
+        "This form is taking too many answers. Try again in a minute.",
+    )
+
+
+async def limit_workflow_webhook(request: Request) -> None:
+    """Refuse an address sending the workflow webhook doors too much. Before any read.
+
+    The per-webhook allowance is spent later, inside the service, once a delivery's
+    signature has verified.
+    """
+    _refuse_if_over(
+        await rate_limit.workflow_webhook_ip_allowed(request),
+        "Too many requests. Try again shortly.",
+    )
+
+
+async def limit_artifact_content(token: str) -> None:
+    """Refuse a signed artifact address loaded too often. Per address, before any read."""
+    _refuse_if_over(
+        await rate_limit.artifact_content_allowed(token),
+        "Too many requests. Try again shortly.",
+    )
+
+
+async def limit_embed_generated_media(
+    public_key: str,
+    filename: str,
+    token: Annotated[str | None, Query(max_length=128)] = None,
+) -> None:
+    """Refuse a signed link to a generated file fetched too often. Per link, before any read.
+
+    Only a link whose signature opens this file on this embed is counted. Any
+    other token - none, a forged one, an expired one - is left to the route, which
+    refuses it with the 404 a missing file gets before any query or read, so it
+    has nothing to spend and costs no counter in Redis.
+    """
+    if token is None or not token_opens(public_key, filename, token, now=datetime.now(UTC)):
+        return
+    _refuse_if_over(
+        await rate_limit.embed_generated_media_allowed(token),
+        "Too many requests. Try again shortly.",
+    )
+
+
+async def limit_map_tiles(request: Request) -> None:
+    """Refuse an address fetching map tiles through the deployment too fast."""
+    _refuse_if_over(
+        await rate_limit.map_tiles_allowed(request), "Too many requests. Try again shortly."
+    )
+
+
+async def limit_hosted_logo(public_key: str) -> None:
+    """Refuse a hosted page whose logo is being fetched too often."""
+    _refuse_if_over(
+        await rate_limit.hosted_logo_allowed(public_key), "Too many requests. Try again shortly."
+    )
+
+
+async def limit_embed_upload(
+    request: Request, public_key: str, x_visitor_key: Annotated[str, Header()]
+) -> None:
+    """Refuse a visitor storing files on a hosted page too fast.
+
+    Two counters, address first, and both have to allow it: the continuity key is
+    minted by the browser, so counting only that bounds nothing at all. The header
+    is read here as well as in the handler because a dependency cannot hand a value
+    back to one, and validating it twice is cheaper than moving the gate after the
+    key is resolved - which is what made probing with a body attached free.
+    """
+    _refuse_if_over(
+        await rate_limit.embed_upload_allowed(
+            request, public_key=public_key, visitor=x_visitor_key
+        ),
+        "Too many uploads. Try again shortly.",
+    )
+
+
+async def limit_embed_dictation(request: Request) -> None:
+    """Refuse a caller sending recordings to a hosted page or a widget too fast.
+
+    Per address, before the key is looked up; the link's own ceiling is spent
+    once the visitor is admitted (`rate_limit.embed_dictation_link_allowed`). A
+    refusal is readable by the site that asked: it runs before admission and says
+    the same to every origin (`app.api.embed_cors`).
+    """
+    decision = await rate_limit.embed_dictation_allowed(request)
+    if not decision.allowed:
+        allow_embed_origin(request, request.headers.get("origin"))
+    _refuse_if_over(decision, "Too many dictations in the last minute. Wait and try again.")
+
+
+class RequireOrgRole:
+    """Dependency that verifies the requester has one of the allowed roles in the active org.
+
+    Usage::
+
+        @router.delete("/{org_id}")
+        async def delete(org: RequireOwner, ...) -> None: ...
+    """
+
+    def __init__(self, *allowed_roles: str) -> None:
+        self.allowed_roles = set(allowed_roles)
+
+    async def __call__(self, org: ActiveOrg, user: CurrentUser, db: DBSession) -> Organization:
+        membership = await _member_repo.get(db, organization_id=org.id, user_id=user.id)
+        if not membership or membership.role not in self.allowed_roles:
+            raise AuthorizationError(
+                message="Insufficient organization role",
+                details={"required": list(self.allowed_roles), "org_id": str(org.id)},
+            )
+        return org
+
+
+RequireOwner = Annotated[Organization, Depends(RequireOrgRole(OrgRole.OWNER.value))]
+RequireAdminPlus = Annotated[
+    Organization, Depends(RequireOrgRole(OrgRole.OWNER.value, OrgRole.ADMIN.value))
+]
+RequireMemberPlus = Annotated[
+    Organization,
+    Depends(RequireOrgRole(OrgRole.OWNER.value, OrgRole.ADMIN.value, OrgRole.MEMBER.value)),
+]
+
+
+# is_app_admin is a global flag on the User model - independent of team
+# membership. Routes guarded by this dep (e.g. /admin/users) stay reachable
+# even when teams are disabled, so the dep itself must not be gated.
+async def _require_app_admin(user: CurrentUser) -> User:
+    """Raises 403 unless the user has the is_app_admin flag set."""
+    if not user.is_app_admin:
+        raise AuthorizationError(message="App admin privileges required")
+    return user
+
+
+CurrentAppAdmin = Annotated[User, Depends(_require_app_admin)]
+
+
+_WS_TOKEN_PROTOCOL_PREFIX = "access_token."
+
+
+def _extract_ws_auth(websocket: WebSocket) -> tuple[str | None, str | None]:
+    """Parse Sec-WebSocket-Protocol header for an auth token + app subprotocol.
+
+    Clients pass the token as a subprotocol of the form
+    `access_token.<JWT>` alongside an optional application subprotocol
+    (e.g. `chat`). Returns (token, app_subprotocol) - either may be None.
+    """
+    raw = websocket.headers.get("sec-websocket-protocol") or ""
+    token: str | None = None
+    app_subprotocol: str | None = None
+    for proto in (p.strip() for p in raw.split(",") if p.strip()):
+        if proto.startswith(_WS_TOKEN_PROTOCOL_PREFIX):
+            token = proto[len(_WS_TOKEN_PROTOCOL_PREFIX) :]
+        elif app_subprotocol is None:
+            app_subprotocol = proto
+    return token, app_subprotocol
+
+
+async def get_current_user_ws(
+    websocket: WebSocket,
+    access_token: str | None = Cookie(None, alias="agenticos_access_token"),
+) -> User:
+    """Authenticate a WebSocket connection.
+
+    Token sources, checked in order:
+    1. `Sec-WebSocket-Protocol` header, in the form `access_token.<JWT>`.
+       The chosen application subprotocol (e.g. `chat`) is echoed back on
+       `accept()` via `websocket.state.accept_subprotocol`.
+    2. Same-origin `agenticos_access_token` cookie (fallback for same-origin clients).
+
+    Tokens in query strings are NOT accepted - they leak into logs and
+    Referer headers.
+
+    Raises:
+        WebSocketException: If token is invalid or user not found. Raising the
+            WebSocket-native exception lets Starlette close the handshake cleanly
+            (close code 4001) - raising an HTTP-domain exception here instead
+            bubbles up unhandled and yields an HTTP 500 on the WS upgrade.
+    """
+
+    subprotocol_token, app_subprotocol = _extract_ws_auth(websocket)
+    websocket.state.accept_subprotocol = app_subprotocol
+
+    auth_token = subprotocol_token or access_token
+
+    if not auth_token:
+        raise WebSocketException(code=4001, reason="Missing authentication token")
+
+    # The token the socket was opened with, so the session can re-run the check
+    # below on every inbound frame - a handshake authenticates once, and without
+    # this a session revoked afterwards keeps being served (#1437).
+    websocket.state.auth_token = auth_token
+
+    # The limits a key meets on a request, met before the handshake opens a
+    # database session for it.
+    if is_api_key(auth_token):
+        refused = await rate_limit.key_attempt_refused(websocket, auth_token)
+        if refused is not None:
+            raise WebSocketException(code=4029, reason=refused[1])
+
+    async with get_db_context() as db:
+        try:
+            caller = await authenticate_socket_key(db, auth_token)
+            user = (
+                caller.user
+                if caller is not None
+                else await authenticate_socket_token(db, auth_token)
+            )
+        except AuthenticationError as exc:
+            if is_api_key(auth_token):
+                await rate_limit.count_refused_key(websocket)
+            raise WebSocketException(code=4001, reason=exc.message) from None
+        # The organization and the narrowed context travel with the socket, so
+        # the organization comes from the key rather than from a query parameter.
+        websocket.state.api_key_caller = caller
+
+        # Eagerly load all columns, then detach from session to avoid
+        # "instance not bound to a Session" errors after the context manager exits
+        await db.refresh(user)
+        db.expunge(user)
+        if caller is not None:
+            await db.refresh(caller.organization)
+            db.expunge(caller.organization)
+        return user
+
+
+CurrentUserWS = Annotated[User, Depends(get_current_user_ws)]
+
+
+async def get_active_organization_ws(
+    websocket: WebSocket,
+    user: CurrentUserWS,
+    organization_id: UUID | None = Query(None),
+) -> Organization:
+    """Resolve the active Organization for a WebSocket session.
+
+    The WebSocket counterpart of :func:`get_active_organization`. Browsers cannot
+    set headers on a WebSocket handshake, so the org arrives as the
+    `organization_id` query parameter instead of `X-Organization-Id`. Unlike a
+    token, an org id is not a secret - membership is verified here, so an id the
+    user does not belong to closes the socket rather than granting anything.
+
+    Falls back as the HTTP dependency does when the parameter is absent - the
+    default organization, the personal one, the only one - which keeps
+    single-org clients working unchanged.
+
+    Raises:
+        WebSocketException: If the fallback leaves a choice (4001), or the user is
+            not a member of the requested org (4003). Membership failure and a
+            non-existent org return the same reason so the socket cannot be used
+            to probe which organizations exist.
+    """
+
+    caller = getattr(websocket.state, "api_key_caller", None)
+    if isinstance(caller, KeyCaller):
+        if organization_id is not None and organization_id != caller.organization.id:
+            raise WebSocketException(code=4003, reason="Organization access denied")
+        return caller.organization
+
+    async with get_db_context() as db:
+        if organization_id is None:
+            org = await OrganizationService(db).fallback_for(user.id)
+            if org is None:
+                raise WebSocketException(code=4001, reason="Name the organization_id")
+        else:
+            # One query, as `get_active_organization` reads it: the foreign key
+            # means a membership always names an organization that exists.
+            found = await _member_repo.get_with_organization(
+                db, organization_id=organization_id, user_id=user.id
+            )
+            if found is None:
+                raise WebSocketException(code=4003, reason="Organization access denied")
+            _membership, org = found
+
+        # Detach so attribute access survives the session closing (same reason as
+        # the user in get_current_user_ws).
+        await db.refresh(org)
+        db.expunge(org)
+        return org
+
+
+ActiveOrgWS = Annotated[Organization, Depends(get_active_organization_ws)]
+
+import secrets
+
+from fastapi.security import APIKeyHeader
+
+
+api_key_header = APIKeyHeader(name=settings.API_KEY_HEADER, auto_error=False)
+
+
+async def verify_api_key(
+    api_key: Annotated[str | None, Depends(api_key_header)],
+) -> str:
+    """Verify API key from header.
+
+    Uses constant-time comparison to prevent timing attacks.
+
+    Raises:
+        AuthenticationError: If API key is missing.
+        AuthorizationError: If API key is invalid.
+    """
+    if api_key is None:
+        raise AuthenticationError(message="API Key header missing")
+    if not secrets.compare_digest(encode_untrusted(api_key), settings.API_KEY.encode()):
+        raise AuthorizationError(message="Invalid API Key")
+    return api_key
+
+
+ValidAPIKey = Annotated[str, Depends(verify_api_key)]
+
+
+from app.core.config import settings
+from app.services.rag.embeddings import EmbeddingService
+from app.services.rag.ingestion import IngestionService
+from app.services.rag.documents import DocumentProcessor
+from app.services.rag.retrieval import RetrievalService
+from app.services.rag.vectorstore import BaseVectorStore, process_vector_store
+
+
+def get_embedding_service(request: Request) -> EmbeddingService:
+    """Get embedding service from lifespan state or create new if not available."""
+    if hasattr(request.state, "embedding_service"):
+        return request.state.embedding_service  # type: ignore[no-any-return]
+    return EmbeddingService(settings=settings.rag)
+
+
+EmbeddingSvc = Annotated[EmbeddingService, Depends(get_embedding_service)]
+
+
+def get_vectorstore(request: Request, embedder: EmbeddingSvc) -> BaseVectorStore:
+    """The store this request reads, from the lifespan or built for the request.
+
+    The lifespan builds one for the process. It is absent when the embedding
+    warmup failed - the lifespan logs it and carries on serving - and then this
+    builds one per request. Both ride the application's own engine, so the
+    per-request one owns nothing to dispose: it used to open a pooled engine of
+    its own, and a degraded deployment answered knowledge-base requests by
+    consuming its remaining Postgres connections a handful at a time (#948).
+    """
+    if hasattr(request.state, "vector_store"):
+        return request.state.vector_store  # type: ignore[no-any-return]
+    return process_vector_store(settings.rag, embedder)
+
+
+VectorStoreSvc = Annotated[BaseVectorStore, Depends(get_vectorstore)]
+
+
+def get_organization_teardown_service(
+    db: DBSession, vector_store: VectorStoreSvc
+) -> OrganizationService:
+    """OrganizationService that can also drop a deleted tenant's vector tables.
+
+    Only the delete route wires the vector store in; every other org route uses
+    the plain factory so it does not build a store it never touches (#9).
+    """
+    return OrganizationService(db, vector_store=vector_store)
+
+
+OrganizationTeardownSvc = Annotated[OrganizationService, Depends(get_organization_teardown_service)]
+
+
+def get_retrieval_service(vector_store: VectorStoreSvc) -> RetrievalService:
+    """Create RetrievalService instance."""
+    return RetrievalService(vector_store=vector_store, settings=settings.rag)
+
+
+RetrievalSvc = Annotated[RetrievalService, Depends(get_retrieval_service)]
+
+
+def get_document_processor() -> DocumentProcessor:
+    """Create DocumentProcessor instance."""
+    return DocumentProcessor(settings=settings.rag)
+
+
+DocumentProcessorSvc = Annotated[DocumentProcessor, Depends(get_document_processor)]
+
+
+def get_ingestion_service(
+    processor: DocumentProcessorSvc,
+    vector_store: VectorStoreSvc,
+) -> IngestionService:
+    """Create IngestionService instance.
+
+    No tenant is bound here: the request never ingests through this service (the
+    API dispatches ingestion to a worker), and its one use - deleting a document -
+    passes the collection's own tenant explicitly, resolved from the knowledge
+    base the route already loaded (#1684).
+    """
+    return IngestionService(processor=processor, vector_store=vector_store)
+
+
+IngestionSvc = Annotated[IngestionService, Depends(get_ingestion_service)]
+
+from app.services.user_slash_command import UserSlashCommandService
+
+
+def get_user_slash_command_service(db: DBSession) -> UserSlashCommandService:
+    return UserSlashCommandService(db)
+
+
+UserSlashCommandSvc = Annotated[UserSlashCommandService, Depends(get_user_slash_command_service)]
+from app.services.dashboard_layout import DashboardLayoutService
+
+
+def get_dashboard_layout_service(db: DBSession) -> DashboardLayoutService:
+    return DashboardLayoutService(db)
+
+
+DashboardLayoutSvc = Annotated[DashboardLayoutService, Depends(get_dashboard_layout_service)]
+from app.services.dashboard_preset import DashboardPresetService
+
+
+def get_dashboard_preset_service(db: DBSession) -> DashboardPresetService:
+    return DashboardPresetService(db)
+
+
+DashboardPresetSvc = Annotated[DashboardPresetService, Depends(get_dashboard_preset_service)]
+from app.services.admin import AdminService
+
+
+def get_admin_service(db: DBSession) -> AdminService:
+    """Create AdminService instance - used by admin REST routes (always
+    available, independent of the optional SQLAdmin UI)."""
+    return AdminService(db)
+
+
+AdminSvc = Annotated[AdminService, Depends(get_admin_service)]
+from app.services.deployment_settings import DeploymentSettingsService
+
+
+def get_deployment_settings_service(db: DBSession) -> DeploymentSettingsService:
+    return DeploymentSettingsService(db)
+
+
+DeploymentSettingsSvc = Annotated[
+    DeploymentSettingsService, Depends(get_deployment_settings_service)
+]
+from app.services.mcp_connection import McpConnectionService
+
+
+def get_mcp_connection_service(db: DBSession) -> McpConnectionService:
+    return McpConnectionService(db)
+
+
+McpConnectionSvc = Annotated[McpConnectionService, Depends(get_mcp_connection_service)]
+from app.services.suggestions import SuggestionService
+
+
+def get_suggestion_service(db: DBSession) -> SuggestionService:
+    return SuggestionService(db)
+
+
+SuggestionSvc = Annotated[SuggestionService, Depends(get_suggestion_service)]
+from app.services.watches import WatchService
+
+
+def get_watch_service(db: DBSession) -> WatchService:
+    return WatchService(db)
+
+
+WatchSvc = Annotated[WatchService, Depends(get_watch_service)]
+from app.services.organization_secret import OrganizationSecretService
+
+
+def get_secret_service(db: DBSession) -> OrganizationSecretService:
+    """Create OrganizationSecretService instance with database session."""
+    return OrganizationSecretService(db)
+
+
+SecretSvc = Annotated[OrganizationSecretService, Depends(get_secret_service)]
+from app.services.openai_codex import OpenAICodexService
+
+
+def get_openai_codex_service(db: DBSession, redis: Redis) -> OpenAICodexService:
+    """Create OpenAICodexService with the session and the Redis client its sign-in waits in."""
+    return OpenAICodexService(db, redis)
+
+
+OpenAICodexSvc = Annotated[OpenAICodexService, Depends(get_openai_codex_service)]
+from app.services.audit import AuditService
+
+
+def get_audit_service(db: DBSession) -> AuditService:
+    """Create AuditService instance with database session."""
+    return AuditService(db)
+
+
+AuditSvc = Annotated[AuditService, Depends(get_audit_service)]
+from app.services.notification_center import NotificationCenterService
+
+
+def get_notification_center_service(db: DBSession) -> NotificationCenterService:
+    """Create NotificationCenterService instance with database session."""
+    return NotificationCenterService(db)
+
+
+NotificationCenterSvc = Annotated[
+    NotificationCenterService, Depends(get_notification_center_service)
+]
+from app.services.notification_delivery import NotificationDeliveryService
+
+
+def get_notification_delivery_service(db: DBSession) -> NotificationDeliveryService:
+    """Create NotificationDeliveryService instance with database session."""
+    return NotificationDeliveryService(db)
+
+
+NotificationDeliverySvc = Annotated[
+    NotificationDeliveryService, Depends(get_notification_delivery_service)
+]
+from app.services.announcement import AnnouncementService
+
+
+def get_announcement_service(db: DBSession) -> AnnouncementService:
+    """Create AnnouncementService instance with database session."""
+    return AnnouncementService(db)
+
+
+AnnouncementSvc = Annotated[AnnouncementService, Depends(get_announcement_service)]
+from app.services.voice import VoicePreviewService, VoiceSettingsService, VoiceUsageService
+
+
+def get_voice_settings_service(db: DBSession) -> VoiceSettingsService:
+    """Create VoiceSettingsService instance with database session."""
+    return VoiceSettingsService(db)
+
+
+VoiceSettingsSvc = Annotated[VoiceSettingsService, Depends(get_voice_settings_service)]
+
+
+def get_voice_usage_service(db: DBSession) -> VoiceUsageService:
+    """Create VoiceUsageService instance with database session."""
+    return VoiceUsageService(db)
+
+
+VoiceUsageSvc = Annotated[VoiceUsageService, Depends(get_voice_usage_service)]
+
+
+def get_voice_preview_service(db: DBSession, redis: Redis) -> VoicePreviewService:
+    """Create VoicePreviewService instance with database session and Redis."""
+    return VoicePreviewService(db, redis)
+
+
+VoicePreviewSvc = Annotated[VoicePreviewService, Depends(get_voice_preview_service)]
+from app.services.background_jobs import BackgroundJobService
+
+
+def get_background_job_service(db: DBSession) -> BackgroundJobService:
+    """Create BackgroundJobService instance with database session."""
+    return BackgroundJobService(db)
+
+
+BackgroundJobSvc = Annotated[BackgroundJobService, Depends(get_background_job_service)]
+from app.services.api_runs import ApiRunService
+
+
+def get_api_run_service(db: DBSession) -> ApiRunService:
+    """Create ApiRunService instance with database session."""
+    return ApiRunService(db)
+
+
+ApiRunSvc = Annotated[ApiRunService, Depends(get_api_run_service)]
+
+
+def prefers_async(
+    prefer: Annotated[
+        str | None, Header(description="`respond-async` (RFC 7240) queues the request.")
+    ] = None,
+) -> bool:
+    """Whether the caller's `Prefer` header asks for `respond-async`, among whatever else it asks."""
+    if prefer is None:
+        return False
+    return any(
+        token.strip().split("=", 1)[0].strip().lower() == "respond-async"
+        for token in prefer.split(",")
+    )
+
+
+PrefersAsync = Annotated[bool, Depends(prefers_async)]
+
+from app.services.project_workspace_transfer import ProjectWorkspaceTransferService
+
+
+def get_project_transfer_service(db: DBSession) -> ProjectWorkspaceTransferService:
+    return ProjectWorkspaceTransferService(db)
+
+
+ProjectTransferSvc = Annotated[
+    ProjectWorkspaceTransferService, Depends(get_project_transfer_service)
+]
+
+
+from app.services.diagnostics import DiagnosticsService
+
+
+def get_diagnostics_service(db: DBSession) -> DiagnosticsService:
+    return DiagnosticsService(db)
+
+
+DiagnosticsSvc = Annotated[DiagnosticsService, Depends(get_diagnostics_service)]
+
+
+from app.services.updates import UpdateService
+
+
+def get_update_service() -> UpdateService:
+    return UpdateService()
+
+
+UpdateSvc = Annotated[UpdateService, Depends(get_update_service)]

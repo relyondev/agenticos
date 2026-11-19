@@ -1,0 +1,112 @@
+"""User database model."""
+
+import uuid
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Literal
+
+from sqlalchemy import Boolean, DateTime, Integer, SmallInteger, String, text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from app.db.models.session import Session
+
+# The column names of the opt-outs below, for code that resolves recipients and
+# needs to say which preference applies. A Literal rather than an enum so a typo
+# is a type error, not a runtime AttributeError inside a `finally` block.
+NotificationPreference = Literal[
+    "notify_budget_alerts",
+    "notify_approval_requests",
+    "notify_usage_reports",
+]
+
+
+class User(Base, TimestampMixin):
+    """User model."""
+
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    # An address asked for and not yet proved. Every mail this deployment sends
+    # goes to `email` - a reset link, an invitation, a budget alert - so a
+    # self-service change that wrote straight to that column pointed all of it at
+    # an address nobody had shown they could read (#1772). The request stages here
+    # instead; confirming the link sent to it moves the value across and clears
+    # this, which is also what makes the link single-use.
+    #
+    # Deliberately not unique: two people may stage the same address, and only
+    # the first to confirm gets it - the unique constraint on `email` is where
+    # that is decided, at the moment it is decided. A constraint here would
+    # instead refuse the second *request*, which leaks that somebody else is
+    # mid-change to an address, and strands the winner behind the loser's
+    # abandoned staging.
+    pending_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Bumped on every password change; a refresh token carries the version it was
+    # minted with, and the refresh path refuses one that is behind. That is what
+    # invalidates a token racing the change's session revocation (#1517).
+    credential_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # The one global privilege. Authorization inside an organization is a
+    # membership row plus the permission catalog, never a column on the user -
+    # see `app/core/permissions.py`. This flag is deliberately outside that: it
+    # administers the *deployment*, so it is not scoped to a tenant.
+    is_app_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    avatar_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # The chosen default-avatar colour, slot 1..10 into the `--avatar-*` ramp;
+    # null means auto (derived from the id). Only used when no picture is set.
+    avatar_color: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    onboarding_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    oauth_provider: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    oauth_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+
+    # Opt-outs for the lifecycle emails (budget alerts, approval requests,
+    # usage reports). Consulted where recipients are resolved, in
+    # NotificationService; transactional mail deliberately has no preference.
+    # Default true: the emails exist because a run nobody was watching went
+    # quiet, and an opt-in nobody has set yet is the same silence.
+    notify_budget_alerts: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    notify_approval_requests: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    notify_usage_reports: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    # The console language this person chose, from any device or through an
+    # agent asked to switch it. Null until they choose: the console then keeps
+    # whatever the browser's cookie or the URL says, as it always did.
+    locale: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # What every agent is told about the person (#2301): the zone "every Monday
+    # at 9" is read in, taken from their browser, and their role and work, which
+    # they write once rather than in every conversation.
+    time_zone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    job_title: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    about: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # When they work - `{"days": [1-7], "start": "HH:MM", "end": "HH:MM"}`, read by
+    # `WorkingHours`. Knowledge for the agent only: nothing is held back or moved
+    # outside these hours, an agent just plans around them.
+    working_hours: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # This person said no to the organization's nightly look at their week.
+    proactive_opt_out: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
+    sessions: Mapped[list[Session]] = relationship(
+        "Session",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="Session.user_id",
+    )
+
+    def __repr__(self) -> str:
+        return f"<User(id={self.id}, email={self.email})>"

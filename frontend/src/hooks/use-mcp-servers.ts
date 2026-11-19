@@ -1,0 +1,162 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+import { apiClient } from "@/lib/api-client";
+import type { McpToolInfo } from "@/lib/mcp-connections-api";
+import { mergeServers, type McpServerRow } from "@/lib/mcp-servers";
+import { qk } from "@/lib/query-keys";
+import type { McpCatalog, PlatformMcpToolList } from "@/types/mcp";
+import { useMcpConnections } from "./use-mcp-connections";
+import { useOrgMcpConnections } from "./use-org-mcp-connections";
+
+/**
+ * The organization's MCP catalog.
+ *
+ * Cached indefinitely: the list is hand-curated in the backend and changes when
+ * it is redeployed, not while someone is reading it.
+ */
+export function useMcpCatalog() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: qk.mcpServers.catalog(),
+    queryFn: () => apiClient.get<McpCatalog>("/agents/mcp-catalog"),
+    staleTime: Infinity,
+  });
+  return { servers: data?.items ?? [], isLoading, error };
+}
+
+/**
+ * One server by its catalog key - curated, or mirrored from the public registry,
+ * which the curated catalog does not hold and which is searched for by name
+ * (a registry server's name is its key). Null while looking, and for a key
+ * neither knows: an agent wrote it, so it may name nothing.
+ */
+export function useMcpServerEntry(key: string | null) {
+  const { servers, isLoading: catalogLoading } = useMcpCatalog();
+  const curated = key === null ? null : (servers.find((server) => server.key === key) ?? null);
+  const mirrored = useQuery({
+    queryKey: qk.mcpServers.entry(key ?? ""),
+    queryFn: () =>
+      apiClient.get<McpCatalog>(`/agents/mcp-servers?q=${encodeURIComponent(key ?? "")}&limit=10`),
+    enabled: key !== null && !catalogLoading && curated === null,
+    staleTime: Infinity,
+  });
+  const entry = curated ?? mirrored.data?.items.find((server) => server.key === key) ?? null;
+  return { entry, isLoading: entry === null && (catalogLoading || mirrored.isLoading) };
+}
+
+/**
+ * The tools of this deployment's own MCP server, for a platform binding to pick from.
+ *
+ * Cached indefinitely for the same reason as the catalog: they change on redeploy.
+ */
+export function usePlatformMcpTools({ enabled = true }: { enabled?: boolean } = {}) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: qk.mcpServers.platformTools(),
+    queryFn: () => apiClient.get<PlatformMcpToolList>("/agents/platform-mcp-tools"),
+    staleTime: Infinity,
+    enabled,
+  });
+  return { tools: data?.items ?? [], isLoading, error };
+}
+
+/** What one page of the server list holds. */
+export const MCP_PAGE_SIZE = 50;
+
+/**
+ * One page of the MCP list: the curated catalog, then the mirrored registry.
+ *
+ * A request rather than a filter, which is the opposite of what this page used
+ * to do. The curated hundred could be held and filtered in the browser; the
+ * 5,703 registry rows behind them cannot, and merging two paged sources in the
+ * browser means the browser working out which page of which source a page of the
+ * list needs. The server joins them and answers with rows.
+ *
+ * `registryTotal` is what the mirror holds, which the count line needs to say
+ * what the list reaches - zero until `agenticos cmd mcp-registry-sync` has run.
+ */
+export function useMcpCatalogPage(
+  query: string,
+  category: string,
+  auth: string,
+  page: number,
+  enabled = true,
+) {
+  const needle = query.trim();
+  const { data, isLoading, isFetching } = useQuery({
+    queryKey: qk.mcpServers.listPage(needle, category, auth, page),
+    enabled,
+    queryFn: () =>
+      apiClient.get<McpCatalog>(
+        `/agents/mcp-servers?q=${encodeURIComponent(needle)}` +
+          `&category=${encodeURIComponent(category)}` +
+          `&auth=${encodeURIComponent(auth)}` +
+          `&skip=${page * MCP_PAGE_SIZE}&limit=${MCP_PAGE_SIZE}`,
+      ),
+    // A page already fetched is worth keeping while the next one loads, so
+    // paging does not blank the grid on every click.
+    placeholderData: (previous) => previous,
+    staleTime: Infinity,
+  });
+  return {
+    servers: data?.items ?? [],
+    total: data?.total ?? 0,
+    registryTotal: data?.registry_total ?? 0,
+    isLoading,
+    isFetching,
+  };
+}
+
+export type { McpServerRow };
+
+/**
+ * Every MCP server, with who has connected it and what it offers.
+ *
+ * One hook for what used to be two pages. The catalog says which servers exist;
+ * the two connection lists say who holds a credential to each. Presenting those
+ * as separate screens is what made the difference between them unanswerable, so
+ * they are joined here and the page renders rows.
+ *
+ * Probe results are held in local state rather than the query cache because
+ * they are not a resource anyone can GET - they exist only as the answer to a
+ * check somebody asked for. The lists, which a check does change server-side,
+ * are refetched by the hook that owns them.
+ */
+export function useMcpServers() {
+  const catalog = useQuery({
+    queryKey: qk.mcpServers.catalog(),
+    queryFn: () => apiClient.get<McpCatalog>("/agents/mcp-catalog"),
+    staleTime: Infinity,
+  });
+  const organization = useOrgMcpConnections();
+  const personal = useMcpConnections();
+
+  const [toolsByConnection, setToolsByConnection] = useState<Record<string, McpToolInfo[]>>({});
+
+  const rows = useMemo(
+    () => mergeServers(catalog.data?.items ?? [], organization.connections, personal.connections),
+    [catalog.data, organization.connections, personal.connections],
+  );
+
+  return {
+    rows,
+    isLoading: catalog.isLoading || organization.isLoading || personal.isLoading,
+    /**
+     * A failure everybody's view depends on is reported — the catalog and the
+     * caller's own connections. The organization list's is not: a member
+     * without `connections:manage` gets a 403 there and can still read the
+     * other two, so surfacing it as the page's error would replace a usable
+     * screen with a refusal about one column of it. A failed catalog is the
+     * opposite case — without it `mergeServers` yields an empty page dressed
+     * as "no servers", on the one deployment state that cannot be true.
+     */
+    error: catalog.error ?? personal.error,
+    organization,
+    personal,
+    /** Tools discovered by a check in this session, keyed by connection id. */
+    toolsByConnection,
+    recordTools: (connectionId: string, tools: McpToolInfo[]) =>
+      setToolsByConnection((previous) => ({ ...previous, [connectionId]: tools })),
+  };
+}

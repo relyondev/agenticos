@@ -1,0 +1,440 @@
+"use client";
+
+import { Children, isValidElement, memo, useLayoutEffect, useMemo, useRef } from "react";
+import type { Components } from "react-markdown";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import { ExternalLink, ImageOff, PanelsTopLeft } from "lucide-react";
+import { useTranslations } from "next-intl";
+
+import { BrandIcon } from "@/components/icons/brand-icon";
+import { brandForUrl, consolePageIcon, isAppLink, offsiteUrl } from "@/lib/link-brands";
+import { rehypeStreamWords } from "@/lib/stream-words";
+import { cn } from "@/lib/utils";
+
+import { CollapsibleBlock } from "./collapsible-block";
+import { MarkdownQuote } from "./markdown-quote";
+import { MarkdownTable } from "./markdown-table";
+import type { MarkdownContentProps } from "./markdown-content";
+
+const REMARK_PLUGINS = [remarkGfm];
+const REHYPE_PLUGINS = [rehypeHighlight];
+const STREAM_PLUGINS = [rehypeHighlight, rehypeStreamWords];
+
+/** Parse `language-xyz` from a `<code>` className that rehype-highlight emits. */
+function languageLabel(className: string | undefined): string | null {
+  if (!className) return null;
+  const match = /(?:^|\s)language-([a-z0-9+\-]+)/i.exec(className);
+  return match && match[1] ? match[1].toLowerCase() : null;
+}
+
+/**
+ * How far an ordered list is indented, from the widest number it will draw.
+ *
+ * A `list-outside` marker is painted to the *left* of the content box, so the
+ * indent has to be padding rather than margin - and it has to be wide enough for
+ * the last item's number, because a turn is wrapped in `overflow-hidden`
+ * (`message-item.tsx`) and anything leaving the box is clipped rather than
+ * overflowing. A 120-item list on 20px of margin lost the leading digit of every
+ * item past nine.
+ */
+function orderedIndent(children: React.ReactNode, start: unknown): string {
+  const items = Children.toArray(children).filter(isValidElement).length;
+  const last = (typeof start === "number" ? start : 1) + Math.max(items - 1, 0);
+  if (last >= 1000) return "pl-12";
+  if (last >= 100) return "pl-10";
+  if (last >= 10) return "pl-8";
+  return "pl-6";
+}
+
+/**
+ * Pre-process markdown to turn bare citation markers [N] into markdown links
+ * with a special `#cite-N` href. The `a` component override below detects this
+ * and renders an interactive CitationBadge instead of a regular link.
+ *
+ * Three shapes are left alone, because in Markdown they already mean something
+ * and rewriting them corrupts the answer:
+ *
+ *   - `[N](url)` is a link somebody wrote - the lookahead for `(`.
+ *   - `[N]: url` is a link reference definition - the lookahead for `:`.
+ *   - `[text][N]` is a *use* of one, and this is the one that was broken:
+ *     rewriting its label turned `See [the docs][1].` into `See [the docs][`
+ *     followed by a stray link. The first alternative matches that whole form
+ *     and hands it back untouched.
+ *
+ * The label check is `(?!\d{1,3}\])` so that consecutive citations - `[1][2]`,
+ * which an agent writes when two sources agree - are still both marked.
+ *
+ * Code spans and blocks are left as-is because the regex does not enter them; in
+ * practice agent responses never cite inside code.
+ */
+const CITATION = /(\[(?!\d{1,3}\])[^\]]*\]\[\d{1,3}\])|\[(\d{1,3})\](?![\(:])/g;
+
+function preprocessCitations(content: string): string {
+  return content.replace(CITATION, (_, referenceLink: string | undefined, n: string) =>
+    referenceLink === undefined ? `[[${n}]](#cite-${n})` : referenceLink,
+  );
+}
+
+/**
+ * The text of a fenced block, whatever shape the highlighter left it in.
+ *
+ * `rehype-highlight` replaces the code's single text child with a tree of
+ * `<span>` tokens, so reading `children` as a string found one only for a block
+ * whose language nothing recognised - which is why the copy button, the single
+ * most-used control on a code block, was missing from every highlighted one.
+ */
+/** A header this short reads better on one line than wrapped to fit its column. */
+const SHORT_HEADER = 24;
+
+/**
+ * Whether a cell is a figure - `1 922`, `48 / 134 / 639`, `12.5%`, `$0.91`.
+ *
+ * A figure is kept on one line and in tabular digits: `148 420` broken after
+ * its thousands separator reads as two numbers, and a column of figures that
+ * do not line up is a column nobody can compare down.
+ */
+function isFigure(text: string): boolean {
+  return /\d/.test(text) && /^[\s\d.,:%/+\-\u2212\u2013$€£x×]+$/.test(text);
+}
+
+/**
+ * How a cell may be laid out. A figure never wraps; a word or two needs no rule;
+ * a longer text gets a floor, because with the figures beside it unable to give
+ * way it was the one column left to squeeze - down to a letter a line.
+ */
+function cellWidth(text: string): string | false {
+  if (isFigure(text)) return "whitespace-nowrap tabular-nums";
+  return text.length > SHORT_CELL && "min-w-[9rem]";
+}
+
+/** A cell this short is a word or two and fits whatever column it lands in. */
+const SHORT_CELL = 16;
+
+function textOf(node: React.ReactNode): string {
+  if (typeof node === "string") return node;
+  /* v8 ignore next -- react-markdown hands children through as strings */
+  if (typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (node && typeof node === "object" && "props" in node) {
+    return textOf((node as React.ReactElement<{ children?: React.ReactNode }>).props.children);
+  }
+  return "";
+}
+
+export const MarkdownContent = memo(function MarkdownContent({
+  content,
+  onCiteClick,
+  bareCode,
+  inertImages,
+  documentMedia,
+  streaming,
+}: MarkdownContentProps) {
+  const t = useTranslations("chat");
+  const processed = onCiteClick ? preprocessCitations(content) : content;
+  const citable = onCiteClick !== undefined;
+  // Read through a ref so a caller passing a fresh handler each render does not
+  // hand ReactMarkdown a new `a` component every time.
+  const cite = useRef(onCiteClick);
+  useLayoutEffect(() => {
+    cite.current = onCiteClick;
+  }, [onCiteClick]);
+
+  // Memoized, not a literal in the JSX: a new object is a new component type for
+  // every `p`, `li` and heading, so React remounted the whole answer on each
+  // streamed frame - restarting every fade-in, which is why a streaming answer
+  // sat invisible and then appeared at once when the turn ended.
+  const components = useMemo<Components>(
+    () => ({
+      pre({ children, ...props }) {
+        const block = (
+          <pre className="overflow-x-auto p-3.5 text-[12.5px] leading-relaxed" {...props}>
+            {children}
+          </pre>
+        );
+        if (bareCode) return block;
+
+        const codeElement = children as React.ReactElement<{
+          children?: React.ReactNode;
+          className?: string;
+        }>;
+        const codeContent = textOf(codeElement?.props?.children);
+        const lang = languageLabel(codeElement?.props?.className);
+
+        return (
+          <CollapsibleBlock
+            className="my-3"
+            // An unlabelled block is still called something, unless it is also
+            // empty - which is what a half-streamed answer looks like for a moment,
+            // and a bar reading "text" over nothing is chrome around nothing.
+            label={lang ?? (codeContent === "" ? null : "text")}
+            copyText={codeContent}
+          >
+            {block}
+          </CollapsibleBlock>
+        );
+      },
+      code({ className, children, ...props }) {
+        const isInline = !className;
+        if (isInline) {
+          return (
+            <code
+              // `box-decoration-clone`: a span that wraps - a package name in a
+              // narrow table cell - keeps its padding and corners on every line
+              // instead of breaking into a pill with its ends cut off.
+              className="bg-foreground/8 text-foreground rounded box-decoration-clone px-1.5 py-0.5 font-mono text-[0.85em]"
+              {...props}
+            >
+              {children}
+            </code>
+          );
+        }
+        return (
+          <code className={className} {...props}>
+            {children}
+          </code>
+        );
+      },
+      img({ src, alt }) {
+        // A remote image in text somebody else wrote is a tracking pixel.
+        // `inertImages` is set where the reader is not the author - the run
+        // timeline, where an operator reviews a colleague's conversation - so
+        // a `![](https://attacker/px.png)` appended to a run would otherwise
+        // fetch on review and hand over the reviewer's address, agent and the
+        // fact that this run was read. Drawn as a link instead: the reader
+        // decides, and nothing loads until they do.
+        const address = typeof src === "string" ? src : "";
+        if (!inertImages) {
+          // eslint-disable-next-line @next/next/no-img-element
+          return <img src={address} alt={alt ?? ""} className="my-2 max-w-full rounded-lg" />;
+        }
+        return (
+          <a
+            href={address}
+            target="_blank"
+            rel="noopener noreferrer nofollow"
+            className="text-muted-foreground hover:text-foreground border-border inline-flex items-center gap-1 rounded-md border border-dashed px-1.5 py-0.5 text-xs"
+          >
+            <ImageOff className="h-3 w-3 shrink-0" aria-hidden />
+            {alt || t("imageNotLoaded")}
+          </a>
+        );
+      },
+      a({ href, children, ...props }) {
+        if (
+          documentMedia &&
+          href &&
+          /^https?:\/\/[^\s]+\.(?:mp4|webm|ogg)(?:[?#].*)?$/i.test(href)
+        ) {
+          return (
+            <span className="my-4 block">
+              <video
+                src={href}
+                controls
+                preload="none"
+                className="max-h-[32rem] w-full rounded-xl"
+                aria-label={textOf(children) || href}
+              >
+                <a href={href}>{children}</a>
+              </video>
+            </span>
+          );
+        }
+        if (href?.startsWith("#cite-") && citable) {
+          const n = parseInt(href.slice(6), 10);
+          if (!Number.isNaN(n)) {
+            return (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  cite.current?.(n);
+                }}
+                className="bg-foreground/10 text-foreground/70 hover:bg-foreground/20 mx-0.5 inline-flex h-[1.1em] cursor-pointer items-center rounded px-1 align-middle font-mono text-[0.72em] font-semibold tabular-nums transition-colors"
+                title={t("sourceNumber", { marker: `[${n}]` })}
+              >
+                {n}
+              </button>
+            );
+          }
+        }
+        // An app this console published opens here, under the app's mark and a
+        // name rather than the forty characters of its address; a page on a
+        // service the reader knows leads with that service's logo.
+        const app = !!href && isAppLink(href, window.location.origin);
+        // Off-site by where the browser resolves it (#2550): `//host`, and
+        // `https:host` on an `http:` console, leave it without starting
+        // `https://`, and with no target they leave in this tab. An absolute `http(s)://` address on this
+        // console still opens in a new tab, as before.
+        const external =
+          app || !href
+            ? null
+            : (offsiteUrl(href, window.location.origin) ??
+              (/^https?:\/\//i.test(href) ? href : null));
+        const isExternal = external !== null;
+        const brand = external ? brandForUrl(external) : null;
+        // A console page the agent points at wears the sidebar's mark for it.
+        const PageIcon = !app && href ? consolePageIcon(href, window.location.origin) : null;
+        const label = app && textOf(children) === href ? t("openApp") : children;
+        return (
+          <a
+            href={href}
+            target={isExternal ? "_blank" : undefined}
+            rel={isExternal ? "noopener noreferrer" : undefined}
+            className="text-foreground hover:text-brand-hover decoration-brand hover:decoration-brand inline-flex items-baseline gap-1 font-medium underline decoration-2 underline-offset-[3px] transition-colors"
+            {...props}
+          >
+            {app && (
+              <PanelsTopLeft
+                aria-hidden
+                className="text-foreground/70 inline h-[0.95em] w-[0.95em] shrink-0 translate-y-[0.1em]"
+              />
+            )}
+            {PageIcon && (
+              <PageIcon
+                aria-hidden
+                className="text-foreground/70 inline h-[0.95em] w-[0.95em] shrink-0 translate-y-[0.1em]"
+              />
+            )}
+            {brand && (
+              <BrandIcon
+                name={brand}
+                className="inline h-[0.95em] w-[0.95em] shrink-0 translate-y-[0.1em]"
+              />
+            )}
+            {label}
+            {isExternal && !brand && (
+              <ExternalLink className="text-foreground/60 inline h-[0.8em] w-[0.8em] shrink-0 -translate-y-[1px]" />
+            )}
+          </a>
+        );
+      },
+      p({ children, ...props }) {
+        return (
+          <p className="mb-3 leading-relaxed last:mb-0" {...props}>
+            {children}
+          </p>
+        );
+      },
+      // Padding, not margin - see `orderedIndent`.
+      ul({ children, ...props }) {
+        return (
+          <ul
+            className="marker:text-muted-foreground mb-3 list-disc space-y-1 pl-5 last:mb-0"
+            {...props}
+          >
+            {children}
+          </ul>
+        );
+      },
+      ol({ children, ...props }) {
+        return (
+          <ol
+            className={cn(
+              "marker:text-muted-foreground mb-3 list-decimal space-y-1 last:mb-0",
+              orderedIndent(children, props.start),
+            )}
+            {...props}
+          >
+            {children}
+          </ol>
+        );
+      },
+      li({ children, ...props }) {
+        return (
+          <li className="leading-relaxed" {...props}>
+            {children}
+          </li>
+        );
+      },
+      h1({ children, ...props }) {
+        return (
+          <h1 className="mt-4 mb-2 text-xl font-bold tracking-tight first:mt-0" {...props}>
+            {children}
+          </h1>
+        );
+      },
+      h2({ children, ...props }) {
+        return (
+          <h2 className="mt-4 mb-2 text-lg font-semibold tracking-tight first:mt-0" {...props}>
+            {children}
+          </h2>
+        );
+      },
+      h3({ children, ...props }) {
+        return (
+          <h3 className="mt-3 mb-2 text-base font-semibold first:mt-0" {...props}>
+            {children}
+          </h3>
+        );
+      },
+      blockquote({ children, ...props }) {
+        return <MarkdownQuote {...props}>{children}</MarkdownQuote>;
+      },
+      table({ children, ...props }) {
+        return <MarkdownTable {...props}>{children}</MarkdownTable>;
+      },
+      thead({ children, ...props }) {
+        return (
+          <thead className="bg-foreground/[0.03]" {...props}>
+            {children}
+          </thead>
+        );
+      },
+      tr({ children, ...props }) {
+        return (
+          <tr className="[tbody_&]:hover:bg-foreground/[0.025] transition-colors" {...props}>
+            {children}
+          </tr>
+        );
+      },
+      // Sentence case, in the body font. Mono capitals made every header twice
+      // its width, so a short one broke over three lines and an emoji in it
+      // sat on a line of its own.
+      th({ children, ...props }) {
+        return (
+          <th
+            className={cn(
+              "border-foreground/10 text-muted-foreground border-b px-3 py-2 text-left align-bottom text-xs font-medium",
+              textOf(children).length <= SHORT_HEADER ? "whitespace-nowrap" : "min-w-[9rem]",
+            )}
+            {...props}
+          >
+            {children}
+          </th>
+        );
+      },
+      td({ children, ...props }) {
+        return (
+          <td
+            className={cn(
+              // The rule under every row but the last, which the frame draws.
+              // `last:` on the cell removed it from the last *column* instead,
+              // and left a gap in the rule under every row.
+              "border-foreground/8 border-b px-3 py-2 align-top [tr:last-child>&]:border-b-0",
+              cellWidth(textOf(children)),
+            )}
+            {...props}
+          >
+            {children}
+          </td>
+        );
+      },
+      hr({ ...props }) {
+        return <hr className="border-foreground/10 my-4" {...props} />;
+      },
+    }),
+    [t, bareCode, inertImages, documentMedia, citable],
+  );
+
+  return (
+    <ReactMarkdown
+      remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={streaming ? STREAM_PLUGINS : REHYPE_PLUGINS}
+      components={components}
+    >
+      {processed}
+    </ReactMarkdown>
+  );
+});

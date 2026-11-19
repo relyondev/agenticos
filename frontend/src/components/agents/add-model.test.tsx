@@ -1,0 +1,200 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  defaultApi,
+  endpointProfileLabel,
+  modelHint,
+  modelIdIsWellFormed,
+  modelPlaceholder,
+  placeholderWords,
+  soleKeyedProvider,
+} from "./add-model";
+import en from "../../../messages/en.json";
+
+/**
+ * Resolve an absolute catalog key, or `undefined` when it is not there.
+ *
+ * Deliberately *not* falling back to the key. It used to, and that is why nothing
+ * caught `pickProviderFirst` being unresolvable: a missing key came back as the
+ * key, and an assertion about a sentence containing "openai/gpt-5" passed anyway.
+ * A resolver that cannot fail cannot be asked whether the copy exists.
+ */
+function resolve(key: string): string | undefined {
+  return key
+    .split(".")
+    .reduce<unknown>(
+      (node, part) =>
+        typeof node === "object" && node !== null
+          ? (node as Record<string, unknown>)[part]
+          : undefined,
+      en,
+    ) as string | undefined;
+}
+
+/** The English catalog: these helpers answer with a key, and this is its sentence. */
+const words = (key: string): string => resolve(key) ?? key;
+
+/**
+ * The one model id this form can know is wrong before sending it.
+ *
+ * OpenRouter routes to other people's models, so its ids carry the origin -
+ * `openai/gpt-5`, never `gpt-5` - and the backend refuses a bare one. That
+ * refusal used to arrive as an unhandled rejection, which Next.js renders as a
+ * full-screen error overlay: a filled-in form replaced by a stack trace,
+ * because of a missing slash.
+ */
+describe("modelIdIsWellFormed", () => {
+  it("refuses a bare id for OpenRouter", () => {
+    expect(modelIdIsWellFormed("openrouter", "gpt-5")).toBe(false);
+  });
+
+  it("accepts a namespaced one", () => {
+    expect(modelIdIsWellFormed("openrouter", "openai/gpt-5")).toBe(true);
+  });
+
+  it("does not impose the rule on providers that do not have it", () => {
+    // Everybody else names their own models, and a slash would be the mistake.
+    expect(modelIdIsWellFormed("openai", "gpt-5")).toBe(true);
+    expect(modelIdIsWellFormed("anthropic", "claude-opus-5")).toBe(true);
+  });
+});
+
+describe("modelHint", () => {
+  it("shows OpenRouter's shape before anybody guesses wrong", () => {
+    expect(words(modelHint("openrouter"))).toContain("openai/gpt-5");
+  });
+
+  it("says nothing specific for a provider with no such rule", () => {
+    expect(modelHint("openai")).not.toContain("/");
+    expect(modelHint(undefined)).not.toContain("/");
+  });
+});
+
+/**
+ * The keys these helpers answer with have to exist, and be absolute.
+ *
+ * `AddModel` and the chat's model picker share them and read *different*
+ * namespaces - `agents` and `chat.modelPicker` - so a relative key resolved for
+ * one caller and threw `MISSING_MESSAGE` for the other. What reached the user was
+ * a console error over the picker, on a component whose own suite was green: the
+ * key was only ever resolved through a helper that fell back to it.
+ */
+describe("the catalog keys these helpers hand back", () => {
+  const providers = [undefined, "openrouter", "openai", "anthropic"];
+
+  it.each(providers)("resolves the placeholder for %s", (providerId) => {
+    const placeholder = modelPlaceholder(providerId);
+    if (typeof placeholder === "string") {
+      // An example id rather than English - `openai/gpt-5` is what the provider
+      // calls the model, and asking the catalog for it is the bug this shape
+      // avoids.
+      expect(placeholder).not.toBe("");
+      return;
+    }
+    expect(placeholder.key).toContain(".");
+    expect(resolve(placeholder.key)).toBeTypeOf("string");
+  });
+
+  it.each(providers)("resolves the hint for %s", (providerId) => {
+    const key = modelHint(providerId);
+
+    expect(key).toContain(".");
+    expect(resolve(key)).toBeTypeOf("string");
+  });
+
+  it("reads a key through whichever namespace the caller is in, because it names one", () => {
+    // The regression, stated as the thing that broke: a root translator resolves
+    // it, and that is the only translator either caller can share.
+    const placeholder = modelPlaceholder(undefined);
+
+    expect(placeholderWords(placeholder, words)).toBe("Pick a provider first");
+  });
+});
+
+/**
+ * Which provider the form starts on.
+ *
+ * A deployment can reach every provider in the catalog; the keys an organization
+ * holds say which of them it can run on. One key is not a choice, and asking for
+ * it anyway is a select somebody has to open to find a single answer in.
+ */
+describe("soleKeyedProvider", () => {
+  const providers = [{ id: "openai" }, { id: "anthropic" }, { id: "openrouter" }];
+
+  it("picks the one provider a key was stored for", () => {
+    expect(soleKeyedProvider(providers, [{ purpose: "openrouter" }])).toBe("openrouter");
+  });
+
+  it("picks it however many keys that one provider has", () => {
+    // Two keys for OpenRouter is still one provider to run on.
+    expect(
+      soleKeyedProvider(providers, [{ purpose: "openrouter" }, { purpose: "openrouter" }]),
+    ).toBe("openrouter");
+  });
+
+  it("chooses nothing when two providers are keyed", () => {
+    // A real choice, and guessing between them would put a model on the wrong
+    // account - which is a bill somebody else pays.
+    expect(soleKeyedProvider(providers, [{ purpose: "openai" }, { purpose: "anthropic" }])).toBe(
+      undefined,
+    );
+  });
+
+  it("chooses nothing when there is no key at all", () => {
+    expect(soleKeyedProvider(providers, [])).toBe(undefined);
+  });
+
+  it("ignores a key stored for something that is not a model provider", () => {
+    // A secret's purpose is the provider id, and the vault holds purposes that
+    // are not providers at all.
+    expect(soleKeyedProvider(providers, [{ purpose: "slack" }])).toBe(undefined);
+  });
+
+  it("survives a secret with no purpose on it", () => {
+    expect(soleKeyedProvider(providers, [{ purpose: null }, { purpose: "openai" }])).toBe("openai");
+  });
+});
+
+describe("defaultApi", () => {
+  // The service's rule, so the select shows what an omitted choice would store.
+  const openai = { native_api: "responses" as const };
+
+  it("gives the provider's own endpoint its native API", () => {
+    expect(defaultApi(openai, "")).toBe("responses");
+    expect(defaultApi(openai, "   ")).toBe("responses");
+  });
+
+  it("gives an endpoint of somebody's own Chat Completions", () => {
+    expect(defaultApi(openai, "http://vllm:8000/v1")).toBe("chat");
+  });
+
+  it("has nothing to say for a provider that serves one API", () => {
+    expect(defaultApi({ native_api: null }, "")).toBeNull();
+    expect(defaultApi(null, "")).toBeNull();
+  });
+});
+
+describe("endpointProfileLabel", () => {
+  it("distinguishes regional URLs, global API and long conflicting names", () => {
+    const base = "OpenRouter · anthropic/claude-sonnet-5";
+    const eu = endpointProfileLabel(base, "https://eu.openrouter.ai/api/v1/", [], "Default API");
+    expect(eu).toBe(`${base} · eu.openrouter.ai/api/v1`);
+    expect(endpointProfileLabel(base, "", [], "Default API")).toBe(`${base} · Default API`);
+    expect(
+      endpointProfileLabel(
+        base,
+        "https://eu.openrouter.ai/api/v1",
+        [eu, `${eu} (2)`],
+        "Default API",
+      ),
+    ).toBe(`${eu} (3)`);
+    expect(
+      endpointProfileLabel(
+        "x".repeat(200),
+        "https://gateway.example/" + "a".repeat(200),
+        [],
+        "Default API",
+      ).length,
+    ).toBeLessThanOrEqual(128);
+  });
+});

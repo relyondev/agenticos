@@ -1,0 +1,255 @@
+"use client";
+
+import { useCallback } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+
+import { getErrorMessage } from "@/lib/api-error";
+import {
+  addGroupMember,
+  createGroup,
+  deleteGroup,
+  listGroupMembers,
+  listGroupResources,
+  listGroups,
+  removeGroupMember,
+  updateGroup,
+  getGroupSpend,
+  getGroupQuality,
+  getGroupsQuality,
+  type QualityWindow,
+  listShareableWithGroup,
+  setGroupLead,
+  shareWithGroup,
+} from "@/lib/groups-api";
+import { qk } from "@/lib/query-keys";
+import type { GroupCreate, GroupShareRequest, GroupUpdate } from "@/types/groups";
+
+/**
+ * Invalidates one organization's groups, and with them every group's member
+ * list, which sits beneath the same key: adding somebody to a group moves the
+ * list's member count as well as the group's own rows.
+ */
+function useInvalidateGroups(orgId: string) {
+  const queryClient = useQueryClient();
+  return useCallback(
+    () => queryClient.invalidateQueries({ queryKey: qk.organizations.groups(orgId) }),
+    [queryClient, orgId],
+  );
+}
+
+/**
+ * One organization's groups, read and changed.
+ *
+ * Any member may read them - a group is what somebody shares with, so the
+ * sharing picker needs the list whoever is sharing. Changing one takes
+ * `members:manage`, which the pages decide before rendering the control.
+ *
+ * `create` and `update` report no failure of their own: the dialog that calls
+ * them shows a taken name under the field it came from (`submitFailure`), and a
+ * toast on top of that would say it twice.
+ */
+export function useGroups(orgId: string) {
+  const t = useTranslations("groups");
+  const tErrors = useTranslations("errors");
+  const queryClient = useQueryClient();
+  const invalidate = useInvalidateGroups(orgId);
+
+  const { data, isLoading, isFetching, error } = useQuery({
+    queryKey: qk.organizations.groups(orgId),
+    queryFn: () => listGroups(orgId),
+    enabled: !!orgId,
+  });
+
+  const create = useMutation({
+    mutationFn: (input: GroupCreate) => createGroup(orgId, input),
+    onSuccess: async () => {
+      await invalidate();
+      toast.success(t("created"));
+    },
+  });
+
+  const update = useMutation({
+    mutationFn: ({ groupId, input }: { groupId: string; input: GroupUpdate }) =>
+      updateGroup(orgId, groupId, input),
+    onSuccess: async () => {
+      await invalidate();
+      toast.success(t("saved"));
+    },
+  });
+
+  const remove = useMutation({
+    mutationFn: (groupId: string) => deleteGroup(orgId, groupId),
+    onSuccess: async () => {
+      // The server deletes the grants made to the group and the directory
+      // mappings naming it in the same transaction, so both are stale now too.
+      await Promise.all([
+        invalidate(),
+        queryClient.invalidateQueries({ queryKey: qk.organizations.directoryMappings(orgId) }),
+        queryClient.invalidateQueries({ queryKey: qk.sharing.all() }),
+      ]);
+      toast.success(t("deleted"));
+    },
+    onError: (failure) => toast.error(getErrorMessage(failure, tErrors)),
+  });
+
+  return { groups: data?.items ?? [], isLoading, isFetching, error, create, update, remove };
+}
+
+/** Who is in one group, and adding or removing somebody by hand. */
+export function useGroupMembers(orgId: string, groupId: string) {
+  const t = useTranslations("groups");
+  const tErrors = useTranslations("errors");
+  const invalidate = useInvalidateGroups(orgId);
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: qk.organizations.groupMembers(orgId, groupId),
+    queryFn: () => listGroupMembers(orgId, groupId),
+  });
+
+  const add = useMutation({
+    mutationFn: (userId: string) => addGroupMember(orgId, groupId, userId),
+    onSuccess: async () => {
+      await invalidate();
+      toast.success(t("memberAdded"));
+    },
+    onError: (failure) => toast.error(getErrorMessage(failure, tErrors)),
+  });
+
+  const remove = useMutation({
+    mutationFn: (userId: string) => removeGroupMember(orgId, groupId, userId),
+    onSuccess: async () => {
+      await invalidate();
+      toast.success(t("memberRemoved"));
+    },
+    onError: (failure) => toast.error(getErrorMessage(failure, tErrors)),
+  });
+
+  const setLead = useMutation({
+    mutationFn: ({ userId, isLead }: { userId: string; isLead: boolean }) =>
+      setGroupLead(orgId, groupId, userId, isLead),
+    onSuccess: async () => {
+      await invalidate();
+      toast.success(t("leadChanged"));
+    },
+    onError: (failure) => toast.error(getErrorMessage(failure, tErrors)),
+  });
+
+  return { members: data?.items ?? [], isLoading, error, add, remove, setLead };
+}
+
+/**
+ * What the caller could share with one group, and sharing several at once (#2072).
+ *
+ * Used by the dialog that offers it, which mounts only when opened: the list is
+ * everything the caller may edit, of every kind.
+ */
+export function useGroupSharing(orgId: string, groupId: string) {
+  const t = useTranslations("groups");
+  const tErrors = useTranslations("errors");
+  const queryClient = useQueryClient();
+  const { data, isLoading, error } = useQuery({
+    queryKey: qk.organizations.groupShareable(orgId, groupId),
+    queryFn: () => listShareableWithGroup(orgId, groupId),
+    enabled: !!orgId && !!groupId,
+  });
+  const share = useMutation({
+    mutationFn: (request: GroupShareRequest) => shareWithGroup(orgId, groupId, request),
+    onSuccess: async (_done, request) => {
+      await queryClient.invalidateQueries({
+        queryKey: qk.organizations.groupResources(orgId, groupId),
+      });
+      await queryClient.invalidateQueries({
+        queryKey: qk.organizations.groupShareable(orgId, groupId),
+      });
+      toast.success(t("sharedWithGroup", { count: request.items.length }));
+    },
+    onError: (failure) => toast.error(getErrorMessage(failure, tErrors)),
+  });
+  return { shareable: data?.items ?? [], isLoading, error, share };
+}
+
+/** What one group has been given - agents, knowledge, skills, context and apps (#2072). */
+export function useGroupResources(orgId: string, groupId: string) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: qk.organizations.groupResources(orgId, groupId),
+    queryFn: () => listGroupResources(orgId, groupId),
+    enabled: !!orgId && !!groupId,
+  });
+  return { resources: data?.items ?? [], isLoading, error };
+}
+
+/**
+ * Every department's month against its cap (#2072). Off for a caller without
+ * `runs:view`, whom the server would refuse.
+ */
+export function useGroupSpend(orgId: string | null | undefined, enabled = true) {
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: qk.organizations.groupSpend(orgId ?? ""),
+    queryFn: () => getGroupSpend(orgId ?? ""),
+    enabled: !!orgId && enabled,
+  });
+  return { spend: data, isLoading, error, refetch };
+}
+
+/**
+ * How each department's people rated answers in a window (#2101). Off for a
+ * caller without `runs:view`, whom the server would refuse.
+ */
+export function useGroupsQuality(
+  orgId: string | null | undefined,
+  window: QualityWindow,
+  enabled = true,
+) {
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: qk.organizations.groupsQuality(orgId ?? "", window),
+    queryFn: () => getGroupsQuality(orgId ?? "", window),
+    enabled: !!orgId && enabled,
+  });
+  return { quality: data, isLoading, error, refetch };
+}
+
+/**
+ * One department's answer quality over the last 30 days (#2101): the split, its
+ * busiest agents and its worst-rated answers. Off unless the caller may read it -
+ * `runs:view`, or leading this department.
+ */
+export function useGroupQuality(
+  orgId: string | null | undefined,
+  groupId: string | null | undefined,
+  enabled = true,
+) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: qk.organizations.groupQuality(orgId ?? "", groupId ?? ""),
+    queryFn: () => getGroupQuality(orgId ?? "", groupId ?? ""),
+    enabled: !!orgId && !!groupId && enabled,
+  });
+  return { quality: data, isLoading, error };
+}
+
+/**
+ * Create several departments at once from the templates (#2072), with one toast.
+ *
+ * One at a time, so a name already taken stops the batch where it is rather than
+ * leaving the reader to work out which of five requests failed.
+ */
+export function useAddDepartments(orgId: string) {
+  const t = useTranslations("groups");
+  const tErrors = useTranslations("errors");
+  const invalidate = useInvalidateGroups(orgId);
+  return useMutation({
+    mutationFn: async (departments: GroupCreate[]) => {
+      for (const department of departments) await createGroup(orgId, department);
+      return departments.length;
+    },
+    onSuccess: async (count) => {
+      await invalidate();
+      toast.success(t("departmentsAdded", { count }));
+    },
+    onError: async (failure) => {
+      await invalidate();
+      toast.error(getErrorMessage(failure, tErrors));
+    },
+  });
+}

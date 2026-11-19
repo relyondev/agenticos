@@ -1,0 +1,943 @@
+"""Skills - an organization's reusable know-how, stored in the database.
+
+A skill is a piece of know-how written once and attached to many agents: how
+refunds are handled, what the house style is, which checks a report must pass.
+This module owns storage and access; turning skills into something an agent can
+read is the skills *capability*.
+"""
+
+import logging
+from collections.abc import Sequence
+from enum import StrEnum
+from typing import Annotated
+from uuid import UUID
+
+from pydantic import StringConstraints, TypeAdapter
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core import catalog
+from app.core.audit import record_audit
+from app.core.exceptions import AlreadyExistsError, BadRequestError, NotFoundError
+from app.core.excerpt import excerpt
+from app.core.permissions import AuthContext, Perm
+from app.db.models.resource_grant import Visibility
+from app.db.models.skill import Skill, SkillResource
+from app.db.updates import writable
+from app.repositories import resource_grant_repo, skill_repo
+from app.repositories.skill import SkillSort
+from app.schemas.skill import (
+    GalleryIndustryRead,
+    GalleryInstallResult,
+    GallerySkillRead,
+    SkillGallery,
+    SkillList,
+    SkillResourceUpdate,
+    SkillSummary,
+    SkillUpdate,
+    skill_name_refusal,
+)
+from app.services import skill_library
+from app.services.access import SKILL, accessible_ids, resolve_access, visible_resource_ids
+from app.services.resource_usage import agents_using, groups_sharing, shared_with_group
+from app.services.sharing import SharingService
+
+logger = logging.getLogger(__name__)
+
+# The shelf names the pickers suggest before an organization has invented its
+# own. Data, not behaviour - a deployment edits the catalog file - and bounded
+# like `SkillCreate.category`, so a suggestion is never something the create
+# endpoint would then refuse.
+SUGGESTED_CATEGORIES: tuple[str, ...] = catalog.load(
+    "skill_categories.json",
+    TypeAdapter(tuple[Annotated[str, StringConstraints(min_length=1, max_length=64)], ...]),
+)
+
+# What a skill's files may be. They are handed to a model as text, so a format
+# it cannot read is not a smaller feature - it is a file the agent is told
+# about and then cannot use.
+MAX_RESOURCE_BYTES = 512 * 1024
+
+
+def _summary(skill: Skill, bundled_names: frozenset[str]) -> SkillSummary:
+    """A skill as the listing shows it.
+
+    `built_in` is a name match against the shipped library because that is
+    all installing keeps: an install copies the folder into an ordinary row,
+    and the name - unique per organization, never editable - is the one trace
+    of where it came from.
+    """
+    return SkillSummary(
+        id=skill.id,
+        name=skill.name,
+        description=skill.description,
+        category=skill.category,
+        visibility=skill.visibility,
+        file_count=len(skill.resources),
+        built_in=skill.name in bundled_names,
+        excerpt=excerpt(skill.content),
+    )
+
+
+def _clean_resource_path(raw: str) -> str:
+    """A resource name from an uploaded path, or a refusal.
+
+    Uploads arrive with whatever the browser sent: a leading folder from a
+    directory picker, Windows separators, and - from an archive somebody
+    crafted - `..`. The name is a key in a table rather than a location on
+    disk, so nothing here can escape anything; it is refused anyway, because a
+    name that *reads* as an escape is a name nobody can reason about.
+    """
+    parts = [segment for segment in raw.replace("\\", "/").split("/") if segment not in ("", ".")]
+    if any(segment == ".." for segment in parts):
+        raise BadRequestError(
+            message=f"'{raw}' is not a usable file name - a path cannot step outside the skill",
+            details={"name": raw},
+        )
+    name = "/".join(parts)
+    if not name:
+        raise BadRequestError(message="A file needs a name", details={"name": raw})
+    if len(name) > 128:
+        raise BadRequestError(
+            message=f"'{name}' is too long a path - 128 characters is the limit",
+            details={"name": name},
+        )
+    return name
+
+
+def _decode_text(name: str, raw: bytes) -> str:
+    """The file as text, or a refusal that says which file and why.
+
+    Skills are read by a model, and what it receives is a string. A PDF stored
+    here would be handed over as mojibake - a file the agent is told it has and
+    cannot use, which is worse than not having it.
+    """
+    if len(raw) > MAX_RESOURCE_BYTES:
+        raise BadRequestError(
+            message=f"'{name}' is over {MAX_RESOURCE_BYTES // 1024} KB",
+            details={"name": name},
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BadRequestError(
+            message=(
+                f"'{name}' is not text. A skill's files are handed to the model as text, so a "
+                "binary one would arrive as noise - keep it somewhere the agent can fetch and "
+                "reference it by URL instead."
+            ),
+            details={"name": name},
+        ) from exc
+
+
+class LibraryRefresh(StrEnum):
+    """What `seed-skills` does, or would do, with one bundled skill."""
+
+    INSTALL = "install"
+    """The organization has no skill by that name."""
+    CURRENT = "current"
+    """Its copy already says what the shipped folder says."""
+    UPDATE = "update"
+    """An unedited copy of an earlier version - or an edited one, when asked to."""
+    EDITED = "edited"
+    """Edited here since it was copied; left alone."""
+    UNTRACKED = "untracked"
+    """Copied before fingerprints were kept and different now; left alone."""
+
+
+def _fingerprint_of(skill: Skill) -> str:
+    """The fingerprint of what the organization's copy says now."""
+    return skill_library.fingerprint(
+        description=skill.description,
+        category=skill.category,
+        content=skill.content,
+        resources=(
+            (resource.name, resource.content, resource.description) for resource in skill.resources
+        ),
+    )
+
+
+def _refresh_plan(
+    existing: Skill | None, bundled: skill_library.LibrarySkill, *, replace_edited: bool
+) -> LibraryRefresh:
+    if existing is None:
+        return LibraryRefresh.INSTALL
+    here = _fingerprint_of(existing)
+    if here == bundled.fingerprint:
+        return LibraryRefresh.CURRENT
+    if here == existing.library_fingerprint or replace_edited:
+        return LibraryRefresh.UPDATE
+    if existing.library_fingerprint is None:
+        return LibraryRefresh.UNTRACKED
+    return LibraryRefresh.EDITED
+
+
+class SkillService:
+    """Manage an organization's skills."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get(
+        self, ctx: AuthContext, skill_id: UUID, *, perm: Perm = Perm.SKILLS_VIEW
+    ) -> Skill:
+        skill = await skill_repo.get(self.db, skill_id, organization_id=ctx.organization_id)
+        if skill is None:
+            raise NotFoundError(message="Skill not found", details={"skill_id": str(skill_id)})
+        if not await resolve_access(self.db, ctx, skill, perm, resource_type=SKILL):
+            raise NotFoundError(message="Skill not found", details={"skill_id": str(skill_id)})
+        return skill
+
+    async def list_skills(
+        self,
+        ctx: AuthContext,
+        *,
+        shared_with_me: bool = False,
+        search: str | None = None,
+        categories: Sequence[str] | None = None,
+        group_id: UUID | None = None,
+        sort: SkillSort = "name",
+        skip: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[Skill], int]:
+        """A page of the skills this caller may see, and how many there are in all.
+
+        Scoped like every shared resource: a role that reaches the whole
+        organization lists everything, anyone else lists their own skills, the
+        org-visible ones and those explicitly shared with them - the same set
+        :func:`resolve_access` would admit one row at a time. `shared_with_me`
+        narrows to what was deliberately shared with the caller - org-visible
+        or explicitly granted, and not their own. `group_id` narrows to the
+        skills shared with one group.
+        """
+        # `None` is `visible_resource_ids` saying the role already reaches every
+        # skill, which is exactly what `see_all` tells the query - so both come
+        # from the one call rather than from the scope being read twice and the
+        # two answers being trusted to agree.
+        shared = await visible_resource_ids(
+            self.db, ctx, resource_type=SKILL, perm=Perm.SKILLS_VIEW
+        )
+        grant_ids = [] if shared is None else shared
+        if shared_with_me and shared is None:
+            # A role that reaches everything never looks its grants up - but
+            # "shared with me" is a question about grants and visibility, not
+            # reach, and without them the answer would degenerate into "the
+            # whole organization minus mine".
+            grant_ids = await resource_grant_repo.list_shared_ids(
+                self.db,
+                organization_id=ctx.organization_id,
+                subject_user_id=ctx.subject_id,
+                resource_type=SKILL.key,
+            )
+        return await skill_repo.list_visible(
+            self.db,
+            organization_id=ctx.organization_id,
+            user_id=ctx.subject_id,
+            see_all=shared is None,
+            shared_ids=grant_ids,
+            shared_with_me=shared_with_me,
+            only_ids=await shared_with_group(self.db, ctx, resource_type=SKILL, group_id=group_id),
+            search=search,
+            categories=categories,
+            sort=sort,
+            skip=skip,
+            limit=limit,
+        )
+
+    async def list_readable(
+        self,
+        ctx: AuthContext,
+        *,
+        shared_with_me: bool = False,
+        search: str | None = None,
+        categories: Sequence[str] | None = None,
+        group_id: UUID | None = None,
+        sort: SkillSort = "name",
+        skip: int = 0,
+        limit: int = 50,
+    ) -> SkillList:
+        """The listing: a page of skills, and everything the page around it needs.
+
+        Three things that are not the page itself travel with it. `total` is the
+        count before paging, which a pager needs and a page cannot supply.
+        `categories` is the whole organization's rather than the page's - a
+        filter chip that vanished with the page it filtered would strand
+        whoever pressed it. `suggested_categories` is the shipped list, for an
+        organization that has not invented its own yet.
+
+        `categories` stays the organization's under `shared_with_me` too: the
+        chips describe what can be filtered to, and narrowing them to the
+        shared subset would make the filter disappear as soon as it was used.
+
+        The listing used to top itself up, copying in any bundled skill the
+        organization did not have. That made a deleted one come back on the
+        next visit, so the only way to retire a shipped skill was to disable it
+        - which is a workaround for a listing that refused to let go. An
+        organization is seeded at creation and `agenticos cmd seed-skills`
+        re-runs that deliberately; the gallery is where a skill is chosen. None
+        of those needs a page that quietly writes rows while it reads.
+        """
+        items, total = await self.list_skills(
+            ctx,
+            shared_with_me=shared_with_me,
+            search=search,
+            categories=categories,
+            group_id=group_id,
+            sort=sort,
+            skip=skip,
+            limit=limit,
+        )
+        bundled_names = frozenset(entry.name for entry in skill_library.library())
+        used = await agents_using(
+            self.db, ctx, field="skill_ids", resource_ids=[skill.id for skill in items]
+        )
+        groups = await groups_sharing(
+            self.db, ctx, resource_type=SKILL, resource_ids=[skill.id for skill in items]
+        )
+        editable = await accessible_ids(self.db, ctx, items, Perm.SKILLS_EDIT, resource_type=SKILL)
+        return SkillList(
+            items=[
+                _summary(skill, bundled_names).model_copy(
+                    update={
+                        "used_by": used[skill.id],
+                        "shared_groups": groups[skill.id],
+                        "can_edit": skill.id in editable,
+                    }
+                )
+                for skill in items
+            ],
+            total=total,
+            categories=await self.list_categories(ctx),
+            suggested_categories=list(SUGGESTED_CATEGORIES),
+        )
+
+    async def list_categories(self, ctx: AuthContext) -> list[str]:
+        """Every distinct category in this organization, for the listing's filter."""
+        return await skill_repo.list_categories(self.db, organization_id=ctx.organization_id)
+
+    async def resolve_for_agent(self, ctx: AuthContext, skill_ids: list[UUID]) -> list[Skill]:
+        """The skills an agent is bound to.
+
+        Scoped to the run's organization and **not** to the runner's own access,
+        which is deliberate and is the same rule delegates and collections follow:
+        the binding is checked once, against the publisher, when the agent is
+        published, and the agent then reads it for everyone who may run it. See
+        `_skill_problems` in `app/services/agent_registry.py` for the check.
+
+        Re-checking here would be wrong twice over. `resolve_access` refuses every
+        context with no subject, so an API key, an embedded widget and a channel
+        message - the surfaces this platform exists to serve - would each lose
+        every skill the agent has. And where there *is* a subject, an agent's
+        instructions would change with who asked: a member or a viewer, whose role
+        gives `SKILLS_VIEW: Scope.SHARED`, would get a thinner answer out of the
+        same published version than a builder does, with the difference visible
+        nowhere.
+
+        A skill deleted after publish is skipped rather than failing
+        the run: the agent is less capable, not broken. Named in the log with the
+        organization, because from inside one tenant a row that was deleted and a
+        row that belongs to another tenant leave the same absence - and the second
+        is a spec somebody should look at rather than a skill somebody removed.
+        """
+        if not skill_ids:
+            return []
+        found = await skill_repo.get_many(self.db, skill_ids, organization_id=ctx.organization_id)
+        resolved = []
+        for skill_id in skill_ids:
+            skill = found.get(skill_id)
+            if skill is None:
+                logger.warning(
+                    "Agent references skill %s which is deleted or not org %s's",
+                    skill_id,
+                    ctx.organization_id,
+                )
+                continue
+            resolved.append(skill)
+        return resolved
+
+    async def create(
+        self,
+        ctx: AuthContext,
+        *,
+        name: str,
+        description: str,
+        content: str,
+        category: str | None = None,
+        visibility: Visibility = Visibility.PRIVATE,
+        library_fingerprint: str | None = None,
+        group_ids: list[UUID] | None = None,
+        user_ids: list[UUID] | None = None,
+    ) -> Skill:
+        """Create a skill.
+
+        Raises:
+            BadRequestError: If the name is not one a model can load the skill
+                by. `SkillCreate` refuses it too, but an applied skill proposal
+                arrives here with an agent's directory name and no schema.
+            AlreadyExistsError: If the name is taken. Names are how the model
+                refers to a skill, so two with one name is an ambiguity the
+                agent cannot resolve.
+        """
+        refusal = skill_name_refusal(name)
+        if refusal is not None:
+            raise BadRequestError(message=refusal, details={"name": name})
+        if await skill_repo.get_by_name(self.db, name, organization_id=ctx.organization_id):
+            raise AlreadyExistsError(
+                message=(
+                    f"A skill named '{name}' already exists. The name is how a model refers to a "
+                    "skill and cannot be changed afterwards, so choose a different one - or open "
+                    "the existing skill and edit it, which reaches every agent bound to it."
+                ),
+                details={"name": name},
+            )
+        skill = await skill_repo.create(
+            self.db,
+            organization_id=ctx.organization_id,
+            owner_user_id=ctx.user_id,
+            name=name,
+            description=description,
+            content=content,
+            category=category,
+            visibility=visibility.value,
+            library_fingerprint=library_fingerprint,
+        )
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.created",
+            target_type="skill",
+            target_id=str(skill.id),
+            details={"name": name},
+        )
+        if group_ids or user_ids:
+            await SharingService(self.db).restrict_to(
+                ctx,
+                skill,
+                resource_type=SKILL,
+                group_ids=group_ids or [],
+                user_ids=user_ids or [],
+            )
+        return skill
+
+    async def update(self, ctx: AuthContext, skill_id: UUID, data: SkillUpdate) -> Skill:
+        """Edit a skill, bumping its version.
+
+        The version is informational - agents bind to a skill, not a version, so
+        an edit reaches every agent immediately. That is the point of skills:
+        fix the policy once.
+        """
+        skill = await self.get(ctx, skill_id, perm=Perm.SKILLS_EDIT)
+        update_data = {**writable(data, over=Skill), "version": skill.version + 1}
+        updated = await skill_repo.update(self.db, skill=skill, update_data=update_data)
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.updated",
+            target_type="skill",
+            target_id=str(skill.id),
+            # An edit changes the instructions every bound agent executes on its
+            # next run - the highest-consequence of the three skill events, and
+            # the one most worth being able to attribute afterwards.
+            details={"name": skill.name, "version": updated.version, "fields": sorted(update_data)},
+        )
+        return updated
+
+    async def install_from_library(self, ctx: AuthContext, key: str) -> Skill:
+        """Copy a bundled skill into this organization, files and all.
+
+        A copy, not a link. From this moment it is an ordinary skill the
+        organization owns and can edit - which is the whole point of skills, and
+        would be taken away by a live reference back to the shipped folder.
+
+        Always organization-visible, set at creation rather than by a follow-up
+        edit: a bundled skill is for everybody, and the only callers left are
+        the seeding paths - organization creation and `seed-skills` - since the
+        per-person Install button was dropped (#281).
+
+        Both seed as the organization's first owner, so the audit entry's
+        actor is an attribution rather than a person who acted. `seeded: true`
+        in its details is what keeps that honest - it is how a reader tells
+        "the platform seeded this as the owner" from a write the owner made.
+
+        Raises:
+            NotFoundError: If no such skill ships with this deployment.
+            AlreadyExistsError: If the organization already has one by that
+                name - seeding twice would otherwise produce a second skill
+                the model cannot tell from the first.
+        """
+        bundled = skill_library.get(key)
+        if bundled is None:
+            raise NotFoundError(message="No such bundled skill", details={"key": key})
+        return await self._copy_library_skill(ctx, bundled, seeded=True)
+
+    async def plan_library_refresh(
+        self, ctx: AuthContext, key: str, *, replace_edited: bool = False
+    ) -> LibraryRefresh:
+        """What `refresh_from_library` would do with one bundled skill, writing nothing.
+
+        Raises:
+            NotFoundError: If no such skill ships with this deployment.
+        """
+        bundled, existing = await self._library_pair(ctx, key)
+        return _refresh_plan(existing, bundled, replace_edited=replace_edited)
+
+    async def refresh_from_library(
+        self, ctx: AuthContext, key: str, *, replace_edited: bool = False
+    ) -> LibraryRefresh:
+        """Bring the organization's copy of a bundled skill up to the shipped version.
+
+        Missing, it is installed. An unedited copy of an earlier version - one
+        that still matches the fingerprint it was written with - is replaced,
+        files and all, with its version bumped, because nobody chose what it
+        says: the platform did, and the platform now says something better. A
+        copy edited here is the organization's and is left alone unless
+        `replace_edited` says to take the bundled version over the edits, and so
+        is one copied before fingerprints were kept, since nothing can tell
+        whether it was edited.
+
+        Raises:
+            NotFoundError: If no such skill ships with this deployment.
+            AlreadyExistsError: If another writer installed it between the check
+                and the copy - the listing's top-up, racing a seed.
+        """
+        bundled, existing = await self._library_pair(ctx, key)
+        return await self._refresh_bundled(ctx, bundled, existing, replace_edited=replace_edited)
+
+    async def refresh_gallery(
+        self, ctx: AuthContext, key: str, *, dry_run: bool = False, replace_edited: bool = False
+    ) -> LibraryRefresh:
+        """Refresh a gallery copy using the same edit protection as seeded skills."""
+        bundled = skill_library.gallery_get(key)
+        if bundled is None:
+            raise NotFoundError(message="No such gallery skill", details={"key": key})
+        existing = await skill_repo.get_by_name(
+            self.db, bundled.name, organization_id=ctx.organization_id
+        )
+        if existing is not None:
+            await self.get(ctx, existing.id, perm=Perm.SKILLS_EDIT)
+        if dry_run:
+            return _refresh_plan(existing, bundled, replace_edited=replace_edited)
+        return await self._refresh_bundled(ctx, bundled, existing, replace_edited=replace_edited)
+
+    async def _refresh_bundled(
+        self,
+        ctx: AuthContext,
+        bundled: skill_library.LibrarySkill,
+        existing: Skill | None,
+        *,
+        replace_edited: bool,
+    ) -> LibraryRefresh:
+        if existing is not None:
+            # Locked and re-read before deciding: an edit a member commits between
+            # the lookup and the overwrite would otherwise be judged on the copy as
+            # it was, found unedited, and replaced. Every edit writes the skill row
+            # (a file edit bumps its version), so the lock serializes with each.
+            existing = await skill_repo.lock(self.db, existing.id)
+        plan = _refresh_plan(existing, bundled, replace_edited=replace_edited)
+        if existing is None:
+            await self._copy_library_skill(ctx, bundled, seeded=True)
+        elif plan is LibraryRefresh.UPDATE:
+            await self._overwrite_from_library(
+                ctx,
+                existing,
+                bundled,
+                replaced_edits=_fingerprint_of(existing) != existing.library_fingerprint,
+            )
+        elif plan is LibraryRefresh.CURRENT and existing.library_fingerprint != bundled.fingerprint:
+            # Says what the folder says, but was never stamped as saying it -
+            # copied before fingerprints were kept. Stamp it, so the next release
+            # can tell an untouched copy from an edited one.
+            await skill_repo.update(
+                self.db, skill=existing, update_data={"library_fingerprint": bundled.fingerprint}
+            )
+        return plan
+
+    async def _library_pair(
+        self, ctx: AuthContext, key: str
+    ) -> tuple[skill_library.LibrarySkill, Skill | None]:
+        bundled = skill_library.get(key)
+        if bundled is None:
+            raise NotFoundError(message="No such bundled skill", details={"key": key})
+        existing = await skill_repo.get_by_name(
+            self.db, bundled.name, organization_id=ctx.organization_id
+        )
+        return bundled, existing
+
+    async def _overwrite_from_library(
+        self,
+        ctx: AuthContext,
+        skill: Skill,
+        bundled: skill_library.LibrarySkill,
+        *,
+        replaced_edits: bool,
+    ) -> None:
+        for resource in list(skill.resources):
+            await skill_repo.delete_resource(self.db, resource)
+        # The loaded collection still holds the rows just deleted, and the update
+        # below refreshes the skill - see `remove_resource` for what that did.
+        self.db.expire(skill, ["resources"])
+        for resource in bundled.resources:
+            await skill_repo.create_resource(
+                self.db,
+                skill_id=skill.id,
+                name=resource.name,
+                description=None,
+                content=resource.content,
+            )
+        updated = await skill_repo.update(
+            self.db,
+            skill=skill,
+            update_data={
+                "description": bundled.description,
+                "content": bundled.content,
+                "category": bundled.category,
+                "version": skill.version + 1,
+                "library_fingerprint": bundled.fingerprint,
+            },
+        )
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.refreshed",
+            target_type="skill",
+            target_id=str(skill.id),
+            # What every bound agent executes changed, and `replaced_edits` is
+            # the part somebody may go looking for: whether an operator chose to
+            # take the bundled version over what the organization had written.
+            details={
+                "key": bundled.key,
+                "name": bundled.name,
+                "version": updated.version,
+                "resources": len(bundled.resources),
+                "seeded": True,
+                "replaced_edits": replaced_edits,
+            },
+        )
+
+    async def _copy_library_skill(
+        self,
+        ctx: AuthContext,
+        bundled: skill_library.LibrarySkill,
+        *,
+        seeded: bool,
+    ) -> Skill:
+        """Write one library or gallery folder in as an ordinary skill.
+
+        Shared by the seeding paths and by the gallery, because a copy is a copy
+        - what differs is who is recorded as having made it. `seeded` is that
+        difference and it is the audit entry's honesty: true means the platform
+        wrote this as the organization's owner, false means a person chose it.
+        """
+        skill = await self.create(
+            ctx,
+            name=bundled.name,
+            description=bundled.description,
+            content=bundled.content,
+            category=bundled.category,
+            visibility=Visibility.ORG,
+            library_fingerprint=bundled.fingerprint,
+        )
+        for resource in bundled.resources:
+            await skill_repo.create_resource(
+                self.db,
+                skill_id=skill.id,
+                name=resource.name,
+                description=None,
+                content=resource.content,
+            )
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.installed",
+            target_type="skill",
+            target_id=str(skill.id),
+            details={
+                "key": bundled.key,
+                "name": bundled.name,
+                "resources": len(bundled.resources),
+                "seeded": seeded,
+            },
+        )
+        return skill
+
+    async def gallery(self, ctx: AuthContext) -> SkillGallery:
+        """The opt-in gallery, with what this organization already has marked.
+
+        `installed` is matched on *name* rather than on key, which is the same
+        rule installing uses: the organization owns its copy from the moment it
+        lands, so a renamed folder in a later release must not offer a second
+        copy of a skill somebody is already editing.
+        """
+        names = frozenset(await skill_repo.list_names(self.db, organization_id=ctx.organization_id))
+        return SkillGallery(
+            industries=[
+                GalleryIndustryRead(
+                    id=industry.id,
+                    skills=[
+                        GallerySkillRead(
+                            key=entry.key,
+                            name=entry.name,
+                            description=entry.description,
+                            category=entry.category,
+                            installed=entry.name in names,
+                        )
+                        for entry in industry.skills
+                    ],
+                )
+                for industry in skill_library.gallery()
+            ]
+        )
+
+    async def install_gallery(self, ctx: AuthContext, keys: Sequence[str]) -> GalleryInstallResult:
+        """Copy gallery skills into this organization, as the caller.
+
+        Not as the organization's owner, which is what the seeding paths do:
+        somebody clicked this, so the audit entry names them and the skill is
+        theirs to have chosen. There is no `seeded` flag on it for the same
+        reason.
+
+        Every outcome is reported rather than raised. A shelf of ten where one
+        is already present must install the other nine, so an existing name is
+        `skipped` and an unrecognised key is `unknown` - and a request that
+        installs nothing is still a 200 describing why.
+        """
+        names = set(await skill_repo.list_names(self.db, organization_id=ctx.organization_id))
+        installed: list[str] = []
+        skipped: list[str] = []
+        unknown: list[str] = []
+
+        for key in dict.fromkeys(keys):
+            entry = skill_library.gallery_get(key)
+            if entry is None:
+                unknown.append(key)
+                continue
+            if entry.name in names:
+                skipped.append(entry.name)
+                continue
+            # Inside a SAVEPOINT, because the name check above is a read and two
+            # members installing one shelf at the same time both pass it. The
+            # loser's insert then violated `uq_skill_org_name` as an unhandled
+            # IntegrityError, which rolled back every skill that request had
+            # already copied - where the endpoint promises the shelf continues
+            # and this entry is reported as `skipped`. The savepoint makes that
+            # promise true: the conflict undoes this copy and nothing else.
+            try:
+                async with self.db.begin_nested():
+                    await self._copy_library_skill(ctx, entry, seeded=False)
+            except IntegrityError:
+                logger.warning(
+                    "Gallery skill %r was installed concurrently; reported as skipped", entry.key
+                )
+                skipped.append(entry.name)
+                names.add(entry.name)
+                continue
+            # Two keys in one request can carry the same name only if the
+            # gallery ships a duplicate; tracking it here keeps that a skip
+            # rather than a unique-name violation mid-request.
+            names.add(entry.name)
+            installed.append(entry.name)
+
+        return GalleryInstallResult(installed=installed, skipped=skipped, unknown=unknown)
+
+    async def add_resource(
+        self,
+        ctx: AuthContext,
+        skill_id: UUID,
+        *,
+        name: str,
+        description: str | None,
+        content: str,
+    ) -> SkillResource:
+        """Attach a file to a skill.
+
+        A skill is not only its body. The body says how the work is done; the
+        files are the reference table, the template, the worked example - the
+        detail that would bury the instructions if it were inlined and that the
+        model loads only when it decides it needs it.
+
+        Editing a skill bumps its version, and so does this: every bound agent
+        executes against the new set of files from its next run, which is the
+        same fact an edit to the body reports.
+
+        Raises:
+            AlreadyExistsError: If a file of that name is already attached. The
+                name is what the model asks for, so two of them is a reference
+                nothing can resolve.
+        """
+        skill = await self.get(ctx, skill_id, perm=Perm.SKILLS_EDIT)
+        if await skill_repo.get_resource_by_name(self.db, name, skill_id=skill.id):
+            raise AlreadyExistsError(
+                message=(
+                    f"'{skill.name}' already has a file called '{name}'. The name is how the "
+                    "model asks for it, so it has to be unique within the skill."
+                ),
+                details={"name": name},
+            )
+        resource = await skill_repo.create_resource(
+            self.db,
+            skill_id=skill.id,
+            name=name,
+            description=description,
+            content=content,
+        )
+        await self._bump_version(skill)
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.resource_added",
+            target_type="skill",
+            target_id=str(skill.id),
+            details={"name": skill.name, "resource": name},
+        )
+        return resource
+
+    async def put_resources(
+        self,
+        ctx: AuthContext,
+        skill_id: UUID,
+        files: Sequence[tuple[str, bytes]],
+    ) -> list[SkillResource]:
+        """Write a set of files at once - an upload of a folder, or of several.
+
+        Named by relative path, so a folder keeps its shape: ``references/
+        workflows.md`` is one resource whose name says where it sits. There are
+        no folder rows and there is deliberately no folder table - a folder is
+        a prefix that some file has, which means an empty one cannot exist and
+        nothing has to keep the two in step.
+
+        A path that already exists is replaced rather than refused. This is the
+        upload path: somebody dragging a corrected folder in means the corrected
+        version, and asking them to delete the old one first is asking them to
+        do the merge by hand.
+
+        Raises:
+            BadRequestError: If a file is not text, or a path escapes the skill.
+                Both are refused for the same reason - what the model is handed
+                has to be readable, and a name is a key rather than a location
+                on anybody's disk.
+        """
+        skill = await self.get(ctx, skill_id, perm=Perm.SKILLS_EDIT)
+
+        written: list[SkillResource] = []
+        for raw_name, raw_content in files:
+            name = _clean_resource_path(raw_name)
+            content = _decode_text(name, raw_content)
+
+            existing = await skill_repo.get_resource_by_name(self.db, name, skill_id=skill.id)
+            if existing is not None:
+                written.append(
+                    await skill_repo.update_resource(
+                        self.db, resource=existing, update_data={"content": content}
+                    )
+                )
+                continue
+            written.append(
+                await skill_repo.create_resource(
+                    self.db,
+                    skill_id=skill.id,
+                    name=name,
+                    description=None,
+                    content=content,
+                )
+            )
+
+        await self._bump_version(skill)
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.resources_uploaded",
+            target_type="skill",
+            target_id=str(skill.id),
+            details={"name": skill.name, "files": [resource.name for resource in written]},
+        )
+        return written
+
+    async def get_resource(
+        self, ctx: AuthContext, skill_id: UUID, resource_id: UUID
+    ) -> SkillResource:
+        """One file, with its body. Reached only through the skill that owns it."""
+        skill = await self.get(ctx, skill_id)
+        resource = await skill_repo.get_resource(self.db, resource_id, skill_id=skill.id)
+        if resource is None:
+            raise NotFoundError(message="File not found", details={"resource_id": str(resource_id)})
+        return resource
+
+    async def update_resource(
+        self, ctx: AuthContext, skill_id: UUID, resource_id: UUID, data: SkillResourceUpdate
+    ) -> SkillResource:
+        skill = await self.get(ctx, skill_id, perm=Perm.SKILLS_EDIT)
+        resource = await skill_repo.get_resource(self.db, resource_id, skill_id=skill.id)
+        if resource is None:
+            raise NotFoundError(message="File not found", details={"resource_id": str(resource_id)})
+        updated = await skill_repo.update_resource(
+            self.db, resource=resource, update_data=writable(data, over=SkillResource)
+        )
+        await self._bump_version(skill)
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.resource_updated",
+            target_type="skill",
+            target_id=str(skill.id),
+            details={"name": skill.name, "resource": resource.name},
+        )
+        return updated
+
+    async def remove_resource(self, ctx: AuthContext, skill_id: UUID, resource_id: UUID) -> None:
+        skill = await self.get(ctx, skill_id, perm=Perm.SKILLS_EDIT)
+        resource = await skill_repo.get_resource(self.db, resource_id, skill_id=skill.id)
+        if resource is None:
+            raise NotFoundError(message="File not found", details={"resource_id": str(resource_id)})
+        name = resource.name
+        await skill_repo.delete_resource(self.db, resource)
+        # `skill.resources` was loaded with the skill and still holds the row just deleted;
+        # the version bump below refreshes the skill and SQLAlchemy refuses to refresh a
+        # collection carrying a deleted instance ("Instance ... has been deleted"), which
+        # answered every DELETE of a resource with a 500 and rolled the delete back
+        # (2026-09-14). Expiring the collection makes the refresh reload it from the table.
+        self.db.expire(skill, ["resources"])
+        await self._bump_version(skill)
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.resource_removed",
+            target_type="skill",
+            target_id=str(skill.id),
+            details={"name": skill.name, "resource": name},
+        )
+
+    async def _bump_version(self, skill: Skill) -> None:
+        """Record that what bound agents execute has changed.
+
+        A file is part of the skill as far as an agent is concerned, so adding,
+        editing or removing one is the same kind of event as editing the body -
+        and a version that only moved for the body would say an agent was
+        unchanged when its reference table had been rewritten.
+        """
+        await skill_repo.update(self.db, skill=skill, update_data={"version": skill.version + 1})
+
+    async def delete(self, ctx: AuthContext, skill_id: UUID) -> None:
+        skill = await self.get(ctx, skill_id, perm=Perm.SKILLS_EDIT)
+        await resource_grant_repo.delete_for_resource(
+            self.db,
+            organization_id=ctx.organization_id,
+            resource_type=SKILL.key,
+            resource_id=skill.id,
+        )
+        await skill_repo.delete(self.db, skill)
+        await record_audit(
+            self.db,
+            actor_user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            action="skill.deleted",
+            target_type="skill",
+            target_id=str(skill_id),
+        )

@@ -1,0 +1,1942 @@
+"""Tests for Knowledge Base scoping - personal / org / app access rules."""
+
+import uuid
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
+
+import pytest
+
+from app.core import background
+from app.core.exceptions import AuthorizationError, BadRequestError, NotFoundError
+from app.core.permissions import AuthContext, OrgRoleName
+from app.db.models.knowledge_base import KBScope, KnowledgeBase
+from app.db.models.resource_grant import GrantLevel, Visibility
+from app.db.vector_tables import VectorScope
+from app.repositories.rag_document import CollectionCounts, CollectionScope, DeletedDocuments
+from app.schemas.knowledge_base import KnowledgeBaseCreate, KnowledgeBaseUpdate
+from app.services.ingestion_config import deployment_defaults
+from app.services.knowledge_base import KnowledgeBaseService, _with_counts
+from app.worker.jobs import BasePurge
+
+
+@pytest.fixture(autouse=True)
+def _no_sync_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No connectors unless a teardown test explicitly supplies one."""
+    monkeypatch.setattr("app.repositories.sync_source.get_all", AsyncMock(return_value=[]))
+
+
+@pytest.fixture(autouse=True)
+def _used_nowhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No agent binds anything here; `test_resource_usage` covers the query."""
+
+    async def nowhere(*_args: object, resource_ids: list[UUID], **_kwargs: object):
+        return {resource_id: [] for resource_id in resource_ids}
+
+    monkeypatch.setattr("app.services.knowledge_base.agents_using", nowhere)
+    monkeypatch.setattr("app.services.knowledge_base.groups_sharing", nowhere)
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_tasks():
+    """A deferred unlink one test starts must not be drained by the next."""
+    background._running.clear()
+    yield
+    background._running.clear()
+
+
+@pytest.fixture(autouse=True)
+def _teardown_reservations(monkeypatch):
+    """The teardown-reservation repo (#1362) hits the database; mock it at the
+    boundary. A name is free to claim and reserving/releasing is a no-op by default;
+    a test that asserts a reservation re-patches `reserve`."""
+    from app.repositories import collection_teardown_repo
+
+    monkeypatch.setattr(collection_teardown_repo, "is_reserved", AsyncMock(return_value=False))
+    monkeypatch.setattr(collection_teardown_repo, "reserve", AsyncMock())
+    monkeypatch.setattr(collection_teardown_repo, "release", AsyncMock())
+
+
+def _ctx(
+    *,
+    organization_id: uuid.UUID | None = None,
+    user_id: uuid.UUID | None = None,
+    role: str = OrgRoleName.OWNER.value,
+    app_admin: bool = False,
+) -> AuthContext:
+    return AuthContext(
+        user_id=user_id or uuid.uuid4(),
+        organization_id=organization_id or uuid.uuid4(),
+        role=role,
+        is_app_admin=app_admin,
+    )
+
+
+def _local_service(
+    *,
+    organization_id: uuid.UUID | None = None,
+    kind: str = "embedding",
+    provider: str = "ollama",
+    active: bool = True,
+) -> MagicMock:
+    """A `local_services` row, as the create and move paths look one up."""
+    row = MagicMock(
+        id=uuid.uuid4(),
+        organization_id=organization_id,
+        kind=kind,
+        provider=provider,
+        base_url="http://ollama:11434/v1",
+        is_active=active,
+    )
+    row.name = "GPU box"
+    return row
+
+
+def _service_visible(row: MagicMock | None):
+    """What the collection may name: the row, or nothing - another tenant's is nothing."""
+    return patch("app.repositories.local_service_repo.get_visible", new=AsyncMock(return_value=row))
+
+
+@pytest.fixture
+def unclaimed_collection_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Creating a base claims its collection name, which reads the KB table.
+
+    Nobody holds the names these tests use, and the answer is not what they are
+    about - see `tests/api/test_collection_name_routes.py` for the claim itself.
+    Without this, the lookup reaches the `MagicMock` standing in for a session.
+    """
+    from app.repositories import collection_teardown_repo, knowledge_base_repo
+
+    async def held_by_nobody(_db: object, collection_name: str) -> list[KnowledgeBase]:
+        del collection_name
+        return []
+
+    async def not_reserved(_db: object, _name: str) -> bool:
+        return False
+
+    monkeypatch.setattr(knowledge_base_repo, "list_by_collection_name", held_by_nobody)
+    monkeypatch.setattr(collection_teardown_repo, "is_reserved", not_reserved)
+
+
+def _kb(
+    scope: str,
+    owner_user_id=None,
+    organization_id=None,
+    is_default: bool = False,
+    visibility: str = Visibility.PRIVATE.value,
+):
+    kb = MagicMock()
+    kb.id = uuid.uuid4()
+    # A real name, not a mock: the teardown takes an advisory lock keyed on it,
+    # and hashing a `MagicMock` is a `TypeError` from `blake2b` rather than
+    # anything about the behaviour under test.
+    kb.collection_name = f"kb_{uuid.uuid4().hex[:8]}"
+    kb.scope = scope
+    kb.owner_user_id = owner_user_id
+    kb.organization_id = organization_id
+    kb.is_default = is_default
+    kb.visibility = visibility
+    return kb
+
+
+def _personal_kb_outside_an_org(owner_user_id: uuid.UUID):
+    """A personal base outside any organization, with the vector scope a real row
+    derives: it takes no unfiled rows, whose tenant `None` is the app scope's."""
+    kb = _kb("personal", owner_user_id=owner_user_id)
+    kb.vector_scope = VectorScope(tenant=None, knowledge_base_id=kb.id, takes_unfiled=False)
+    return kb
+
+
+def _readable_kb(collection_name: str) -> KnowledgeBase:
+    """A real ORM row, because this one goes through the response schema.
+
+    Deliberately not the `MagicMock` the scoping tests use. `KnowledgeBaseRead`
+    validates `from_attributes`, and a `MagicMock` answers *every* attribute -
+    including the three counts, which it hands over as mocks that Pydantic
+    coerces to `1`. The test then passes while asserting nothing, or fails while
+    the code is correct. A real row has no such attributes, so the schema
+    defaults are what get exercised.
+    """
+    return KnowledgeBase(
+        id=uuid.uuid4(),
+        name="Collection",
+        description=None,
+        scope=KBScope.ORG.value,
+        collection_name=collection_name,
+        is_default=False,
+        visibility=Visibility.ORG.value,
+        ingestion_config=deployment_defaults().model_dump(mode="json"),
+        embedding_model="text-embedding-3-small",
+        embedding_dim=1536,
+        # Stated rather than left to the column default: a server default is
+        # applied by the database, and this row is never inserted.
+        embedding_provider="openrouter",
+        embedding_secret_id=None,
+        organization_id=uuid.uuid4(),
+        owner_user_id=None,
+        created_at=datetime(2026, 7, 31, tzinfo=UTC),
+        updated_at=None,
+    )
+
+
+def _patch_dispatch(monkeypatch) -> AsyncMock:
+    """Stand in for the cleanup job a KB delete queues."""
+    dispatch = AsyncMock()
+    monkeypatch.setattr("app.worker.tasks.teardown_tasks.queue_external_state_cleanup", dispatch)
+    return dispatch
+
+
+class TestKBAccessControl:
+    """Service-level access checks for all 3 scopes (PostgreSQL async)."""
+
+    @pytest.fixture
+    def mock_db(self):
+        # `execute` is awaited by the advisory lock the teardown takes, so it has
+        # to be an `AsyncMock`; the rest of the session is never reached here,
+        # because every repository call is patched.
+        db = MagicMock(execute=AsyncMock())
+        db.info = {}
+        return db
+
+    @pytest.mark.anyio
+    async def test_personal_kb_visible_to_owner(self, mock_db):
+        user_id = uuid.uuid4()
+        kb = _kb("personal", owner_user_id=user_id)
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            result = await svc.get(kb.id, ctx=_ctx(user_id=user_id))
+            assert result is kb
+
+    @pytest.mark.anyio
+    async def test_personal_kb_hidden_from_other_user(self, mock_db):
+        kb = _kb("personal", owner_user_id=uuid.uuid4())
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(NotFoundError):
+                await svc.get(kb.id, ctx=_ctx())
+
+    @pytest.mark.anyio
+    async def test_org_kb_visible_to_a_role_that_sees_the_whole_org(self, mock_db):
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id)
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            result = await svc.get(kb.id, ctx=_ctx(organization_id=org_id))
+            assert result is kb
+
+    @pytest.mark.anyio
+    async def test_a_private_org_kb_is_hidden_from_a_member_who_does_not_own_it(self, mock_db):
+        """The audit finding: membership alone used to read every org collection."""
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id, owner_user_id=uuid.uuid4())
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.resource_grant_repo.get_level", new=AsyncMock(return_value=None)
+            ),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(NotFoundError):
+                await svc.get(kb.id, ctx=_ctx(organization_id=org_id, role="member"))
+
+    @pytest.mark.anyio
+    async def test_an_org_visible_kb_is_readable_by_a_member(self, mock_db):
+        org_id = uuid.uuid4()
+        kb = _kb(
+            "org",
+            organization_id=org_id,
+            owner_user_id=uuid.uuid4(),
+            visibility=Visibility.ORG.value,
+        )
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            result = await svc.get(kb.id, ctx=_ctx(organization_id=org_id, role="member"))
+            assert result is kb
+
+    @pytest.mark.anyio
+    async def test_org_kb_hidden_from_other_org(self, mock_db):
+        kb = _kb("org", organization_id=uuid.uuid4())
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(NotFoundError):
+                await svc.get(kb.id, ctx=_ctx())
+
+    @pytest.mark.anyio
+    async def test_app_kb_visible_to_anyone(self, mock_db):
+        kb = _kb("app")
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            result = await svc.get(kb.id, ctx=_ctx(role="viewer"))
+            assert result is kb
+
+    @pytest.mark.anyio
+    async def test_cannot_delete_default_kb(self, mock_db):
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id, is_default=True)
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(BadRequestError):
+                await svc.delete(kb.id, ctx=_ctx(organization_id=org_id))
+
+    @pytest.mark.anyio
+    async def test_default_kb_in_another_org_is_reported_as_missing_not_undeletable(self, mock_db):
+        """The "cannot delete the default" rule must not answer for a row out of reach.
+
+        It is a statement about a specific row, so a caller outside the
+        organization getting it back learns that the id exists *and* that it is
+        that organization's default base.
+        """
+        kb = _kb("org", organization_id=uuid.uuid4(), is_default=True)
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(NotFoundError):
+                await svc.delete(kb.id, ctx=_ctx())
+
+    @pytest.mark.anyio
+    async def test_non_app_admin_cannot_create_app_kb(self, mock_db):
+        data = KnowledgeBaseCreate(
+            name="Global KB",
+            scope="app",
+            collection_name="global",
+            embedding_model="text-embedding-3-small",
+        )
+
+        svc = KnowledgeBaseService(mock_db)
+        with pytest.raises(AuthorizationError):
+            await svc.create(data, ctx=_ctx())
+
+    @pytest.mark.anyio
+    async def test_app_admin_can_create_app_kb(self, mock_db, unclaimed_collection_name):
+        """An app-scoped collection has no organization vault to hold a key, so
+        the one provider it may embed through is a keyless one on the
+        deployment's own network (#1631)."""
+        service = _local_service()
+        data = KnowledgeBaseCreate(
+            name="Global KB",
+            scope="app",
+            collection_name="global",
+            embedding_model="nomic-embed-text",
+            embedding_provider="ollama",
+            embedding_endpoint_id=service.id,
+        )
+        mock_kb = MagicMock()
+
+        with (
+            _service_visible(service),
+            patch(
+                "app.repositories.knowledge_base_repo.create",
+                new=AsyncMock(return_value=mock_kb),
+            ) as created,
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            result = await svc.create(data, ctx=_ctx(app_admin=True))
+
+        assert result is mock_kb
+        assert created.call_args.kwargs["embedding_provider"] == "ollama"
+        assert created.call_args.kwargs["embedding_secret_id"] is None
+        assert created.call_args.kwargs["embedding_endpoint_id"] == service.id
+
+    @pytest.mark.anyio
+    async def test_an_app_kb_on_a_keyed_provider_is_refused_where_the_provider_was_chosen(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """Before this, the row was created and failed on its first document
+        with advice about a vault it has not got (#1631)."""
+        data = KnowledgeBaseCreate(
+            name="Global KB",
+            scope="app",
+            collection_name="global",
+            embedding_model="text-embedding-3-small",
+            embedding_provider="openrouter",
+        )
+
+        with (
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx(app_admin=True))
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_provider"
+        assert "keyless provider" in exc.value.message
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_an_org_kb_is_created_owned_by_its_creator(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """`own` in the matrix is meaningless for a row nobody owns."""
+        creator = uuid.uuid4()
+        secret = MagicMock(id=uuid.uuid4(), purpose="openrouter")
+        data = KnowledgeBaseCreate(
+            name="Team KB",
+            scope="org",
+            collection_name="team",
+            embedding_model="text-embedding-3-small",
+            embedding_provider="openrouter",
+            embedding_secret_id=secret.id,
+        )
+
+        with (
+            patch(
+                "app.repositories.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret),
+            ),
+            patch("app.services.knowledge_base.resolve_access", new=AsyncMock(return_value=True)),
+            patch(
+                "app.repositories.knowledge_base_repo.create",
+                new=AsyncMock(return_value=MagicMock()),
+            ) as created,
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            await svc.create(data, ctx=_ctx(user_id=creator))
+
+        assert created.call_args.kwargs["owner_user_id"] == creator
+
+    @pytest.mark.anyio
+    async def test_personal_kb_owner_can_delete(self, mock_db, monkeypatch):
+        user_id = uuid.uuid4()
+        kb = _kb("personal", owner_user_id=user_id)
+        dispatch = _patch_dispatch(monkeypatch)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.lock", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.delete", new=AsyncMock(return_value=True)),
+            patch(
+                "app.repositories.rag_document_repo.delete_by_knowledge_base",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "app.repositories.knowledge_base_repo.list_by_collection_name",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch("app.repositories.sync_source.get_all", new=AsyncMock(return_value=[])),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            await svc.delete(kb.id, ctx=_ctx(user_id=user_id))
+            # The row is not the whole teardown: with nothing else on the collection,
+            # its vector table is dropped too - by a cleanup job queued on this
+            # session, so a rollback takes it back with the rows (#1266, #1349).
+
+        dispatch.assert_awaited_once_with(mock_db, [], [kb.collection_name], base_purges=[])
+
+    @pytest.mark.anyio
+    async def test_deleting_a_kb_dispatches_a_durable_cleanup(self, mock_db, monkeypatch):
+        """The stored files and the table drop are a cleanup job queued on the delete's
+        own session, so a rollback keeps them (#1293) and a worker restart
+        mid-cleanup does not orphan them (#1349)."""
+        user_id = uuid.uuid4()
+        kb = _personal_kb_outside_an_org(user_id)
+        dispatch = _patch_dispatch(monkeypatch)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.lock", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.delete", new=AsyncMock(return_value=True)),
+            patch(
+                "app.repositories.rag_document_repo.delete_by_knowledge_base",
+                new=AsyncMock(return_value=["rag/docs/a.pdf", "rag/docs/b.md"]),
+            ),
+            patch(
+                "app.repositories.knowledge_base_repo.list_by_collection_name",
+                new=AsyncMock(return_value=[MagicMock()]),
+            ),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            await svc.delete(kb.id, ctx=_ctx(user_id=user_id))
+
+        # A sibling still holds the name, so only the files ride the job, not a drop.
+        dispatch.assert_awaited_once_with(
+            mock_db,
+            ["rag/docs/a.pdf", "rag/docs/b.md"],
+            [],
+            base_purges=[BasePurge(collection=kb.collection_name, knowledge_base_id=kb.id)],
+        )
+
+    @pytest.mark.anyio
+    async def test_deleting_the_last_kb_locks_it_and_deactivates_its_sources(
+        self, mock_db, monkeypatch
+    ):
+        """The teardown locks the base before enumerating its documents, so a
+        concurrent insert cannot detach a row; and once no base claims the
+        collection name, a scheduled sync source pointing at it is deactivated
+        rather than left to recreate the table this drops (#1266)."""
+        user_id = uuid.uuid4()
+        kb = _kb("personal", owner_user_id=user_id)
+        source = MagicMock(id=uuid.uuid4())
+        lock = AsyncMock(return_value=kb)
+        get_all = AsyncMock(return_value=[source])
+        update = AsyncMock()
+        dispatch = _patch_dispatch(monkeypatch)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.lock", new=lock),
+            patch("app.repositories.knowledge_base_repo.delete", new=AsyncMock(return_value=True)),
+            patch(
+                "app.repositories.rag_document_repo.delete_by_knowledge_base",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "app.repositories.knowledge_base_repo.list_by_collection_name",
+                new=AsyncMock(return_value=[kb]),
+            ),
+            patch("app.repositories.sync_source.get_all", new=get_all),
+            patch("app.repositories.sync_source.update", new=update),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            await svc.delete(kb.id, ctx=_ctx(user_id=user_id))
+
+        lock.assert_awaited_once_with(mock_db, kb.id)
+        get_all.assert_awaited_once_with(
+            mock_db, collection_name=kb.collection_name, for_update=True
+        )
+        update.assert_awaited_once_with(mock_db, source.id, collection_name=None, is_active=False)
+        dispatch.assert_awaited_once_with(mock_db, [], [kb.collection_name], base_purges=[])
+
+    @pytest.mark.anyio
+    async def test_deleting_a_kb_a_sibling_still_holds_keeps_the_collection(
+        self, mock_db, monkeypatch
+    ):
+        """A collection another base still claims keeps its vector table and its
+        sync sources - the teardown removes only what this base owned (#1266)."""
+        user_id = uuid.uuid4()
+        kb = _personal_kb_outside_an_org(user_id)
+        get_all = AsyncMock(return_value=[])
+        update = AsyncMock()
+        dispatch = _patch_dispatch(monkeypatch)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.lock", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.delete", new=AsyncMock(return_value=True)),
+            patch(
+                "app.repositories.rag_document_repo.delete_by_knowledge_base",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "app.repositories.knowledge_base_repo.list_by_collection_name",
+                new=AsyncMock(return_value=[MagicMock()]),
+            ),
+            patch("app.repositories.sync_source.get_all", new=get_all),
+            patch("app.repositories.sync_source.update", new=update),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            await svc.delete(kb.id, ctx=_ctx(user_id=user_id))
+
+        # No table to drop, but the base's own chunks stay in the kept table
+        # under an id nothing reads, so they are deleted by it (#2537).
+        dispatch.assert_awaited_once_with(
+            mock_db,
+            [],
+            [],
+            base_purges=[BasePurge(collection=kb.collection_name, knowledge_base_id=kb.id)],
+        )
+        get_all.assert_awaited_once_with(
+            mock_db, collection_name=kb.collection_name, for_update=True
+        )
+        update.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_the_cleanup_rides_the_deletes_own_session(self, mock_db, monkeypatch):
+        """Queued on the session that removed the rows, so a transaction that does not
+        commit takes the job back with them, and the restored KB and document rows
+        still describe a live table and its files (#1293, #1347, #1349)."""
+        user_id = uuid.uuid4()
+        kb = _kb("personal", owner_user_id=user_id)
+        dispatch = _patch_dispatch(monkeypatch)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.lock", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.delete", new=AsyncMock(return_value=True)),
+            patch(
+                "app.repositories.rag_document_repo.delete_by_knowledge_base",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "app.repositories.knowledge_base_repo.list_by_collection_name",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch("app.repositories.sync_source.get_all", new=AsyncMock(return_value=[])),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            await svc.delete(kb.id, ctx=_ctx(user_id=user_id))
+
+        dispatch.assert_awaited_once_with(mock_db, [], [kb.collection_name], base_purges=[])
+
+    @staticmethod
+    def _drop_repos(monkeypatch, *, holders: list) -> dict[str, AsyncMock]:
+        """The repositories a collection drop reaches, at the boundary.
+
+        `holders` is what the name lookup returns: the bases that hold it. Each
+        gets the vector scope a real row derives, so whose unfiled rows a base
+        takes is decided as it would be."""
+        from app.repositories import knowledge_base_repo, rag_document_repo
+
+        for holder in holders:
+            holder.vector_scope = VectorScope(
+                tenant=holder.organization_id,
+                knowledge_base_id=holder.id,
+                takes_unfiled=holder.organization_id is not None,
+            )
+        repos = {
+            "lock": AsyncMock(),
+            "delete": AsyncMock(),
+            "list_by_collection_name": AsyncMock(return_value=holders),
+        }
+        for name, mock in repos.items():
+            monkeypatch.setattr(knowledge_base_repo, name, mock)
+        repos["by_name"] = AsyncMock(return_value=["rag/docs/legacy.txt"])
+        repos["by_base"] = AsyncMock(return_value=["rag/docs/ours.txt"])
+        repos["by_kept_base"] = AsyncMock(
+            return_value=DeletedDocuments(
+                storage_paths=["rag/docs/ours.txt"], vector_document_ids=["doc-1"]
+            )
+        )
+        repos["unfiled"] = AsyncMock(
+            return_value=DeletedDocuments(
+                storage_paths=["rag/docs/legacy-ours.txt"], vector_document_ids=["legacy-1"]
+            )
+        )
+        monkeypatch.setattr(
+            rag_document_repo, "stored_vector_ids_at_clear", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr(rag_document_repo, "delete_by_collection", repos["by_name"])
+        monkeypatch.setattr(rag_document_repo, "delete_unfiled_with_vectors", repos["unfiled"])
+        monkeypatch.setattr(rag_document_repo, "delete_by_knowledge_base", repos["by_base"])
+        monkeypatch.setattr(
+            rag_document_repo, "delete_by_knowledge_base_with_vectors", repos["by_kept_base"]
+        )
+        return repos
+
+    @pytest.mark.anyio
+    async def test_dropping_a_rag_collection_deletes_the_row_and_dispatches_the_drop(
+        self, mock_db, monkeypatch
+    ):
+        """`DELETE /rag/collections/{name}` reaches here: the documents and the KB
+        row go in the request, the table drop is handed to the durable, locked
+        cleanup (#1355). No base holds the name any more, so every document row
+        under it goes with the table, unfiled ones included."""
+        kb = _kb("org", is_default=False)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb])
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        repos["lock"].assert_awaited_once_with(mock_db, kb.id)
+        repos["by_name"].assert_awaited_once_with(mock_db, "docs")
+        repos["by_base"].assert_not_awaited()
+        repos["delete"].assert_awaited_once_with(mock_db, kb.id)
+        dispatch.assert_awaited_once_with(
+            mock_db, ["rag/docs/legacy.txt"], ["docs"], base_purges=[]
+        )
+
+    @pytest.mark.anyio
+    async def test_dropping_a_default_rag_collection_keeps_the_row_but_drops_the_table(
+        self, mock_db, monkeypatch
+    ):
+        """A default base keeps its row so the org keeps a usable knowledge base, but
+        its vector table is dropped all the same - so a cleared default stops returning
+        the documents deleted with it, rather than leaving them searchable (#1361,
+        #1364). Its own row is filtered out of the reference check by id."""
+        from app.repositories import collection_teardown_repo
+
+        kb = _kb("org", is_default=True)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        reserve = AsyncMock()
+        monkeypatch.setattr(collection_teardown_repo, "reserve", reserve)
+        repos = self._drop_repos(monkeypatch, holders=[kb])
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        repos["delete"].assert_not_awaited()  # the default row is kept
+        reserve.assert_awaited_once()  # reserved until the drop runs
+        dispatch.assert_awaited_once_with(
+            mock_db, ["rag/docs/legacy.txt"], ["docs"], base_purges=[]
+        )
+
+    @pytest.mark.anyio
+    async def test_clearing_a_default_whose_name_a_sibling_shares_keeps_the_table(
+        self, mock_db, monkeypatch
+    ):
+        """The name is not tenant-unique: a sibling (or another org) still holding it
+        backs a table their chunks live in too, so clearing this default must not drop
+        it from under them (#913). Only the default's own documents go, and the
+        purge names them: the default takes uploads again under the same id once
+        this commits, and a purge of the whole base would take theirs (#2560)."""
+        from app.repositories import collection_teardown_repo
+
+        kb = _kb("org", is_default=True)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        reserve = AsyncMock()
+        monkeypatch.setattr(collection_teardown_repo, "reserve", reserve)
+        repos = self._drop_repos(monkeypatch, holders=[kb, _kb("org")])
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        repos["delete"].assert_not_awaited()  # the default row is kept
+        repos["by_name"].assert_not_awaited()  # the sibling's documents stay
+        repos["by_kept_base"].assert_awaited_once_with(mock_db, kb.id)
+        reserve.assert_not_awaited()  # a sibling holds the name, so it is not reserved
+        dispatch.assert_awaited_once_with(  # the shared table is kept
+            mock_db,
+            ["rag/docs/ours.txt"],
+            [],
+            base_purges=[
+                BasePurge(collection="docs", knowledge_base_id=kb.id, vector_document_ids=["doc-1"])
+            ],
+        )
+
+    @pytest.mark.anyio
+    async def test_a_large_cleared_defaults_purge_is_split_across_entries(
+        self, mock_db, monkeypatch
+    ):
+        """One entry per 500 documents, so the queue spreads a large default's
+        purge across jobs; a default with no ingested document purges nothing."""
+        from app.services import knowledge_base as kb_module
+
+        kb = _kb("org", is_default=True)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb, _kb("org")])
+        ids = [f"doc-{i}" for i in range(kb_module._PURGE_IDS_PER_ENTRY + 1)]
+        repos["by_kept_base"].return_value = DeletedDocuments(
+            storage_paths=[], vector_document_ids=ids
+        )
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        purges = dispatch.await_args.kwargs["base_purges"]
+        assert [purge.vector_document_ids for purge in purges] == [ids[:-1], ids[-1:]]
+
+        repos["by_kept_base"].return_value = DeletedDocuments(
+            storage_paths=[], vector_document_ids=[]
+        )
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        assert dispatch.await_args.kwargs["base_purges"] == []
+
+    @pytest.mark.anyio
+    async def test_dropping_a_rag_collection_a_sibling_still_holds_keeps_the_table(
+        self, mock_db, monkeypatch
+    ):
+        """The row goes, but a second base - here another organization's - still
+        claims the name, so the table is kept (#913). Only this base's documents
+        are deleted, by its id, and its chunks are purged from the kept table: the
+        name alone reached the other organization's rows too (#2560)."""
+        kb = _kb("org", is_default=False)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(
+            monkeypatch, holders=[kb, _kb("org", organization_id=uuid.uuid4())]
+        )
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        repos["by_name"].assert_not_awaited()
+        repos["by_base"].assert_awaited_once_with(mock_db, kb.id)
+        repos["delete"].assert_awaited_once_with(mock_db, kb.id)
+        dispatch.assert_awaited_once_with(
+            mock_db,
+            ["rag/docs/ours.txt"],
+            [],
+            base_purges=[BasePurge(collection="docs", knowledge_base_id=kb.id)],
+        )
+
+    @pytest.mark.anyio
+    async def test_dropping_an_empty_base_a_sibling_holds_still_purges_its_chunks(
+        self, mock_db, monkeypatch
+    ):
+        """No stored file to unlink is no reason to skip the purge: a synced
+        document stores none, and its chunks are in the kept table all the same."""
+        kb = _kb("org", is_default=False)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb, _kb("org")])
+        repos["by_base"].return_value = []
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        dispatch.assert_awaited_once_with(
+            mock_db, [], [], base_purges=[BasePurge(collection="docs", knowledge_base_id=kb.id)]
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.security
+    async def test_clearing_a_default_takes_its_tenants_unfiled_documents(
+        self, mock_db, monkeypatch
+    ):
+        """A kept default lists its organization's unfiled rows under the name, so
+        a clear that left them kept them listed and downloadable, their chunks
+        searchable (#2560). Another organization's base on the name does not take
+        them, so they go - and the purge names them within the tenant."""
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id, is_default=True)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(
+            monkeypatch, holders=[kb, _kb("org", organization_id=uuid.uuid4())]
+        )
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        repos["unfiled"].assert_awaited_once_with(mock_db, CollectionScope.of(kb))
+        repos["by_name"].assert_not_awaited()
+        dispatch.assert_awaited_once_with(
+            mock_db,
+            ["rag/docs/ours.txt", "rag/docs/legacy-ours.txt"],
+            [],
+            base_purges=[
+                BasePurge(
+                    collection="docs",
+                    knowledge_base_id=kb.id,
+                    vector_document_ids=["doc-1", "legacy-1"],
+                    takes_unfiled=True,
+                    tenant=org_id,
+                )
+            ],
+        )
+
+    @pytest.mark.security
+    @pytest.mark.anyio
+    async def test_a_same_tenant_base_on_the_name_keeps_the_unfiled_documents(
+        self, mock_db, monkeypatch
+    ):
+        """Another base of the same organization on the name still reads the
+        unfiled rows, so clearing this one leaves them to it."""
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id, is_default=True)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb, _kb("org", organization_id=org_id)])
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        repos["unfiled"].assert_not_awaited()
+        assert dispatch.await_args.kwargs["base_purges"] == [
+            BasePurge(collection="docs", knowledge_base_id=kb.id, vector_document_ids=["doc-1"])
+        ]
+
+    @pytest.mark.security
+    @pytest.mark.anyio
+    async def test_dropping_a_base_takes_its_tenants_unfiled_documents(self, mock_db, monkeypatch):
+        """A dropped non-default base's unfiled rows go too when no base of its
+        tenant still takes them: left, they would come back with the tenant's
+        next base on the name. The whole base is purged, and the unfiled chunks
+        by the deleted documents' ids."""
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        self._drop_repos(monkeypatch, holders=[kb, _kb("org", organization_id=uuid.uuid4())])
+
+        await KnowledgeBaseService(mock_db).delete_for_rag_collection(kb)
+
+        dispatch.assert_awaited_once_with(
+            mock_db,
+            ["rag/docs/ours.txt", "rag/docs/legacy-ours.txt"],
+            [],
+            base_purges=[
+                BasePurge(collection="docs", knowledge_base_id=kb.id),
+                BasePurge(
+                    collection="docs",
+                    knowledge_base_id=kb.id,
+                    vector_document_ids=["legacy-1"],
+                    takes_unfiled=True,
+                    tenant=org_id,
+                ),
+            ],
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.security
+    async def test_deleting_a_base_takes_its_tenants_unfiled_documents(self, mock_db, monkeypatch):
+        """`DELETE /kb/{id}` with another organization's base on the name kept the
+        table and deleted only the rows filed under the base, so its tenant's
+        unfiled rows stayed, with their files and chunks, for the tenant's next
+        base on the name (#2560). They go as a collection drop takes them."""
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(
+            monkeypatch, holders=[kb, _kb("org", organization_id=uuid.uuid4())]
+        )
+        monkeypatch.setattr(KnowledgeBaseService, "get_for_write", AsyncMock(return_value=kb))
+
+        await KnowledgeBaseService(mock_db).delete(kb.id, ctx=_ctx(organization_id=org_id))
+
+        repos["unfiled"].assert_awaited_once_with(mock_db, CollectionScope.of(kb))
+        repos["delete"].assert_awaited_once_with(mock_db, kb.id)
+        dispatch.assert_awaited_once_with(
+            mock_db,
+            ["rag/docs/ours.txt", "rag/docs/legacy-ours.txt"],
+            [],
+            base_purges=[
+                BasePurge(collection="docs", knowledge_base_id=kb.id),
+                BasePurge(
+                    collection="docs",
+                    knowledge_base_id=kb.id,
+                    vector_document_ids=["legacy-1"],
+                    takes_unfiled=True,
+                    tenant=org_id,
+                ),
+            ],
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.security
+    async def test_deleting_a_base_leaves_unfiled_documents_to_a_same_tenant_base(
+        self, mock_db, monkeypatch
+    ):
+        """Another base of the same organization on the name still reads the
+        unfiled rows, so deleting this one leaves them to it."""
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id)
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb, _kb("org", organization_id=org_id)])
+        monkeypatch.setattr(KnowledgeBaseService, "get_for_write", AsyncMock(return_value=kb))
+
+        await KnowledgeBaseService(mock_db).delete(kb.id, ctx=_ctx(organization_id=org_id))
+
+        repos["unfiled"].assert_not_awaited()
+        dispatch.assert_awaited_once_with(
+            mock_db,
+            ["rag/docs/ours.txt"],
+            [],
+            base_purges=[BasePurge(collection="docs", knowledge_base_id=kb.id)],
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.security
+    async def test_rag_drop_refuses_a_name_several_bases_hold(self, mock_db, monkeypatch):
+        """`rag-drop` dropped the table by name with no reference check, so a name
+        another organization's base still held lost its table (#2560). With
+        several holders and no base named, nothing is deleted and nothing queued."""
+        kb = _kb("org", organization_id=uuid.uuid4())
+        kb.collection_name = "docs"
+        theirs = _kb("org", organization_id=uuid.uuid4())
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb, theirs])
+
+        with pytest.raises(BadRequestError) as refused:
+            await KnowledgeBaseService(mock_db).drop_collection_by_name("docs")
+
+        assert refused.value.details["knowledge_base_ids"] == [kb.id, theirs.id]
+        repos["by_name"].assert_not_awaited()
+        repos["by_base"].assert_not_awaited()
+        repos["delete"].assert_not_awaited()
+        dispatch.assert_not_awaited()
+
+    @pytest.mark.anyio
+    @pytest.mark.security
+    async def test_rag_drop_of_a_named_base_keeps_the_shared_table(self, mock_db, monkeypatch):
+        """Naming one of the holders clears it as `DELETE /rag/collections/{name}`
+        does: its documents and row go, its chunks are purged, the table stays."""
+        kb = _kb("org", organization_id=uuid.uuid4())
+        kb.collection_name = "docs"
+        theirs = _kb("org", organization_id=uuid.uuid4())
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb, theirs])
+
+        cleared = await KnowledgeBaseService(mock_db).drop_collection_by_name(
+            "docs", knowledge_base_id=kb.id
+        )
+
+        assert cleared is kb
+        repos["by_name"].assert_not_awaited()
+        repos["delete"].assert_awaited_once_with(mock_db, kb.id)
+        assert dispatch.await_args.args[2] == []
+
+    @pytest.mark.anyio
+    async def test_rag_drop_of_a_base_not_on_the_name_is_refused(self, mock_db, monkeypatch):
+        """An id that holds no base under the name is refused, not taken as the
+        sole holder."""
+        kb = _kb("org", organization_id=uuid.uuid4())
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb])
+
+        with pytest.raises(NotFoundError):
+            await KnowledgeBaseService(mock_db).drop_collection_by_name(
+                "docs", knowledge_base_id=uuid.uuid4()
+            )
+
+        repos["delete"].assert_not_awaited()
+        dispatch.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_rag_drop_of_the_sole_holder_drops_the_table(self, mock_db, monkeypatch):
+        """One base holds the name, so it is cleared and the table dropped."""
+        kb = _kb("org", organization_id=uuid.uuid4())
+        kb.collection_name = "docs"
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[kb])
+
+        cleared = await KnowledgeBaseService(mock_db).drop_collection_by_name("docs")
+
+        assert cleared is kb
+        repos["delete"].assert_awaited_once_with(mock_db, kb.id)
+        dispatch.assert_awaited_once_with(
+            mock_db, ["rag/docs/legacy.txt"], ["docs"], base_purges=[]
+        )
+
+    @pytest.mark.anyio
+    async def test_rag_drop_of_an_unclaimed_name_reserves_and_drops_it(self, mock_db, monkeypatch):
+        """A collection `rag-ingest` filled with no base goes whole, its rows with
+        it, under a reservation so a claim cannot adopt the table first (#1362)."""
+        from app.repositories import collection_teardown_repo
+
+        reserve = AsyncMock()
+        monkeypatch.setattr(collection_teardown_repo, "reserve", reserve)
+        dispatch = _patch_dispatch(monkeypatch)
+        repos = self._drop_repos(monkeypatch, holders=[])
+
+        cleared = await KnowledgeBaseService(mock_db).drop_collection_by_name("cli-docs")
+
+        assert cleared is None
+        repos["by_name"].assert_awaited_once_with(mock_db, "cli-docs")
+        reserve.assert_awaited_once_with(mock_db, "cli-docs")
+        dispatch.assert_awaited_once_with(mock_db, ["rag/docs/legacy.txt"], ["cli-docs"])
+
+    @pytest.mark.anyio
+    async def test_personal_kb_non_owner_is_refused_as_missing(self, mock_db):
+        """Somebody else's personal base is reported absent, not forbidden.
+
+        The read path has always answered this way; the write path answering 403
+        made it a way to confirm that a `kb_id` belongs to somebody.
+        """
+        kb = _kb("personal", owner_user_id=uuid.uuid4())
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(NotFoundError):
+                await svc.delete(kb.id, ctx=_ctx())
+
+    @pytest.mark.anyio
+    async def test_app_kb_non_admin_is_refused_as_forbidden(self, mock_db):
+        """The one write refusal that stays a 403: the caller can read the row anyway."""
+        kb = _kb("app")
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(AuthorizationError):
+                await svc.delete(kb.id, ctx=_ctx())
+
+    @pytest.mark.anyio
+    async def test_a_viewer_who_can_read_an_org_kb_cannot_write_to_it(self, mock_db):
+        """The audit finding: the six per-KB write routes resolved READ access only.
+
+        A Viewer holds `collections:view` and nothing else, so uploading,
+        deleting documents and wiring sync sources must refuse them - as a 403,
+        because an org-visible row is one they can already open through
+        `GET /kb/{kb_id}`.
+        """
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id, visibility=Visibility.ORG.value)
+        ctx = _ctx(organization_id=org_id, role=OrgRoleName.VIEWER.value)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.resource_grant_repo.get_level", new=AsyncMock(return_value=None)
+            ),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(AuthorizationError):
+                await svc.get_for_write(kb.id, ctx=ctx)
+
+    @pytest.mark.anyio
+    async def test_an_edit_grant_lets_a_viewer_write_to_that_one_kb(self, mock_db):
+        """A grant widens what a role allows; a role gate on the route could not see it."""
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id)
+        ctx = _ctx(organization_id=org_id, role=OrgRoleName.VIEWER.value)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=GrantLevel.EDIT),
+            ),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            assert await svc.get_for_write(kb.id, ctx=ctx) is kb
+
+    @pytest.mark.anyio
+    async def test_a_read_grant_is_not_an_edit_grant(self, mock_db):
+        """Levels are ordered: being shown a base is not being handed its contents."""
+        org_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id)
+        ctx = _ctx(organization_id=org_id, role=OrgRoleName.VIEWER.value)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=GrantLevel.READ),
+            ),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(AuthorizationError):
+                await svc.get_for_write(kb.id, ctx=ctx)
+
+    @pytest.mark.anyio
+    async def test_a_member_writes_their_own_kb_without_a_grant(self, mock_db):
+        """`collections:edit: own` reaches the member's own row with no grant lookup."""
+        org_id = uuid.uuid4()
+        member_id = uuid.uuid4()
+        kb = _kb("org", organization_id=org_id, owner_user_id=member_id)
+        ctx = _ctx(organization_id=org_id, user_id=member_id, role=OrgRoleName.MEMBER.value)
+        grant_lookup = AsyncMock(return_value=None)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.resource_grant_repo.get_level", new=grant_lookup),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            assert await svc.get_for_write(kb.id, ctx=ctx) is kb
+
+        grant_lookup.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_member_cannot_write_an_org_visible_kb_they_do_not_own(self, mock_db):
+        """Org-wide visibility shares *reading*; writing still takes ownership or a grant."""
+        org_id = uuid.uuid4()
+        kb = _kb(
+            "org",
+            organization_id=org_id,
+            owner_user_id=uuid.uuid4(),
+            visibility=Visibility.ORG.value,
+        )
+        ctx = _ctx(organization_id=org_id, role=OrgRoleName.MEMBER.value)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.resource_grant_repo.get_level", new=AsyncMock(return_value=None)
+            ),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(AuthorizationError):
+                await svc.get_for_write(kb.id, ctx=ctx)
+
+    @pytest.mark.security
+    @pytest.mark.anyio
+    async def test_a_write_from_another_tenant_is_reported_as_missing(self, mock_db):
+        """The write path answers exactly as the read path: 404, never an oracle."""
+        kb = _kb("org", organization_id=uuid.uuid4())
+        ctx = _ctx()
+        grant_lookup = AsyncMock(return_value=GrantLevel.EDIT)
+
+        with (
+            patch("app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.resource_grant_repo.get_level", new=grant_lookup),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(NotFoundError):
+                await svc.get_for_write(kb.id, ctx=ctx)
+
+        grant_lookup.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_an_app_scoped_kb_refuses_a_member_write_as_forbidden(self, mock_db):
+        """Everyone can read an app base, so only the write refusal protects it."""
+        kb = _kb("app")
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(AuthorizationError):
+                await svc.get_for_write(kb.id, ctx=_ctx())
+
+    @pytest.mark.anyio
+    async def test_an_app_admin_writes_to_an_app_scoped_kb(self, mock_db):
+        kb = _kb("app")
+        ctx = _ctx(role=OrgRoleName.VIEWER.value, app_admin=True)
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_by_id", new=AsyncMock(return_value=kb)
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            assert await svc.get_for_write(kb.id, ctx=ctx) is kb
+
+    @pytest.mark.anyio
+    async def test_list_accessible_passes_the_callers_scope_to_the_query(self, mock_db):
+        """An org-wide role skips the ownership predicate; a narrow one narrows it."""
+        ctx = _ctx()
+
+        with patch(
+            "app.repositories.knowledge_base_repo.get_accessible",
+            new=AsyncMock(return_value=[]),
+        ) as mock_list:
+            svc = KnowledgeBaseService(mock_db)
+            await svc.list_accessible(ctx)
+
+            mock_list.assert_called_once()
+            _, kwargs = mock_list.call_args
+            assert kwargs.get("user_id") == ctx.user_id
+            assert kwargs.get("organization_id") == ctx.organization_id
+            assert kwargs.get("see_all_org") is True
+
+    @pytest.mark.anyio
+    async def test_list_accessible_narrows_for_a_member_and_carries_their_grants(self, mock_db):
+        granted = uuid.uuid4()
+        ctx = _ctx(role=OrgRoleName.MEMBER.value)
+
+        with (
+            patch(
+                "app.repositories.knowledge_base_repo.get_accessible",
+                new=AsyncMock(return_value=[]),
+            ) as mock_list,
+            patch(
+                "app.repositories.resource_grant_repo.list_shared_ids",
+                new=AsyncMock(return_value=[granted]),
+            ),
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            await svc.list_accessible(ctx)
+
+            _, kwargs = mock_list.call_args
+            assert kwargs.get("see_all_org") is False
+            assert list(kwargs.get("shared_org_ids")) == [granted]
+
+
+class TestBindingAnEmbeddingSecret:
+    """Choosing a vault key for a collection's embeddings.
+
+    Binding a key lends it: the collection bills it for everyone who can write
+    the collection. So the chooser has to be able to reach the key themselves,
+    and a key they cannot view is refused as one the vault does not hold.
+    """
+
+    @pytest.fixture
+    def mock_db(self):
+        # `execute` is awaited by the advisory lock the teardown takes, so it has
+        # to be an `AsyncMock`; the rest of the session is never reached here,
+        # because every repository call is patched.
+        return MagicMock(execute=AsyncMock())
+
+    def _secret(self, purpose: str = "openrouter"):
+        secret = MagicMock()
+        secret.id = uuid.uuid4()
+        secret.purpose = purpose
+        return secret
+
+    @pytest.mark.security
+    @pytest.mark.anyio
+    async def test_a_private_secret_the_caller_cannot_view_is_refused(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """Another member's private key, supplied by id, is turned away.
+
+        Without the caller's `secrets:view` check the org-scoped lookup alone
+        binds it - the picker only ever offered keys they can see, but the API
+        takes an id and an id is guessable.
+        """
+        secret = self._secret()
+        data = KnowledgeBaseCreate(
+            name="Team KB",
+            scope="org",
+            collection_name="team",
+            embedding_model="text-embedding-3-small",
+            embedding_provider="openrouter",
+            embedding_secret_id=secret.id,
+        )
+
+        with (
+            patch(
+                "app.repositories.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret),
+            ),
+            patch(
+                "app.services.knowledge_base.resolve_access",
+                new=AsyncMock(return_value=False),
+            ),
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            with pytest.raises(BadRequestError) as exc:
+                await svc.create(data, ctx=_ctx(role=OrgRoleName.MEMBER.value))
+
+        assert "not in this organization's vault" in exc.value.message
+        created.assert_not_called()
+
+    @pytest.mark.security
+    @pytest.mark.anyio
+    async def test_a_secret_the_caller_can_view_is_bound(self, mock_db, unclaimed_collection_name):
+        secret = self._secret()
+        data = KnowledgeBaseCreate(
+            name="Team KB",
+            scope="org",
+            collection_name="team",
+            embedding_model="text-embedding-3-small",
+            embedding_provider="openrouter",
+            embedding_secret_id=secret.id,
+        )
+
+        with (
+            patch(
+                "app.repositories.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret),
+            ),
+            patch(
+                "app.services.knowledge_base.resolve_access",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.repositories.knowledge_base_repo.create",
+                new=AsyncMock(return_value=MagicMock()),
+            ) as created,
+        ):
+            svc = KnowledgeBaseService(mock_db)
+            await svc.create(data, ctx=_ctx(role=OrgRoleName.MEMBER.value))
+
+        assert created.call_args.kwargs["embedding_secret_id"] == secret.id
+
+
+class TestWhoServesTheEmbeddingModel:
+    """The provider is per collection, and unlike the model it can be changed.
+
+    The model cannot: the vector column was created at its width and every
+    stored vector is in its space. The provider can, because the same model
+    served from somewhere else produces vectors in the same space - which is
+    what makes rotating a key or moving onto an organization's own account
+    something other than re-ingesting the collection.
+    """
+
+    @pytest.fixture
+    def mock_db(self):
+        # `execute` is awaited by the advisory lock the teardown takes, so it has
+        # to be an `AsyncMock`; the rest of the session is never reached here,
+        # because every repository call is patched.
+        return MagicMock(execute=AsyncMock())
+
+    def _kb_row(self, *, provider: str = "openrouter", secret_id: uuid.UUID | None = None):
+        return MagicMock(
+            id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            embedding_model="text-embedding-3-small",
+            embedding_dim=1536,
+            embedding_provider=provider,
+            embedding_secret_id=secret_id,
+            embedding_base_url=None,
+        )
+
+    @pytest.mark.anyio
+    async def test_a_new_collection_must_name_its_provider(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """There is no deployment-wide default to fall back to, and the refusal
+        names the select that was left empty."""
+        with (
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(
+                KnowledgeBaseCreate(
+                    name="KB",
+                    scope="org",
+                    collection_name="kb",
+                    embedding_model="text-embedding-3-small",
+                ),
+                ctx=_ctx(),
+            )
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_provider"
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_new_organization_collection_must_name_the_key_that_pays(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """A collection without a key cannot index its first document, and
+        there is no deployment key it could embed on instead - so the form's
+        key select is the field the refusal marks."""
+        data = KnowledgeBaseCreate(
+            name="KB",
+            scope="org",
+            collection_name="kb",
+            embedding_model="text-embedding-3-small",
+            embedding_provider="openrouter",
+        )
+
+        with (
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx())
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_secret_id"
+        assert "OpenRouter" in exc.value.message
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_provider_that_cannot_serve_the_model_is_refused_at_creation(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """`text-embedding-3-large` is 3072 wide, and a provider offering it at
+        1536 would produce vectors the column cannot hold."""
+        data = KnowledgeBaseCreate(
+            name="KB",
+            scope="org",
+            collection_name="kb",
+            embedding_model="text-embedding-3-large",
+            embedding_provider="not-a-provider",
+        )
+
+        with (
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx())
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_provider"
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_key_for_another_provider_is_refused(self, mock_db, unclaimed_collection_name):
+        """The failure this whole choice exists to prevent: an OpenAI key sent to
+        openrouter.ai is refused there, having already arrived."""
+        secret = MagicMock(id=uuid.uuid4(), purpose="openai")
+        data = KnowledgeBaseCreate(
+            name="KB",
+            scope="org",
+            collection_name="kb",
+            embedding_model="text-embedding-3-small",
+            embedding_provider="openrouter",
+            embedding_secret_id=secret.id,
+        )
+
+        with (
+            patch(
+                "app.repositories.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret),
+            ),
+            patch("app.services.knowledge_base.resolve_access", new=AsyncMock(return_value=True)),
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx())
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_secret_id"
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_an_existing_collection_moves_provider_and_key_together(self, mock_db):
+        kb = self._kb_row()
+        secret = MagicMock(id=uuid.uuid4(), purpose="openai")
+
+        with (
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret),
+            ),
+            patch("app.services.knowledge_base.resolve_access", new=AsyncMock(return_value=True)),
+            patch(
+                "app.repositories.knowledge_base_repo.update",
+                new=AsyncMock(return_value=kb),
+            ) as updated,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id,
+                KnowledgeBaseUpdate(embedding_provider="openai", embedding_secret_id=secret.id),
+                ctx=_ctx(),
+            )
+
+        assert updated.call_args.kwargs["embedding_provider"] == "openai"
+        assert updated.call_args.kwargs["embedding_secret_id"] == secret.id
+
+    @pytest.mark.anyio
+    async def test_moving_provider_and_leaving_the_old_key_behind_is_refused(self, mock_db):
+        """The key stays unless somebody says otherwise, so this would leave an
+        OpenRouter key pointed at OpenAI - refused, naming the control that moved."""
+        kb = self._kb_row(secret_id=uuid.uuid4())
+        secret = MagicMock(id=kb.embedding_secret_id, purpose="openrouter")
+
+        with (
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret),
+            ),
+            patch("app.repositories.knowledge_base_repo.update", new=AsyncMock()) as updated,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id, KnowledgeBaseUpdate(embedding_provider="openai"), ctx=_ctx()
+            )
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_provider"
+        updated.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_collection_cannot_be_left_without_a_key(self, mock_db):
+        """A null id means "leave it alone" on a partial update, and there is no
+        word for clearing the key: with no deployment-wide key to fall back to,
+        a collection without one cannot index, so the update leaves the key it
+        has in place."""
+        kb = self._kb_row(secret_id=uuid.uuid4())
+
+        assert "clear_embedding_secret" not in KnowledgeBaseUpdate.model_fields
+        with (
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.knowledge_base_repo.update",
+                new=AsyncMock(return_value=kb),
+            ) as updated,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id, KnowledgeBaseUpdate(name="renamed"), ctx=_ctx()
+            )
+
+        assert updated.call_args.kwargs["embedding_secret_id"] is None
+        assert "clear_embedding_secret" not in updated.call_args.kwargs
+
+    def _local_row(self, *, organization_id: uuid.UUID | None, secret_id: uuid.UUID | None = None):
+        """A row on a model Ollama serves, at its width."""
+        return MagicMock(
+            id=uuid.uuid4(),
+            organization_id=organization_id,
+            embedding_model="nomic-embed-text",
+            embedding_dim=768,
+            embedding_provider="ollama",
+            embedding_secret_id=secret_id,
+            embedding_base_url=None,
+            embedding_endpoint_id=None,
+        )
+
+    @pytest.mark.anyio
+    async def test_a_keyless_provider_takes_no_key_and_asks_for_none(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """An Ollama on the deployment's own network is paid by nobody, so the
+        rule that a new organization collection must name a key does not apply
+        to it (#1632)."""
+        service = _local_service(organization_id=uuid.uuid4())
+        data = KnowledgeBaseCreate(
+            name="Local",
+            scope="org",
+            collection_name="local",
+            embedding_model="nomic-embed-text",
+            embedding_provider="ollama",
+            embedding_endpoint_id=service.id,
+        )
+
+        with (
+            _service_visible(service),
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx())
+
+        assert created.call_args.kwargs["embedding_provider"] == "ollama"
+        assert created.call_args.kwargs["embedding_secret_id"] is None
+        assert created.call_args.kwargs["embedding_endpoint_id"] == service.id
+
+    @pytest.mark.anyio
+    async def test_a_keyless_provider_without_a_local_service_is_refused_on_that_field(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """The catalog holds no address for a server the deployment runs, so a
+        keyless collection has to say where - the way a keyed one says who pays."""
+        data = KnowledgeBaseCreate(
+            name="Local",
+            scope="org",
+            collection_name="local",
+            embedding_model="nomic-embed-text",
+            embedding_provider="ollama",
+        )
+
+        with (
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx())
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_endpoint_id"
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("row", "reason"),
+        [
+            (None, "not one this collection may name"),
+            (_local_service(kind="ocr", provider="liteparse"), "embeds through Ollama"),
+            (_local_service(active=False), "turned off"),
+        ],
+        ids=["invisible", "wrong-kind", "paused"],
+    )
+    async def test_a_local_service_it_may_not_use_is_refused_on_the_field(
+        self, mock_db, unclaimed_collection_name, row, reason
+    ):
+        """Another tenant's service reads as one that does not exist, so a
+        refusal cannot enumerate their hosts."""
+        data = KnowledgeBaseCreate(
+            name="Local",
+            scope="org",
+            collection_name="local",
+            embedding_model="nomic-embed-text",
+            embedding_provider="ollama",
+            embedding_endpoint_id=uuid.uuid4(),
+        )
+
+        with (
+            _service_visible(row),
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError, match=reason) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx())
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_endpoint_id"
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_local_service_named_for_a_keyed_provider_is_refused(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """A vendor is reached at the catalog's address; recording a local
+        service beside it would be a claim about where the data goes that
+        nothing acts on."""
+        data = KnowledgeBaseCreate(
+            name="KB",
+            scope="org",
+            collection_name="kb",
+            embedding_model="text-embedding-3-small",
+            embedding_provider="openrouter",
+            embedding_secret_id=uuid.uuid4(),
+            embedding_endpoint_id=uuid.uuid4(),
+        )
+
+        with (
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx())
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_endpoint_id"
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_key_named_for_a_keyless_provider_is_refused_on_the_key(
+        self, mock_db, unclaimed_collection_name
+    ):
+        """Nothing would send it, so accepting it would record a credential
+        binding that means nothing - and bill nobody while looking as if it did."""
+        data = KnowledgeBaseCreate(
+            name="Local",
+            scope="org",
+            collection_name="local",
+            embedding_model="nomic-embed-text",
+            embedding_provider="ollama",
+            embedding_secret_id=uuid.uuid4(),
+        )
+
+        with (
+            patch("app.repositories.knowledge_base_repo.create", new=AsyncMock()) as created,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).create(data, ctx=_ctx())
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_secret_id"
+        assert "takes no key" in exc.value.message
+        created.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_moving_to_a_keyless_provider_leaves_the_old_key_unexamined(self, mock_db):
+        """The key stays on the row - there is no word for clearing it - and it
+        is not checked against a provider that will never see it. The resolver
+        leaves it sealed for the same reason."""
+        kb = self._local_row(organization_id=uuid.uuid4(), secret_id=uuid.uuid4())
+        kb.embedding_provider = "openai"
+        service = _local_service(organization_id=kb.organization_id)
+
+        with (
+            _service_visible(service),
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.knowledge_base_repo.update", new=AsyncMock(return_value=kb)
+            ) as updated,
+            patch("app.repositories.organization_secret_repo.get", new=AsyncMock()) as vault,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id,
+                KnowledgeBaseUpdate(embedding_provider="ollama", embedding_endpoint_id=service.id),
+                ctx=_ctx(),
+            )
+
+        assert updated.call_args.kwargs["embedding_provider"] == "ollama"
+        assert updated.call_args.kwargs["embedding_endpoint_id"] == service.id
+        vault.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_moving_to_a_keyless_provider_needs_its_service_in_the_same_request(
+        self, mock_db
+    ):
+        """Unless the row already names one for it - a move back."""
+        kb = self._local_row(organization_id=uuid.uuid4())
+        kb.embedding_provider = "openai"
+
+        with (
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.update", new=AsyncMock()) as updated,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id, KnowledgeBaseUpdate(embedding_provider="ollama"), ctx=_ctx()
+            )
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_endpoint_id"
+        updated.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_moving_back_onto_a_keyless_provider_reuses_the_service_the_row_holds(
+        self, mock_db
+    ):
+        kb = self._local_row(organization_id=uuid.uuid4())
+        kb.embedding_provider = "openai"
+        service = _local_service(organization_id=kb.organization_id)
+        kb.embedding_endpoint_id = service.id
+
+        with (
+            _service_visible(service),
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch(
+                "app.repositories.knowledge_base_repo.update", new=AsyncMock(return_value=kb)
+            ) as updated,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id, KnowledgeBaseUpdate(embedding_provider="ollama"), ctx=_ctx()
+            )
+
+        assert updated.call_args.kwargs["embedding_provider"] == "ollama"
+
+    @pytest.mark.anyio
+    async def test_a_local_service_cannot_be_given_to_a_collection_on_a_keyed_provider(
+        self, mock_db
+    ):
+        kb = self._local_row(organization_id=uuid.uuid4())
+        kb.embedding_provider = "openai"
+        kb.embedding_model, kb.embedding_dim = "text-embedding-3-small", 1536
+
+        with (
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.update", new=AsyncMock()) as updated,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id, KnowledgeBaseUpdate(embedding_endpoint_id=uuid.uuid4()), ctx=_ctx()
+            )
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_endpoint_id"
+        updated.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_moving_to_a_keyless_provider_with_a_key_in_hand_is_refused(self, mock_db):
+        kb = self._local_row(organization_id=uuid.uuid4())
+
+        with (
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.update", new=AsyncMock()) as updated,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id,
+                KnowledgeBaseUpdate(embedding_provider="ollama", embedding_secret_id=uuid.uuid4()),
+                ctx=_ctx(),
+            )
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_secret_id"
+        updated.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_an_app_scoped_collection_cannot_be_moved_onto_a_keyed_provider(self, mock_db):
+        """The same rule as at creation, on the control that moved: a collection
+        with no vault cannot pay a vendor, and a keyed address with no key is a
+        collection that stops indexing on the next document (#1631)."""
+        kb = self._local_row(organization_id=None)
+        kb.embedding_model, kb.embedding_dim = "text-embedding-3-small", 1536
+
+        with (
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.update", new=AsyncMock()) as updated,
+            pytest.raises(BadRequestError) as exc,
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id, KnowledgeBaseUpdate(embedding_provider="openai"), ctx=_ctx(app_admin=True)
+            )
+
+        assert exc.value.details["fields"][0]["field"] == "embedding_provider"
+        updated.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_provider_that_cannot_serve_this_collections_model_is_refused(self, mock_db):
+        """3072-wide vectors are already in the column; a provider serving that
+        model only at 1536 would write into it as though the widths agreed."""
+        kb = MagicMock(
+            id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            embedding_model="a-model-nobody-serves",
+            embedding_dim=1536,
+            embedding_provider="openrouter",
+            embedding_secret_id=None,
+        )
+
+        with (
+            patch.object(KnowledgeBaseService, "get_for_write", new=AsyncMock(return_value=kb)),
+            patch("app.repositories.knowledge_base_repo.update", new=AsyncMock()) as updated,
+            pytest.raises(BadRequestError),
+        ):
+            await KnowledgeBaseService(mock_db).update(
+                kb.id, KnowledgeBaseUpdate(embedding_provider="openai"), ctx=_ctx()
+            )
+
+        updated.assert_not_called()
+
+
+class TestCollectionCounts:
+    """The listing's document and chunk counts.
+
+    They exist so a picker can tell a filled collection from an empty one, so
+    what matters is that the count reaches the response - not that a repository
+    was called.
+    """
+
+    @pytest.fixture
+    def mock_db(self):
+        # `execute` is awaited by the advisory lock the teardown takes, so it has
+        # to be an `AsyncMock`; the rest of the session is never reached here,
+        # because every repository call is patched.
+        return MagicMock(execute=AsyncMock())
+
+    @pytest.mark.anyio
+    async def test_counts_are_asked_for_by_base_not_by_collection_name(self, mock_db):
+        """Bases share a collection name and each holds its own rows (#2486).
+
+        Asked by name, an app base and an organization's base sharing it each
+        reported the other's documents on the listing.
+        """
+        first = _readable_kb("shared_a1b2c3")
+        second = _readable_kb("shared_a1b2c3")
+
+        with patch(
+            "app.repositories.rag_document_repo.counts_by_scope",
+            new=AsyncMock(return_value={}),
+        ) as mock_counts:
+            await KnowledgeBaseService(mock_db).counts_for([first, second])
+
+        _, kwargs = mock_counts.call_args
+        assert kwargs.get("scopes") == [CollectionScope.of(first), CollectionScope.of(second)]
+
+    @pytest.mark.anyio
+    async def test_counting_nothing_asks_the_database_nothing(self, mock_db):
+        """An organization with no collections must not issue an `IN ()` query."""
+        counts = await KnowledgeBaseService(mock_db).counts_for([])
+        assert counts == {}
+
+    def test_a_collection_nothing_was_written_to_reads_as_zero(self):
+        """The group query returns no row for an empty collection, not a zero row.
+
+        The listing defaults that absence, so a brand-new collection has to
+        render as `0 documents` rather than as a missing key blowing up the
+        listing.
+        """
+        read = _with_counts(_readable_kb("fresh_000000"), None)
+
+        assert read.document_count == 0
+        assert read.indexed_count == 0
+        assert read.chunk_count == 0
+
+    def test_a_failed_document_still_counts_as_a_document(self):
+        """`indexed_count` below `document_count` is how a failure stays visible.
+
+        Reporting only what indexed would make a collection where half the
+        uploads died look like a collection half that size, with nothing on the
+        listing to suggest otherwise.
+        """
+        read = _with_counts(
+            _readable_kb("half_broken"),
+            CollectionCounts(documents=12, chunks=340, indexed=8),
+        )
+
+        assert read.document_count == 12
+        assert read.indexed_count == 8
+        assert read.chunk_count == 340
+
+    @pytest.mark.anyio
+    async def test_the_listing_gives_each_row_its_own_counts(self, mock_db):
+        """The join is by base id, so a count cannot land on a sibling.
+
+        Both halves are ordered lists of the same length, which is exactly the
+        shape that hides an off-by-one: the filled collection here is second.
+        """
+        empty = _readable_kb("empty_000000")
+        filled = _readable_kb("filled_111111")
+
+        with (
+            patch(
+                "app.repositories.knowledge_base_repo.get_accessible",
+                new=AsyncMock(return_value=[empty, filled]),
+            ),
+            patch(
+                "app.repositories.rag_document_repo.counts_by_scope",
+                new=AsyncMock(
+                    return_value={filled.id: CollectionCounts(documents=3, chunks=90, indexed=3)}
+                ),
+            ),
+        ):
+            listing = await KnowledgeBaseService(mock_db).list_readable(_ctx())
+
+        assert listing.total == 2
+        assert [item.document_count for item in listing.items] == [0, 3]
+        assert [item.chunk_count for item in listing.items] == [0, 90]
+
+
+@pytest.mark.anyio
+async def test_custom_embedding_endpoint_requires_connection_authority():
+    service = KnowledgeBaseService(MagicMock())
+    with pytest.raises(AuthorizationError):
+        await service._embedding_url(
+            _ctx(role="member"), "openrouter", "https://eu.openrouter.ai/api/v1"
+        )
+    assert (
+        await service._embedding_url(_ctx(), "openrouter", "https://eu.openrouter.ai/api/v1/")
+        == "https://eu.openrouter.ai/api/v1"
+    )
+    with pytest.raises(BadRequestError):
+        await service._embedding_url(_ctx(), "openai", "https://example.com/v1")

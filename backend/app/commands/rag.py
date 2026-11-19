@@ -1,0 +1,871 @@
+"""
+RAG CLI commands for document management and retrieval.
+
+Commands:
+    rag-collections   - List collections with stats
+    rag-ingest        - Ingest file/directory
+    rag-search        - Search knowledge base
+    rag-drop          - Drop collection
+    rag-stats         - Overall RAG system statistics
+    rag-sources       - List configured sync sources
+    rag-source-add    - Add a new sync source
+    rag-source-remove - Remove a sync source
+    rag-source-sync   - Trigger sync for a source (or all)
+"""
+
+import asyncio
+import hashlib
+import json
+from pathlib import Path
+from uuid import UUID
+
+import click
+
+from app.commands import command, error, info, success, warning
+from app.core.background import drain
+from app.core.exceptions import AppException
+from app.core.permissions import AuthContext
+from app.db.models.knowledge_base import KBScope
+from app.db.session import get_db_context
+from app.db.vector_tables import VectorScope
+from app.repositories import knowledge_base_repo, organization_repo
+from app.schemas.sync_source import SyncSourceCreate
+from app.services.knowledge_base import KnowledgeBaseService
+from app.services.rag.citation import citation_locator
+from app.services.rag.config import DEFAULT_COLLECTION_NAME, DocumentExtensions, RAGSettings
+from app.services.rag.documents import DocumentProcessor
+from app.services.rag.embeddings import EmbeddingService
+from app.services.rag.failures import IngestionStage, failure_summary
+from app.services.rag.filters import UnscopedScope
+from app.services.rag.ingestion import IngestionService
+from app.services.rag.retrieval import RetrievalService
+from app.services.rag.sources.google_drive import GoogleDriveSource
+from app.services.rag.sources.s3 import S3Source
+from app.services.rag.vectorstore import BaseVectorStore, process_vector_store
+from app.services.rag_document import RAGDocumentService
+from app.services.rag_sync import RAGSyncService
+from app.services.sync_source import SyncSourceService
+
+# How long `rag-source-sync` waits for the syncs it started before giving up on
+# them. A connector sync is minutes of network I/O over somebody else's rate
+# limit, so `drain`'s 30-second default - written for a shutdown, where the work
+# is about to be restarted anyway - would cancel an ordinary run. An hour is a
+# bound rather than a promise: a sync that overruns it is cancelled and said so.
+_SYNC_TIMEOUT_SECONDS = 3600.0
+
+
+def get_rag_services() -> tuple[
+    RAGSettings, BaseVectorStore, DocumentProcessor, RetrievalService, IngestionService
+]:
+    """Initialize RAG services for CLI usage.
+
+    Creates and returns all necessary RAG service components:
+    - Settings (RAG configuration)
+    - Vector store (Milvus)
+    - Document processor
+    - Retrieval service
+    - Ingestion service
+
+    Returns:
+        Tuple of (settings, vector_store, processor, retrieval, ingestion) services.
+    """
+    settings = RAGSettings()
+    embedder = EmbeddingService(settings=settings)
+    # On the process engine, like the API's stores: a CLI command is one
+    # process, one piece of work, and its pool goes down with it.
+    vector_store = process_vector_store(settings, embedder)
+    processor = DocumentProcessor(settings=settings)
+    retrieval = RetrievalService(vector_store=vector_store, settings=settings)
+    ingestion = IngestionService(processor=processor, vector_store=vector_store)
+    return settings, vector_store, processor, retrieval, ingestion
+
+
+async def list_collections_async(vector_store: BaseVectorStore) -> None:
+    """List all collections with their stats.
+
+    Args:
+        vector_store: The Milvus vector store to query.
+    """
+    collection_names = await vector_store.list_collections()
+
+    if not collection_names:
+        info("No collections found.")
+        return
+
+    click.echo(f"\nFound {len(collection_names)} collection(s):\n")
+
+    for name in collection_names:
+        try:
+            info_obj = await vector_store.get_collection_info(name, VectorScope(tenant=None))
+            click.echo(f"  {name}")
+            click.echo(f"    Vectors: {info_obj.total_vectors:,}")
+            click.echo(f"    Dimension: {info_obj.dim}")
+            click.echo()
+        except Exception as e:
+            warning(f"Could not get info for '{name}': {e}")
+
+
+@command("rag-collections", help="List collections with stats")
+def rag_collections() -> None:
+    """List all available collections in the vector store with their statistics."""
+    _, vector_store, _, _, _ = get_rag_services()
+    asyncio.run(list_collections_async(vector_store))
+
+
+async def ingest_path_async(
+    path: str,
+    collection: str,
+    recursive: bool,
+    vector_store: BaseVectorStore,
+    processor: DocumentProcessor,
+    ingestion: IngestionService,
+    replace: bool = True,
+    sync_mode: str = "full",
+) -> None:
+    """Ingest files from a path (file or directory).
+
+    Args:
+        path: Path to a file or directory to ingest.
+        collection: Target collection name.
+        recursive: Whether to recursively process directories.
+        vector_store: The Milvus vector store.
+        processor: Document processor for parsing files.
+        ingestion: Ingestion service for storing documents.
+    """
+    target_path = Path(path).resolve()
+
+    if not target_path.exists():
+        error(f"Path does not exist: {target_path}")
+        return
+
+    if target_path.is_file():
+        files = [target_path]
+    elif target_path.is_dir():
+        if recursive:
+            files = list(target_path.rglob("*"))
+            files = [f for f in files if f.is_file() and not f.name.startswith(".")]
+        else:
+            files = list(target_path.iterdir())
+            files = [f for f in files if f.is_file() and not f.name.startswith(".")]
+    else:
+        error(f"Invalid path: {target_path}")
+        return
+
+    if not files:
+        warning("No files found to ingest.")
+        return
+
+    allowed_extensions = {ext.value for ext in DocumentExtensions}
+    files = [f for f in files if f.suffix.lower() in allowed_extensions]
+
+    if not files:
+        warning(f"No supported files found. Allowed: {', '.join(allowed_extensions)}")
+        return
+
+    from tqdm import tqdm
+
+    info(f"Syncing {len(files)} file(s) into '{collection}' (mode={sync_mode})...")
+
+    success_count = 0
+    error_count = 0
+    replaced_count = 0
+    skipped_count = 0
+
+    async with get_db_context() as db:
+        sync_log = await RAGSyncService(db).create_sync_log(
+            source="local", collection_name=collection, mode=sync_mode
+        )
+        sync_log_id = str(sync_log.id)
+
+    with tqdm(files, unit="file", desc="Syncing", ncols=80) as pbar:
+        for filepath in pbar:
+            pbar.set_postfix_str(filepath.name[:30], refresh=True)
+
+            source_path = str(filepath.resolve())
+            if sync_mode in ("new_only", "update_only"):
+                # One scan for both answers - see `existing_document` for why
+                # they are not two calls (#548, #566).
+                existing = await ingestion.existing_document(collection, source_path)
+
+                if sync_mode == "new_only":
+                    if existing.document_id:
+                        file_hash: str = hashlib.sha256(filepath.read_bytes()).hexdigest()
+                        if existing.content_hash and file_hash == existing.content_hash:
+                            skipped_count += 1
+                            continue
+
+                elif sync_mode == "update_only":
+                    if not existing.document_id:
+                        skipped_count += 1
+                        continue
+                    file_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
+                    if existing.content_hash and file_hash == existing.content_hash:
+                        skipped_count += 1
+                        continue
+
+            try:
+                async with get_db_context() as db:
+                    documents = RAGDocumentService(db)
+                    await documents.hold_ingestion_name(collection)
+                    rag_doc = await documents.create_document(
+                        collection_name=collection,
+                        filename=filepath.name,
+                        filesize=filepath.stat().st_size,
+                        filetype=filepath.suffix.lstrip(".").lower(),
+                        # The address this command already looks documents up by, a
+                        # few lines above. Omitted, the row got `NULL` and a repeated
+                        # failure here kept inflating the collection's count - the
+                        # defect #996 fixed for the two worker flows and not for this
+                        # one.
+                        source_path=source_path,
+                    )
+                    doc_id = str(rag_doc.id)
+            except AppException as exc:
+                error_count += 1
+                tqdm.write(f"  ✗ {filepath.name}: {exc.message}")
+                continue
+
+            try:
+                result = await ingestion.ingest_file(
+                    filepath=filepath,
+                    rag_document_id=rag_doc.id,
+                    collection_name=collection,
+                    replace=replace,
+                    # So the stored document identifies itself the way this
+                    # command's own `existing_document` call asks for it, and the
+                    # row and the vector agree on which file this is.
+                    source_path=source_path,
+                )
+                if result.status.value == "done":
+                    # `ingest_file` only sets `document_id` on the branch that
+                    # returns `DONE` - the two travel together in `IngestionResult`.
+                    assert result.document_id is not None
+                    async with get_db_context() as db:
+                        # A fresh row per file, every run, the same as the sync
+                        # worker flows - this command has no retry concept, so
+                        # `attempt` is always `1`, the column's own default.
+                        documents = RAGDocumentService(db)
+                        recorded = await documents.complete_ingestion(
+                            doc_id,
+                            vector_document_id=result.document_id,
+                            chunk_count=result.chunk_count,
+                            replaced_document_id=result.replaced_document_id,
+                            attempt=1,
+                        )
+                        if not recorded:
+                            # Its row was deleted while it indexed (#2565).
+                            await documents.discard_untracked(
+                                collection, result.document_id, scope=ingestion.scope
+                            )
+                    if recorded:
+                        success_count += 1
+                        if result.message and "replaced" in result.message:
+                            replaced_count += 1
+                    else:
+                        tqdm.write(f"  - {filepath.name}: deleted while indexing")
+                else:
+                    error_count += 1
+                    tqdm.write(f"  ✗ {filepath.name}: {result.error_message}")
+                    async with get_db_context() as db:
+                        await RAGDocumentService(db).fail_ingestion(
+                            doc_id,
+                            error_message=result.error_message or "Unknown error",
+                            attempt=1,
+                        )
+            except Exception as e:
+                error_count += 1
+                # The operator running this command reads the whole exception on
+                # their own terminal; the row they leave behind is read on the
+                # documents page by anyone in the organization, so it gets the
+                # summary (#423).
+                tqdm.write(f"  ✗ {filepath.name}: {e!s}")
+                async with get_db_context() as db:
+                    await RAGDocumentService(db).fail_ingestion(
+                        doc_id,
+                        error_message=failure_summary(e, stage=IngestionStage.INGEST),
+                        attempt=1,
+                    )
+
+    async with get_db_context() as db:
+        await RAGSyncService(db).complete_sync(
+            sync_log_id,
+            status="done" if error_count == 0 else "error",
+            total_files=len(files),
+            ingested=success_count - replaced_count,
+            updated=replaced_count,
+            skipped=skipped_count,
+            failed=error_count,
+        )
+
+    click.echo()
+    msg = f"Done: {success_count} ingested"
+    if replaced_count > 0:
+        msg += f" ({replaced_count} updated)"
+    if skipped_count > 0:
+        msg += f", {skipped_count} skipped"
+    success(msg)
+    if error_count > 0:
+        error(f"Failed: {error_count} files")
+
+
+@command("rag-ingest", help="Ingest file/directory into knowledge base")
+@click.argument("path", type=click.Path(exists=True))
+@click.option(
+    "--collection",
+    "-c",
+    default=DEFAULT_COLLECTION_NAME,
+    help=f"Collection name (default: {DEFAULT_COLLECTION_NAME})",
+)
+@click.option(
+    "--recursive/--no-recursive",
+    "-r",
+    default=False,
+    help="Recursively process directories (default: False)",
+)
+@click.option(
+    "--replace/--no-replace",
+    default=True,
+    help="Replace existing documents with same source path (default: True)",
+)
+@click.option(
+    "--sync-mode",
+    type=click.Choice(["full", "new_only", "update_only"]),
+    default="full",
+    help="Sync mode: full (replace all), new_only (add new + update changed), update_only (only update changed, skip new)",
+)
+def rag_ingest(path: str, collection: str, recursive: bool, replace: bool, sync_mode: str) -> None:
+    """
+    Ingest a file or directory into the knowledge base.
+
+    PATH: Path to a file or directory to ingest.
+
+    Example:
+        project cmd rag-ingest ./docs
+        project cmd rag-ingest ./docs --sync-mode new_only
+        project cmd rag-ingest ./docs --sync-mode update_only
+    """
+    _, vector_store, processor, _, ingestion = get_rag_services()
+    asyncio.run(
+        ingest_path_async(
+            path, collection, recursive, vector_store, processor, ingestion, replace, sync_mode
+        )
+    )
+
+
+async def search_async(
+    query: str,
+    collection: str,
+    top_k: int,
+    retrieval: RetrievalService,
+) -> None:
+    """Search the knowledge base.
+
+    Args:
+        query: The search query.
+        collection: Target collection name.
+        top_k: Number of results to return.
+        retrieval: Retrieval service for searching.
+    """
+    info(f"Searching collection '{collection}' for: \"{query}\"")
+    click.echo()
+
+    # The one path allowed the explicit unscoped marker: `rag-search` is
+    # cross-tenant maintenance, run by an operator against a named collection,
+    # not an ordinary tenant-scoped caller (FA-039 §2.2). No ordinary API or
+    # agent-tool caller can reach this variant.
+    results = await retrieval.retrieve(
+        query=query,
+        collection_name=collection,
+        scope=UnscopedScope(),
+        limit=top_k,
+    )
+
+    if not results:
+        warning("No results found.")
+        return
+
+    for i, result in enumerate(results, 1):
+        click.echo(f"--- Result {i} (score: {result.score:.4f}) ---")
+
+        if result.metadata:
+            filename = result.metadata.get("filename", "Unknown")
+            locator = citation_locator(result.metadata)
+            click.echo(f"Source: {filename}{locator}")
+
+        content = result.content[:500]
+        if len(result.content) > 500:
+            content += "..."
+        click.echo(content)
+        click.echo()
+
+
+@command("rag-search", help="Search knowledge base")
+@click.argument("query")
+@click.option(
+    "--collection",
+    "-c",
+    default=DEFAULT_COLLECTION_NAME,
+    help=f"Collection name (default: {DEFAULT_COLLECTION_NAME})",
+)
+@click.option(
+    "--top-k",
+    "-k",
+    default=4,
+    type=int,
+    help="Number of results to return (default: 4)",
+)
+def rag_search(query: str, collection: str, top_k: int) -> None:
+    """
+    Search the knowledge base for relevant content.
+
+    QUERY: The search query.
+
+    Example:
+        project cmd rag-search "what is fastapi"
+        project cmd rag-search "deployment guide" --collection docs --top-k 10
+    """
+    _, _, _, retrieval, _ = get_rag_services()
+    asyncio.run(search_async(query, collection, top_k, retrieval))
+
+
+async def drop_collection_async(
+    collection: str, yes: bool, knowledge_base_id: UUID | None = None
+) -> bool:
+    """Drop a collection through the knowledge-base teardown.
+
+    `KnowledgeBaseService.drop_collection_by_name` decides what goes: the base
+    holding the name is cleared as `DELETE /rag/collections/{name}` clears it, and
+    a table another base still holds stays. The table and the stored files go in
+    a cleanup job a worker runs once this commits. The command used to drop the
+    table directly, whoever else still used it, and leave the document rows
+    behind (#2560).
+
+    Args:
+        collection: Name of the collection to drop.
+        yes: Whether to skip confirmation prompt.
+        knowledge_base_id: The base to clear, when several hold the name.
+
+    Returns:
+        Whether the drop was queued.
+    """
+    if not yes:
+        click.confirm(
+            f"Are you sure you want to drop collection '{collection}'? This cannot be undone.",
+            abort=True,
+        )
+
+    try:
+        async with get_db_context() as db:
+            kb = await KnowledgeBaseService(db).drop_collection_by_name(
+                collection, knowledge_base_id=knowledge_base_id
+            )
+    except AppException as e:
+        error(f"Failed to drop collection '{collection}': {e.message}")
+        if ids := (e.details or {}).get("knowledge_base_ids"):
+            info("Name one with --knowledge-base: " + ", ".join(str(i) for i in ids))
+        return False
+    if kb is None:
+        success(f"Collection '{collection}' queued for dropping; a worker removes its table.")
+    elif kb.is_default:
+        success(f"Collection '{collection}' cleared; its default knowledge base {kb.id} is kept.")
+    else:
+        success(f"Collection '{collection}' dropped with its knowledge base {kb.id}.")
+    return True
+
+
+@command("rag-drop", help="Drop a collection")
+@click.argument("collection")
+@click.option(
+    "--knowledge-base",
+    "knowledge_base_id",
+    type=click.UUID,
+    default=None,
+    help="The knowledge base to clear, when several hold the collection name",
+)
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    help="Skip confirmation prompt",
+)
+def rag_drop(collection: str, knowledge_base_id: UUID | None, yes: bool) -> None:
+    """
+    Drop a collection and all its data.
+
+    COLLECTION: Name of the collection to drop.
+
+    The name is not unique across organizations. When several knowledge bases
+    hold it, name the one to clear with --knowledge-base; its documents go, and
+    the vector table stays for the others.
+
+    Example:
+        project cmd rag-drop my_collection
+        project cmd rag-drop my_collection --yes
+        project cmd rag-drop docs --knowledge-base 6f1c... --yes
+    """
+    if not asyncio.run(drop_collection_async(collection, yes, knowledge_base_id)):
+        raise SystemExit(1)
+
+
+@command("rag-stats", help="Show overall RAG system statistics")
+def rag_stats() -> None:
+    """Display overall RAG system statistics."""
+    settings, vector_store, _, _, _ = get_rag_services()
+
+    asyncio.run(stats_async(settings, vector_store))
+
+
+async def stats_async(settings: RAGSettings, vector_store: BaseVectorStore) -> None:
+    """Show RAG system statistics.
+
+    Args:
+        settings: RAG configuration settings.
+        vector_store: The Milvus vector store.
+    """
+    click.echo("RAG System Statistics")
+    click.echo("=" * 40)
+
+    try:
+        collection_names = await vector_store.list_collections()
+        click.echo(f"\nCollections: {len(collection_names)}")
+    except Exception as e:
+        warning(f"Could not list collections: {e}")
+        collection_names = []
+
+    click.echo("\nConfiguration:")
+    click.echo(f"  Embedding model: {settings.embeddings_config.model}")
+    click.echo(f"  Embedding dimension: {settings.embeddings_config.dim}")
+    click.echo(f"  Chunk size: {settings.chunk_size}")
+    click.echo(f"  Chunk overlap: {settings.chunk_overlap}")
+    click.echo(f"  Parser method: {settings.pdf_parser.method}")
+
+    if collection_names:
+        click.echo("\nCollection Details:")
+        total_vectors = 0
+        for name in collection_names:
+            try:
+                info_obj = await vector_store.get_collection_info(name, VectorScope(tenant=None))
+                click.echo(f"  {name}:")
+                click.echo(f"    Vectors: {info_obj.total_vectors:,}")
+                total_vectors += info_obj.total_vectors
+            except Exception:
+                click.echo(f"  {name}: Error getting info")
+
+        click.echo(f"\nTotal vectors: {total_vectors:,}")
+
+    click.echo()
+
+
+@command("rag-sync-gdrive")
+@click.option("--collection", "-c", default=DEFAULT_COLLECTION_NAME, help="Target collection name")
+@click.option("--folder-id", "-f", default="", help="Google Drive folder ID (empty = root)")
+def rag_sync_gdrive(collection: str, folder_id: str) -> None:
+    """Sync documents from Google Drive into a RAG collection."""
+
+    _, vector_store, processor, _, ingestion = get_rag_services()
+    source = GoogleDriveSource()
+
+    async def _sync() -> None:
+        result = await source.sync(
+            collection_name=collection,
+            ingestion_service=ingestion,
+            path=folder_id,
+        )
+        success(f"Synced {result.ingested}/{result.total_files} files from Google Drive")
+        if result.failed:
+            for err in result.errors:
+                warning(f"  {err}")
+
+    asyncio.run(_sync())
+
+
+@command("rag-sync-s3")
+@click.option("--collection", "-c", default=DEFAULT_COLLECTION_NAME, help="Target collection name")
+@click.option("--prefix", "-p", default="", help="S3 prefix (folder path)")
+@click.option("--bucket", "-b", default="", help="S3 bucket (empty = default from settings)")
+def rag_sync_s3(collection: str, prefix: str, bucket: str) -> None:
+    """Sync documents from S3/MinIO into a RAG collection."""
+
+    _, vector_store, processor, _, ingestion = get_rag_services()
+    source = S3Source(bucket=bucket)
+
+    async def _sync() -> None:
+        result = await source.sync(
+            collection_name=collection,
+            ingestion_service=ingestion,
+            path=prefix,
+        )
+        success(f"Synced {result.ingested}/{result.total_files} files from S3")
+        if result.failed:
+            for err in result.errors:
+                warning(f"  {err}")
+
+    asyncio.run(_sync())
+
+
+@command("rag-sources", help="List configured sync sources")
+def rag_sources() -> None:
+    """List all configured sync sources with their status."""
+
+    async def _list() -> None:
+        async with get_db_context() as db:
+            svc = SyncSourceService(db)
+            sources = await svc.list_sources()
+
+            if not sources.items:
+                info("No sync sources configured.")
+                return
+
+            click.echo(f"\nFound {sources.total} sync source(s):\n")
+            for s in sources.items:
+                status_str = s.last_sync_status or "never"
+                active_str = "active" if s.is_active else "inactive"
+                click.echo(f"  [{active_str}] {s.name} (id={s.id})")
+                click.echo(f"    Type: {s.connector_type}")
+                click.echo(f"    Collection: {s.collection_name}")
+                click.echo(f"    Sync mode: {s.sync_mode}")
+                if s.schedule_minutes:
+                    click.echo(f"    Schedule: every {s.schedule_minutes} min")
+                else:
+                    click.echo("    Schedule: manual")
+                click.echo(f"    Last sync: {status_str}")
+                if s.last_error:
+                    click.echo(f"    Last error: {s.last_error}")
+                click.echo()
+
+    asyncio.run(_list())
+
+
+@command("rag-source-add", help="Add a new sync source")
+@click.option("--name", required=True, help="Source name")
+@click.option("--type", "connector_type", required=True, help="Connector type (e.g. gdrive, s3)")
+@click.option("--org", "org_id", required=True, help="Organization id that owns the collection")
+@click.option("--collection", required=True, help="Target collection name")
+@click.option(
+    "--secret-id",
+    "secret_id",
+    help="Vault secret the connector authenticates with. Required unless the connector needs none.",
+)
+@click.option("--config", "config_json", required=True, help="Config JSON string")
+@click.option(
+    "--sync-mode",
+    default="new_only",
+    type=click.Choice(["full", "new_only", "update_only"]),
+    help="Sync mode",
+)
+@click.option(
+    "--schedule",
+    "schedule_minutes",
+    type=int,
+    default=0,
+    help="Schedule interval in minutes (0=manual)",
+)
+def rag_source_add(
+    name: str,
+    connector_type: str,
+    org_id: str,
+    collection: str,
+    secret_id: str | None,
+    config_json: str,
+    sync_mode: str,
+    schedule_minutes: int,
+) -> None:
+    """
+    Add a new sync source configuration.
+
+    `--org` is required, and the collection has to be one that organization
+    already holds. A sync *writes into* the collection it names, so a row
+    pointing at a name nobody owns is a source that fails in a worker, and one
+    pointing at another tenant's is an injection rather than a read - the same
+    reason the HTTP route resolves the collection through
+    `CollectionAccessService.writable` before creating anything. This command
+    had no ctx and so asked neither question: it wrote whatever name it was
+    given, into a row with no organization at all (#707).
+
+    `--secret-id` names the vault credential the connector authenticates with -
+    a `gcp_service_account` for Drive, an `aws_credentials` pair for S3. It is not
+    a config field: a credential in `--config` is refused, because `config` says
+    how to find the documents and holds nothing that has to be kept (#937). A
+    source may be created without one and will refuse to sync until it has one.
+
+    Example:
+        project cmd rag-source-add --name "My Drive" --type gdrive \\
+            --org 0c8f... --collection docs --secret-id 7d21... \\
+            --config '{"folder_id": "abc123"}' --sync-mode new_only
+    """
+    try:
+        config_dict = json.loads(config_json)
+    except json.JSONDecodeError as e:
+        error(f"Invalid JSON config: {e}")
+        raise SystemExit(1) from e
+
+    try:
+        organization_id = UUID(org_id)
+    except ValueError as exc:
+        error(f"Not an organization id: {org_id}")
+        raise SystemExit(1) from exc
+
+    secret_uuid: UUID | None = None
+    if secret_id is not None:
+        try:
+            secret_uuid = UUID(secret_id)
+        except ValueError as exc:
+            error(f"Not a secret id: {secret_id}")
+            raise SystemExit(1) from exc
+
+    data = SyncSourceCreate(
+        name=name,
+        connector_type=connector_type,
+        collection_name=collection,
+        config=config_dict,
+        secret_id=secret_uuid,
+        sync_mode=sync_mode,
+        schedule_minutes=schedule_minutes if schedule_minutes > 0 else None,
+    )
+
+    async def _create() -> bool:
+        async with get_db_context() as db:
+            organization = await organization_repo.get_by_id(db, organization_id)
+            if organization is None:
+                error(f"No such organization: {org_id}")
+                return False
+            # `list_by_collection_name`, not `get_by_collection_name`: the column
+            # is not unique, so the singular lookup answers with whichever row
+            # the database returns first and would hand this organization
+            # another's collection (#913). The candidates are filtered here, by
+            # the organization the operator named.
+            #
+            # Org-scoped only, and that is not the same question as "carries this
+            # organization_id": a *personal* base carries it too, and
+            # `writable_kb` lets only its owner write to one. Accepting one here
+            # would point an organization-owned source at a member's private
+            # collection, which every member holding `connections:manage` can
+            # then see and trigger. The CLI has no caller identity, so the org
+            # scope is the only one it can claim on the organization's behalf -
+            # an app-scoped base belongs to the deployment and takes an app
+            # admin.
+            candidates = await knowledge_base_repo.list_by_collection_name(db, collection)
+            owned = [
+                kb
+                for kb in candidates
+                if kb.organization_id == organization_id and kb.scope == KBScope.ORG.value
+            ]
+            if not owned:
+                error(
+                    f"No organization-scoped collection '{collection}' in {organization.name}. "
+                    "A sync writes into the collection it names, so it has to exist first - "
+                    "and a personal collection is its owner's to point a source at, not the "
+                    "organization's."
+                )
+                return False
+
+            svc = SyncSourceService(db)
+            try:
+                # A context with no subject: there is no person at a shell prompt
+                # for `resolve_access` to evaluate, and the service says so - the
+                # vault's per-member visibility is about members of an
+                # organization, not about whoever hosts it. The tenant check still
+                # applies.
+                source = await svc.create_source(data, ctx=AuthContext.anonymous(organization_id))
+            except (ValueError, AppException) as e:
+                error(f"Failed to create source: {e}")
+                return False
+            success(f"Sync source created: {source.name} (id={source.id})")
+            return True
+
+    # A refusal has to be a non-zero exit, not red text on stdout: `error` is
+    # `click.secho`, so returning normally from a refused command left click
+    # exiting 0 and a shell script carrying on as though the source existed.
+    if not asyncio.run(_create()):
+        raise SystemExit(1)
+
+
+@command("rag-source-remove", help="Remove a sync source")
+@click.argument("source_id")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def rag_source_remove(source_id: str, yes: bool) -> None:
+    """
+    Remove a sync source configuration.
+
+    SOURCE_ID: The ID of the sync source to remove.
+
+    Example:
+        project cmd rag-source-remove abc-123-def
+    """
+    if not yes:
+        click.confirm(f"Are you sure you want to remove sync source '{source_id}'?", abort=True)
+
+    async def _remove() -> None:
+        async with get_db_context() as db:
+            svc = SyncSourceService(db)
+            try:
+                # The row's own organization, because this command is
+                # deployment-wide and a shell prompt has no active one. The
+                # context carries no subject either, which is what the audit
+                # entry records: removed, by nobody a session can name (#983).
+                source = await svc.get_source(source_id)
+                await svc.delete_source(
+                    source_id, ctx=AuthContext.anonymous(source.organization_id)
+                )
+                success(f"Sync source '{source_id}' removed.")
+            except Exception as e:
+                error(f"Failed to remove source: {e}")
+
+    asyncio.run(_remove())
+
+
+@command("rag-source-sync", help="Trigger sync for a source")
+@click.argument("source_id", required=False)
+@click.option("--all", "sync_all", is_flag=True, help="Sync all active sources")
+def rag_source_sync(source_id: str | None, sync_all: bool) -> None:
+    """
+    Trigger sync for a configured source (or all active sources).
+
+    SOURCE_ID: The ID of the sync source to sync (optional if --all).
+
+    Example:
+        project cmd rag-source-sync abc-123-def
+        project cmd rag-source-sync --all
+    """
+    if not source_id and not sync_all:
+        error("Provide a SOURCE_ID or use --all to sync all active sources.")
+        return
+
+    async def _sync() -> None:
+        triggered = 0
+        async with get_db_context() as db:
+            svc = SyncSourceService(db)
+
+            if sync_all:
+                sources = await svc.list_sources(is_active=True)
+                if not sources.items:
+                    warning("No active sync sources found.")
+                    return
+                info(f"Triggering sync for {sources.total} active source(s)...")
+                for s in sources.items:
+                    try:
+                        log = await svc.trigger_sync(str(s.id))
+                        triggered += 1
+                        success(f"  {s.name}: sync started (log_id={log.id})")
+                    except Exception as e:
+                        error(f"  {s.name}: failed - {e}")
+            else:
+                try:
+                    assert source_id is not None
+                    log = await svc.trigger_sync(source_id)
+                    triggered += 1
+                    success(f"Sync triggered (log_id={log.id})")
+                except Exception as e:
+                    error(f"Failed to trigger sync: {e}")
+
+        if not triggered:
+            return
+        # The syncs run in tasks started when the session above committed, and
+        # `asyncio.run` cancels whatever is still pending when this coroutine
+        # returns - so without the wait the command reports syncs it then kills.
+        # It reported them before this too: the tasks were created earlier but
+        # died at exactly the same moment.
+        info(f"Waiting for {triggered} sync(s) to finish...")
+        await drain(timeout=_SYNC_TIMEOUT_SECONDS)
+
+    asyncio.run(_sync())

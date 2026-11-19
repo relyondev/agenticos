@@ -1,0 +1,534 @@
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+import { parseSubject, toLevel } from "./grants";
+import { SharingPanel } from "./sharing-panel";
+import type { OrganizationMember } from "@/types";
+import type { Group } from "@/types/groups";
+import type { ResourceGrant, ResourceSharing } from "@/types/sharing";
+
+const share = { mutate: vi.fn(), isPending: false };
+const revoke = { mutate: vi.fn(), isPending: false };
+const setVisibility = { mutate: vi.fn(), isPending: false };
+
+let sharing: ResourceSharing | undefined;
+let members: OrganizationMember[];
+let groups: Group[];
+
+// Read at render time, not at factory time, so each test can reshape the state
+// the panel is given.
+vi.mock("@/hooks", () => ({
+  useSharing: () => ({ sharing, isLoading: sharing === undefined, share, revoke, setVisibility }),
+  useMembers: () => ({ members }),
+  useGroups: () => ({ groups }),
+}));
+
+function member(userId: string, email: string): OrganizationMember {
+  return {
+    id: `m-${userId}`,
+    organization_id: "org-1",
+    user_id: userId,
+    role: "member",
+    email,
+    full_name: null,
+    avatar_url: null,
+    avatar_color: null,
+    joined_at: "2026-01-01T00:00:00Z",
+    source: "manual",
+  };
+}
+
+function group(id: string, name: string): Group {
+  return {
+    id,
+    organization_id: "org-1",
+    name,
+    description: null,
+    icon: null,
+    monthly_budget_usd: null,
+    member_count: 3,
+    created_at: "2026-01-01T00:00:00Z",
+  };
+}
+
+const GRANT: ResourceGrant = {
+  id: "g1",
+  subject_user_id: "u-sam",
+  subject_email: "sam@example.com",
+  subject_group_id: null,
+  subject_group_name: null,
+  resource_type: "agent",
+  resource_id: "a1",
+  level: "read",
+};
+
+const GROUP_GRANT: ResourceGrant = {
+  id: "g2",
+  subject_user_id: null,
+  subject_email: null,
+  subject_group_id: "g-fin",
+  subject_group_name: "Finance",
+  resource_type: "agent",
+  resource_id: "a1",
+  level: "use",
+};
+
+const SHARING: ResourceSharing = {
+  resource_type: "agent",
+  resource_id: "a1",
+  owner_user_id: "u-owner",
+  visibility: "private",
+  grants: [GRANT],
+};
+
+function renderPanel(canManage = true, overrides?: Partial<ResourceSharing>) {
+  // Only when a test asks: the others set `sharing` themselves, including to
+  // `undefined` for the loading state, and overwriting it here would decide
+  // for them.
+  if (overrides) sharing = { ...SHARING, ...overrides };
+  return render(<SharingPanel resourceType="agent" resourceId="a1" canManage={canManage} />);
+}
+
+/** The picker's label: one picker for members and groups both. */
+const ADD = "Add a person or group";
+
+/** Open a Radix select and choose one of its options. */
+async function choose(trigger: HTMLElement, option: string) {
+  await userEvent.click(trigger);
+  await userEvent.click(await screen.findByRole("option", { name: option }));
+}
+
+beforeAll(() => {
+  // Radix drives its listbox with pointer-capture and scrolling APIs jsdom does
+  // not implement; without them the menu never opens and every select test
+  // fails for a reason that has nothing to do with this component.
+  Element.prototype.hasPointerCapture = () => false;
+  Element.prototype.setPointerCapture = () => {};
+  Element.prototype.releasePointerCapture = () => {};
+  Element.prototype.scrollIntoView = () => {};
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  sharing = structuredClone(SHARING);
+  members = [
+    member("u-owner", "owner@example.com"),
+    member("u-sam", "sam@example.com"),
+    member("u-nina", "nina@example.com"),
+  ];
+  groups = [group("g-fin", "Finance"), group("g-ops", "Ops")];
+});
+
+describe("SharingPanel", () => {
+  it("waits for the sharing state rather than rendering an empty one", () => {
+    sharing = undefined;
+    renderPanel();
+    expect(screen.queryByText("General access")).not.toBeInTheDocument();
+  });
+
+  it("says who the general access reaches, under the choice", () => {
+    renderPanel();
+    expect(screen.getByText(/Nobody else finds this agent in their list/)).toBeInTheDocument();
+  });
+
+  it("says who an organization-wide resource reaches", () => {
+    renderPanel(true, { visibility: "org" });
+    expect(
+      screen.getByText("Everyone in the organization who can view agents at all."),
+    ).toBeInTheDocument();
+  });
+
+  it("does not offer a visibility this product has no concept of", async () => {
+    // "Team" is a third value the column accepts and `resolve_access`
+    // understands, and it means "anyone whose role reaches team resources" -
+    // a role scope with no team behind it, because there are no teams here.
+    // Offering it asked people to choose between a concept the product has and
+    // one it does not.
+    renderPanel();
+    await choose(screen.getByLabelText("General access"), "Everyone in the organization");
+    expect(screen.queryByRole("option", { name: /Team/ })).toBeNull();
+  });
+
+  it("still shows Team for a row already set to it", () => {
+    // Otherwise a legacy row renders with nothing selected, and the one action
+    // that would fix it - picking something else - looks like it is already done.
+    renderPanel(true, { visibility: "team" });
+    expect(screen.getByLabelText("General access")).toHaveTextContent(/Team/);
+  });
+
+  it("shows the visibility the resource actually has", () => {
+    renderPanel();
+    expect(screen.getByLabelText("General access")).toHaveTextContent("Only people with access");
+  });
+
+  it("asks the server to widen visibility instead of assuming it worked", async () => {
+    renderPanel();
+    await choose(screen.getByLabelText("General access"), "Everyone in the organization");
+    expect(setVisibility.mutate).toHaveBeenCalledWith("org");
+  });
+
+  it("names each person the resource is shared with, and at what level", () => {
+    renderPanel();
+    expect(screen.getByText("sam@example.com")).toBeInTheDocument();
+    expect(screen.getByLabelText("Access for sam@example.com")).toHaveTextContent("Can view");
+    // The owner heads the list, named as the owner rather than given a level.
+    expect(screen.getByText("owner@example.com")).toBeInTheDocument();
+    expect(screen.getByText("Owner")).toBeInTheDocument();
+  });
+
+  it("says plainly that nobody has access when there is no owner to list", () => {
+    sharing = { ...SHARING, owner_user_id: null, grants: [] };
+    renderPanel();
+    expect(screen.getByText("Not shared with anyone yet.")).toBeInTheDocument();
+  });
+
+  it("draws a group it is shared with by the group's own icon", () => {
+    groups = [{ ...group("g-fin", "Finance"), icon: "banknote" } as Group];
+    const { container } = renderPanel(true, { grants: [GROUP_GRANT] });
+    expect(container.querySelector("li svg")).not.toBeNull();
+  });
+
+  it("explains an empty picker rather than offering an empty menu", () => {
+    // Everyone in this organization already reaches the resource, which is a
+    // different thing from the member list having failed to load.
+    members = [member("u-owner", "owner@example.com"), member("u-sam", "sam@example.com")];
+    groups = [group("g-fin", "Finance")];
+    renderPanel(true, { grants: [GRANT, GROUP_GRANT] });
+    expect(screen.getByLabelText(ADD)).toHaveTextContent("Everyone already has access");
+    expect(screen.getByLabelText(ADD)).toBeDisabled();
+  });
+
+  it("falls back to the subject id when the server could not name them", () => {
+    // A grant outlives the membership that explains it. Showing nothing would
+    // leave a row nobody can identify well enough to revoke.
+    sharing = { ...SHARING, grants: [{ ...GRANT, subject_email: null }] };
+    renderPanel();
+    expect(screen.getByText("u-sam")).toBeInTheDocument();
+  });
+
+  it("changes a level with the same call that created the share", async () => {
+    renderPanel();
+    await choose(screen.getByLabelText("Access for sam@example.com"), "Can edit");
+    expect(share.mutate).toHaveBeenCalledWith({ subject_user_id: "u-sam", level: "edit" });
+  });
+
+  it("revokes the person whose row was clicked", async () => {
+    renderPanel();
+    await userEvent.click(screen.getByRole("button", { name: "Remove sam@example.com" }));
+    expect(revoke.mutate).toHaveBeenCalledWith({ kind: "user", id: "u-sam" });
+  });
+
+  it("offers only members who do not already reach it", async () => {
+    renderPanel();
+    await userEvent.click(screen.getByLabelText(ADD));
+
+    expect(await screen.findByRole("option", { name: "nina@example.com" })).toBeInTheDocument();
+    // Sam already has a grant and the owner cannot be granted access they
+    // already own - offering either produces a call the server refuses.
+    expect(screen.queryByRole("option", { name: "sam@example.com" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "owner@example.com" })).not.toBeInTheDocument();
+  });
+
+  it("finds a member by typing part of their address", async () => {
+    groups = [];
+    members = [...members, member("u-noor", "noor@other.example")];
+    renderPanel();
+    await userEvent.click(screen.getByLabelText(ADD));
+    await userEvent.type(await screen.findByPlaceholderText("Search by name or email…"), "other");
+
+    expect(screen.getByRole("option", { name: "noor@other.example" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "nina@example.com" })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("option", { name: "noor@other.example" }));
+    expect(screen.getByLabelText(ADD)).toHaveTextContent("noor@other.example");
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+    expect(share.mutate).toHaveBeenCalledWith({ subject_user_id: "u-noor", level: "read" });
+  });
+
+  it("says so when nobody matches", async () => {
+    renderPanel();
+    await userEvent.click(screen.getByLabelText(ADD));
+    await userEvent.type(await screen.findByPlaceholderText("Search by name or email…"), "zzz");
+
+    expect(screen.getByText("Nobody here matches that.")).toBeInTheDocument();
+  });
+
+  it("shares with the member and level that were chosen", async () => {
+    renderPanel();
+    await choose(screen.getByLabelText(ADD), "nina@example.com");
+    await choose(screen.getByLabelText("Access"), "Can use");
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+
+    expect(share.mutate).toHaveBeenCalledWith({ subject_user_id: "u-nina", level: "use" });
+  });
+
+  it("lists a group it is shared with by name, marked as a group", () => {
+    renderPanel(true, { grants: [GRANT, GROUP_GRANT] });
+
+    expect(screen.getByText("Finance")).toBeInTheDocument();
+    expect(screen.getByText("Group")).toHaveClass("sr-only");
+    expect(screen.getByLabelText("Access for Finance")).toHaveTextContent("Can use");
+  });
+
+  it("falls back to the group id when the server could not name it", () => {
+    renderPanel(true, { grants: [{ ...GROUP_GRANT, subject_group_name: null }] });
+
+    expect(screen.getByText("g-fin")).toBeInTheDocument();
+  });
+
+  it("changes a group's level by the group's key, not a user's", async () => {
+    renderPanel(true, { grants: [GROUP_GRANT] });
+    await choose(screen.getByLabelText("Access for Finance"), "Can edit");
+
+    expect(share.mutate).toHaveBeenCalledWith({ subject_group_id: "g-fin", level: "edit" });
+  });
+
+  it("revokes a group at the group endpoint", async () => {
+    renderPanel(true, { grants: [GROUP_GRANT] });
+    await userEvent.click(screen.getByRole("button", { name: "Remove Finance" }));
+
+    expect(revoke.mutate).toHaveBeenCalledWith({ kind: "group", id: "g-fin" });
+  });
+
+  it("offers only the groups it is not already shared with", async () => {
+    renderPanel(true, { grants: [GRANT, GROUP_GRANT] });
+    await userEvent.click(screen.getByLabelText(ADD));
+
+    expect(await screen.findByRole("option", { name: "Ops" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Finance" })).not.toBeInTheDocument();
+  });
+
+  it("shares with the group that was chosen, by its own key", async () => {
+    renderPanel();
+    await choose(screen.getByLabelText(ADD), "Ops");
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+
+    expect(share.mutate).toHaveBeenCalledWith({ subject_group_id: "g-ops", level: "read" });
+  });
+
+  it("offers groups alone when every member already reaches it", async () => {
+    members = [member("u-owner", "owner@example.com"), member("u-sam", "sam@example.com")];
+    renderPanel();
+    await userEvent.click(screen.getByLabelText(ADD));
+
+    expect(await screen.findByRole("option", { name: "Ops" })).toBeInTheDocument();
+    expect(screen.queryByText("Members")).not.toBeInTheDocument();
+  });
+
+  it("cannot share with nobody", () => {
+    renderPanel();
+    expect(screen.getByRole("button", { name: "Share" })).toBeDisabled();
+  });
+
+  it("leaves someone who cannot edit the resource nothing to change", () => {
+    renderPanel(false);
+    expect(screen.queryByRole("button", { name: "Share" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Remove sam@example.com" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("General access")).toBeDisabled();
+    expect(screen.getByLabelText("Access for sam@example.com")).toBeDisabled();
+  });
+
+  it("wires every label to the control it names", () => {
+    // A label with no htmlFor reads as decoration to a screen reader and leaves
+    // the control it describes unnamed. This regressed once already.
+    const { container } = renderPanel();
+    const labels = Array.from(container.querySelectorAll<HTMLLabelElement>("label"));
+
+    expect(labels.length).toBeGreaterThan(0);
+    for (const label of labels) {
+      expect(label.htmlFor, `"${label.textContent}" names no control`).not.toBe("");
+      expect(document.getElementById(label.htmlFor)).not.toBeNull();
+    }
+  });
+
+  it("says what sharing a key does not control, where the key is shared", () => {
+    // The trap this note exists for: once an agent binds this key it runs with it
+    // for everyone who can run that agent, including people who cannot see the
+    // key here. Sharing is about who may bind and rotate it, not who benefits.
+    render(<SharingPanel resourceType="secret" resourceId="s1" canManage />);
+
+    expect(
+      screen.getByText(/it runs with it for everyone who can run that agent/),
+    ).toBeInTheDocument();
+  });
+
+  it("says the same about a collection an agent searches", () => {
+    render(<SharingPanel resourceType="collection" resourceId="c1" canManage />);
+
+    expect(screen.getByText(/searches it for everyone who can run that agent/)).toBeInTheDocument();
+  });
+
+  it("names an artifact as an artifact, not as the catch-all secret", () => {
+    // The copy selects on the resource type, and `other` reads "secret": an
+    // artifact missing its own branch told its owner who reaches "this secret".
+    const { container } = render(
+      <SharingPanel resourceType="artifact" resourceId="r1" canManage />,
+    );
+
+    expect(screen.getByText(/Nobody else finds this app in their list/)).toBeInTheDocument();
+    expect(container.textContent).not.toMatch(/secret/i);
+  });
+
+  it("adds no such note to an agent, where running it is the point", () => {
+    renderPanel();
+
+    expect(screen.queryByText(/everyone who can run that agent/)).toBeNull();
+  });
+});
+
+describe("including data", () => {
+  const PERSON_TEXT =
+    "sam@example.com can change the data everyone sees on this page, including new tables " +
+    "and columns, without asking you. This also covers their API runs.";
+
+  function renderPage(mayGrantEditData: boolean, grants: ResourceGrant[] = [GRANT]) {
+    sharing = { ...SHARING, resource_type: "artifact", grants };
+    return render(
+      <SharingPanel
+        resourceType="artifact"
+        resourceId="a1"
+        canManage
+        mayGrantEditData={mayGrantEditData}
+      />,
+    );
+  }
+
+  it("offers it to nobody on anything but a page, whatever the flag says", async () => {
+    render(<SharingPanel resourceType="agent" resourceId="a1" canManage mayGrantEditData />);
+    await userEvent.click(screen.getByLabelText("Access for sam@example.com"));
+
+    expect(await screen.findByRole("option", { name: "Can edit" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Can edit, including data" })).toBeNull();
+  });
+
+  it("does not offer it to a page's editor the server did not allow to give it", async () => {
+    renderPage(false);
+    await userEvent.click(screen.getByLabelText("Access for sam@example.com"));
+    expect(await screen.findByRole("option", { name: "Can edit" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Can edit, including data" })).toBeNull();
+  });
+
+  it("still names a row that holds it, and lets any editor lower it without a popup", async () => {
+    renderPage(false, [{ ...GRANT, level: "edit_data" }]);
+    expect(screen.getByLabelText("Access for sam@example.com")).toHaveTextContent(
+      "Can edit, including data",
+    );
+
+    await choose(screen.getByLabelText("Access for sam@example.com"), "Can edit");
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(share.mutate).toHaveBeenCalledWith({ subject_user_id: "u-sam", level: "edit" });
+  });
+
+  it("says what it allows before raising a person to it, and sends the text's id with it", async () => {
+    renderPage(true);
+    await choose(screen.getByLabelText("Access for sam@example.com"), "Can edit, including data");
+
+    expect(share.mutate).not.toHaveBeenCalled();
+    expect(await screen.findByText(PERSON_TEXT)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Give access" }));
+
+    expect(share.mutate).toHaveBeenCalledWith({
+      subject_user_id: "u-sam",
+      level: "edit_data",
+      confirmed: "edit_data.person.v2",
+    });
+  });
+
+  it("names a member with a full name by it in the popup, as the audit entry does", async () => {
+    members = [{ ...member("u-sam", "sam@example.com"), full_name: "Sam Rivera" }];
+    renderPage(true);
+    await choose(screen.getByLabelText("Access for sam@example.com"), "Can edit, including data");
+
+    expect(
+      await screen.findByText(/^Sam Rivera can change the data everyone sees/),
+    ).toBeInTheDocument();
+  });
+
+  it("gives a group the wording for everyone in it, now and later", async () => {
+    renderPage(true, [{ ...GROUP_GRANT, level: "edit" }]);
+    await choose(screen.getByLabelText("Access for Finance"), "Can edit, including data");
+
+    expect(
+      await screen.findByText(
+        /^Anyone in Finance, now or later, can change the data everyone sees/,
+      ),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Give access" }));
+
+    expect(share.mutate).toHaveBeenCalledWith({
+      subject_group_id: "g-fin",
+      level: "edit_data",
+      confirmed: "edit_data.group.v2",
+    });
+  });
+
+  it("shares nothing when the popup is cancelled", async () => {
+    renderPage(true);
+    await choose(screen.getByLabelText("Access for sam@example.com"), "Can edit, including data");
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    expect(share.mutate).not.toHaveBeenCalled();
+  });
+
+  it("asks before adding someone at it, naming them as the picker does", async () => {
+    members = [{ ...member("u-nina", "nina@example.com"), full_name: "Nina Park" }];
+    renderPage(true, []);
+    await choose(screen.getByLabelText(ADD), "Nina Park (nina@example.com)");
+    await choose(screen.getByLabelText("Access"), "Can edit, including data");
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+
+    expect(
+      await screen.findByText(/^Nina Park can change the data everyone sees/),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Give access" }));
+
+    expect(share.mutate).toHaveBeenCalledWith({
+      subject_user_id: "u-nina",
+      level: "edit_data",
+      confirmed: "edit_data.person.v2",
+    });
+  });
+
+  it("asks before adding a group at it, and not for another level", async () => {
+    renderPage(true, []);
+    await choose(screen.getByLabelText(ADD), "Ops");
+    await choose(screen.getByLabelText("Access"), "Can edit, including data");
+    await userEvent.click(screen.getByRole("button", { name: "Share" }));
+    expect(await screen.findByText(/^Anyone in Ops, now or later/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(share.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("toLevel", () => {
+  it("reads back each level the catalog offers", () => {
+    expect(toLevel("read")).toBe("read");
+    expect(toLevel("use")).toBe("use");
+    expect(toLevel("edit")).toBe("edit");
+    expect(toLevel("edit_data")).toBe("edit_data");
+  });
+
+  it("refuses a level this product has no concept of", () => {
+    // Radix hands back a plain string. Defaulting an unknown one to "read" would
+    // silently grant something nobody chose; throwing says a level was added to
+    // the backend and not to this list.
+    expect(() => toLevel("admin")).toThrow("Unknown grant level: admin");
+  });
+});
+
+describe("parseSubject", () => {
+  it("reads back the kind the picker encoded", () => {
+    expect(parseSubject("user:u-1")).toEqual({ kind: "user", id: "u-1" });
+    expect(parseSubject("group:g-1")).toEqual({ kind: "group", id: "g-1" });
+  });
+
+  it.each(["u-1", "user:", "team:t-1"])("refuses %j rather than guessing a kind", (value) => {
+    // A member and a group are both bare UUIDs; guessing which one a value meant
+    // would share with the wrong kind of subject.
+    expect(() => parseSubject(value)).toThrow(`Unknown grant subject: ${value}`);
+  });
+});

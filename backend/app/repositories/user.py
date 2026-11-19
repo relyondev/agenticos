@@ -1,0 +1,281 @@
+"""User repository."""
+
+from collections.abc import Sequence
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.locks import LockScope, hold_name
+from app.db.models.conversation import Conversation
+from app.db.models.user import User
+from app.repositories._search import contains_ci
+
+
+async def has_accounts(db: AsyncSession) -> bool:
+    """Whether this installation already has an account, without scanning it."""
+    return bool(await db.scalar(select(select(User.id).exists())))
+
+
+async def claim_first_account(db: AsyncSession) -> bool:
+    """Claim first-account admission until the caller commits or rolls back.
+
+    Ordinary sign-ups never wait on the bootstrap lock. Fresh-install contenders
+    re-read after acquiring it, so only the account actually created first gets
+    the policy exception and deployment-administrator authority.
+    """
+    if await has_accounts(db):
+        return False
+    await hold_name(db, LockScope.ACCOUNT_BOOTSTRAP, "deployment")
+    return not await has_accounts(db)
+
+
+async def get_by_id(db: AsyncSession, user_id: UUID) -> User | None:
+    """Get user by ID."""
+    return await db.get(User, user_id)
+
+
+async def get_by_ids(db: AsyncSession, user_ids: Sequence[UUID]) -> list[User]:
+    """The users with these ids, in one query; an id with no user is left out."""
+    if not user_ids:
+        return []
+    result = await db.execute(select(User).where(User.id.in_(user_ids)))
+    return list(result.scalars().all())
+
+
+async def get_by_id_for_update(db: AsyncSession, user_id: UUID) -> User | None:
+    """Fetch a user row and acquire a SELECT FOR UPDATE lock."""
+    result = await db.execute(select(User).where(User.id == user_id).with_for_update())
+    return result.scalar_one_or_none()
+
+
+async def get_by_id_for_no_key_update(db: AsyncSession, user_id: UUID) -> User | None:
+    """Fetch a user row and acquire a SELECT FOR NO KEY UPDATE lock.
+
+    Weaker than FOR UPDATE: it serialises against another FOR UPDATE (so two
+    ordered self-deletes still queue on a shared row) but does *not* conflict
+    with the FOR KEY SHARE an unrelated foreign-key write takes on this row - a
+    channel identity relinked to this user, say - so locking a delete's heirs
+    this way does not deadlock against those writes (#1134). `key_share=True`
+    is SQLAlchemy's spelling of FOR NO KEY UPDATE.
+    """
+    result = await db.execute(
+        select(User).where(User.id == user_id).with_for_update(key_share=True)
+    )
+    return result.scalar_one_or_none()
+
+
+async def hold_key_share(db: AsyncSession, user_ids: Sequence[UUID]) -> None:
+    """Take the weakest row lock on each of `user_ids`, in id order.
+
+    `FOR KEY SHARE` is exactly what a foreign key referencing these rows takes
+    when it is inserted, so this acquires nothing extra - it only acquires it
+    *earlier*. That is the whole purpose: `record_audit` holds a
+    transaction-scoped lock on the audit chain, and a write that reaches for a
+    user row afterwards closes an ABBA cycle against `app_admin_ids_for_update`,
+    which takes its rows first and the chain second (#1763). A caller about to
+    write notifications inside an audited transaction takes them here instead,
+    before the chain lock, so every transaction takes user rows first.
+
+    `ORDER BY id`, for the same reason `app_admin_ids_for_update` orders: two
+    callers taking overlapping sets take them in the same order and one waits
+    rather than both holding half. Key share conflicts with nothing another
+    audited write does, so this queues only against an exclusive locker - an
+    admin deletion, which is the other side of the cycle.
+    """
+    if not user_ids:
+        return
+    await db.execute(
+        select(User.id)
+        .where(User.id.in_(sorted(user_ids)))
+        .order_by(User.id)
+        .with_for_update(read=True, key_share=True)
+    )
+
+
+async def app_admin_ids_for_update(db: AsyncSession) -> list[UUID]:
+    """Every app admin's id, locked, in a fixed order.
+
+    The lock is on the *set* rather than on one row, because what has to hold is
+    a fact about the set: a deployment keeps at least one administrator. Two
+    admins deleting each other locked different target rows, never contended,
+    and both committed - leaving nobody who could sign in to administer the
+    deployment and a direct database write as the only recovery (#1208).
+
+    `ORDER BY id` is what keeps that from being a deadlock instead: rows are
+    locked in the order they are returned, so two requests taking the same set
+    take it in the same order and one waits rather than both holding half of it.
+    """
+    result = await db.execute(
+        select(User.id).where(User.is_app_admin.is_(True)).order_by(User.id).with_for_update()
+    )
+    return list(result.scalars().all())
+
+
+async def get_by_email(db: AsyncSession, email: str) -> User | None:
+    """Get user by email."""
+    result = await db.execute(select(User).where(User.email == email))
+    return result.scalar_one_or_none()
+
+
+async def get_by_oauth(db: AsyncSession, provider: str, oauth_id: str) -> User | None:
+    """Get user by OAuth provider and ID."""
+    result = await db.execute(
+        select(User).where(User.oauth_provider == provider, User.oauth_id == oauth_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_multi(
+    db: AsyncSession,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[User]:
+    """Get multiple users with pagination."""
+    result = await db.execute(select(User).offset(skip).limit(limit))
+    return list(result.scalars().all())
+
+
+async def create(
+    db: AsyncSession,
+    *,
+    email: str,
+    hashed_password: str | None,
+    full_name: str | None = None,
+    is_active: bool = True,
+    is_app_admin: bool = False,
+    oauth_provider: str | None = None,
+    oauth_id: str | None = None,
+) -> User:
+    """Create a new user.
+
+    Note: Password should already be hashed by the service layer.
+
+    There is no `role`: the column was dropped before the migration chain was
+    squashed, and authority
+    inside an organization is a membership row plus the permission catalog.
+    `is_app_admin` is the one privilege a user carries on their own row, and it
+    administers the deployment rather than any organization.
+    """
+    user = User(
+        email=email,
+        hashed_password=hashed_password,
+        full_name=full_name,
+        is_active=is_active,
+        is_app_admin=is_app_admin,
+        oauth_provider=oauth_provider,
+        oauth_id=oauth_id,
+    )
+    db.add(user)
+    await db.flush()
+    await db.refresh(user)
+    return user
+
+
+async def update(
+    db: AsyncSession,
+    *,
+    db_user: User,
+    update_data: dict[str, Any],
+) -> User:
+    """Update a user.
+
+    Note: If password needs updating, it should already be hashed.
+    """
+    for field, value in update_data.items():
+        setattr(db_user, field, value)
+
+    db.add(db_user)
+    await db.flush()
+    await db.refresh(db_user)
+    return db_user
+
+
+async def update_avatar(db: AsyncSession, user_id: UUID, avatar_url: str) -> User:
+    """Update a user's avatar URL."""
+    user = await db.get(User, user_id)
+    if user is None:
+        raise ValueError(f"User {user_id} not found")
+    user.avatar_url = avatar_url
+    await db.flush()
+    await db.refresh(user)
+    return user
+
+
+async def delete(db: AsyncSession, user_id: UUID) -> User | None:
+    """Delete a user."""
+    user = await get_by_id(db, user_id)
+    if user:
+        await db.delete(user)
+        await db.flush()
+    return user
+
+
+async def list_non_admins(db: AsyncSession) -> list[User]:
+    """Every user who does not administer the deployment.
+
+    Keyed on `is_app_admin` because that is the only privilege left on a user row
+    - the `role` column this used to read was dropped before the migration chain
+    was squashed, so the old predicate raised `AttributeError` before deleting
+    anything.
+
+    Returned rather than bulk-deleted so `UserService.delete_non_admins` can
+    remove them one at a time through the single-row `delete`, which reconciles
+    each user's personal org and owned rows first: a bulk `DELETE users` 500s on
+    the personal-org `created_by_user_id` RESTRICT FK every seeded account has
+    (#1124).
+    """
+    result = await db.execute(select(User).where(User.is_app_admin.is_(False)))
+    return list(result.scalars().all())
+
+
+async def has_any(db: AsyncSession) -> bool:
+    """Return True if at least one user exists."""
+    result = await db.execute(select(User).limit(1))
+    return result.scalars().first() is not None
+
+
+async def admin_list_with_counts(
+    db: AsyncSession,
+    *,
+    skip: int = 0,
+    limit: int = 50,
+    search: str | None = None,
+    sort_by: str = "created_at",
+    sort_dir: str = "desc",
+) -> tuple[list[tuple[User, int]], int]:
+    """Admin: list users with their conversation counts.
+
+    Returns list of (user, conversation_count) tuples and total count.
+    """
+    conv_count_col = func.count(Conversation.id).label("conversation_count")
+    query = (
+        select(User, conv_count_col)
+        .outerjoin(Conversation, Conversation.user_id == User.id)
+        .group_by(User.id)
+    )
+    count_query = select(func.count()).select_from(User)
+
+    if search:
+        condition = contains_ci(User.email, search) | contains_ci(User.full_name, search)
+        query = query.where(condition)
+        count_query = count_query.where(condition)
+
+    sort_columns = {
+        "email": User.email,
+        "full_name": User.full_name,
+        "created_at": User.created_at,
+        "conversations": conv_count_col,
+    }
+    sort_col = sort_columns.get(sort_by, User.created_at)
+    sort_col = sort_col.desc() if sort_dir == "desc" else sort_col.asc()
+    # `full_name` is nullable and Postgres sorts NULL first on a descending
+    # order, so sorting by name put every account that never filled one in
+    # ahead of the alphabet. A row with no name sorts last either way.
+    query = query.order_by(sort_col.nulls_last()).offset(skip).limit(limit)
+
+    total = await db.scalar(count_query) or 0
+    rows = (await db.execute(query)).all()
+    return [(user, count) for user, count in rows], total

@@ -1,0 +1,80 @@
+"""Tool output limits - reduce a tool return too large for the model's window."""
+
+from pydantic_ai_harness.tool_output_limits import READ_TOOL_NAME
+
+from app.agents.capabilities._registry import (
+    CapabilityBuildContext,
+    CapabilityToolInfo,
+    register,
+)
+from app.agents.capabilities.sandbox import WORKSPACE_RESOURCE
+from app.agents.capabilities.tool_output_limits._capability import (
+    DEFAULT_MAX_CHARS,
+    DEFAULT_SUMMARY_PROMPT,
+    DEFAULT_THRESHOLD,
+    READ_TOOL_RESULT_TEXT,
+    ActionName,
+    MeteredToolOutputLimits,
+    StrategyName,
+    ToolOutputLimitsConfig,
+    build_limits,
+)
+from app.agents.capabilities.tool_output_limits._store import (
+    OVERFLOW_PREFIX,
+    SPILL_LOG_RESOURCE,
+    OverflowWriteError,
+    WorkspaceOverflowStore,
+)
+
+__all__ = [
+    "DEFAULT_MAX_CHARS",
+    "DEFAULT_SUMMARY_PROMPT",
+    "DEFAULT_THRESHOLD",
+    "OVERFLOW_PREFIX",
+    "SPILL_LOG_RESOURCE",
+    "ActionName",
+    "MeteredToolOutputLimits",
+    "OverflowWriteError",
+    "StrategyName",
+    "ToolOutputLimitsConfig",
+    "WorkspaceOverflowStore",
+    "build_limits",
+]
+
+
+@register(
+    id="tool_output_limits",
+    name="Tool output limits",
+    category="utility",
+    description=(
+        "Reduce a tool return too large for the model's window - spill it to the "
+        "agent's backend, truncate it, or summarise it - so it stops being re-sent "
+        "in full on every later request."
+    ),
+    tools=(
+        CapabilityToolInfo(
+            id=READ_TOOL_NAME,
+            # The summary, not the whole text: this is what the Builder shows.
+            description=READ_TOOL_RESULT_TEXT.summary,
+        ),
+    ),
+    config_schema=ToolOutputLimitsConfig,
+)
+def _build(ctx: CapabilityBuildContext) -> MeteredToolOutputLimits[object]:
+    """Build the configured reduction, wrapped so a summary's spend is billed.
+
+    Always returns something: binding the capability *is* the decision to reduce,
+    the way binding `compaction` is the decision to compact. The spill store is the
+    run's own workspace when it bound `sandbox`, and an ephemeral in-memory one when
+    it did not - resolved from `resources`, never fetched here.
+    """
+    config = (
+        ctx.config if isinstance(ctx.config, ToolOutputLimitsConfig) else ToolOutputLimitsConfig()
+    )
+    return MeteredToolOutputLimits(
+        wrapped=build_limits(
+            config,
+            workspace=ctx.resources.get(WORKSPACE_RESOURCE),
+            spill_log=ctx.resources.get(SPILL_LOG_RESOURCE),
+        )
+    )

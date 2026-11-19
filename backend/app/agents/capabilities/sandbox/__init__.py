@@ -1,0 +1,174 @@
+"""Files and a shell — the workspace an agent works in.
+
+`code_execution` computes: a Python evaluator with no network, no filesystem and
+a restricted standard library. That restriction is what makes it safe to grant
+broadly and what makes it useless for the next thing agents are asked to do —
+read a report, write a script, run it, keep the output.
+
+This is that: a real filesystem, and on the backends that have one, a real
+shell. The two coexist deliberately. `code_execution` needs no infrastructure
+and works on every deployment; this one needs a place to put files, and on the
+`state` backend it has no shell at all, so an agent granted both computes with
+one and remembers with the other.
+
+The spec chooses a **backend**, never an image, a mount, a network mode or a
+ceiling. Those are the operator's, and a spec is authored in a browser by
+whoever holds `edit` on an agent - one that could name a Docker image could name
+one whose entrypoint mounts the host.
+"""
+
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+from pydantic_ai.capabilities import CombinedCapability
+
+from app.agents.capabilities._registry import CapabilityBuildContext, register
+from app.agents.capabilities.sandbox._capability import WORKSPACE_TOOLS, build_workspace
+from app.agents.capabilities.sandbox._identity import (
+    BackendKind,
+    SessionScope,
+    WorkspaceIdentity,
+    WorkspaceScopeUnavailable,
+    scope_key,
+)
+
+__all__ = [
+    "SHARED_SCOPES",
+    "WORKSPACE_RESOURCE",
+    "WORKSPACE_SHARED_RESOURCE",
+    "BackendKind",
+    "SandboxConfig",
+    "SessionScope",
+    "WorkspaceIdentity",
+    "WorkspaceScopeUnavailable",
+    "scope_key",
+]
+
+WORKSPACE_SHARED_RESOURCE = "workspace_shared"
+"""Whether other people's runs work in the run's workspace too, beside `WORKSPACE_RESOURCE`.
+
+They run as the same sandbox user, so anything one writes there the others can
+read - which is what a person's own credential must not be written into.
+"""
+
+SHARED_SCOPES: frozenset[str] = frozenset({"project", "agent", "channel"})
+"""Scopes whose container other people's runs always work in. A `conversation`
+one is shared too once somebody else may write in the conversation."""
+
+WORKSPACE_RESOURCE = "workspace"
+"""Where the runner leaves the workspace it opened for this run.
+
+Resolved outside the capability because opening one reads and writes the
+database - loading a stored `state` document, recording which session id belongs
+to which conversation - and a capability must never reach the database itself.
+Tools work in `ctx.workspace`, which the runner sets by passing this same
+workspace to the run. The resource is for what is built before the run starts
+and so has no `ctx` to ask - the spill store of `tool_output_limits` - and for
+handing a delegate its parent's workspace. Absent for a preview or a unit test,
+where an in-memory workspace that lives and dies with the run is the honest
+answer rather than an error.
+"""
+
+
+class SandboxConfig(BaseModel):
+    """Which workspace this agent gets, and who shares it.
+
+    Two decisions, and the second is the one worth reading twice: `backend` is
+    an infrastructure choice, while `session_scope` is a **data-sharing
+    policy**. Getting the first wrong costs a feature; getting the second wrong
+    shows one person another person's files.
+    """
+
+    backend: Literal["state", "service", "local"] = Field(
+        title="Where files live",
+        default="state",
+        description=(
+            "state: files only, no shell, stored by the platform - works on every "
+            "deployment with no extra services. "
+            "service: a container or cloud sandbox, on one of the connections this "
+            "organization has registered. "
+            "local: the person selects and approves their own computer in desktop chat; "
+            "no machine path or native consent is stored in this spec."
+        ),
+    )
+    connection_id: UUID | None = Field(
+        title="Sandbox connection",
+        default=None,
+        description=(
+            "Which registered sandbox connection to run on; empty takes the "
+            "organization's default. An id, never an address or a token - a spec is "
+            "exported to a client's git repository, so the only thing it may carry "
+            "is a reference. The connection decides whether that is a container on "
+            "a host you run or a sandbox in Daytona's cloud."
+        ),
+    )
+    # The default on every surface; a binding on one exposure may say otherwise. A
+    # Slack thread is a conversation, a direct message keeps its own workspace, and a
+    # user's scope crosses surfaces once they link their account.
+    session_scope: Literal["run", "conversation", "channel", "user", "agent"] = Field(
+        title="Who shares the workspace",
+        default="conversation",
+        description=(
+            "Who shares one workspace: run (a fresh one every turn), conversation "
+            "(everyone in the chat or Slack thread), channel (a whole Slack channel), "
+            "user (one person across chats) or agent (everyone who talks to it)."
+        ),
+        json_schema_extra={"x-advanced": True},
+    )
+    runtime: str | None = Field(
+        title="Runtime",
+        default=None,
+        max_length=64,
+        description=(
+            "Which environment a container-backed workspace runs, named from the "
+            "list the connection's service allows. Empty takes the connection's "
+            "default. An alias, never an image."
+        ),
+    )
+    include_execute: bool = Field(
+        title="Allow shell commands",
+        default=True,
+        description=(
+            "Whether the agent may run shell commands. Turning it off leaves the "
+            "file tools and removes the shell entirely, rather than gating it."
+        ),
+    )
+
+
+@register(
+    id="sandbox",
+    voice="hand_off",
+    name="Sandbox",
+    category="analysis",
+    description="Read, write and run things in a workspace that persists between turns.",
+    # Every tool declared, including `execute` when a configuration might not
+    # offer it. A tool absent from this list cannot be gated by the approval
+    # policy or renamed by a binding, and the dangerous half of that is silent:
+    # a workspace whose `execute` nobody declared runs unattended forever.
+    #
+    # `side_effecting` is per tool because this capability is genuinely two
+    # things. One flag would either make the agent ask permission to list a
+    # directory, or let it overwrite a file unattended.
+    tools=WORKSPACE_TOOLS,
+    config_schema=SandboxConfig,
+    scopes=("sandbox:execute",),
+    # The capability as a whole acts on the world; the four read-only tools say
+    # otherwise for themselves. This is what a binding's `approval` falls back
+    # to when it says nothing about a particular tool.
+    side_effecting=True,
+    # No `secret=` here, and that is the change worth noting: the credential
+    # belongs to the *connection*, not to a binding. Two hosts need two tokens,
+    # and a key attached per agent could not express that - nor could it be one
+    # concept with the Daytona account an organization bills its cloud sandboxes
+    # to. A connection carries both.
+)
+def _build(ctx: CapabilityBuildContext) -> CombinedCapability[Any]:
+    """The library's console tools, working in the run's workspace.
+
+    The workspace is not built here: opening one reads the database, and this
+    runs inside `build_agent`, which has no session and must not acquire one.
+    The runner opens it and passes it to the run.
+    """
+    config = ctx.config if isinstance(ctx.config, SandboxConfig) else SandboxConfig()
+    return build_workspace(include_execute=config.include_execute)

@@ -1,0 +1,296 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { CreateAgentDialog, deriveHandle } from "./create-agent-dialog";
+import { apiClient } from "@/lib/api-client";
+import { ApiError } from "@/lib/api-error";
+
+vi.mock("@/lib/api-client", () => ({
+  apiClient: { get: vi.fn(), post: vi.fn(), put: vi.fn(), delete: vi.fn() },
+}));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+import { toast } from "sonner";
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+/** The 409 the registry answers when a name derives a handle already in use. */
+const HANDLE_TAKEN = new ApiError(409, "An agent with the handle 'support' already exists", {
+  error: {
+    code: "ALREADY_EXISTS",
+    message: "An agent with the handle 'support' already exists",
+    details: { slug: "support" },
+  },
+});
+
+function open(onCreated = vi.fn()) {
+  const onOpenChange = vi.fn();
+  render(<CreateAgentDialog open onOpenChange={onOpenChange} onCreated={onCreated} />, { wrapper });
+  return { onCreated, onOpenChange };
+}
+
+const name = () => screen.getByLabelText("Name");
+const create = () => screen.getByRole("button", { name: "Create" });
+
+describe("deriveHandle", () => {
+  it.each([
+    ["Support Copilot", "support-copilot"],
+    ["  Refunds  ", "refunds"],
+    ["Sales / EMEA", "sales-emea"],
+    ["Ärger", "rger"],
+    // What the backend does with a name that leaves nothing behind. Predicting
+    // it is the point: the reader sees the surprise before they cause it.
+    ["!!!", "agent"],
+  ])("derives %s into @%s, exactly as the backend would", (input, expected) => {
+    expect(deriveHandle(input)).toBe(expected);
+  });
+});
+
+describe("CreateAgentDialog", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+  });
+
+  it("shows the handle the name will produce, while it is being typed", async () => {
+    // The handle is what a duplicate is refused on, what Slack resolves, and
+    // the one thing about an agent that cannot be changed afterwards. A reader
+    // told "the handle 'support' is taken" needs to have seen where it came
+    // from.
+    open();
+    await userEvent.type(name(), "Support Copilot");
+
+    expect(screen.getByText("@support-copilot")).toBeInTheDocument();
+  });
+
+  it("keeps the optional details folded until asked for", async () => {
+    // A draft needs a name and an audience; the description and the catalog
+    // labels wait behind More options rather than lengthening every create.
+    open();
+
+    expect(screen.queryByLabelText("Description")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "More options" }));
+
+    expect(screen.getByLabelText("Description")).toBeInTheDocument();
+    expect(screen.getByLabelText("Add a tag")).toBeInTheDocument();
+  });
+
+  it("offers the agent to the organization unless somebody says otherwise", async () => {
+    // Private was the default, so every agent was made invisible and then shared
+    // by hand - and the second person to go looking was told it did not exist.
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support Copilot" });
+    open();
+
+    await userEvent.type(name(), "Support Copilot");
+    await userEvent.click(create());
+
+    await waitFor(() =>
+      expect(apiClient.post).toHaveBeenCalledWith(
+        "/agents",
+        expect.objectContaining({ visibility: "org" }),
+      ),
+    );
+  });
+
+  it("asks the server for the rest of the starter agent, which only it holds (#2301)", async () => {
+    // Its instructions, skills, the platform's tools and its budget - an agent
+    // made any other way keeps an empty field empty.
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support Copilot" });
+    open();
+
+    await userEvent.type(name(), "Support Copilot");
+    await userEvent.click(create());
+
+    await waitFor(() =>
+      expect(apiClient.post).toHaveBeenCalledWith(
+        "/agents",
+        expect.objectContaining({ from_starter: true }),
+      ),
+    );
+  });
+
+  it("starts every agent with the starter agent's recommended capabilities", async () => {
+    // What the AgenticOS template binds, config and all - ask_user among
+    // them (#2064) - and nothing the catalog does not recommend.
+    const sandbox = {
+      id: "sandbox",
+      config: { include_execute: true },
+      approval: "default",
+      tool_approval: {},
+      tool_overrides: {},
+      secret_id: null,
+      enabled: true,
+    };
+    vi.mocked(apiClient.get).mockImplementation(async (path: string) =>
+      path === "/agents/capabilities"
+        ? {
+            items: [
+              { id: "sandbox", name: "Sandbox", description: "", recommended: sandbox },
+              {
+                id: "ask_user",
+                name: "Ask",
+                description: "",
+                recommended: { ...sandbox, id: "ask_user", config: {} },
+              },
+              { id: "guardrails", name: "Guardrails", description: "", recommended: null },
+            ],
+            total: 3,
+          }
+        : { items: [], total: 0 },
+    );
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support Copilot" });
+    open();
+
+    await userEvent.type(name(), "Support Copilot");
+    expect(await screen.findByText("Starts with 2 recommended tools")).toBeInTheDocument();
+    await waitFor(() => expect(create()).toBeEnabled());
+    await userEvent.click(create());
+
+    await waitFor(() =>
+      expect(apiClient.post).toHaveBeenCalledWith(
+        "/agents",
+        expect.objectContaining({
+          spec: expect.objectContaining({
+            capabilities: [
+              expect.objectContaining({
+                id: "sandbox",
+                enabled: true,
+                config: { include_execute: true },
+              }),
+              expect.objectContaining({ id: "ask_user", enabled: true }),
+            ],
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("sends private when private is asked for", async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support" });
+    open();
+
+    await userEvent.type(name(), "Support");
+    await userEvent.click(screen.getByRole("radio", { name: /Only me/ }));
+    await userEvent.click(create());
+
+    await waitFor(() =>
+      expect(apiClient.post).toHaveBeenCalledWith(
+        "/agents",
+        expect.objectContaining({ visibility: "private" }),
+      ),
+    );
+  });
+
+  it("sends the labels it was given, folded by the server afterwards", async () => {
+    // The catalog a new agent joins is the moment somebody knows what to call
+    // it; the detail page can still change these later without a publish.
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support" });
+    open();
+
+    await userEvent.type(name(), "Support");
+    await userEvent.click(screen.getByRole("button", { name: "More options" }));
+    await userEvent.type(screen.getByLabelText("Add a category"), "support{Enter}");
+    await userEvent.type(screen.getByLabelText("Add a tag"), "billing{Enter}");
+    await userEvent.click(create());
+
+    await waitFor(() =>
+      expect(apiClient.post).toHaveBeenCalledWith(
+        "/agents",
+        expect.objectContaining({ categories: ["support"], tags: ["billing"] }),
+      ),
+    );
+  });
+
+  it("marks the name and keeps the form when the handle is taken", async () => {
+    vi.mocked(apiClient.post).mockRejectedValue(HANDLE_TAKEN);
+    const { onCreated } = open();
+
+    await userEvent.type(name(), "Support");
+    await userEvent.click(screen.getByRole("button", { name: "More options" }));
+    await userEvent.type(screen.getByLabelText("Description"), "Answers questions.");
+    await userEvent.click(create());
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("An agent with the handle 'support' already exists"),
+      ).toBeInTheDocument(),
+    );
+    // Beside the field, not floating over the page: the input is marked, and
+    // the message is what a screen reader reads out for it.
+    expect(name()).toHaveAttribute("aria-invalid", "true");
+    expect(name()).toHaveAccessibleDescription(/An agent with the handle 'support' already exists/);
+
+    // Everything typed is still there, and nothing has navigated away.
+    expect(name()).toHaveValue("Support");
+    expect(screen.getByLabelText("Description")).toHaveValue("Answers questions.");
+    expect(onCreated).not.toHaveBeenCalled();
+    // And it is not also announced as a failure - one problem, one place.
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("clears the mark as soon as the name changes", async () => {
+    // The server's verdict was about the value that was sent. Leaving it on a
+    // field the reader has since fixed is a form arguing with itself.
+    vi.mocked(apiClient.post).mockRejectedValue(HANDLE_TAKEN);
+    open();
+
+    await userEvent.type(name(), "Support");
+    await userEvent.click(create());
+    await waitFor(() => expect(name()).toHaveAttribute("aria-invalid", "true"));
+
+    await userEvent.type(name(), "2");
+    expect(name()).not.toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("still says something broke when something broke", async () => {
+    // The line this must not cross. A 500 is not a hint about the name, and
+    // dressing it as one would send somebody editing a field that was fine.
+    vi.mocked(apiClient.post).mockRejectedValue(
+      new ApiError(500, "An unexpected error occurred", {
+        error: { code: "INTERNAL_ERROR", message: "An unexpected error occurred", details: null },
+      }),
+    );
+    open();
+
+    await userEvent.type(name(), "Support");
+    await userEvent.click(create());
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("An unexpected error occurred"));
+    expect(name()).not.toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("cannot send a name longer than the server accepts", async () => {
+    // A round trip that can only end in a refusal is one the browser can spare.
+    open();
+    expect(name()).toHaveAttribute("maxLength", "128");
+  });
+
+  it("hands the created agent back and empties itself", async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support" });
+    const { onCreated } = open();
+
+    await userEvent.type(name(), "Support");
+    await userEvent.click(create());
+
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "a1", name: "Support" }));
+    expect(name()).toHaveValue("");
+  });
+
+  it("closes without creating when cancelled", async () => {
+    const { onOpenChange } = open();
+
+    await userEvent.type(name(), "Support");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(apiClient.post).not.toHaveBeenCalled();
+  });
+});

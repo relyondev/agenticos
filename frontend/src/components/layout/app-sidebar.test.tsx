@@ -1,0 +1,340 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import { NAV_GROUPS, SidebarNav, isActive } from "./app-sidebar";
+
+const can = vi.fn<(permission: string) => boolean>();
+const currentPath = vi.fn<() => string>(() => "/dashboard");
+const currentUser = vi.fn<() => { is_app_admin?: boolean } | null>(() => ({}));
+
+vi.mock("next/navigation", () => ({
+  usePathname: () => currentPath(),
+  // next-intl's createNavigation wraps these at module scope; see `vitest.setup.ts`.
+  redirect: vi.fn(),
+  permanentRedirect: vi.fn(),
+}));
+vi.mock("next-intl", async () => ({
+  useTranslations: (await import("@/test-utils/intl")).keyTranslations(),
+}));
+vi.mock("@/hooks/use-permissions", () => ({ usePermissions: () => ({ can }) }));
+const recentProjects = vi.fn<() => { id: string; name: string }[]>(() => []);
+vi.mock("@/hooks/use-projects", () => ({
+  useProjects: () => ({ projects: recentProjects() }),
+}));
+const waiting = vi.fn<() => { id: string }[]>(() => []);
+vi.mock("@/hooks/use-suggestions", () => ({ useSuggestions: () => ({ suggestions: waiting() }) }));
+const sidebar = { openGroups: [] as string[], toggleGroup: vi.fn<(key: string) => void>() };
+vi.mock("@/stores", () => ({
+  useAuthStore: () => ({ user: currentUser() }),
+  useSidebarStore: <T,>(select: (state: typeof sidebar) => T) => select(sidebar),
+}));
+
+function renderNav() {
+  return render(<SidebarNav />);
+}
+
+describe("isActive", () => {
+  it("lights the entry for the page you are on", () => {
+    expect(isActive("/agents", "/agents")).toBe(true);
+  });
+
+  it("keeps a section lit on its detail pages", () => {
+    // Otherwise opening one agent makes the sidebar claim you are nowhere.
+    expect(isActive("/agents/abc-123", "/agents")).toBe(true);
+  });
+
+  it("keeps a two-letter section lit on its detail pages", () => {
+    // The reported bug: the locale prefix used to be stripped by shape rather
+    // than by name, so `/kb` was mistaken for a locale and eaten - leaving
+    // `/5eacffcc-…`, which is inside nothing. Both the list and the detail page
+    // showed a sidebar with no entry lit at all.
+    expect(isActive("/kb", "/kb")).toBe(true);
+    expect(isActive("/kb/5eacffcc-873e-42fe-a73a-32cd19322d00", "/kb")).toBe(true);
+  });
+
+  it("ignores the locale prefix", () => {
+    // `/en/agents` and `/agents` are the same page; without this every entry
+    // goes dark for anyone not on the default locale.
+    expect(isActive("/en/agents", "/agents")).toBe(true);
+    expect(isActive("/pl/agents/abc", "/agents")).toBe(true);
+    expect(isActive("/pl/kb/abc", "/kb")).toBe(true);
+  });
+
+  it("does not light a section on a route that merely starts the same way", () => {
+    expect(isActive("/agents-archive", "/agents")).toBe(false);
+  });
+
+  it("gives a sub-route to the entry that owns it, not to the one above it", () => {
+    // The one case a prefix gets wrong, and the reason the rule is stated once
+    // here rather than as a flag every future entry has to remember.
+    const hrefs = ["/settings", "/settings/providers"];
+
+    expect(isActive("/settings/providers", "/settings/providers", hrefs)).toBe(true);
+    expect(isActive("/settings/providers", "/settings", hrefs)).toBe(false);
+    expect(isActive("/settings/providers/openai", "/settings", hrefs)).toBe(false);
+  });
+
+  it("returns a sub-route to the entry above once nothing more specific claims it", () => {
+    // Deleting the more specific entry must be enough; no second edit.
+    expect(isActive("/settings/providers", "/settings", ["/settings"])).toBe(true);
+    expect(isActive("/settings/profile", "/settings", ["/settings", "/settings/providers"])).toBe(
+      true,
+    );
+  });
+});
+
+describe("SidebarNav", () => {
+  it("shows every destination the caller is entitled to", () => {
+    can.mockReturnValue(true);
+
+    renderNav();
+
+    for (const label of ["dashboard", "chat", "agents", "skills", "activity", "routines"]) {
+      expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
+    }
+  });
+
+  it("hides what the caller's role does not allow", () => {
+    // Presentation, not enforcement - but a link that can only refuse them is
+    // an invitation to try something that cannot work.
+    can.mockImplementation((permission) => permission !== "skills:view");
+
+    renderNav();
+
+    expect(screen.queryByRole("link", { name: "skills" })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "agents" })).toBeInTheDocument();
+  });
+
+  it("shows the Vault to anyone who can view secrets, without connections:manage", () => {
+    // The backend gates the Vault's listing on secrets:view; a Member holds it
+    // at OWN scope but never holds connections:manage. Gating the nav on the
+    // latter hid the Vault from everyone below admin.
+    can.mockImplementation((permission) => permission === "secrets:view");
+    sidebar.openGroups = ["connections"];
+
+    renderNav();
+
+    expect(screen.getByRole("link", { name: "vault" })).toBeInTheDocument();
+  });
+
+  it("hides the Vault when the caller cannot even list secrets", () => {
+    can.mockImplementation((permission) => permission === "connections:manage");
+    sidebar.openGroups = ["connections"];
+
+    renderNav();
+
+    expect(screen.queryByRole("link", { name: "vault" })).not.toBeInTheDocument();
+  });
+
+  it("reveals nothing while permissions are still loading", () => {
+    // `can()` answers false until they arrive, so the nav fills in rather than
+    // briefly offering entries that are about to vanish.
+    can.mockReturnValue(false);
+
+    renderNav();
+
+    expect(screen.queryByRole("link", { name: "agents" })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "dashboard" })).toBeInTheDocument();
+  });
+
+  it("drops a group heading when nothing in it survives the filter", () => {
+    // A "Build" label above empty space reads as a broken page.
+    can.mockReturnValue(false);
+
+    renderNav();
+
+    expect(screen.queryByText("build")).not.toBeInTheDocument();
+  });
+
+  it("keeps the admin group for platform admins only", () => {
+    // The flag, and only the flag. There used to be a `role === "admin"`
+    // fallback in `isAppAdmin`; while it existed this group appeared for
+    // accounts whose every request behind it was refused.
+    can.mockReturnValue(true);
+    currentUser.mockReturnValue({ is_app_admin: false });
+
+    const { unmount } = renderNav();
+    expect(screen.queryByRole("link", { name: "adminOverview" })).not.toBeInTheDocument();
+    unmount();
+
+    currentUser.mockReturnValue({ is_app_admin: true });
+    renderNav();
+    expect(screen.getByRole("link", { name: "adminOverview" })).toBeInTheDocument();
+  });
+
+  it("marks the current page for assistive technology", () => {
+    can.mockReturnValue(true);
+    currentPath.mockReturnValue("/agents");
+
+    renderNav();
+
+    expect(screen.getByRole("link", { name: "agents" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("link", { name: "chat" })).not.toHaveAttribute("aria-current");
+  });
+
+  it("folds a set-up-once group to its heading until somebody opens it", () => {
+    can.mockReturnValue(true);
+    currentPath.mockReturnValue("/dashboard");
+    sidebar.openGroups = [];
+
+    renderNav();
+
+    expect(screen.queryByRole("link", { name: "mcpServers" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "connections" }));
+    expect(sidebar.toggleGroup).toHaveBeenCalledWith("connections");
+  });
+
+  it("never folds the group holding the page you are on", () => {
+    can.mockReturnValue(true);
+    currentPath.mockReturnValue("/channels");
+    sidebar.openGroups = [];
+
+    renderNav();
+
+    expect(screen.getByRole("link", { name: "channels" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: "connections" })).toBeDisabled();
+  });
+
+  it("opens a group somebody opened before", () => {
+    can.mockReturnValue(true);
+    currentPath.mockReturnValue("/dashboard");
+    sidebar.openGroups = ["organization"];
+
+    renderNav();
+
+    expect(screen.getByRole("link", { name: "groups" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "organization" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  it("lists the reader's recent projects above all of them, lighting the one open", () => {
+    can.mockReturnValue(true);
+    currentPath.mockReturnValue("/projects/p-2");
+    recentProjects.mockReturnValue([
+      { id: "p-1", name: "Q3 launch" },
+      { id: "p-2", name: "treasury" },
+    ]);
+
+    renderNav();
+
+    expect(screen.getByRole("link", { name: /Q3 launch/ })).toHaveAttribute(
+      "href",
+      "/projects/p-1",
+    );
+    expect(screen.getByRole("link", { name: /treasury/ })).toHaveAttribute("aria-current", "page");
+    // The list entry lights on its own page only, not under every project.
+    expect(screen.getByRole("link", { name: "allProjects" })).not.toHaveAttribute("aria-current");
+    expect(screen.getByText("T")).toBeInTheDocument();
+    recentProjects.mockReturnValue([]);
+  });
+
+  it("draws the rail as the same list without its words", () => {
+    // Folded groups stay folded, so the rail offers what the column does and
+    // its fold control opens the same group; a project is named by its title.
+    can.mockReturnValue(true);
+    currentPath.mockReturnValue("/projects");
+    sidebar.openGroups = [];
+    recentProjects.mockReturnValue([{ id: "p-1", name: "Q3 launch" }]);
+
+    render(<SidebarNav collapsed />);
+
+    expect(screen.queryByRole("link", { name: "mcpServers" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "connections" }));
+    expect(sidebar.toggleGroup).toHaveBeenCalledWith("connections");
+    expect(screen.getByRole("link", { name: "Q3 launch" })).toHaveAttribute("title", "Q3 launch");
+    expect(screen.getByRole("link", { name: "allProjects" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    recentProjects.mockReturnValue([]);
+  });
+
+  it("draws a group that never folds as a rule on the rail", () => {
+    can.mockReturnValue(true);
+    currentPath.mockReturnValue("/dashboard");
+
+    render(<SidebarNav collapsed />);
+
+    expect(screen.queryByText("build")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "agents" })).toBeInTheDocument();
+  });
+
+  it("runs the caller's callback on navigation, so the drawer can close", () => {
+    can.mockReturnValue(true);
+    const onNavigate = vi.fn();
+
+    render(<SidebarNav onNavigate={onNavigate} />);
+    screen.getByRole("link", { name: "chat" }).click();
+
+    expect(onNavigate).toHaveBeenCalled();
+  });
+});
+
+describe("the navigation definition", () => {
+  const hrefs = NAV_GROUPS.flatMap((group) => group.items.map((item) => item.href));
+  const lit = (path: string) => hrefs.filter((href) => isActive(path, href));
+
+  it("lights exactly one entry on every destination it declares", () => {
+    // Guards the real table, not a hypothetical one: a new entry that shadows an
+    // existing section, or is shadowed by it, fails here rather than in a
+    // browser.
+    for (const href of hrefs) expect(lit(href), href).toEqual([href]);
+  });
+
+  it("lights exactly one entry on a sub-page of every destination", () => {
+    for (const href of hrefs) expect(lit(`${href}/1e0a`), href).toEqual([href]);
+  });
+
+  it("lights nothing on a page no entry owns", () => {
+    // /profile and /billing are reached from the account menu; claiming a
+    // section for them would be a lie, not a nicety.
+    expect(lit("/profile")).toEqual([]);
+    expect(lit("/agents-archive")).toEqual([]);
+  });
+
+  it("has no duplicate destinations", () => {
+    // Two entries pointing at one page means two of them light up at once.
+    const hrefs = NAV_GROUPS.flatMap((group) => group.items.map((item) => item.href));
+
+    expect(new Set(hrefs).size).toBe(hrefs.length);
+  });
+
+  it("gives every platform destination a permission to hide behind", () => {
+    // Dashboard, Chat and Organizations are open to any member by design, and so
+    // is Documents: it lists the files an agent kept *for the person looking*,
+    // and the backend narrows it to what they are part of - a permission here
+    // would hide somebody's own files behind an operator's authority. Groups too:
+    // any member reads them, because a group is what somebody shares with (#2072).
+    // The inbox holds only what was brought to the person looking (#2301).
+    // Everything else must state what it needs, or a Viewer is shown pages that
+    // will refuse them.
+    const open = new Set(["dashboard", "chat", "inbox", "organizations", "groups", "documents"]);
+    const unguarded = NAV_GROUPS.filter((group) => !group.adminOnly)
+      .flatMap((group) => group.items)
+      .filter((item) => !item.permission && !open.has(item.labelKey));
+
+    expect(unguarded).toEqual([]);
+  });
+});
+
+describe("the inbox count (#2301)", () => {
+  it("says how many wait, as a number in the column and a dot on the rail", () => {
+    can.mockReturnValue(true);
+    waiting.mockReturnValue([{ id: "s1" }, { id: "s2" }]);
+    const { unmount } = render(<SidebarNav />);
+    expect(screen.getByLabelText("inboxCount")).toHaveTextContent("2");
+    unmount();
+
+    render(<SidebarNav collapsed />);
+    expect(screen.getByLabelText("inboxCount")).toBeEmptyDOMElement();
+  });
+
+  it("shows nothing when nothing waits", () => {
+    can.mockReturnValue(true);
+    waiting.mockReturnValue([]);
+    render(<SidebarNav />);
+    expect(screen.queryByLabelText("inboxCount")).toBeNull();
+  });
+});

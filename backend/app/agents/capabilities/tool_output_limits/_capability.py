@@ -1,0 +1,431 @@
+"""Reducing an oversized tool return before it costs the run for the rest of it.
+
+A tool can hand back a payload large enough to dominate the model's window - a
+grep over a big repository, a verbose API response, a directory listing that runs
+to tens of thousands of characters. That return persists in history as a
+`ToolReturnPart`, so it is re-sent on *every* later request of the run, paying its
+token cost again each time. The repo's existing answer is to truncate at the
+source (`code_execution` clips at 8,000 chars); the right default, the wrong
+ceiling, because the part that mattered is silently gone from the model's view.
+
+The reduction itself is `pydantic-ai-harness`'s `ToolOutputLimits`, the same
+bargain `compaction` strikes with the harness: the library owns the mechanism,
+this module owns the two things a platform has to add.
+
+**A store the tenant owns.** The harness default keeps spilled payloads on shared
+disk, forever - a cross-tenant leak that outlives the run. Here a spill goes to
+the agent's own backend when it has one, and to an ephemeral in-memory backend
+when it does not; see :mod:`._store` and :func:`_build_store`.
+
+**A budget that can see a summary.** The `summarize` action writes through an
+`Agent` the harness builds itself, so that request never passes `BudgetGuard` -
+the same #16 hole `compaction` closes. Its tokens land in `ctx.usage` and nowhere
+else, so :class:`MeteredToolOutputLimits` books the delta against the run's ledger,
+and skips the reduction outright at a budget cap so the summary cannot spend past
+it (agenticos#1808).
+
+One thing this site does *not* yet do that `compaction` and `system_reminders` do:
+make the summary content-free and give it the run's model settings. The harness's
+`ToolOutputLimits._summarize` neither passes `model_settings` to its summary
+`agent.run` nor takes a per-request content-free model without mutating shared band
+config, so those two are a noted follow-up rather than a hack here; the branches
+that add the RAG auxiliary sites are where the shared runner earns its keep.
+
+One knob the harness offers is deliberately not exposed: the `bands` list. The
+Builder renders a form from the config's JSON schema and cannot draw a nested list
+of `(threshold, action)` pairs, so - as `compaction` chooses a strategy rather than
+composing tiers - an author picks one `action` and one `threshold`, and the module
+assembles the single band with the fallbacks the harness README recommends
+(`spill -> truncate`, `summarize -> spill -> truncate`), so a reduction that cannot
+run degrades to a cheaper one rather than to a silent drop.
+"""
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_ai.capabilities import WrapperCapability
+from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition
+from pydantic_ai.toolsets import AgentToolset
+from pydantic_ai.workspaces import Workspace
+from pydantic_ai_backends import StateWorkspace
+from pydantic_ai_harness.tool_output_limits import (
+    READ_TOOL_NAME,
+    Action,
+    Band,
+    Spill,
+    Summarize,
+    ToolOutputLimits,
+    Truncate,
+    TruncationStrategy,
+    indented_json,
+)
+from pydantic_core import to_json
+
+from app.agents.capabilities._tool_text import ToolText
+from app.agents.capabilities.budget import (
+    can_afford_ambient_call,
+    record_ambient_usage,
+    usage_counts,
+    usage_delta,
+)
+from app.agents.capabilities.tool_output_limits._store import WorkspaceOverflowStore
+
+DEFAULT_THRESHOLD = 60_000
+"""Characters at or above which a return is reduced, when a binding names none.
+
+Above the harness's own 10,000 on purpose. A fetched page or a file of 30,000 to
+40,000 characters is an ordinary return an agent is expected to read whole, and
+at 10,000 it arrived as a preview the model had to page through - which read as
+the tool being broken. `web_fetch` returns up to 50,000 characters of content by
+default, and its URL, title and truncation marker come on top, so the threshold
+sits clear of all of it: a full fetch passes untouched."""
+
+DEFAULT_TOKEN_THRESHOLD = DEFAULT_THRESHOLD // 4
+"""The same default for a binding that measures in tokens (`over_tokens`).
+
+A quarter, because the harness estimates a token as about four characters - so
+switching the unit does not quietly make the default four times as permissive."""
+
+DEFAULT_MAX_CHARS = 20_000
+"""Characters kept when a return is truncated, or when a spill falls back to one.
+
+Large enough that a truncated return still carries the bulk of an ordinary one;
+4,000 left too little of a page to act on. Never more than the threshold when a
+binding leaves this unset: a truncation that keeps more than the size it was
+triggered at leaves the return as it was."""
+
+DEFAULT_SUMMARY_PROMPT: str = ToolOutputLimits().summary_prompt
+"""The prompt a `summarize` reduction is written with, unless a binding replaces it.
+
+Read off the library rather than copied, so the two cannot drift - a copy here
+would be offered to authors long after the upstream one changed, and the gap
+between the prompt they edit and the prompt that runs would be invisible. Building
+a throwaway `ToolOutputLimits` is cheap: its default store touches no disk until a
+payload is written."""
+
+ActionName = Literal["spill", "truncate", "summarize"]
+"""Which reduction a binding picked.
+
+Stored in published specs and exported into a client's git repository, so these
+three strings are as permanent as the capability id. An action that stops making
+sense is deprecated in the documentation; the value keeps resolving.
+"""
+
+StrategyName = Literal["head", "tail", "head_tail"]
+"""Which end(s) of an oversized text a `truncate` keeps."""
+
+
+class ToolOutputLimitsConfig(BaseModel):
+    """How an agent should reduce a tool return too large for its window.
+
+    Flat scalars and two enums, deliberately: the Builder generates this form from
+    the JSON schema and renders string, number, boolean and enum fields, so the
+    band the harness composes from a nested list is expressed here as one `action`
+    at one `threshold` instead.
+    """
+
+    action: ActionName = Field(
+        title="When a result is too long",
+        default="spill",
+        description="What to do with a return once it is over the threshold",
+        # What the Builder puts in the picker; spec values cannot say what they do.
+        json_schema_extra={
+            "x-enum-labels": {
+                "spill": "Keep it in full on the backend; the model reads slices on demand",
+                "truncate": "Clamp it to a character budget - cheap, lossy, no read-back",
+                "summarize": "Replace it with an LLM summary - the expensive option",
+            }
+        },
+    )
+    threshold: int = Field(
+        title="Size limit",
+        default=DEFAULT_THRESHOLD,
+        ge=500,
+        description=(
+            "Size at or above which a return is reduced. Characters by default; "
+            "estimated tokens when 'over tokens' is set, where it defaults to "
+            f"{DEFAULT_TOKEN_THRESHOLD:,}"
+        ),
+    )
+    over_tokens: bool = Field(
+        title="Measure in tokens",
+        default=False,
+        description="Measure the threshold in estimated tokens rather than characters",
+        json_schema_extra={"x-advanced": True},
+    )
+    max_chars: int = Field(
+        title="Characters kept",
+        default=DEFAULT_MAX_CHARS,
+        ge=200,
+        description=(
+            "Characters kept when a return is truncated, or when a spill or summary "
+            "falls back to truncation. Left unset, never more than the threshold"
+        ),
+        json_schema_extra={"x-advanced": True},
+    )
+    truncation_strategy: StrategyName = Field(
+        title="Which part to keep",
+        default="head_tail",
+        description="Which end(s) of an oversized text to keep when truncating",
+        json_schema_extra={
+            "x-advanced": True,
+            "x-enum-labels": {
+                "head": "Keep the start - good for headers and schemas",
+                "tail": "Keep the end - good for logs, where errors land last",
+                "head_tail": "Keep the start and end, eliding the middle",
+            },
+        },
+    )
+    strip_ansi: bool = Field(
+        title="Strip terminal colours",
+        default=False,
+        description="Strip terminal colour codes from text returns before measuring and reducing",
+        json_schema_extra={"x-advanced": True},
+    )
+    summary_prompt: str = Field(
+        title="Summary prompt",
+        default=DEFAULT_SUMMARY_PROMPT,
+        min_length=1,
+        max_length=8_000,
+        description=(
+            "What the summarising model is told, for the 'summarize' action. Must "
+            "contain {output}, where the tool's full output is inserted; {tool_name} "
+            "is available too, for the name of the tool that produced it"
+        ),
+        json_schema_extra={"x-advanced": True, "x-multiline": True},
+    )
+
+    @model_validator(mode="after")
+    def _defaults_follow_the_threshold(self) -> ToolOutputLimitsConfig:
+        """Fill the two defaults that depend on what the binding did set.
+
+        A threshold left unset in token mode is the character default in tokens,
+        not 60,000 tokens. And an unset `max_chars` is capped at the threshold in
+        characters: a binding asking to truncate at 10,000 would otherwise keep
+        20,000, and a return between the two would be "truncated" to itself.
+        """
+        if "threshold" not in self.model_fields_set and self.over_tokens:
+            self.threshold = DEFAULT_TOKEN_THRESHOLD
+        if "max_chars" not in self.model_fields_set:
+            in_chars = self.threshold * 4 if self.over_tokens else self.threshold
+            self.max_chars = min(DEFAULT_MAX_CHARS, in_chars)
+        return self
+
+    @field_validator("summary_prompt")
+    @classmethod
+    def _must_carry_the_output(cls, prompt: str) -> str:
+        """A summary prompt missing `{output}` summarises nothing; a stray field crashes it.
+
+        Refused here rather than mid-run, which is where it would otherwise
+        surface: the harness formats this string only when a `summarize` fires,
+        on the long returns an agent actually spills, so the mistake would be a
+        turn that summarised an empty string - or raised `KeyError` on an unknown
+        placeholder - after the run was already underway.
+
+        Only `{output}` is required. The harness always passes `tool_name=` too,
+        so a prompt that never names the tool formats fine and is a legitimate
+        choice; requiring it would refuse a valid prompt for no mechanism's sake.
+        """
+        if "{output}" not in prompt:
+            raise ValueError("The summary prompt must contain {output}")
+        try:
+            prompt.format(tool_name="", output="")
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                "The summary prompt has a placeholder other than {tool_name} and {output}"
+            ) from exc
+        return prompt
+
+
+def _action(config: ToolOutputLimitsConfig) -> Action:
+    """The single band action this configuration asks for, with harness fallbacks.
+
+    `spill` degrades to a truncation when the backend cannot keep the payload, and
+    `summarize` degrades through a spill to a truncation when the model call or the
+    store fails - so a reduction that cannot run becomes a cheaper one, never a
+    silent drop. `summarize` inherits the run's model (`model=None`), which is the
+    only one whose credential was resolved from the vault.
+    """
+    truncate = Truncate(
+        strategy=TruncationStrategy(config.truncation_strategy), max_chars=config.max_chars
+    )
+    if config.action == "truncate":
+        return truncate
+    spill = Spill(then=truncate)
+    if config.action == "spill":
+        return spill
+    return Summarize(then=spill)
+
+
+def _build_store(
+    workspace: Workspace | None, spill_log: list[str] | None = None
+) -> WorkspaceOverflowStore:
+    """Where spills go: the run's own workspace, or an ephemeral one built for it.
+
+    An agent that binds `sandbox` has a workspace the runner opened and keyed to
+    the organization; a spill lives and dies with it, which on the default `run`
+    scope is exactly the run. On a longer-scoped workspace (`conversation`,
+    `user`, `agent`) a spill must not outlive the run either, and each kind has
+    its own mechanism: a `state` workspace has the reserved prefix stripped at
+    flush, so spills never enter the persisted document, and a *container*
+    workspace has this run's handles - recorded in `spill_log` - deleted off its
+    filesystem when the workspace closes (#803).
+
+    An agent with no workspace gets a fresh in-memory document here, so the store
+    is per-run and process-local rather than on shared disk. The fallback is
+    uncapped: the store itself grows with each spill, but nothing is persisted and
+    the run bounds how much it can accumulate before it is discarded whole. No
+    handles are recorded for it - there is nothing to delete from a document that
+    dies with the run.
+    """
+    if workspace is None:
+        return WorkspaceOverflowStore(Workspace(StateWorkspace().backend()))
+    return WorkspaceOverflowStore(workspace, spill_log=spill_log)
+
+
+def build_limits(
+    config: ToolOutputLimitsConfig,
+    *,
+    workspace: Workspace | None,
+    spill_log: list[str] | None = None,
+) -> ToolOutputLimits[object]:
+    """The harness capability this configuration asks for, spilling into `workspace`."""
+    return ToolOutputLimits(
+        bands=[Band(over=config.threshold, action=_action(config))],
+        over_tokens=config.over_tokens,
+        store=_build_store(workspace, spill_log),
+        strip_ansi=config.strip_ansi,
+        summary_prompt=config.summary_prompt,
+        serializer=readable_return,
+    )
+
+
+def readable_return(value: object) -> str:
+    """A structured return as text that pages by line once it is spilled.
+
+    `read_tool_result` slices by line, and compact JSON is one line - so a page
+    an MCP server returned as `{"title": ..., "text": "..."}` read back as "1
+    matching line, output capped" whatever offset the model asked for, and it
+    went looking for the file with a shell instead. A text field is the part
+    worth paging, so a mapping holding one is written out with that text as it
+    is, one field after another; anything else is indented JSON, one field per
+    line, which is the harness's own preset.
+    """
+    if not isinstance(value, Mapping) or not any(
+        isinstance(field, str) and "\n" in field for field in value.values()
+    ):
+        return indented_json(value)
+    return "\n".join(
+        f"{key}:\n{field}"
+        if isinstance(field, str) and "\n" in field
+        else f"{key}: {to_json(field, fallback=repr).decode()}"
+        for key, field in value.items()
+    )
+
+
+READ_TOOL_RESULT_TEXT = ToolText(
+    summary="Read part of a tool result that was too large to return whole.",
+    usage=(
+        "The handle comes from a tool return that said it had been spilled. Read "
+        "the part you need rather than the whole payload: narrow with `pattern` "
+        "first, then page with `offset` and `limit`."
+    ),
+    returns=(
+        "The matching lines, under a header saying which slice of how many they "
+        "are, so a further call can pick up where this one stopped. A handle this "
+        "run never spilled says so - that result is gone, not elsewhere, and no "
+        "other handle will find it."
+    ),
+)
+
+
+@dataclass
+class MeteredToolOutputLimits(WrapperCapability[AgentDepsT]):
+    """Books what a `summarize` reduction spent against the run that spent it.
+
+    Wrapped around every configuration, not only `summarize`. An allowlist of
+    "these can spend" is a list somebody has to remember to extend, and the entry
+    they forget is a model call nobody is billed for - the same #16 shape the
+    wrapper exists to close. `spill` and `truncate` call no model, so the delta is
+    zero and nothing is booked; the cost of being uniform is reading four integers
+    per tool return.
+
+    The delta is measured on `ctx.usage`, which is what the harness's summary
+    `Agent` was handed and therefore the only place its tokens appear, and booked
+    through :func:`record_ambient_usage` rather than a ledger held here - the
+    runner opens `metered_by` around the whole run, and a reduction inside a
+    delegation must bill to its own row rather than to whichever ledger was
+    captured when this was assembled.
+
+    Booked in a `finally`: a summary that raised after its model call still spent
+    the tokens, and a run that failed is exactly the one whose cost is argued about
+    later.
+
+    At a budget cap the reduction is skipped before the wrapped capability runs, so
+    a `summarize` band cannot spend its own request past the cap (agenticos#1808);
+    the return passes through un-reduced. Content-suppression (agenticos#1809) and
+    the run's model settings (agenticos#1810) for this summary are the follow-up the
+    module docstring names - the harness exposes no clean knob for either here.
+    `BudgetGuard` still refuses the next real request the same as for compaction.
+    """
+
+    def get_toolset(self) -> AgentToolset[AgentDepsT] | None:
+        """The library's toolset, with `read_tool_result` described properly.
+
+        The library's own text is one sentence and says nothing about what comes
+        back - and this is the tool a model reaches for holding a handle to a
+        result it could not be given whole, which is the worst moment to leave it
+        guessing whether an empty answer means "no matches" or "gone". Rewritten
+        here rather than upstream because `pydantic-ai-harness` is Pydantic's
+        package, not this organization's: its default is a pull request to them,
+        and the text a deployment shows is its own either way.
+
+        Re-described in place rather than wrapped in `prepared`: a prepared
+        toolset resolves its tools per request, so it has no tool list for
+        `app/services/capability_contracts.py` to read, and the Builder would
+        show the catalog's one-liner for the one tool somebody had just taken
+        the trouble to describe. `Tool.description` is what each request's
+        `ToolDefinition` is built from, so this reaches both readers.
+        """
+        toolset = super().get_toolset()
+        if toolset is None:  # pragma: no cover - the library always builds one
+            return None
+        tool = getattr(toolset, "tools", {}).get(READ_TOOL_NAME)
+        if tool is None:
+            # The same refusal `ToolOverrides` makes, for the same reason: left
+            # alone, the model would read the library's sentence while the
+            # Builder shows this one, with nothing reporting the difference.
+            raise TypeError(
+                "Tool output limits no longer offers `read_tool_result` as a "
+                "readable tool, so it cannot be described here"
+            )
+        tool.description = READ_TOOL_RESULT_TEXT.render()
+        return toolset
+
+    async def after_tool_execute(
+        self,
+        ctx: RunContext[AgentDepsT],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: dict[str, Any],
+        result: Any,
+    ) -> Any:
+        if not await can_afford_ambient_call():
+            # At a budget cap a `summarize` band's own request would spend past it,
+            # so the reduction is skipped and the return passes through un-reduced
+            # (agenticos#1808). Content-suppression and the run's model settings for
+            # this summary are a noted follow-up - see the class docstring.
+            return result
+        before = usage_counts(ctx.usage)
+        try:
+            return await self.wrapped.after_tool_execute(
+                ctx, call=call, tool_def=tool_def, args=args, result=result
+            )
+        finally:
+            spent = usage_delta(before, ctx.usage)
+            if spent is not None:
+                record_ambient_usage(ctx.model.model_name or "unknown", spent)

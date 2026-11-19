@@ -1,0 +1,335 @@
+"""RAG API schemas."""
+
+from typing import Any, Literal
+
+from pydantic import Field, computed_field, field_validator
+
+from app.schemas.base import BaseSchema
+from app.services.rag.citation import cited_page
+from app.services.rag.config import DEFAULT_COLLECTION_NAME
+from app.services.rag.filters import RetrievalFilters
+
+
+class RAGSearchRequest(BaseSchema):
+    """Parameters for a vector search query.
+
+    Business metadata filters go in the structured `filters` object (source,
+    document type, organizational unit, date range, parent document). The tenant
+    conjunct is never expressible here — it is server-derived from the caller's
+    context, so a supplied filter can only narrow, never widen, access.
+    """
+
+    collection_name: str = Field(
+        DEFAULT_COLLECTION_NAME, description="Target collection for search"
+    )
+    collection_names: list[str] | None = Field(
+        None, description="Search across multiple collections (overrides collection_name)"
+    )
+    query: str = Field(..., description="Natural language search query")
+    limit: int = Field(default=4, ge=1, le=20)
+    min_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    filters: RetrievalFilters | None = Field(
+        None, description="Structured business filters (narrowing only)."
+    )
+    filter: str | None = Field(
+        None,
+        # Marked deprecated in the generated OpenAPI schema. Not Field(deprecated=True),
+        # which also emits a Python DeprecationWarning every time the server reads the
+        # field - on every search that carries it - for a caller who cannot see it.
+        json_schema_extra={"deprecated": True},
+        description=(
+            'Deprecated. Only a full-match `parent_doc_id == "<id>"` expression is '
+            "accepted; any other string is rejected. Use `filters.parent_doc_id` instead."
+        ),
+    )
+
+
+class RAGSearchResult(BaseSchema):
+    """A single retrieved chunk with its associated metadata."""
+
+    content: str
+    score: float
+    metadata: dict[str, Any]
+    parent_doc_id: str
+
+    @computed_field  # type: ignore[prop-decorator]  # pydantic's documented form
+    @property
+    def page(self) -> int | None:
+        """The page a citation may name for this chunk, or `None` when its format has none.
+
+        `metadata.page_num` is 1 for every Markdown, text and `.docx` chunk, a
+        number the parser needs rather than a location in the file, so a
+        caller showing a page reads this rather than `page_num` (#2489).
+        """
+        return cited_page(self.metadata)
+
+
+class RAGSearchResponse(BaseSchema):
+    """List of results found in the vector store."""
+
+    results: list[RAGSearchResult]
+
+
+class RAGFilterValues(BaseSchema):
+    """Distinct in-scope values for a free-form filter dimension.
+
+    Makes `organizational_unit` — the one author-supplied, corpus-dependent
+    filter dimension — discoverable, so a caller narrows on values that exist
+    rather than guessing a value the corpus does not use (which returns silently
+    empty, fail-closed). Tenant- and collection-scoped like every other read.
+    """
+
+    organizational_unit: list[str] = Field(
+        default_factory=list, description="Distinct organizational-unit values in scope."
+    )
+
+
+class RAGIngestionStatus(BaseSchema):
+    """Where a collection's, or a knowledge base's, documents are in their ingestion.
+
+    Answered from the tracked documents, not from the vectors: the vectors grow
+    while the worker is still ingesting, so a caller waiting for the documents to
+    be searchable waits for `complete` (#2486).
+    """
+
+    indexing_status: Literal["indexing", "complete"] = Field(
+        default="complete",
+        description=(
+            "`indexing` while any of the documents is still queued or being ingested, "
+            "`complete` once every one has finished or failed. A failed document does "
+            "not hold it at `indexing`; it is counted in `failed_count`."
+        ),
+    )
+    processing_count: int = Field(
+        default=0, description="Documents queued or being ingested - neither finished nor failed"
+    )
+    indexed_count: int = Field(default=0, description="Documents that finished ingesting")
+    failed_count: int = Field(
+        default=0, description="Documents whose ingestion failed, and which hold no vectors"
+    )
+
+
+class RAGCollectionInfo(RAGIngestionStatus):
+    """Statistical information about a specific collection, and whether it is still indexing.
+
+    It used to report the constant `complete`, which let a script start querying
+    a collection with hundreds of uploads still queued behind it (#2486).
+    """
+
+    name: str
+    total_vectors: int
+    dim: int
+
+
+class RAGCollectionList(BaseSchema):
+    """List of all available collection names."""
+
+    items: list[str]
+    total: int
+
+
+class RAGDocumentItem(BaseSchema):
+    """Information about a single document in a collection."""
+
+    document_id: str = Field(..., description="Unique identifier of the document")
+    filename: str | None = Field(None, description="Original filename of the document")
+    filesize: int | None = Field(None, description="Size of the file in bytes")
+    filetype: str | None = Field(None, description="MIME type of the file")
+    chunk_count: int = Field(default=0, description="Number of chunks/vectors in the collection")
+    additional_info: dict[str, Any] | None = Field(None, description="Additional metadata")
+
+
+class RAGDocumentList(BaseSchema):
+    """List of all documents in a collection."""
+
+    items: list[RAGDocumentItem]
+    total: int = Field(..., description="Total number of unique documents")
+
+
+class RAGMessageResponse(BaseSchema):
+    """Simple message response."""
+
+    message: str
+
+
+class RAGTrackedDocumentItem(BaseSchema):
+    """A document tracked in the SQL database."""
+
+    id: str
+    collection_name: str
+    filename: str
+    filesize: int
+    filetype: str
+    status: str
+    error_message: str | None = None
+    vector_document_id: str | None = None
+    chunk_count: int = 0
+    has_file: bool = False
+    created_at: str | None = None
+    completed_at: str | None = None
+    # What actually read this document, rather than what the collection is
+    # configured with today. `was_overridden` is stored rather than derived:
+    # the collection's configuration moves on, so comparing the two later would
+    # start calling ordinary uploads departures.
+    parser: str | None = None
+    image_description_model: str | None = None
+    embedding_model: str | None = None
+    was_overridden: bool = False
+    # Which part of the organization the document was ingested as belonging to,
+    # and so what its chunks are narrowable on. `None` for everything ingested
+    # before anything wrote the dimension, and for an upload that named no unit
+    # (#1777).
+    organizational_unit: str | None = None
+
+
+class RAGTrackedDocumentList(BaseSchema):
+    """List of tracked RAG documents."""
+
+    items: list[RAGTrackedDocumentItem]
+    total: int
+
+
+class RAGParsedPage(BaseSchema):
+    """One page of a document as the parser left it, chunk by chunk.
+
+    Chunks are returned separately rather than joined because that is what was
+    actually indexed - adjacent chunks repeat their configured overlap, and a
+    silent join would present the duplication as the parser's mistake.
+    """
+
+    page_num: int
+    chunks: list[str]
+    # Whether anything on this page is worth embedding. Markdown reconstruction
+    # wraps an unreadable scan in an empty fenced block, which `.strip()` keeps,
+    # so this is `has_indexable_text`, not "the content is non-empty".
+    has_text: bool
+
+
+class RAGParsedContent(BaseSchema):
+    """How a document parsed: the stored chunks, reconstructed in page order."""
+
+    id: str
+    filename: str
+    parser: str | None = None
+    chunk_count: int
+    has_text: bool
+    pages: list[RAGParsedPage]
+
+
+class RAGIngestResponse(BaseSchema):
+    """Response for document ingestion (async or sync)."""
+
+    id: str
+    status: str
+    filename: str
+    collection: str
+    message: str
+    document_id: str | None = None
+
+
+class RAGRetryResponse(BaseSchema):
+    """Response for document retry."""
+
+    id: str
+    status: str
+    message: str
+
+
+class RAGSyncRequest(BaseSchema):
+    """Request to trigger a sync operation."""
+
+    collection_name: str = Field(DEFAULT_COLLECTION_NAME, description="Target collection")
+    mode: str = Field("full", description="Sync mode: full, new_only, update_only")
+    path: str = Field("", description="Source path")
+
+
+class RAGSyncLogItem(BaseSchema):
+    """A sync operation log entry."""
+
+    id: str
+    source: str
+    collection_name: str
+    status: str
+    mode: str
+    total_files: int = 0
+    ingested: int = 0
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
+    removed: int = 0
+    error_message: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+
+    @field_validator("started_at", "completed_at", mode="before")
+    @classmethod
+    def serialize_datetime(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        return str(v)
+
+
+class RAGSyncLogList(BaseSchema):
+    """List of sync log entries."""
+
+    items: list[RAGSyncLogItem]
+    total: int
+
+
+class RAGSyncResponse(BaseSchema):
+    """Response for sync trigger."""
+
+    id: str
+    status: str
+    message: str
+
+
+class SupportedFormatsResponse(BaseSchema):
+    parser: str
+    formats: list[str]
+
+
+class EmbeddingModelEntry(BaseSchema):
+    model: str
+    dim: int
+
+
+class EmbeddingProviderEntry(BaseSchema):
+    """One provider a collection can embed through, and what it serves."""
+
+    provider: str
+    name: str
+    models: list[EmbeddingModelEntry]
+    # An endpoint on the deployment's own network that takes no key, so the form
+    # asks for none - and the only kind an app-scoped collection may embed through.
+    keyless: bool
+
+
+class EmbeddingModelsResponse(BaseSchema):
+    """What a collection may be created with, and what an existing one may move to.
+
+    Grouped by provider, because "which models exist" was never the question a
+    form needed answered: the list used to be every model this build knew a
+    *width* for, which included three sentence-transformer weights and two
+    vendors nothing here can call - so the picker offered models whose first
+    document would fail to index.
+    """
+
+    providers: list[EmbeddingProviderEntry]
+
+
+class EndpointEmbeddingModels(BaseSchema):
+    """The embedding models one custom endpoint serves, of those this build offers.
+
+    `source` says whether the endpoint answered. `live` is its own listing,
+    narrowed to the catalog because a width is needed and the listing states
+    none; `curated` is the provider's whole catalog, returned when the endpoint
+    could not be asked, so the form still has something to show and can say
+    that it is unconfirmed.
+    """
+
+    provider: str
+    models: list[EmbeddingModelEntry]
+    source: Literal["live", "curated"]

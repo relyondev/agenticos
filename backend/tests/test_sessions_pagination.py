@@ -1,0 +1,203 @@
+"""Paging a user's signed-in devices.
+
+The interesting part is not that a page comes back - it is that `total` counts
+the user's sessions rather than the page. Without that the client cannot tell a
+full page from the last one, and revoking the final row on page three leaves it
+sitting on a page that no longer exists.
+"""
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+
+from app.repositories import session as session_repo
+from app.services.session import SessionService, hash_token
+
+pytestmark = pytest.mark.anyio
+
+
+def _session_row(device: str) -> MagicMock:
+    row = MagicMock()
+    row.id = uuid4()
+    row.device_name = device
+    row.device_type = "desktop"
+    row.ip_address = "203.0.113.4"
+    row.app_platform = None
+    row.app_version = None
+    row.created_at = datetime.now(UTC)
+    row.last_used_at = datetime.now(UTC)
+    return row
+
+
+@pytest.fixture
+def service() -> SessionService:
+    return SessionService(AsyncMock())
+
+
+async def test_a_page_reports_the_total_not_its_own_length(service: SessionService) -> None:
+    """The client pages on `total`; the page's own size cannot tell it anything.
+
+    This was the bug in the unpaginated version: it returned every session and
+    set `total` to how many it happened to return, which is only right when
+    there is exactly one page.
+    """
+    user_id = uuid4()
+    page = [_session_row("Chrome"), _session_row("Safari")]
+
+    with (
+        patch(
+            "app.repositories.push_subscription.sessions_with_push",
+            new=AsyncMock(return_value={page[0].id}),
+        ),
+        patch(
+            "app.repositories.session.get_user_sessions", new=AsyncMock(return_value=page)
+        ) as fetch,
+        patch(
+            "app.repositories.session.count_user_sessions", new=AsyncMock(return_value=17)
+        ) as count,
+    ):
+        result = await service.list_sessions(user_id, skip=10, limit=2)
+
+    assert len(result.items) == 2
+    assert result.total == 17
+    assert [item.push for item in result.items] == [True, False]
+    kwargs = fetch.await_args.kwargs
+    assert (kwargs["open_only"], kwargs["skip"], kwargs["limit"]) == (True, 10, 2)
+    # The same cutoff in both statements. A session lapsing between them would
+    # otherwise be in the page and outside the total, which is the invariant the
+    # client pages on breaking with nobody writing a row.
+    assert kwargs["now"] == count.await_args.kwargs["now"]
+
+
+async def test_the_page_is_what_the_caller_asked_for(service: SessionService) -> None:
+    """A limit the route did not pass must not silently become "everything"."""
+    with (
+        patch(
+            "app.repositories.session.get_user_sessions", new=AsyncMock(return_value=[])
+        ) as fetch,
+        patch("app.repositories.session.count_user_sessions", new=AsyncMock(return_value=0)),
+    ):
+        await service.list_sessions(uuid4())
+
+    assert fetch.await_args.kwargs["limit"] is not None
+    assert fetch.await_args.kwargs["skip"] == 0
+
+
+class TestRepositoryQuery:
+    """The query itself, which is where an unstable page order would come from."""
+
+    @staticmethod
+    async def _statement(**kwargs: Any) -> Any:
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(all=list)))
+
+        await session_repo.get_user_sessions(db, uuid4(), **kwargs)
+
+        return db.execute.await_args.args[0]
+
+    async def test_the_order_is_total_so_a_row_cannot_land_on_two_pages(self) -> None:
+        """`last_used_at` ties on two sign-ins in the same moment.
+
+        Postgres is free to return tied rows in any order, and a page boundary
+        falling inside a tie shows one session twice and another never.
+        """
+        statement = await self._statement(skip=5, limit=5)
+
+        assert "ORDER BY sessions.last_used_at DESC, sessions.id" in str(statement)
+        assert statement._limit_clause is not None
+        assert statement._offset_clause is not None
+
+    async def test_no_limit_means_every_session(self) -> None:
+        """Revoking and validating a refresh token need the whole set, not a page."""
+        statement = await self._statement()
+
+        assert statement._limit_clause is None
+
+
+class TestRotate:
+    """In-place refresh rotation - the row keeps its id so a live token's `sid`
+    stays valid across a refresh (#1501)."""
+
+    async def test_rotate_session_rekeys_in_place_and_moves_provenance(self) -> None:
+        row = MagicMock()
+        with patch.object(session_repo, "rotate", AsyncMock(return_value=row)) as rotate:
+            result = await SessionService(MagicMock()).rotate_session(
+                row, "a-new-refresh-token", ip_address="203.0.113.9", user_agent="Firefox on Linux"
+            )
+
+        assert result is row
+        rotate.assert_awaited_once()
+        kwargs = rotate.await_args.kwargs
+        assert kwargs["session"] is row
+        assert kwargs["refresh_token_hash"] == hash_token("a-new-refresh-token")
+        assert kwargs["expires_at"] > datetime.now(UTC)
+        assert kwargs["ip_address"] == "203.0.113.9"
+        assert kwargs["user_agent"] == "Firefox on Linux"
+        assert kwargs["device_name"] == "Firefox"  # derived from the refreshing UA
+
+    async def test_the_repo_moves_the_hash_window_and_provenance_but_not_the_id(self) -> None:
+        db = MagicMock()
+        db.add = MagicMock()
+        db.flush = AsyncMock()
+        db.refresh = AsyncMock()
+        session_id = uuid4()
+        row = MagicMock(id=session_id)
+        new_expiry = datetime.now(UTC)
+
+        returned = await session_repo.rotate(
+            db,
+            session=row,
+            refresh_token_hash="deadbeef",
+            expires_at=new_expiry,
+            device_name="Chrome",
+            device_type="desktop",
+            ip_address="203.0.113.9",
+            user_agent="Chrome UA",
+        )
+
+        assert returned is row
+        assert row.id == session_id
+        assert row.refresh_token_hash == "deadbeef"
+        assert row.expires_at == new_expiry
+        assert row.ip_address == "203.0.113.9"
+        assert row.device_name == "Chrome"
+        db.flush.assert_awaited_once()
+        db.refresh.assert_awaited_once_with(row)
+
+    async def test_validate_locks_the_row_against_a_concurrent_refresh(self) -> None:
+        """A refresh takes the row `FOR UPDATE`, so a concurrent one bearing the
+        same token serializes behind it rather than both rotating (#1501 review)."""
+        row = MagicMock(impersonator_user_id=None, expires_at=datetime.now(UTC) + timedelta(days=1))
+        with (
+            patch.object(
+                session_repo, "get_by_refresh_token_hash", AsyncMock(return_value=row)
+            ) as get,
+            patch.object(session_repo, "update_last_used", AsyncMock()),
+        ):
+            result = await SessionService(MagicMock()).validate_refresh_token("a-token")
+
+        assert result is row
+        assert get.await_args.kwargs["for_update"] is True
+
+    async def test_the_locked_lookup_selects_for_update(self) -> None:
+        db = MagicMock()
+        result = MagicMock()
+        result.scalar_one_or_none = MagicMock(return_value=None)
+        db.execute = AsyncMock(return_value=result)
+
+        await session_repo.get_by_refresh_token_hash(db, "hash", for_update=True)
+
+        assert db.execute.await_args.args[0]._for_update_arg is not None
+
+    async def test_the_plain_lookup_does_not_lock(self) -> None:
+        db = MagicMock()
+        result = MagicMock()
+        result.scalar_one_or_none = MagicMock(return_value=None)
+        db.execute = AsyncMock(return_value=result)
+
+        await session_repo.get_by_refresh_token_hash(db, "hash")
+
+        assert db.execute.await_args.args[0]._for_update_arg is None

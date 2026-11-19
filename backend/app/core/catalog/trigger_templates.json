@@ -1,0 +1,182 @@
+[
+  {
+    "key": "daily_briefing",
+    "label": "Daily briefing",
+    "description": "What needs your attention today across your calendar, email and messages.",
+    "prompt": "Prepare my briefing for today. Using the calendar, email and messaging tools you can reach, list today's meetings with a line on what each is for, the messages that are waiting on me, and anything due today. Lead with what is most urgent, keep it to a page, and say plainly if a source was not available to you.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 8 * * 1-5"
+    }
+  },
+  {
+    "key": "inbox_triage",
+    "label": "Inbox triage",
+    "description": "Sort new email into what needs a reply, what to read and what can wait, with drafts for the urgent ones.",
+    "prompt": "Go through the email that arrived since your last run. Sort it into three groups - needs a reply from me, worth reading, can wait - with one line on each message. For anything urgent, draft a short reply I can send as it is or edit. Do not send anything yourself.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 8 * * 1-5"
+    }
+  },
+  {
+    "key": "meeting_prep",
+    "label": "Meeting prep",
+    "description": "A short brief before each of today's meetings: who is coming, the context and the agenda.",
+    "prompt": "For each meeting on my calendar today, write a short brief: who is attending and their role, what we last discussed with them (from email, notes or documents you can reach), the agenda if there is one, and two or three questions worth raising. One section per meeting, in the order they happen.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "30 7 * * 1-5"
+    }
+  },
+  {
+    "key": "weekly_team_summary",
+    "label": "Weekly review",
+    "description": "A Friday summary of what the team got done this week, and what carries into next week.",
+    "prompt": "Write a review of this week for the team: what was finished, what is still in progress, decisions that were made, and anything that slipped or is blocked. Use the tools and documents you can reach, keep it short enough to read in two minutes, and end with the three priorities for next week.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 16 * * 5"
+    }
+  },
+  {
+    "key": "content_ideas",
+    "label": "Content ideas",
+    "description": "A few post ideas each week, drawn from the latest news in your industry.",
+    "prompt": "Look at this week's news and discussion in our industry. Suggest five ideas for posts we could publish, each with a working title, the angle that makes it ours, and the source that prompted it. Prefer topics where we have something specific to say over general commentary.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 9 * * 1"
+    }
+  },
+  {
+    "key": "monitor_topic",
+    "label": "Monitor a topic",
+    "description": "Watch for news and mentions of a topic, a competitor or a keyword, and report only what is new.",
+    "prompt": "Search for news and mentions of the topic, company or keyword named below since your last run. Report only what is new: one line per item with its source and why it matters to us. If nothing new appeared, say so in one sentence.\n\nTopic:",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 9 * * *"
+    }
+  },
+  {
+    "key": "monthly_report",
+    "label": "Monthly report",
+    "description": "A report of the previous month - what was done, the numbers worth noting and what comes next.",
+    "prompt": "Compile a report of last month: what shipped, the main issues resolved, any metrics worth highlighting, and the priorities that carry into this month. Structure it with clear headings so it can be shared as-is.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 9 1 * *"
+    }
+  },
+  {
+    "key": "pr_digest_weekday_mornings",
+    "label": "Pull-request digest",
+    "description": "The open pull requests that need attention, grouped by what they are waiting on.",
+    "prompt": "Summarise my team's open pull requests. Group them by whether they are waiting on a review, waiting on changes from the author, or approved and ready to merge, and call out any that have been open for more than three days.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 8 * * 1-5"
+    }
+  },
+  {
+    "key": "triage_new_issues_daily",
+    "label": "Issue triage",
+    "description": "New issues since yesterday, with a suggested priority, label and likely duplicates.",
+    "prompt": "Review the issues opened in the last day. For each one, suggest a priority and a label, note any that look like duplicates of an existing issue, and flag anything that appears to be a security report.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 7 * * *"
+    }
+  },
+  {
+    "key": "standup_prep_weekdays",
+    "label": "Stand-up prep",
+    "description": "A short stand-up update drafted from yesterday's activity.",
+    "prompt": "Draft a concise stand-up update: what was merged or closed yesterday, what is in progress, and anything that looks blocked or is waiting on someone. Keep it to a few bullet points.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "30 8 * * 1-5"
+    }
+  },
+  {
+    "key": "hourly_monitoring",
+    "label": "Health check",
+    "description": "Check the systems you watch and speak up only when something needs attention.",
+    "prompt": "Check the systems and dashboards you have access to. Report only what needs attention - a failing check, an error spike, an unusual metric - and stay silent about anything that is healthy.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "interval",
+      "interval_seconds": 3600
+    }
+  },
+  {
+    "key": "github_triage_new_issue",
+    "label": "Triage the new issue",
+    "description": "When an issue is opened, propose a priority, labels and the next step.",
+    "prompt": "A new issue was just opened - its details are in this message. Read it, suggest a priority and labels, note whether it looks like a duplicate of an existing issue, and flag it immediately if it appears to be a security report. End with a comment-ready summary of your triage.",
+    "trigger_type": "event",
+    "event_source": "github"
+  },
+  {
+    "key": "email_draft_reply",
+    "label": "Draft a reply to the email",
+    "description": "When an email arrives, summarise what the sender needs and draft a reply to review.",
+    "prompt": "An email just arrived - its subject, sender and body are in this message. Summarise in one line what the sender needs, then draft a reply I can review and send. Match the sender's tone, answer every question they asked, and keep it brief.",
+    "trigger_type": "event",
+    "event_source": "gmail"
+  },
+  {
+    "key": "outlook_draft_reply",
+    "label": "Draft a reply to the email",
+    "description": "When an email arrives, summarise what the sender needs and draft a reply to review.",
+    "prompt": "An email just arrived - its subject, sender and body are in this message. Summarise in one line what the sender needs, then draft a reply I can review and send. Match the sender's tone, answer every question they asked, and keep it brief.",
+    "trigger_type": "event",
+    "event_source": "outlook"
+  },
+  {
+    "key": "email_action_items",
+    "label": "Turn the email into action items",
+    "description": "When an email arrives, extract the action items, owners and deadlines.",
+    "prompt": "An email just arrived - its details are in this message. Extract every action item it contains, who owns each one, and any deadline mentioned or implied. List them ready to paste into our tracker, and say plainly if the email contains no actionable work.",
+    "trigger_type": "event",
+    "event_source": "gmail"
+  },
+  {
+    "key": "outlook_action_items",
+    "label": "Turn the email into action items",
+    "description": "When an email arrives, extract the action items, owners and deadlines.",
+    "prompt": "An email just arrived - its details are in this message. Extract every action item it contains, who owns each one, and any deadline mentioned or implied. List them ready to paste into our tracker, and say plainly if the email contains no actionable work.",
+    "trigger_type": "event",
+    "event_source": "outlook"
+  },
+  {
+    "key": "webhook_act_on_delivery",
+    "label": "Act on the delivery",
+    "description": "When a payload arrives, say what happened and take the next step.",
+    "prompt": "A webhook just delivered a payload - it is in this message. Say what happened in plain words, decide whether it needs action, and if it does, take it with the tools you have or spell out exactly what a person should do.",
+    "trigger_type": "event",
+    "event_source": "webhook"
+  },
+  {
+    "key": "weekly_tips",
+    "label": "Weekly tips",
+    "description": "What your agents did this week, and one thing in AgenticOS you have not tried yet.",
+    "prompt": "Write my weekly AgenticOS note, in my language. First, in three to five lines, what my agents and routines did this week - the runs, what they cost and anything that failed - using the platform tools you can reach. Then suggest one feature I have not used yet that fits my work, in two sentences with a concrete first step, and do not repeat a suggestion I declined before. Keep it short enough to read in a minute.",
+    "trigger_type": "schedule",
+    "suggested_cadence": {
+      "schedule_kind": "cron",
+      "cron_expression": "0 8 * * 1"
+    }
+  }
+]

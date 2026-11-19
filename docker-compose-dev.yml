@@ -1,0 +1,402 @@
+# The dev server. `make dev-server`.
+#
+#   docker compose --env-file backend/.env -f docker-compose-dev.yml pull
+#   docker compose --env-file backend/.env -f docker-compose-dev.yml up -d
+#
+# A deployed environment, not a laptop: the images are pulled from GHCR rather
+# than built - `edge` by default, which is whatever `main` last published, or
+# the `AGENTICOS_VERSION` in `backend/.env` - the source is not bind-mounted,
+# uvicorn does not reload, and Postgres and Redis are not published to the
+# host. It differs from production in the things a shared
+# testing environment wants — verbose logging, a single worker, no resource
+# ceilings, and `ENVIRONMENT=dev` so an agent's traces and alerts are separable
+# from real ones.
+#
+# Put a reverse proxy in front of port 8000; `nginx/nginx.conf` is the template.
+# The frontend is `docker-compose-dev.frontend.yml`.
+
+services:
+  # Runs the migrations and exits; `app` and `worker` wait for it to have
+  # completed, so `make dev-server` is a `pull` and an `up`.
+  migrate:
+    image: ghcr.io/vstorm-co/agenticos-backend:${AGENTICOS_VERSION:-edge}
+    command: agenticos db upgrade
+    env_file:
+      - ./backend/.env
+    environment:
+      - ENVIRONMENT=dev
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+    networks:
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    image: ghcr.io/vstorm-co/agenticos-backend:${AGENTICOS_VERSION:-edge}
+    # Longer than background.drain()'s 30s timeout, or Docker's 10s default
+    # SIGKILLs the container mid-drain and an upload stays `processing` (#11).
+    stop_grace_period: 40s
+    volumes:
+      - media_data:/app/media
+    env_file:
+      - ./backend/.env
+    environment:
+      # Verbose on purpose: this is where a failure is meant to be diagnosed.
+      - DEBUG=true
+      - ENVIRONMENT=dev
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+      # The browser profile's egress proxy, on by default so starting the browser
+      # starts the pinning path too. Set BROWSER_EGRESS_PROXY= (empty) in the root
+      # .env only for a browser outside compose that cannot reach it.
+      - BROWSER_EGRESS_PROXY=${BROWSER_EGRESS_PROXY-http://browser-egress:3128}
+      # Empty unless the sandbox profile is up. Note what is absent from
+      # this service: the Docker socket.
+    # --ws websockets-sansio: uvicorn's `auto` picks the legacy websockets impl,
+    # which is broken with websockets >=14 (handshake → HTTP 500). Required for
+    # the chat WS. No --reload: there is no mounted source to watch.
+    #
+    # One process, and PID 1 is the server itself - so there is no supervisor
+    # here and deliberately none added (#358). A worker that *dies* takes the
+    # container with it and `restart: unless-stopped` below acts; a worker whose
+    # event loop stops turning used to keep the container `Up` and serving
+    # nothing, and now ends its own process from `app/core/watchdog.py` after
+    # fifteen silent seconds, which lands it in the first case. `--workers 2` would have
+    # bought uvicorn's own supervisor instead, at a second interpreter on a
+    # small box, and only for a *stopped* PID 1 - which the kernel makes
+    # unreachable anyway, dropping `SIGSTOP` sent to a namespace's init from
+    # inside it. `EVENT_LOOP_WEDGED_AFTER` in `backend/.env` changes the
+    # threshold, `0` switches it off.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --ws websockets-sansio
+    ports:
+      - "8000:8000"
+    networks:
+      backend:
+        # `nginx/nginx.conf` proxies to `backend:8000`. The alias makes that
+        # template resolve without the operator having to rename anything.
+        aliases:
+          - backend
+      # Where `artifact-render` is, when its profile is up. Empty otherwise.
+      render: {}
+      browser: {}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # Moved out of backend/Dockerfile, which the worker shares and could never
+    # answer; see docker-compose.yml for the whole reasoning, including why
+    # `raise_for_status` and a 30s start_period are not what the image had.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  db:
+    # pgvector, not stock postgres: the RAG store runs
+    # `CREATE EXTENSION IF NOT EXISTS vector` when a collection is first
+    # written to, and on postgres:16-alpine that fails with
+    # `extension "vector" is not available` — so every document upload 500s
+    # before a row is committed.
+    image: pgvector/pgvector:pg16
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      - POSTGRES_DB=${POSTGRES_DB:-agenticos}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # No published port: reachable only from this network.
+    networks:
+      - backend
+    # See docker-compose.yml for why `service_healthy` needs a grace to wait
+    # through, and what a missing one costs a redeploy (#1831).
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: valkey/valkey:8-alpine
+    # `--save ''` and no volume: everything here is rebuildable and carries a
+    # TTL, and a persisted snapshot is what a Valkey upgrade refuses to read
+    # (#1830).
+    command: >-
+      valkey-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      --save ''
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # The background worker: ingestion, syncs, fired triggers, cleanups and the
+  # scheduled sweeps. Without it documents upload and then never become
+  # searchable. See docker-compose.yml.
+  worker:
+    image: ghcr.io/vstorm-co/agenticos-backend:${AGENTICOS_VERSION:-edge}
+    volumes:
+      - media_data:/app/media
+    command: python -m app.worker
+    env_file:
+      - ./backend/.env
+    environment:
+      - DEBUG=false
+      - ENVIRONMENT=dev
+      - POSTGRES_HOST=db
+      - REDIS_HOST=redis
+      # The browser profile's egress proxy, on by default so starting the browser
+      # starts the pinning path too. Set BROWSER_EGRESS_PROXY= (empty) in the root
+      # .env only for a browser outside compose that cannot reach it.
+      - BROWSER_EGRESS_PROXY=${BROWSER_EGRESS_PROXY-http://browser-egress:3128}
+    networks:
+      - backend
+      - render
+      - browser
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sys, time; sys.exit(time.time() - os.stat(os.environ.get('WORKER_HEALTH_FILE', '/tmp/agenticos-worker-alive')).st_mtime > 90)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEMORY_LIMIT:-4g}
+    restart: unless-stopped
+
+  # The only service holding the Docker socket. See docker-compose.yml for the
+  # reasoning; the differences here are that it is not on by default (mounting
+  # the socket on a shared host is a deliberate act) and that the image tag is
+  # pinned rather than tracking a minor.
+  # The browser the web browser capability drives (#2127). Behind a profile,
+  # because only an agent bound to `browser_use` needs one: `docker compose
+  # --profile browser up -d browser`. Never published - the API reaches it on the
+  # compose network as `http://browser:9222`, which `BROWSER_CDP_ALLOWED_HOSTS`
+  # has to name. A full Chromium with a window under a virtual display
+  # (`docker/browser`), so a site sees a desktop browser rather than a headless
+  # shell it refuses on sight (#2130). `TZ` and `BROWSER_LANG` are where and in
+  # which language it says it is.
+  browser:
+    image: ghcr.io/vstorm-co/agenticos-browser:${AGENTICOS_VERSION:-edge}
+    profiles: [browser]
+    environment:
+      - TZ=${BROWSER_TZ:-UTC}
+      - BROWSER_LANG=${BROWSER_LANG:-en-US}
+    # Room for pages that use shared memory; the default 64 MB crashes tabs.
+    shm_size: 1gb
+    networks:
+      - browser
+    restart: unless-stopped
+
+  # The browser's egress proxy (`docker/browser-egress`): the app and the worker
+  # default BROWSER_EGRESS_PROXY to it, so every browse without an organization
+  # proxy goes out through it. It resolves each host itself, refuses
+  # private, loopback, link-local and metadata addresses, and connects to the
+  # address it checked - so neither a redirect nor a name that rebinds between
+  # two lookups takes a page inside the deployment's network.
+  browser-egress:
+    image: ubuntu/squid:6.6-24.04_edge
+    profiles: [browser]
+    volumes:
+      - ./docker/browser-egress/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - browser
+    restart: unless-stopped
+
+  sandboxd:
+    # Exactly the `pydantic-ai-backend` version in backend/uv.lock: the backend's
+    # client and this service ship together, and a client newer than the service
+    # calls routes it does not have (#2484). Bump both at once;
+    # backend/tests/test_sandboxd_compat.py fails when they differ.
+    image: ghcr.io/vstorm-co/sandboxd:0.2.39
+    profiles: [sandbox]
+    # The token comes from the same file every other secret in this stack comes
+    # from, rather than through compose interpolation. Interpolation reads the
+    # project root, not `backend/.env`, so a token generated where the
+    # application reads it would have been invisible here - and every other
+    # variable in this file carries a default precisely so the stack starts with
+    # no env file at all. The service exits naming the variable when it is
+    # missing, which `docker compose logs sandboxd` shows.
+    env_file:
+      - ./backend/.env
+    environment:
+      SANDBOXD_HOST: 0.0.0.0
+      SANDBOXD_PORT: "8080"
+      # Mounted at the same path on both sides, which is the only arrangement
+      # that works: this service creates the directory and then asks the daemon
+      # to bind-mount it, and the daemon resolves the path on the host. A named
+      # volume, or any path that exists only in this container, is refused with
+      # "mounts denied".
+      #
+      # The directory has to be writable by uid 10001 - `mkdir -p` then
+      # `chown 10001:10001`, since `install -o` refuses a uid no account owns
+      # once, on the host - and it is where a conversation's files live, so it
+      # belongs on storage somebody backs up.
+      SANDBOXD_WORKSPACE_ROOT: ${SANDBOX_WORKSPACE_ROOT:-/var/lib/agenticos/sandbox-workspaces}
+      # Which environments an agent may ask for. **Generated - do not edit here.**
+      # `make sandbox-runtimes` writes it from
+      # backend/app/core/catalog/sandbox_runtimes.json, which is where a runtime
+      # is added or a package changed, and which the connection dialog offers as
+      # well - so the two cannot disagree about what this deployment ships.
+      # `backend/tests/test_sandbox_runtime_catalog.py` fails when this line has
+      # drifted from that file.
+      #
+      # Written into a tracked file rather than read from one at start-up because
+      # `docker compose up` has to work without generating anything first;
+      # otherwise a deployment silently gets the library's own default allowlist.
+      #
+      # Not a form in the product, and that is upstream's decision rather than an
+      # omission: `PUT /policy` changes ceilings and lifetimes at run time and
+      # deliberately refuses `runtimes` membership, because naming an image is a
+      # decision about isolation and this token belongs to an application rather
+      # than to whoever runs the host. Changing the list is a restart, and
+      # `prewarm` rebuilds what it names as the service starts rather than inside
+      # somebody's first request - which is minutes on a cold cache, and the
+      # reason this deployment ships two runtimes rather than eight.
+      SANDBOXD_RUNTIMES: '{"workbench":{"description":"Python, Node and LibreOffice - documents, data, charts and code","runtime":{"name":"workbench","base_image":"python:3.12-slim","description":"Python, Node and LibreOffice - documents, data, charts and code","setup_commands":["apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates ripgrep fd-find jq less procps xz-utils poppler-utils libreoffice-writer libreoffice-calc libreoffice-impress unzip zip tzdata fonts-dejavu-core && ln -s /usr/bin/fdfind /usr/local/bin/fd && rm -rf /var/lib/apt/lists/*","arch=\"$$(dpkg --print-architecture)\"; case \"$$arch\" in amd64) node_arch=x64 ;; arm64) node_arch=arm64 ;; *) echo \"no Node build for $$arch\" >&2; exit 1 ;; esac; curl -fsSL \"https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-$${node_arch}.tar.xz\" | tar -xJ -C /usr/local --strip-components=1 --exclude CHANGELOG.md --exclude README.md --exclude LICENSE && npm install -g tsx @anthropic-ai/claude-code@2.1.288 @openai/codex@0.160.0 && npm cache clean --force","curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh"],"packages":["liteparse","pypdf","python-docx","openpyxl","python-pptx","pillow","pandas","duckdb","matplotlib","httpx","requests","beautifulsoup4","lxml","markdownify","pyyaml","tabulate","reportlab"],"env_vars":{"PYTHONUNBUFFERED":"1","PYTHONDONTWRITEBYTECODE":"1","PYTHONUTF8":"1","MPLBACKEND":"Agg","PIP_DISABLE_PIP_VERSION_CHECK":"1"}},"mem_limit":"2g","network_mode":"bridge"},"desktop":{"description":"A Linux desktop (XFCE and Firefox) for computer use, with Python and a shell","runtime":{"name":"desktop","base_image":"python:3.12-slim","description":"A Linux desktop (XFCE and Firefox) for computer use, with Python and a shell","setup_commands":["apt-get update && apt-get install -y --no-install-recommends xvfb x11-utils xfce4 xfce4-terminal dbus-x11 xdotool scrot firefox-esr fonts-dejavu-core fonts-noto-color-emoji git curl ca-certificates jq procps unzip && rm -rf /var/lib/apt/lists/*"],"packages":[],"env_vars":{"PYTHONUNBUFFERED":"1","PYTHONUTF8":"1","PIP_DISABLE_PIP_VERSION_CHECK":"1"}},"mem_limit":"2g","network_mode":"bridge"}}'
+      # An escape starts from whoever the container runs as, and the default is
+      # root. The image is built around this uid - a home directory and a
+      # virtualenv it owns, without which an agent's `pip install` fails - so it
+      # only applies to a runtime this deployment builds, which both of ours are.
+      # It also makes every file an agent writes owned by this uid on the host,
+      # rather than by root.
+      #
+      # **The service's own uid, and it has to be.** Opening a session `chown`s
+      # the workspace to this user, and a sandboxd running unprivileged can only
+      # do that for itself - so a different number here fails at the first
+      # session rather than at start-up.
+      SANDBOXD_SANDBOX_UID: "10001"
+      SANDBOXD_PERSIST_CONTAINERS: "true"
+      # What a session installed inside its container - the build, the wheels,
+      # `node_modules` - reclaimed a day after it stopped. Without it a persisted
+      # container is kept for ever and the host fills up with the ones nobody
+      # reattached to. The workspace is untouched: the files are the work, the
+      # container is rebuildable.
+      SANDBOXD_CONTAINER_TTL: "86400"
+      SANDBOXD_MAX_SESSIONS_PER_TENANT: "10"
+      SANDBOXD_NETWORK_MODE: none
+      SANDBOXD_UI_ENABLED: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SANDBOX_WORKSPACE_ROOT:-/var/lib/agenticos/sandbox-workspaces}:${SANDBOX_WORKSPACE_ROOT:-/var/lib/agenticos/sandbox-workspaces}
+    group_add:
+      - "${DOCKER_GID:-0}"
+    networks:
+      - backend
+    restart: unless-stopped
+
+  # An identity provider to test single sign-on against, off by default.
+  #
+  # `make dev` does not need one and nobody developing a chat surface should pay
+  # for a JVM starting, so it is behind a profile: `docker compose -f
+  # docker-compose-dev.yml --profile sso up -d keycloak`. The realm is imported
+  # rather than clicked together, so the client, its secret and the two users the
+  # SSO spec signs in as are the same on every machine - including the one whose
+  # address the provider has *not* verified, which is the refusal worth a test.
+  #
+  # **The hostname is `keycloak`, not `localhost`, and that is the whole trick.**
+  # An issuer is one string that both the browser and the API have to resolve to
+  # the same provider: `localhost:8081` is Keycloak from the host and the API
+  # container's own loopback from inside the stack, so a containerized backend
+  # fails discovery before the browser is ever redirected. Publishing on the same
+  # port the container listens on and adding one line to the host's `/etc/hosts`
+  # makes one URL work from both sides:
+  #
+  #   echo "127.0.0.1 keycloak" | sudo tee -a /etc/hosts
+  #
+  # Then, in `backend/.env`:
+  #   OIDC_ISSUER=http://keycloak:8081/realms/agenticos
+  #   OIDC_CLIENT_ID=agenticos
+  #   OIDC_CLIENT_SECRET=e2e-client-secret
+  #   OIDC_REDIRECT_URI=http://localhost:8000/api/v1/oauth/oidc/callback
+  # and the frontend with OAUTH_PROVIDERS=google,oidc. Then `E2E_OIDC=1 make
+  # test-e2e`; without that variable the SSO spec skips itself.
+  artifact-render:
+    # The browser `preview_artifact` draws a page in. Opt-in, and the same service
+    # as in docker-compose.yml, which says why each line is there: set
+    # ARTIFACT_RENDER_CDP_URL=http://artifact-render:9222 (never on
+    # BROWSER_CDP_ALLOWED_HOSTS) and pull an image built with the `browser`
+    # extra. `render` has no route off the host.
+    image: chromedp/headless-shell:155.0.8059.40
+    profiles: [artifact-render]
+    command:
+      - --disable-dev-shm-usage
+      - --no-first-run
+      - --disable-background-networking
+      - --disable-component-update
+      - --disable-default-apps
+      - --disable-sync
+      - --mute-audio
+      - --hide-scrollbars
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    networks:
+      - render
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    profiles: [sso]
+    command: start-dev --import-realm --http-port=8081
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # The issuer the API discovers is the address the browser is sent to as
+      # well, so it has to be a name both can resolve - see above.
+      KC_HOSTNAME: http://keycloak:8081
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+    ports:
+      # The same port on both sides, so one URL is correct from the host and
+      # from the compose network.
+      - "8081:8081"
+    volumes:
+      - ./e2e-fixtures/keycloak:/opt/keycloak/data/import:ro
+    networks:
+      - backend
+
+networks:
+  backend:
+    # Named so `docker-compose-dev.frontend.yml`, a project of its own, can join
+    # it as an external network. Set AGENTICOS_NETWORK in backend/.env when two
+    # stacks share a host - both files read it, so they still meet.
+    name: ${AGENTICOS_NETWORK:-agenticos_backend}
+    driver: bridge
+  render:
+    # The page renderer's network: the API, the runner and the browser, no way out.
+    internal: true
+  browser:
+    # The browser's own network, which only the API and the worker share with it
+    # to reach `browser:9222`. A page it is sent to - or redirected to - cannot
+    # reach the database, Redis or MinIO, because nothing else is on it.
+    driver: bridge
+
+volumes:
+  media_data:
+  postgres_data:

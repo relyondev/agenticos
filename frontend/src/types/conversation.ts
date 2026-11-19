@@ -1,0 +1,262 @@
+import {
+  type CodingHarness,
+  RatingValue,
+  type ChatMessageFile,
+  type ConversationCost,
+  type UserRating,
+} from "./chat";
+import type { RatingsByDay } from "./stats";
+
+/**
+ * An agent that answered in a conversation.
+ *
+ * A list, never one: the picker can be changed mid-thread, so a conversation
+ * can have been had with several agents in turn. Listings order them by latest use, newest first.
+ */
+export interface ConversationAgent {
+  id: string;
+  slug: string;
+  name: string;
+  has_avatar: boolean;
+  /** The colour its face was given; absent from an older backend. */
+  avatar_color?: number | null;
+}
+
+/** A member of the organization, as much as a chat needs to draw them. */
+export interface ChatPerson {
+  user_id: string;
+  /** Their name, or their address where they never set one. */
+  name: string;
+  has_avatar: boolean;
+  avatar_color: number | null;
+}
+
+export interface Conversation {
+  id: string;
+  user_id?: string;
+  title?: string;
+  created_at: string;
+  /** Null until the conversation is first changed after it was created. */
+  updated_at: string | null;
+  is_archived: boolean;
+  /**
+   * Whether **the caller** has starred it. A property of the reader rather than
+   * of the row - a thread can be shared, and one person's star must not decide
+   * where it sits for everybody who can see it (#929).
+   */
+  is_favourite?: boolean;
+  /** Most recently used first. Empty means the general assistant. */
+  agents?: ConversationAgent[];
+  /** Coding harnesses actually used, newest first; absent from older servers. */
+  coding_agents?: CodingHarness[];
+  /** The project it was started in, whose files and instructions its runs share. */
+  project_id?: string | null;
+  /** `api` for a conversation an organization key's run opened (#2122). */
+  origin?: "api" | "workflow" | null;
+  /** Holds an answer the caller has not seen since they last had it open. Listings only. */
+  unread?: boolean;
+  /** When the run still at work in it began; null when none is. Listings only. */
+  running_since?: string | null;
+}
+
+/** One of a project's chats, with the people around it - a project's chats are its members'. */
+export interface ProjectChat extends Conversation {
+  /** Who started it; null when that account is gone. */
+  owner: ChatPerson | null;
+  /** Everyone who has had it open, most recently first. */
+  seen_by: (ChatPerson & { read_at: string })[];
+  /** Whose run is at work in it now; null when none is. */
+  working: ChatPerson | null;
+  /** Who has it open right now. */
+  here: ChatPerson[];
+}
+
+export interface ConversationMessage {
+  /** Authenticated author, paired with the submission correlation. */
+  sender?: ChatPerson | null;
+  client_message_id?: string | null;
+  id: string;
+  conversation_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  thinking?: string | null;
+  created_at: string;
+  model_name?: string;
+  tokens_used?: number;
+  /**
+   * What this turn cost, stored per message.
+   *
+   * Split because input and output are priced an order of magnitude apart, so one
+   * total cannot say whether an answer was expensive because of a long context or a
+   * long answer. Absent on any message written before the API recorded it, and on a
+   * turn whose cost could not be read - which means "not recorded", never "free", so
+   * a client draws nothing rather than zeroes.
+   */
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  /** A string, like every other money field the API returns: `Numeric` is serialized
+   *  as one so a sum of a thousand turns cannot drift from the budget it is compared
+   *  against. */
+  cost_usd?: string | null;
+  /**
+   * Whether `cost_usd` is a floor rather than the whole of it.
+   *
+   * True when the turn reached a model with no price entry. Null on every
+   * message written before it was recorded, which is "not recorded" rather than
+   * "exact" - a client draws the caveat on `true` alone.
+   */
+  cost_is_partial?: boolean | null;
+  /**
+   * Tokens the history sent with this turn occupied, after any compaction.
+   *
+   * The count only: the window it is a share of belongs to the model answering
+   * next, which the chat lets somebody switch between turns.
+   */
+  context_used_tokens?: number | null;
+  /**
+   * How the run that produced this turn ended.
+   *
+   * Null for a turn written outside a run. `cancelled` is the one worth drawing:
+   * a stopped run leaves a half-written answer that reads exactly like a complete
+   * one, so without this the reader believes the agent said all it had to say.
+   */
+  run_status?: string | null;
+  /** Which configured agent answered. Null for the general assistant. */
+  agent_id?: string | null;
+  tool_calls?: ConversationToolCall[];
+  files?: ChatMessageFile[];
+  user_rating?: UserRating;
+  rating_count?: { likes: number; dislikes: number } | null;
+}
+
+export interface ConversationToolCall {
+  id: string;
+  message_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  args: Record<string, unknown>;
+  result?: string;
+  status: "pending" | "running" | "completed" | "failed";
+  started_at: string;
+  completed_at?: string;
+  duration_ms?: number;
+}
+
+export interface ConversationListResponse {
+  items: Conversation[];
+  total: number;
+}
+
+/** `GET /conversations/{id}/messages`: the thread, and what all of it cost. */
+export interface ConversationMessagesResponse {
+  items: ConversationMessage[];
+  total: number;
+  /** What the whole thread cost, summed server-side. Null when nothing was measured. */
+  cost: ConversationCost | null;
+}
+
+export interface ConversationWithMessages extends Conversation {
+  messages: ConversationMessage[];
+}
+/**
+ * Message rating types.
+ */
+
+export interface MessageRating {
+  id: string;
+  message_id: string;
+  user_id: string | null;
+  rating: RatingValue;
+  comment: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MessageRatingWithDetails extends MessageRating {
+  message_content: string | null;
+  message_role: string | null;
+  conversation_id: string | null;
+  user_email: string | null;
+  user_name: string | null;
+}
+
+export interface MessageRatingListResponse {
+  items: MessageRatingWithDetails[];
+  total: number;
+}
+
+// Distinct from `RatingsSummary` in `./stats` (which carries a from/to/scope
+// window): this is the admin `/admin/ratings/summary` response, named apart so
+// the two are not confused on import by a single trailing `s` (#559).
+export interface AdminRatingsSummary {
+  total_ratings: number;
+  like_count: number;
+  dislike_count: number;
+  average_rating: number;
+  with_comments: number;
+  ratings_by_day: RatingsByDay[];
+}
+
+export interface ConversationShare {
+  id: string;
+  conversation_id: string;
+  shared_by: string;
+  shared_with?: string;
+  share_token?: string;
+  permission: "view" | "edit";
+  shared_with_email?: string;
+  shared_by_email?: string;
+  created_at: string;
+}
+
+export interface ConversationShareListResponse {
+  items: ConversationShare[];
+  total: number;
+}
+
+export interface AdminConversation {
+  id: string;
+  user_id?: string;
+  title?: string;
+  is_archived: boolean;
+  message_count: number;
+  user_email?: string;
+  agents?: ConversationAgent[];
+  /** Coding harnesses actually used, newest first; absent from older servers. */
+  coding_agents?: CodingHarness[];
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface AdminConversationListResponse {
+  items: AdminConversation[];
+  total: number;
+}
+
+/**
+ * One user as the deployment admin sees them - `AdminUserRead`, field for field.
+ *
+ * Field for field is the point. This is hand-written against a schema nothing
+ * checks it against, and the copy that used to live in `use-admin-users.ts`
+ * declared a `role: string` that the API stopped returning when `users.role` was
+ * dropped in migration `0066` - so the users table drew a Role column that was
+ * empty on every row, and TypeScript was happy because the type said otherwise.
+ * There is one copy now, and `conversation_count` is in it because the backend
+ * computes it with a join on every page load.
+ */
+export interface AdminUser {
+  id: string;
+  email: string;
+  full_name: string | null;
+  is_active: boolean;
+  is_app_admin: boolean;
+  conversation_count: number;
+  created_at: string;
+}
+
+export interface AdminUserListResponse {
+  items: AdminUser[];
+  total: number;
+}

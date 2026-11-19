@@ -1,0 +1,151 @@
+"use client";
+
+import { useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { apiClient } from "@/lib/api-client";
+import { qk } from "@/lib/query-keys";
+import type {
+  Invitation,
+  InvitationAccepted,
+  InvitationCreated,
+  NewInviteLink,
+  InvitationList,
+  InviteMemberInput,
+} from "@/types";
+
+export function useInvitations(orgId: string) {
+  const queryClient = useQueryClient();
+  // Two namespaces because the toasts belong to two surfaces: inviting and
+  // revoking happen on the members page, accepting on the invitation page. Every
+  // message below was already in the catalog and read by nothing (#425).
+  const t = useTranslations("members");
+  const tInvite = useTranslations("invitations");
+
+  // React Query owns the list: cached per-org, deduped, no refetch storms.
+  // Mutations patch the cache directly to keep the UI instant. The query stays
+  // disabled until an orgId is provided (some consumers mount with "" to only
+  // use acceptInvitation).
+  const { data: invitations = [], isLoading } = useQuery({
+    queryKey: qk.invitations.list(orgId),
+    queryFn: async () => (await apiClient.get<InvitationList>(`/orgs/${orgId}/invitations`)).items,
+    enabled: !!orgId,
+  });
+
+  const writeCache = useCallback(
+    (updater: (prev: Invitation[]) => Invitation[]) =>
+      queryClient.setQueryData<Invitation[]>(qk.invitations.list(orgId), (prev = []) =>
+        updater(prev),
+      ),
+    [queryClient, orgId],
+  );
+
+  // Kept for API compatibility: the list auto-fetches on mount; this forces a
+  // background refresh.
+  const fetchInvitations = useCallback(() => {
+    if (!orgId) return;
+    queryClient.invalidateQueries({ queryKey: qk.invitations.list(orgId) });
+  }, [queryClient, orgId]);
+
+  const invite = useCallback(
+    async (input: InviteMemberInput): Promise<InvitationCreated | null> => {
+      try {
+        const created = await apiClient.post<InvitationCreated>(
+          `/orgs/${orgId}/invitations`,
+          input,
+        );
+        // The token is still stripped before the invitation reaches the *cache*.
+        // It is a bearer credential and this cache backs the members page, which
+        // has no use for it - but it is returned to the caller, which does: the
+        // dialog shows the link once, in memory, and that is the only copy
+        // anybody gets. The reasoning that used to be here said the token could
+        // go because it was "already on its way to the invitee by email", which
+        // is untrue on a deployment with no mail service (#1484).
+        const { invitation_token: _token, ...invitation } = created;
+        writeCache((prev) => [invitation, ...prev]);
+        // No toast. Whether this was sent is the dialog's to say now, because it
+        // is the thing holding the link to say it beside - and a toast claiming
+        // "sent" is exactly what was wrong.
+        return created;
+      } catch {
+        toast.error(t("failedInvite"));
+        return null;
+      }
+    },
+    [orgId, writeCache, t],
+  );
+
+  // By id, under the organization. The backend also revokes by token, but that
+  // route is the invitee's - they have no id and no org - and putting a live
+  // credential in the URL of an authenticated admin action would only write it
+  // into server logs and browser history.
+  const revokeInvitation = useCallback(
+    async (invitationId: string) => {
+      try {
+        await apiClient.delete(`/orgs/${orgId}/invitations/${invitationId}`);
+        writeCache((prev) => prev.filter((i) => i.id !== invitationId));
+        toast.success(t("revokeSuccess"));
+      } catch {
+        toast.error(t("failedRevoke"));
+      }
+    },
+    [orgId, writeCache, t],
+  );
+
+  // POST /invitations/<token> *is* the accept - the proxy route maps it onto the
+  // backend's /accept. Posting to `/invitations/<token>/accept` from here hit no
+  // route at all and came back as the 404 page; because the failure was
+  // swallowed below, the accept screen then announced "You joined the
+  // organization!" to people who had joined nothing. The error is rethrown so
+  // that screen's error branch is reachable at all.
+  const acceptInvitation = useCallback(
+    async (token: string): Promise<string> => {
+      try {
+        const accepted = await apiClient.post<InvitationAccepted>(`/invitations/${token}`);
+        toast.success(tInvite("acceptSuccess"));
+        return accepted.organization_id;
+      } catch (error) {
+        toast.error(tInvite("failedTitle"));
+        throw error;
+      }
+    },
+    [tInvite],
+  );
+
+  /**
+   * Mint a shareable link, and hand the URL back once.
+   *
+   * Unlike `invite`, the token *is* returned to the caller: a link nobody can
+   * copy is a link that does nothing. It is still kept out of the cache - the
+   * page shows it once, in the dialog that asked for it, and the listing that
+   * cache backs carries no tokens for the same reason it never has.
+   */
+  const createLink = useCallback(
+    async (input: NewInviteLink): Promise<string | null> => {
+      try {
+        const created = await apiClient.post<InvitationCreated>(
+          `/orgs/${orgId}/invitations/link`,
+          input,
+        );
+        const { invitation_token: token, ...invitation } = created;
+        writeCache((prev) => [invitation, ...prev]);
+        return `${window.location.origin}/invitations/${token}`;
+      } catch {
+        toast.error(t("failedCreateLink"));
+        return null;
+      }
+    },
+    [orgId, writeCache, t],
+  );
+
+  return {
+    invitations,
+    isLoading,
+    fetchInvitations,
+    invite,
+    createLink,
+    revokeInvitation,
+    acceptInvitation,
+  };
+}

@@ -1,0 +1,123 @@
+import { DiagnosticsPresence } from "@/components/layout/diagnostics-presence";
+import { ReleaseNotes } from "@/components/layout/release-notes";
+import { Suspense } from "react";
+
+import { AddToAgentPrompt } from "@/components/agents/add-to-agent";
+import { AssistantWidget } from "@/components/assistant/assistant-widget";
+import { DeploymentGate } from "@/components/branding/deployment-gate";
+import { DesktopBridge } from "@/components/desktop/desktop-bridge";
+import { MobileBridge } from "@/components/mobile/mobile-bridge";
+import { PullToRefresh } from "@/components/mobile/pull-to-refresh";
+import { CustomIconsProvider } from "@/components/icons/custom-icons";
+import { MobileHeader, Sidebar } from "@/components/layout";
+import { MainViewport } from "@/components/layout/main-viewport";
+import { AccountLocale } from "@/components/layout/account-locale";
+import { AccountTimeZone } from "@/components/layout/account-time-zone";
+import { ActiveOrgGuard } from "@/components/layout/active-org-guard";
+import { OnScreenKeyboard } from "@/components/layout/on-screen-keyboard";
+import { AppSidebar } from "@/components/layout/app-sidebar";
+import { AuthGuard } from "@/components/layout/auth-guard";
+import { CommandPalette } from "@/components/layout/command-palette";
+import { ImpersonationBanner } from "@/components/layout/impersonation-banner";
+import { InstallPrompt } from "@/components/layout/install-prompt";
+import { OfflineBanner } from "@/components/layout/offline-banner";
+import { LiveUpdates } from "@/components/live-updates/live-updates";
+import { NavigationProgress } from "@/components/layout/navigation-progress";
+import { PageTransition } from "@/components/layout/page-transition";
+import { OnboardingFlows } from "@/components/onboarding/onboarding-flows";
+import { OnboardingTour } from "@/components/onboarding/onboarding-tour";
+
+export default function DashboardLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <AuthGuard>
+      {/* An organization the server refuses is not a page-level problem: it
+          empties every permission-gated destination at once, so the recovery
+          lives beside the navigation it would otherwise silently strip. */}
+      <ActiveOrgGuard />
+      <ReleaseNotes />
+      {/* The language the account chose, here or on another device or by asking an agent. */}
+      <AccountLocale />
+      <AccountTimeZone />
+      <DiagnosticsPresence />
+      {/* Changes made through the API, MCP or the assistant reach open pages. */}
+      <LiveUpdates />
+      {/* Inside the desktop app: the badge, native notifications and the menu's navigation. */}
+      <DesktopBridge />
+      {/* Inside the phone app: live activities on the lock screen, and their buttons. */}
+      <MobileBridge />
+      {/* A phone pulls the page down to read it again. */}
+      <PullToRefresh />
+      {/* It reads the search params, which a prerendered page only has in the browser. */}
+      <Suspense fallback={null}>
+        <NavigationProgress />
+      </Suspense>
+      {/* Which custom brand marks the deployment ships - fetched once here so
+          every icon down the tree reads it from context instead of querying. */}
+      <CustomIconsProvider>
+        <OnScreenKeyboard />
+        {/* As tall as what can be seen, keyboard and address bar included -
+            see `useOnScreenKeyboard`; `100dvh` until it has measured. */}
+        {/* Less the phone app's status bar, which `body` leaves room for
+            (`desktop.css`); zero everywhere else. */}
+        <div className="flex h-[calc(var(--app-height,100dvh)-var(--shell-inset-top,0px))] flex-col">
+          {/* Nothing above `md`: the brand, the organization, search, settings
+            and the account are all in the column now, and this renders only
+            where the column is a slide-over that needs opening. */}
+          <MobileHeader />
+          <ImpersonationBanner />
+          <OfflineBanner />
+          <InstallPrompt />
+          {/* The column and the content scroll independently, which is the point
+            of a persistent sidebar: navigation stays put while a long run list
+            moves under it. */}
+          <div className="flex min-h-0 flex-1">
+            <AppSidebar />
+            {/* `relative` is load-bearing, and not for anything it positions.
+                An absolutely positioned descendant with no positioned ancestor
+                resolves against the initial containing block, and its layout
+                overflow then inflates the *document's* scrollable rect: measured
+                on the agent Builder, `documentElement.scrollHeight` read 3130
+                against a 1290 viewport while the document could not be scrolled
+                by a pixel. Chrome draws a scrollbar track for that - inert, with
+                a full-height thumb - so anybody whose macOS shows scrollbars
+                always saw two bars side by side and one of them did nothing. The
+                offenders are the hidden inputs Radix's Select renders. Contained
+                here, `scrollHeight` is the viewport's own 1290.
+
+                `relative` rather than `contain: paint`, which fixes it equally
+                and would also make this the containing block for every `fixed`
+                descendant - the chat's sources panel and two drop overlays are
+                `fixed` and rendered inline, so containment would move them.
+
+                No bottom padding here, and that is the fix rather than an
+                omission: `DeploymentGate` wraps every page in a `min-h-0 flex-1`
+                box, so a long page overflows *that* and this element's padding
+                edge stays where the shorter box ended - buried mid-content.
+                Measured at 0px below the last card, at every width, in Chromium
+                151 and WebKit 26.5. The room under a page is declared once, on
+                `PageTransition`'s unconstrained branch, where it paints (#933). */}
+            <MainViewport>
+              {/* Inside `main` rather than around the whole shell: a
+                    maintenance window still leaves the navigation and the account
+                    menu, because the administrator who has to end it reaches the
+                    settings page through them. */}
+              <DeploymentGate>
+                <PageTransition>{children}</PageTransition>
+              </DeploymentGate>
+            </MainViewport>
+          </div>
+          {/* The one navigation on a phone too: the drawer holds every section,
+              where a bottom bar repeated five of them and took a strip of the
+              screen from every page. */}
+          <Sidebar />
+          <CommandPalette />
+          <AddToAgentPrompt />
+          <OnboardingTour />
+          <OnboardingFlows />
+          {/* The AI Architect, in the corner of every page (#2063). */}
+          <AssistantWidget />
+        </div>
+      </CustomIconsProvider>
+    </AuthGuard>
+  );
+}

@@ -1,0 +1,228 @@
+"""What a turn's recorded order has to survive, and what it must not invent.
+
+The timeline exists so a reloaded conversation is the one somebody watched. Every
+test here is a way the two could drift apart again.
+"""
+
+from app.services.chat_timeline import TurnTimeline
+
+
+class TestAccumulatingOneTurn:
+    def test_consecutive_deltas_of_one_kind_are_one_part(self):
+        """A sentence arrives as a dozen frames and is one block on screen. A part
+        per frame would be a dozen rows where the client showed one."""
+        timeline = TurnTimeline()
+
+        timeline.add_text("Two ")
+        timeline.add_text("are ")
+        timeline.add_text("open.")
+
+        assert [(part.type, part.text) for part in timeline.parts] == [("text", "Two are open.")]
+
+    def test_the_space_between_two_deltas_is_not_trimmed(self):
+        """The parts are accumulated, so trimming each delta deletes the space the
+        words meet at. `MessagePart` turns `str_strip_whitespace` off for exactly
+        this, and "Two " + "are open." became "Twoare open." without it."""
+        timeline = TurnTimeline()
+
+        timeline.add_text("Two ")
+        timeline.add_text("are open.")
+
+        assert timeline.text == "Two are open."
+
+    def test_a_tool_closes_the_open_text_part(self):
+        """The turn the whole change is about: words, work, then more words. Both
+        blocks of text survive and the tool sits between them."""
+        timeline = TurnTimeline()
+
+        timeline.add_text("Here are the charts.")
+        timeline.add_tool("call-1")
+        timeline.add_tool("call-2")
+        timeline.add_text("Done - three of them.")
+
+        assert [(part.type, part.text or part.tool_call_id) for part in timeline.parts] == [
+            ("text", "Here are the charts."),
+            ("tool", "call-1"),
+            ("tool", "call-2"),
+            ("text", "Done - three of them."),
+        ]
+
+    def test_the_stored_text_is_every_block_and_not_only_the_last(self):
+        timeline = TurnTimeline()
+
+        timeline.add_text("First. ")
+        timeline.add_tool("call-1")
+        timeline.add_text("Second.")
+
+        assert timeline.text == "First. Second."
+
+    def test_a_new_response_opens_a_new_text_part(self):
+        """#2108: a background tool answers as a message, not a tool part, so the
+        text written while it ran and after it returned met with nothing between."""
+        timeline = TurnTimeline()
+
+        timeline.add_text("A haiku while it runs.")
+        timeline.next_response()
+        timeline.add_text("The heading is Example Domain.")
+
+        assert [part.text for part in timeline.parts] == [
+            "A haiku while it runs.",
+            "The heading is Example Domain.",
+        ]
+
+    def test_deltas_of_one_response_stay_one_part(self):
+        timeline = TurnTimeline()
+
+        timeline.next_response()
+        timeline.add_text("One ")
+        timeline.add_text("sentence.")
+
+        assert [part.text for part in timeline.parts] == ["One sentence."]
+
+    def test_a_second_block_of_reasoning_is_separated_from_the_first(self):
+        """Providers emit a block per thought with no trailing space, so joining
+        them ran the last word of one into the first of the next."""
+        timeline = TurnTimeline()
+
+        timeline.add_thinking("Counting.")
+        timeline.add_thinking("Now checking.")
+
+        assert timeline.thinking == "Counting. Now checking."
+
+    def test_reasoning_and_text_are_read_back_separately(self):
+        timeline = TurnTimeline()
+
+        timeline.add_thinking("Deciding what to plot.")
+        timeline.add_text("Here it is.")
+
+        assert timeline.thinking == "Deciding what to plot."
+        assert timeline.text == "Here it is."
+
+    def test_a_turn_that_never_reasoned_records_no_trace(self):
+        """None, not "": the column means "did not reason", and an empty string is
+        a reasoning pane somebody can open onto nothing."""
+        timeline = TurnTimeline()
+
+        timeline.add_text("Thirty days.")
+
+        assert timeline.thinking is None
+
+    def test_reasoning_resumed_after_a_tool_is_still_one_trace(self):
+        timeline = TurnTimeline()
+
+        timeline.add_thinking("Checking the policy.")
+        timeline.add_tool("call-1")
+        timeline.add_thinking("That settles it.")
+
+        assert timeline.thinking == "Checking the policy. That settles it."
+
+    def test_an_answered_question_becomes_a_part_where_it_was_asked(self):
+        """The question and the answer land between the words either side of them,
+        so a reopened conversation shows the turn in the order it happened."""
+        timeline = TurnTimeline()
+
+        timeline.add_text("I need to know first. ")
+        timeline.add_ask_user("Which region?", "eu-west-1")
+        timeline.add_text("Deploying to eu-west-1.")
+
+        assert [
+            (part.type, part.question, part.answer)
+            if part.type == "ask_user"
+            else (part.type, part.text)
+            for part in timeline.parts
+        ] == [
+            ("text", "I need to know first. "),
+            ("ask_user", "Which region?", "eu-west-1"),
+            ("text", "Deploying to eu-west-1."),
+        ]
+
+
+class TestWhatIsWorthStoring:
+    def test_a_turn_with_an_order_stores_it(self):
+        timeline = TurnTimeline()
+
+        timeline.add_tool("call-1")
+        timeline.add_text("Thirty days.")
+
+        stored = timeline.stored()
+        assert stored is not None
+        assert [part.type for part in stored] == ["tool", "text"]
+
+    def test_a_turn_of_one_part_stores_nothing(self):
+        """An ordinary question and answer has no sequence to preserve, and the
+        row's own columns already say everything it contained. Writing one would
+        put a JSONB array on every plain turn in the deployment to record that the
+        answer came after the question."""
+        timeline = TurnTimeline()
+
+        timeline.add_text("Thirty days.")
+
+        assert timeline.stored() is None
+
+    def test_a_turn_that_produced_nothing_stores_nothing(self):
+        assert TurnTimeline().stored() is None
+
+    def test_a_lone_answered_question_is_stored_even_as_one_part(self):
+        """Unlike a lone tool call (its `tool_calls` row) or a lone block of text
+        (`content`), an `ask_user` part has no column to fall back to - so dropping
+        it as "a turn of one part" would lose the question and the answer (#502)."""
+        timeline = TurnTimeline()
+
+        timeline.add_ask_user("Which region?", "eu-west-1")
+
+        stored = timeline.stored()
+        assert stored is not None
+        assert [(part.type, part.question, part.answer) for part in stored] == [
+            ("ask_user", "Which region?", "eu-west-1")
+        ]
+
+
+class TestWhatThePersonAdded:
+    """A mid-run correction is a moment in the turn, kept where it landed (#2087)."""
+
+    def test_it_sits_between_what_came_before_and_after_and_is_not_text(self):
+        timeline = TurnTimeline()
+        timeline.add_text("Looking at the US numbers. ")
+        timeline.add_steer("use the EU numbers")
+        timeline.add_steer("and round them")
+        timeline.add_text("Switching to the EU numbers.")
+
+        assert [part.type for part in timeline.parts] == ["text", "steer", "steer", "text"]
+        assert timeline.text == "Looking at the US numbers. Switching to the EU numbers."
+
+    def test_a_lone_one_is_still_stored(self):
+        timeline = TurnTimeline()
+        timeline.add_steer("stop")
+
+        assert timeline.stored() == timeline.parts
+
+
+def test_file_origin_is_kept_even_for_a_single_part_and_survives_serialization() -> None:
+    from uuid import uuid4
+
+    from app.schemas.conversation import LocalMessageFileSource, MessagePart
+
+    source = LocalMessageFileSource(id=uuid4())
+    timeline = TurnTimeline(file_source=source)
+    timeline.add_tool("generated-file")
+    stored = timeline.stored()
+    assert stored is not None
+    reloaded = [MessagePart.model_validate(part.model_dump(mode="json")) for part in stored]
+    assert reloaded[0].file_source == source
+    assert "root" not in source.model_dump()
+    assert timeline.text == ""
+
+
+def test_legacy_local_file_origins_are_redacted_without_losing_the_turn() -> None:
+    from app.schemas.conversation import MessagePart
+
+    part = MessagePart.model_validate(
+        {
+            "type": "text",
+            "text": "Done",
+            "file_source": {"kind": "local", "root": "/Users/alice/private"},
+        }
+    )
+    assert part.text == "Done"
+    assert part.file_source is None
+    assert "/Users/alice" not in part.model_dump_json()

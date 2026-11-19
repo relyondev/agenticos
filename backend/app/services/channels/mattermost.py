@@ -1,0 +1,1454 @@
+"""Mattermost channel adapter.
+
+Mattermost is self-hosted, which is the one thing that makes it different from
+the other two adapters: there is no api.mattermost.com to talk to, so every bot
+carries the URL of its own server (`ChannelBot.api_base_url`). A bot without one
+cannot send anything, and that is reported when the bot is saved rather than the
+first time somebody messages it.
+
+Two ways in, both supported, because Mattermost deployments differ:
+
+*Outgoing webhooks* - Mattermost POSTs to us when a trigger word matches or a
+message lands in a watched channel. Configured in Mattermost's own integrations
+page, so `register_webhook` has nothing to call; it logs the URL to paste. The
+payload carries a shared `token`, which is what `verify_webhook_signature`
+compares - Mattermost does not sign bodies the way Slack does, so this is a
+bearer check and the token must be treated as a credential.
+
+*The WebSocket event stream* - a bot token authenticates, and every `posted`
+event arrives. This is the equivalent of Slack's Socket Mode: nothing to expose
+publicly, which is what a private deployment behind a VPN needs. It is what
+`start_polling` runs.
+
+Both paths normalise into the same `IncomingMessage`, so the router, the access
+policy and the mention handling are shared with Slack and Telegram.
+"""
+
+import asyncio
+import base64
+import binascii
+import contextlib
+import json
+import logging
+import re
+import secrets
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import parse_qs, quote
+
+import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+
+from app.agents.capabilities.channel_tools import (
+    ChannelDetails,
+    ChannelDirectoryUnsupported,
+    ChannelMember,
+    ChannelPost,
+    ChannelSummary,
+)
+from app.core.security import encode_untrusted
+from app.db.session import get_db_context
+from app.services.channels import connection_state
+from app.services.channels.attachments import routed_type
+from app.services.channels.base import (
+    ChannelAdapter,
+    FeedbackComment,
+    IncomingAttachment,
+    IncomingMessage,
+    IncomingPress,
+    OutgoingMessage,
+    PromptMessage,
+    broadcast_mentioned,
+    feedback_value,
+    mentionable_text,
+    split_thread,
+    supervise_stream,
+    thread_key,
+)
+from app.services.channels.exceptions import ChannelNotConfigured
+from app.services.channels.router import ChannelMessageRouter
+from app.services.channels.webhooks import inbound_actions_url, inbound_dialogs_url, sign_press
+
+logger = logging.getLogger(__name__)
+
+FEEDBACK_DIALOG = "aos_feedback_comment"
+"""The `callback_id` of the "what was wrong?" dialog (#2084)."""
+
+# Mattermost closes an idle socket; the client is expected to keep it warm.
+_PING_SECONDS = 30.0
+_HTTP_TIMEOUT = 20.0
+_FILE_INFO_CONCURRENCY = 4
+"""How many `GET /files/{id}/info` lookups one webhook post runs at once."""
+
+TRIGGER_MAX_AGE = timedelta(minutes=5)
+"""How old a press's trigger id may be. Mattermost relays a press at once."""
+
+
+def trigger_presser(trigger_id: str, public_key_der: bytes, *, now: datetime) -> str | None:
+    """The user a Mattermost trigger id was minted for, if its server signed it lately.
+
+    A press's body is not signed - its `user_id` is whatever the request says -
+    but the trigger id beside it is: the server mints it per press as
+    `<client id>:<user id>:<ms>:[<channel id>:]<base64 ECDSA signature>`, over
+    everything before the signature, with the key whose public half it publishes
+    in its client config. Older servers leave the channel out; both are read.
+    """
+    try:
+        parts = base64.b64decode(trigger_id, validate=True).decode().split(":")
+        minted = datetime.fromtimestamp(int(parts[2]) / 1000, UTC)
+        signature = base64.b64decode(parts[-1], validate=True)
+        key = serialization.load_der_public_key(public_key_der)
+    except binascii.Error, UnicodeDecodeError, ValueError, IndexError:
+        return None
+    if len(parts) < 4 or abs(now - minted) > TRIGGER_MAX_AGE:
+        return None
+    if not isinstance(key, ec.EllipticCurvePublicKey):
+        return None
+    signed = ":".join(parts[:-1]) + ":"
+    try:
+        key.verify(signature, signed.encode(), ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        return None
+    return parts[1] or None
+
+
+def _posted_at(create_at: Any) -> datetime | None:
+    """A Mattermost timestamp as a datetime, or `None` if it was not one.
+
+    Mattermost counts milliseconds since the epoch. `None` rather than a raise:
+    this decorates a line of history, and a post with an unreadable timestamp is
+    still a post somebody wrote.
+    """
+    if not isinstance(create_at, int | float) or not create_at:
+        return None
+    return datetime.fromtimestamp(create_at / 1000, UTC)
+
+
+def decode_webhook_body(raw: str) -> dict[str, Any]:
+    """One outgoing-webhook body, whichever encoding the integration was given.
+
+    Mattermost sends JSON or `application/x-www-form-urlencoded` depending on
+    how the integration was set up, and the two halves of receiving one - the
+    token check below and the message itself - have to agree on which it was.
+    They did not. The token was found by trying JSON and falling back to a form
+    parse; the message was decoded from the declared Content-Type instead, so a
+    body whose header disagreed with its bytes authenticated and then parsed to
+    nothing. The webhook answered 200 and the message was never delivered.
+
+    Which is why the header is not consulted at all: what a body *is* settles
+    it, and a form body is never valid JSON. Anything neither reads as an empty
+    payload, which downstream takes as "no message here" - and no token can be
+    found in it, so this cannot widen what authenticates.
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError, TypeError:
+        return {key: values[0] for key, values in parse_qs(raw).items()}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+class MattermostAdapter(ChannelAdapter):
+    """Mattermost, over its REST API and its WebSocket event stream."""
+
+    platform: str = "mattermost"
+
+    def __init__(self) -> None:
+        # One client per adapter, not one per call. A streamed turn is dozens of
+        # REST calls to the same host - an edit a second, plus typing and each
+        # attachment - and a fresh client per call throws the connection pool
+        # away before it is reused, paying a TLS handshake every time (#952).
+        self._http = httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
+        self._socket_tasks: dict[str, asyncio.Task[None]] = {}
+        # Where each bot's server lives. Set by the service when a bot starts,
+        # because the adapter is a singleton and the URL is per bot.
+        self._base_urls: dict[str, str] = {}
+        # The live socket per bot, so a typing indicator can be sent on the
+        # connection the stream already holds, and the sequence number that
+        # connection is up to.
+        self._sockets: dict[str, Any] = {}
+        # Which account each bot is, so a mention of it can be told from a mention
+        # of somebody else. Resolved per stream session - see `_own_user_id`.
+        self._own_ids: dict[str, str] = {}
+        # The bot's own handle, beside its id and for a different job: the id is
+        # what a mention list is matched against, and the handle is what has to
+        # come *out* of the text. Mattermost writes a mention as literal
+        # `@username`, so without this the agent is handed its own handle as
+        # content and answers about it.
+        self._own_names: dict[str, str] = {}
+        self._seq: dict[str, int] = {}
+        # Each server's public signing key, which proves who pressed a button.
+        self._signing_keys: dict[str, bytes] = {}
+
+    def remember_server(self, bot_id: str, api_base_url: str) -> None:
+        """Record which Mattermost server a bot belongs to."""
+        self._base_urls[bot_id] = api_base_url.rstrip("/")
+
+    def prepare_connection(
+        self,
+        bot_id: str,
+        *,
+        api_base_url: str | None,
+        app_token: str | None,
+        approved_guild_ids: tuple[str, ...] = (),
+    ) -> None:
+        if api_base_url:
+            self.remember_server(bot_id, api_base_url)
+
+    def _client(self) -> contextlib.AbstractAsyncContextManager[httpx.AsyncClient]:
+        """The adapter's shared HTTP client, borrowed for one request cycle.
+
+        Wrapped in `nullcontext` so a call site's `async with` hands back the
+        shared client and does not close it on exit - the pool stays warm across
+        a streamed turn's many calls (#952). The client is built once in
+        `__init__`, the one place the timeout is set, and closed in `aclose`.
+        """
+        return contextlib.nullcontext(self._http)
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+    @staticmethod
+    def _headers(bot_token: str) -> dict[str, str]:
+        """The bearer auth header every REST call to this server carries."""
+        return {"Authorization": f"Bearer {bot_token}"}
+
+    async def welcome(
+        self,
+        bot_token: str,
+        email: str,
+        text: str,
+        *,
+        api_base_url: str | None,
+        places: Sequence[str] = (),
+    ) -> bool:
+        """Find the person by address and greet them in a direct channel with the bot.
+
+        A server that hides addresses from bots answers 403 or 404 to the
+        lookup; both read as not found rather than as a failure.
+        """
+        if not api_base_url:
+            return False
+        base_url = api_base_url.rstrip("/")
+        headers = self._headers(bot_token)
+        async with self._client() as client:
+            found = await client.get(
+                f"{base_url}/api/v4/users/email/{quote(email)}", headers=headers
+            )
+            if found.status_code in (403, 404):
+                return False
+            found.raise_for_status()
+            me = await client.get(f"{base_url}/api/v4/users/me", headers=headers)
+            me.raise_for_status()
+            direct = await client.post(
+                f"{base_url}/api/v4/channels/direct",
+                headers=headers,
+                json=[me.json()["id"], found.json()["id"]],
+            )
+            direct.raise_for_status()
+            posted = await client.post(
+                f"{base_url}/api/v4/posts",
+                headers=headers,
+                json={"channel_id": direct.json()["id"], "message": text},
+            )
+            posted.raise_for_status()
+        return True
+
+    async def send_message(self, bot_token: str, msg: OutgoingMessage) -> None:
+        """Post a reply.
+
+        `platform_chat_id` is `channel_id` or `channel_id:root_id`; the second
+        form is a thread, folded the same way Slack's is so one conversation per
+        thread falls out of the router without it knowing about threads.
+        """
+        if not msg.api_base_url:
+            raise ValueError("Mattermost bot has no server URL. Set it on the bot before sending.")
+        # Trailing slash stripped here rather than trusted from the row: an
+        # operator types `https://mattermost.acme.com/` roughly half the time,
+        # and `{base}/api/v4/posts` then has two slashes in it. Mattermost
+        # answers a 301 to the single-slash form, httpx does not follow a
+        # redirect on a POST by default, and the reply is lost with a
+        # `HTTPStatusError` in the log rather than an answer in the thread.
+        # `remember_server` has always stripped it, so the socket path was fine
+        # and only replies failed - which is the confusing half of the bug.
+        base_url = msg.api_base_url.rstrip("/")
+
+        channel_id, root_id = split_thread(msg.platform_chat_id)
+        headers = self._headers(bot_token)
+
+        async with self._client() as client:
+            uploads: list[tuple[str, tuple[str, bytes, str]]] = []
+            if msg.image_png is not None:
+                uploads.append(("files", (msg.image_filename, msg.image_png, "image/png")))
+            uploads.extend(
+                ("files", (attachment.filename, attachment.content, attachment.mime_type))
+                for attachment in msg.attachments
+            )
+
+            file_ids: list[str] = []
+            if uploads:
+                upload = await client.post(
+                    f"{base_url}/api/v4/files",
+                    headers=headers,
+                    data={"channel_id": channel_id},
+                    files=uploads,
+                )
+                upload.raise_for_status()
+                file_ids = [item["id"] for item in upload.json().get("file_infos", [])]
+
+            body: dict[str, Any] = {"channel_id": channel_id, "message": msg.text}
+            if root_id:
+                body["root_id"] = root_id
+            if file_ids:
+                body["file_ids"] = file_ids
+
+            response = await client.post(f"{base_url}/api/v4/posts", headers=headers, json=body)
+            response.raise_for_status()
+
+    async def begin_reply(self, bot_token: str, msg: OutgoingMessage) -> str | None:
+        """Post the message that will become the answer, and return its id."""
+        if not msg.api_base_url:
+            return None
+        channel_id, root_id = split_thread(msg.platform_chat_id)
+        body: dict[str, Any] = {"channel_id": channel_id, "message": msg.text}
+        if root_id:
+            body["root_id"] = root_id
+
+        async with self._client() as client:
+            response = await client.post(
+                f"{msg.api_base_url.rstrip('/')}/api/v4/posts",
+                headers=self._headers(bot_token),
+                json=body,
+            )
+        response.raise_for_status()
+        post_id = response.json().get("id")
+        return str(post_id) if post_id else None
+
+    async def update_reply(self, bot_token: str, msg: OutgoingMessage, handle: str) -> None:
+        """Rewrite a post that is already on screen.
+
+        `PATCH` rather than `PUT /posts/{id}`: the full update wants the whole
+        post back and would drop anything it was not told about. Mattermost
+        broadcasts `post_edited`, so every client watching the channel sees the
+        text change without doing anything.
+        """
+        # Never None in practice - `begin_reply` refused without one and is the
+        # only thing that hands out a handle - but the type says otherwise and a
+        # crash mid-answer is a worse way to find out.
+        base_url = (msg.api_base_url or "").rstrip("/")
+        async with self._client() as client:
+            response = await client.put(
+                f"{base_url}/api/v4/posts/{handle}/patch",
+                headers=self._headers(bot_token),
+                json={"message": msg.text},
+            )
+        response.raise_for_status()
+
+    async def send_prompt(self, bot_token: str, prompt: PromptMessage) -> None:
+        """An approval or a question as an interactive message, a button per choice.
+
+        Mattermost posts a press to the button's integration URL - this
+        deployment's - with the `context` it was given. Nothing in that request is
+        signed by Mattermost, so the context carries this deployment's own
+        signature over the bot and the value, and a press without it is ignored.
+        """
+        if not prompt.api_base_url:
+            raise ValueError("Mattermost bot has no server URL. Set it on the bot before sending.")
+        channel_id, root_id = split_thread(prompt.platform_chat_id)
+        bot_id = prompt.bot_id
+        body: dict[str, Any] = {
+            "channel_id": channel_id,
+            "message": prompt.text,
+            "props": {
+                "attachments": [
+                    {
+                        "text": "",
+                        "actions": [
+                            {
+                                "id": f"aos{index}",
+                                "name": choice.label,
+                                "style": {"primary": "primary", "danger": "danger"}.get(
+                                    choice.style or "", "default"
+                                ),
+                                "integration": {
+                                    "url": inbound_actions_url(bot_id),
+                                    "context": {
+                                        "value": choice.value,
+                                        "text": prompt.text,
+                                        "signature": sign_press(bot_id, choice.value),
+                                    },
+                                },
+                            }
+                            for index, choice in enumerate(prompt.choices)
+                        ],
+                    }
+                ]
+            },
+        }
+        if root_id:
+            body["root_id"] = root_id
+        async with self._client() as client:
+            response = await client.post(
+                f"{prompt.api_base_url.rstrip('/')}/api/v4/posts",
+                headers=self._headers(bot_token),
+                json=body,
+            )
+        response.raise_for_status()
+
+    async def offer_feedback(
+        self, bot_token: str, msg: OutgoingMessage, handle: str, run_id: str, *, bot_id: str
+    ) -> None:
+        """Thumbs under a finished answer, signed like any other button of ours (#2084)."""
+        base_url = (msg.api_base_url or "").rstrip("/")
+        actions = [
+            {
+                "id": f"aosfb{index}",
+                "name": label,
+                "integration": {
+                    "url": inbound_actions_url(bot_id),
+                    "context": {
+                        "value": value,
+                        "text": msg.text,
+                        "signature": sign_press(bot_id, value),
+                    },
+                },
+            }
+            for index, (label, value) in enumerate(
+                (
+                    (":+1: Helpful", feedback_value(run_id, helpful=True)),
+                    (":-1: Not helpful", feedback_value(run_id, helpful=False)),
+                )
+            )
+        ]
+        async with self._client() as client:
+            response = await client.put(
+                f"{base_url}/api/v4/posts/{handle}/patch",
+                headers=self._headers(bot_token),
+                json={"props": {"attachments": [{"text": "", "actions": actions}]}},
+            )
+        response.raise_for_status()
+
+    async def acknowledge_message(
+        self, bot_token: str, incoming: IncomingMessage, reaction: str
+    ) -> None:
+        """React to the question with the bot's chosen emoji, as the bot (#2084)."""
+        base_url = self._base_urls.get(incoming.bot_id)
+        if not base_url or not incoming.message_id:
+            return
+        own = self._own_ids.get(incoming.bot_id) or await self._own_user_id(
+            incoming.bot_id, bot_token
+        )
+        if own is None:
+            return
+        async with self._client() as client:
+            response = await client.post(
+                f"{base_url}/api/v4/reactions",
+                headers=self._headers(bot_token),
+                json={"user_id": own, "post_id": incoming.message_id, "emoji_name": reaction},
+            )
+        response.raise_for_status()
+
+    async def ask_feedback_comment(
+        self, bot_token: str, press: IncomingPress, run_id: str, *, bot_id: str
+    ) -> None:
+        """Open the "what was wrong?" dialog for whoever pressed thumbs-down.
+
+        Mattermost signs nothing a dialog sends back, so its state carries our
+        signature over the run, as a button's context does.
+        """
+        base_url = self._base_urls.get(bot_id)
+        if base_url is None or press.trigger_id is None:
+            return
+        dialog = {
+            "callback_id": FEEDBACK_DIALOG,
+            "title": "What was wrong?",
+            "submit_label": "Send",
+            "elements": [
+                {
+                    "display_name": "Tell the agent's builders",
+                    "name": "comment",
+                    "type": "textarea",
+                    "max_length": 2000,
+                }
+            ],
+            # Bound to the person whose proven press opened it: the submission's
+            # `user_id` is unsigned, and a replayed state must not rate as
+            # somebody else.
+            "state": (
+                f"{run_id}:{press.platform_user_id}:"
+                f"{sign_press(bot_id, f'{run_id}:{press.platform_user_id}')}"
+            ),
+        }
+        async with self._client() as client:
+            response = await client.post(
+                f"{base_url}/api/v4/actions/dialogs/open",
+                headers=self._headers(bot_token),
+                json={
+                    "trigger_id": press.trigger_id,
+                    "url": inbound_dialogs_url(bot_id),
+                    "dialog": dialog,
+                },
+            )
+        response.raise_for_status()
+
+    async def settle_feedback(self, bot_token: str, press: IncomingPress, helpful: bool) -> None:
+        """Keep shared buttons available; the callback privately confirms the vote.
+
+        Removing them from the post would stop every other participant voting.
+        """
+
+    async def settle_prompt(self, bot_token: str, press: IncomingPress, text: str) -> None:
+        """Take the buttons off the pressed post, leaving what was asked and chosen."""
+        base_url = self._base_urls.get(press.bot_id)
+        if press.message_id is None or base_url is None:
+            return
+        shown = f"{press.prompt_text}\n**{text}**" if press.prompt_text else f"**{text}**"
+        async with self._client() as client:
+            response = await client.put(
+                f"{base_url}/api/v4/posts/{press.message_id}/patch",
+                headers=self._headers(bot_token),
+                json={"message": shown, "props": {"attachments": []}},
+            )
+        response.raise_for_status()
+
+    @staticmethod
+    def parse_command(form: dict[str, str], bot_id: str) -> IncomingMessage | None:
+        """`/agent <question>`, asked in the channel it was typed in (#2084).
+
+        A direct message's channel is named `<user>__<user>`, which is how a
+        private chat is told from a room - the same rule the event stream reads
+        off its channel type.
+        """
+        text = (form.get("text") or "").strip()
+        channel = form.get("channel_id", "")
+        if not text or not channel:
+            return None
+        return IncomingMessage(
+            platform="mattermost",
+            bot_id=bot_id,
+            platform_user_id=form.get("user_id", ""),
+            platform_chat_id=channel,
+            chat_type="private" if "__" in form.get("channel_name", "") else "group",
+            text=text,
+            raw=dict(form),
+            platform_username=form.get("user_name"),
+            message_id=form.get("trigger_id"),
+            addressed=True,
+            platform_team_id=form.get("team_id"),
+        )
+
+    async def pressed_by(self, base_url: str, payload: dict[str, Any]) -> bool:
+        """Whether the press's `user_id` is the person the server says pressed.
+
+        Checked against the trigger id the server signed, so a participant who
+        learned a button's context cannot press it as somebody with more say.
+        The key is read once per server, and read again once when a trigger does
+        not verify against it, in case the server's key changed. No key, no press.
+        """
+        claimed = str(payload.get("user_id") or "")
+        trigger = payload.get("trigger_id")
+        if not claimed or not isinstance(trigger, str) or not base_url:
+            return False
+        presser = None
+        for fresh in (False, True):
+            key = await self._signing_key(base_url.rstrip("/"), fresh=fresh)
+            if key is None:
+                return False
+            presser = trigger_presser(trigger, key, now=datetime.now(UTC))
+            if presser is not None:
+                break
+        return presser == claimed
+
+    async def _signing_key(self, base_url: str, *, fresh: bool) -> bytes | None:
+        if not fresh and base_url in self._signing_keys:
+            return self._signing_keys[base_url]
+        async with self._client() as client:
+            response = await client.get(
+                f"{base_url}/api/v4/config/client", params={"format": "old"}
+            )
+        response.raise_for_status()
+        encoded = response.json().get("AsymmetricSigningPublicKey")
+        if not isinstance(encoded, str) or not encoded:
+            return None
+        self._signing_keys[base_url] = base64.b64decode(encoded)
+        return self._signing_keys[base_url]
+
+    @staticmethod
+    def parse_press(payload: dict[str, Any], bot_id: str) -> IncomingPress | None:
+        """A pressed button, if its context carries this deployment's signature."""
+        context = payload.get("context") or {}
+        value = context.get("value")
+        signature = context.get("signature")
+        if not isinstance(value, str) or not isinstance(signature, str):
+            return None
+        if not secrets.compare_digest(signature, sign_press(bot_id, value)):
+            return None
+        return IncomingPress(
+            platform="mattermost",
+            bot_id=bot_id,
+            platform_user_id=str(payload.get("user_id", "")),
+            platform_chat_id=str(payload.get("channel_id", "")),
+            value=value,
+            platform_username=payload.get("user_name"),
+            message_id=payload.get("post_id"),
+            prompt_text=context.get("text") if isinstance(context.get("text"), str) else None,
+            trigger_id=payload.get("trigger_id"),
+        )
+
+    @staticmethod
+    def parse_feedback_comment(payload: dict[str, Any], bot_id: str) -> FeedbackComment | None:
+        """A submitted "what was wrong?" dialog, if its state carries our signature.
+
+        The state names the run and the person who opened the dialog, both under
+        the signature, and the submission must come from that person.
+        """
+        if payload.get("cancelled") or payload.get("callback_id") != FEEDBACK_DIALOG:
+            return None
+        run_id, _, rest = str(payload.get("state") or "").partition(":")
+        user_id, _, signature = rest.partition(":")
+        if not run_id or not user_id or str(payload.get("user_id", "")) != user_id:
+            return None
+        if not secrets.compare_digest(signature, sign_press(bot_id, f"{run_id}:{user_id}")):
+            return None
+        text = str((payload.get("submission") or {}).get("comment") or "").strip()
+        if not text:
+            return None
+        return FeedbackComment(
+            platform="mattermost",
+            bot_id=bot_id,
+            platform_user_id=user_id,
+            run_id=run_id,
+            text=text,
+        )
+
+    async def typing(self, bot_id: str, msg: OutgoingMessage) -> None:
+        """Say the bot is composing, over the socket we already hold.
+
+        Only on the event-stream path: this is a WebSocket action, and a bot
+        reached by outgoing webhook has no socket. Nothing is raised in that
+        case - the placeholder post says the same thing more durably, and this
+        is the decoration on top of it.
+        """
+        socket = self._sockets.get(bot_id)
+        if socket is None:
+            return
+        channel_id, root_id = split_thread(msg.platform_chat_id)
+        with contextlib.suppress(Exception):
+            await socket.send(
+                json.dumps(
+                    {
+                        "action": "user_typing",
+                        "seq": self._next_seq(bot_id),
+                        "data": {"channel_id": channel_id, "parent_id": root_id},
+                    }
+                )
+            )
+
+    def _next_seq(self, bot_id: str) -> int:
+        """The next sequence number on this bot's socket.
+
+        Mattermost expects them to rise per connection. Kept here rather than in
+        `_run_stream` because the keepalive and this both send, and two counters
+        on one socket is a protocol error waiting for a busy day.
+        """
+        self._seq[bot_id] = self._seq.get(bot_id, 1) + 1
+        return self._seq[bot_id]
+
+    #
+    # Every call here needs `read_channel` on the channel, which a bot holds by
+    # being a member of it. That is the permission boundary, it is Mattermost's
+    # own, and it is deliberately the only one: an allow-list of our own would
+    # be a second answer to "may this bot see this channel", and the two would
+    # disagree the first time somebody removed the bot from a channel.
+
+    @staticmethod
+    def _server(api_base_url: str | None) -> str:
+        """The server to ask, or a refusal a person in the channel can read.
+
+        Raises:
+            ChannelDirectoryUnsupported: If the bot has no server URL recorded.
+                Reported rather than guessed at, for the same reason
+                `download_attachment` refuses: guessing a Mattermost address is
+                guessing which company's server to send a bot token to.
+        """
+        if not api_base_url:
+            raise ChannelDirectoryUnsupported(
+                "This Mattermost bot has no server URL recorded, so nothing about "
+                "the channel can be looked up."
+            )
+        return api_base_url.rstrip("/")
+
+    @staticmethod
+    def _display_name(user: dict[str, Any]) -> str | None:
+        """What a person is called, preferring what they chose to be called."""
+        full = " ".join(
+            part for part in (user.get("first_name"), user.get("last_name")) if part
+        ).strip()
+        return user.get("nickname") or full or None
+
+    async def channel_details(
+        self, bot_token: str, channel_id: str, *, api_base_url: str | None
+    ) -> ChannelDetails:
+        """`GET /channels/{id}`, with the member count from `/stats` beside it."""
+        base_url = self._server(api_base_url)
+        headers = self._headers(bot_token)
+        async with self._client() as client:
+            channel = await client.get(f"{base_url}/api/v4/channels/{channel_id}", headers=headers)
+            channel.raise_for_status()
+            stats = await client.get(
+                f"{base_url}/api/v4/channels/{channel_id}/stats", headers=headers
+            )
+            stats.raise_for_status()
+
+        found = channel.json()
+        member_count = stats.json().get("member_count")
+        return ChannelDetails(
+            channel_id=str(found.get("id") or channel_id),
+            name=self._channel_name(found, channel_id),
+            purpose=str(found.get("purpose") or "") or None,
+            # Mattermost calls it `header`; the contract calls it `topic`,
+            # because Slack does and one of the two names had to win.
+            topic=str(found.get("header") or "") or None,
+            # "O" is an open channel; everything else - private, direct, group -
+            # is somewhere not everyone can walk into.
+            is_private=found.get("type") != "O",
+            member_count=None if member_count is None else int(member_count),
+        )
+
+    @staticmethod
+    def _channel_name(found: dict[str, Any], channel_id: str) -> str:
+        """What to call this channel to somebody reading a reply.
+
+        `display_name` is what people see in the sidebar and `name` is the URL
+        slug, so the slug is the fallback - a model quoting it reads as a typo.
+
+        Except in a direct or group message, where Mattermost leaves
+        `display_name` empty and names the channel after the user ids joined by
+        two underscores. Handing an agent
+        `cm36shpzrpnt9jmc5hzcerkjie__wz75u9w6zjba7dn7jwf4aush5y` as "the channel
+        you are in" is worse than telling it nothing, and it is what
+        `{channel_name}` filled in until this existed.
+        """
+        kind = str(found.get("type") or "")
+        if kind == "D":
+            return "a direct message"
+        if kind == "G":
+            return "a group message"
+        return str(found.get("display_name") or found.get("name") or channel_id)
+
+    async def channel_members(
+        self, bot_token: str, channel_id: str, *, api_base_url: str | None, limit: int
+    ) -> list[ChannelMember]:
+        """`GET /channels/{id}/members`, resolved to names in one `/users/ids` call.
+
+        Two requests rather than one per member: a channel of forty people would
+        otherwise be forty round trips inside a tool call, on a bot somebody is
+        waiting for.
+        """
+        base_url = self._server(api_base_url)
+        headers = self._headers(bot_token)
+        async with self._client() as client:
+            members = await client.get(
+                f"{base_url}/api/v4/channels/{channel_id}/members",
+                headers=headers,
+                params={"per_page": limit},
+            )
+            members.raise_for_status()
+            memberships = {
+                str(entry.get("user_id")): str(entry.get("roles") or "") for entry in members.json()
+            }
+            if not memberships:
+                return []
+
+            users = await client.post(
+                f"{base_url}/api/v4/users/ids", headers=headers, json=sorted(memberships)
+            )
+            users.raise_for_status()
+
+        return [
+            ChannelMember(
+                user_id=str(user.get("id")),
+                username=str(user.get("username") or "") or None,
+                display_name=self._display_name(user),
+                is_bot=bool(user.get("is_bot")),
+                role=(
+                    "admin"
+                    if "channel_admin" in memberships.get(str(user.get("id")), "")
+                    else "member"
+                ),
+            )
+            for user in users.json()
+        ]
+
+    async def is_channel_member(
+        self, bot_token: str, channel_id: str, platform_user_id: str, *, api_base_url: str | None
+    ) -> bool:
+        """`GET /channels/{id}/members/{user_id}` - Mattermost answers per account.
+
+        A 404 is the platform saying "not in this channel", which is an answer
+        rather than a failure. Anything else unexpected - a 403 because the bot
+        itself was removed, a server error - raises, and the participant model
+        treats a question it could not ask as a refusal.
+        """
+        base_url = self._server(api_base_url)
+        async with self._client() as client:
+            found = await client.get(
+                f"{base_url}/api/v4/channels/{channel_id}/members/{platform_user_id}",
+                headers=self._headers(bot_token),
+            )
+        if found.status_code == 404:
+            return False
+        found.raise_for_status()
+        return True
+
+    async def search_channels(
+        self, bot_token: str, channel_id: str, *, api_base_url: str | None, query: str, limit: int
+    ) -> list[ChannelSummary]:
+        """`POST /teams/{team_id}/channels/search`, in this channel's own team.
+
+        Team-scoped rather than the server-wide `POST /channels/search`, which
+        needs system-administrator rights: a bot searching every team on
+        somebody's Mattermost is a wider answer than the question deserves, and
+        one most deployments would refuse outright.
+        """
+        base_url = self._server(api_base_url)
+        headers = self._headers(bot_token)
+        async with self._client() as client:
+            channel = await client.get(f"{base_url}/api/v4/channels/{channel_id}", headers=headers)
+            channel.raise_for_status()
+            team_id = str(channel.json().get("team_id") or "")
+            if not team_id:
+                # A direct or group message belongs to no team, so there is no
+                # scope to search from here. Said rather than answered with an
+                # empty list, which would read as "no such channel".
+                raise ChannelDirectoryUnsupported(
+                    "This is a direct message, which is not in a team - there is no "
+                    "channel list to search from here."
+                )
+
+            found = await client.post(
+                f"{base_url}/api/v4/teams/{team_id}/channels/search",
+                headers=headers,
+                json={"term": query},
+            )
+            found.raise_for_status()
+
+        return [
+            ChannelSummary(
+                channel_id=str(entry.get("id")),
+                name=str(entry.get("display_name") or entry.get("name") or ""),
+                purpose=str(entry.get("purpose") or "") or None,
+                is_private=entry.get("type") != "O",
+            )
+            for entry in found.json()[:limit]
+        ]
+
+    async def channel_history(
+        self,
+        bot_token: str,
+        channel_id: str,
+        *,
+        api_base_url: str | None,
+        limit: int,
+        thread_id: str | None = None,
+    ) -> list[ChannelPost]:
+        """The recent transcript, newest last and without the system noise.
+
+        `GET /posts/{root}/thread` for a thread and `GET /channels/{id}/posts`
+        for the channel: Mattermost has threads, so those are two transcripts and
+        the agent is in the thread. Asked for the channel while answering in a
+        thread, "summarise what we decided above" summarised the rest of the room
+        (#1353).
+
+        Both endpoints answer the same `{order, posts}` shape, so the reversal and
+        the system-message filter below serve either. `order` comes back newest
+        first, and a model reading a conversation top to bottom wants it the way a
+        person would.
+        """
+        base_url = self._server(api_base_url)
+        headers = self._headers(bot_token)
+        url = (
+            f"{base_url}/api/v4/posts/{thread_id}/thread"
+            if thread_id
+            else f"{base_url}/api/v4/channels/{channel_id}/posts"
+        )
+        async with self._client() as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params={"per_page": limit},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            posts = payload.get("posts") or {}
+            order = [
+                post_id
+                for post_id in reversed(payload.get("order") or [])
+                # "somebody joined the channel" is not what was said in it.
+                if not str((posts.get(post_id) or {}).get("type") or "").startswith("system_")
+            ]
+            if not order:
+                return []
+
+            authors = await client.post(
+                f"{base_url}/api/v4/users/ids",
+                headers=headers,
+                json=sorted({str(posts[post_id].get("user_id")) for post_id in order}),
+            )
+            authors.raise_for_status()
+
+        named = {
+            str(user.get("id")): str(user.get("username") or user.get("id"))
+            for user in authors.json()
+        }
+        return [
+            ChannelPost(
+                author=named.get(str(posts[post_id].get("user_id")), "unknown"),
+                text=str(posts[post_id].get("message") or ""),
+                posted_at=_posted_at(posts[post_id].get("create_at")),
+                post_id=str(post_id),
+                author_id=(
+                    str(posts[post_id].get("user_id")) if posts[post_id].get("user_id") else None
+                ),
+            )
+            for post_id in order
+        ]
+
+    async def thread_attachments(
+        self,
+        bot_token: str,
+        channel_id: str,
+        *,
+        thread_id: str,
+        api_base_url: str | None,
+        limit: int,
+    ) -> list[IncomingAttachment]:
+        """The files on a thread's earlier posts, oldest first.
+
+        `GET /posts/{root}/thread`, the same endpoint `channel_history` reads for
+        a thread, and `_attachments` builds the handles - so a file posted before
+        the bot arrived is described exactly as one posted to it.
+
+        The address comes from the argument rather than the per-session cache,
+        which is why `_attachments` takes one: this runs on the turn that opens a
+        conversation and belongs to no stream session, and on a webhook-mode bot
+        there is no session at all.
+        """
+        base_url = self._server(api_base_url)
+        async with self._client() as client:
+            response = await client.get(
+                f"{base_url}/api/v4/posts/{thread_id}/thread",
+                headers=self._headers(bot_token),
+                params={"per_page": limit},
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+        posts = payload.get("posts") or {}
+        found: list[IncomingAttachment] = []
+        # `order` is newest first, like every Mattermost listing; reversed so the
+        # caller's "keep the last few" keeps the most recent, not the oldest.
+        for post_id in reversed(payload.get("order") or []):
+            post = posts.get(post_id) or {}
+            props = post.get("props") or {}
+            # Its own uploads: a chart it drew, a file it returned. Feeding those
+            # back would have the agent answering about its own output.
+            if props.get("from_bot") == "true" or props.get("from_webhook") == "true":
+                continue
+            found.extend(self._attachments(post, base_url=base_url))
+        return found
+
+    async def start_polling(self, bot_id: str, bot_token: str) -> None:
+        """Open the event stream for one bot."""
+        existing = self._socket_tasks.get(bot_id)
+        if existing is not None and not existing.done():
+            logger.info("Mattermost stream already running for bot %s", bot_id)
+            return
+
+        self._socket_tasks[bot_id] = asyncio.create_task(
+            self._supervise(bot_id, bot_token), name=f"mattermost_ws_{bot_id}"
+        )
+        logger.info("Started Mattermost event stream for bot %s", bot_id)
+
+    async def stop_polling(self, bot_id: str) -> None:
+        task = self._socket_tasks.pop(bot_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        logger.info("Stopped Mattermost event stream for bot %s", bot_id)
+
+    async def _supervise(self, bot_id: str, bot_token: str) -> None:
+        """Event-stream sessions, reopened under the shared reconnect loop."""
+        await supervise_stream(
+            bot_id,
+            platform="Mattermost event stream",
+            session=lambda: self._run_stream(bot_id, bot_token),
+            failing=(
+                "The Mattermost event stream keeps dropping. Check that the "
+                "server is reachable and the bot token is still valid."
+            ),
+        )
+
+    async def _own_user_id(self, bot_id: str, bot_token: str) -> str | None:
+        """Which Mattermost account this bot *is*, so a mention of it is legible.
+
+        Resolved once per stream session rather than per message, and stored beside
+        the base URL because it is the same kind of per-bot fact. `None` when the
+        server would not say: the caller then treats every post as addressed, which
+        is the behaviour a bot had before this existed - answering too much is a
+        worse failure than answering too little only where somebody chose it.
+        """
+        base_url = self._base_urls.get(bot_id)
+        if not base_url:
+            return None
+        try:
+            async with self._client() as client:
+                response = await client.get(
+                    f"{base_url}/api/v4/users/me",
+                    headers=self._headers(bot_token),
+                )
+            response.raise_for_status()
+            me = response.json()
+            username = str(me.get("username") or "")
+            if username:
+                self._own_names[bot_id] = username
+            return str(me.get("id") or "") or None
+        except Exception:
+            logger.warning("mattermost_own_id_unresolved", extra={"bot_id": bot_id}, exc_info=True)
+            return None
+
+    def _without_own_mention(self, text: str, bot_id: str) -> str:
+        """The message with the bot's own `@handle` taken out.
+
+        Mattermost writes a mention as literal `@username` in the text, so the
+        handle is the envelope rather than the message: the agent *is* the
+        addressee, and handing it its own handle as content is what had Slack's
+        adapter answering "just the mention" about a message that said `try
+        again`.
+
+        Only the bot's own, and only when the handle is known - `@ada` is a
+        colleague, and deleting it would delete the point of the sentence.
+
+        The right-hand guard is a negative lookahead over the characters a
+        Mattermost username may hold, not `\b`: a word boundary matches between
+        `s` and `-`, so `@ops` ate `@ops-oncall` and left `-oncall` behind -
+        somebody else's handle, mangled. Whitespace is collapsed after, so a
+        leading mention leaves no gap and a mid-sentence one leaves no double.
+        """
+        own = self._own_names.get(bot_id)
+        if not own:
+            return text
+        return " ".join(re.sub(rf"@{re.escape(own)}(?![a-z0-9._-])", " ", text).split())
+
+    async def _run_stream(self, bot_id: str, bot_token: str) -> None:
+        """One authenticated session on the event stream."""
+        try:
+            from websockets.asyncio.client import connect
+        except ImportError as exc:
+            raise ChannelNotConfigured(
+                message=(
+                    "The Mattermost event stream needs the 'websockets' package. "
+                    "Use webhook mode, or install it."
+                ),
+                details={"bot_id": bot_id},
+            ) from exc
+
+        base_url = self._base_urls.get(bot_id)
+        if not base_url:
+            raise ChannelNotConfigured(
+                message=(
+                    "Mattermost bot has no server URL; cannot open a stream. Set the "
+                    "bot's server URL, or switch it to webhook mode."
+                ),
+                details={"bot_id": bot_id},
+            )
+
+        socket_url = base_url.replace("https://", "wss://").replace("http://", "ws://")
+        async with connect(f"{socket_url}/api/v4/websocket") as socket:
+            await socket.send(
+                json.dumps(
+                    {
+                        "seq": 1,
+                        "action": "authentication_challenge",
+                        "data": {"token": bot_token},
+                    }
+                )
+            )
+            self._sockets[bot_id] = socket
+            # Before the first frame is read, so no post is judged against an
+            # unknown identity - a miss there would answer a channel it should
+            # have stayed out of.
+            own = await self._own_user_id(bot_id, bot_token)
+            if own is not None:
+                self._own_ids[bot_id] = own
+            await connection_state.record_up(bot_id)
+            keepalive = asyncio.create_task(self._keepalive(socket))
+            # The entry expires on a TTL and the frame loop below may sit quiet
+            # for hours, so it is re-stamped on its own clock rather than by
+            # traffic (#1351). Torn down with the ping it sits beside.
+            beat = asyncio.create_task(connection_state.heartbeat(bot_id))
+            try:
+                async for frame in socket:
+                    await self._on_frame(frame, bot_id)
+            finally:
+                self._sockets.pop(bot_id, None)
+                for task in (keepalive, beat):
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+    async def _keepalive(self, socket: Any) -> None:
+        seq = 2
+        while True:
+            await asyncio.sleep(_PING_SECONDS)
+            await socket.send(json.dumps({"seq": seq, "action": "ping"}))
+            seq += 1
+
+    async def _on_frame(self, frame: str | bytes, bot_id: str) -> None:
+        """Handle one event. A malformed frame is skipped, never fatal."""
+        try:
+            payload = json.loads(frame)
+        except json.JSONDecodeError, TypeError:
+            return
+        if payload.get("event") != "posted":
+            return
+
+        incoming = self.parse_incoming(payload, bot_id)
+        if incoming is None:
+            return
+        router = ChannelMessageRouter()
+        async with get_db_context() as db:
+            await router.route(incoming, db)
+
+    async def register_webhook(self, bot_token: str, url: str, secret: str | None) -> bool:
+        """Mattermost has no API for this: outgoing webhooks are created in its
+        own integrations page. Logged so the URL can be pasted there."""
+        logger.info(
+            "Mattermost: create an outgoing webhook pointing at %s "
+            "(System Console → Integrations → Outgoing Webhooks)",
+            url,
+        )
+        return True
+
+    async def delete_webhook(self, bot_token: str) -> bool:
+        """Also removed by hand, in the same place."""
+        return True
+
+    def verify_webhook_signature(
+        self, headers: dict[str, str], secret: str, body: str | None = None
+    ) -> bool:
+        """Compare the token Mattermost puts in the body.
+
+        Mattermost does not sign the payload the way Slack does - an outgoing
+        webhook carries a shared token instead - so this is a bearer check, and
+        the token is a credential rather than a signing key. Compared in
+        constant time for the same reason every other token here is.
+        """
+        if not secret or not body:
+            return False
+        payload = decode_webhook_body(body)
+        token = str(payload.get("token", ""))
+        return bool(token) and secrets.compare_digest(encode_untrusted(token), secret.encode())
+
+    def parse_incoming(self, raw_payload: dict[str, Any], bot_id: str) -> IncomingMessage | None:
+        """Normalise a `posted` event or an outgoing-webhook body.
+
+        The two arrive in different shapes - the socket nests a JSON *string*
+        under `data.post`, the webhook is flat - and everything downstream is
+        shared, so the difference stops here.
+        """
+        if raw_payload.get("event") == "posted":
+            return self._from_socket(raw_payload, bot_id)
+        return self._from_webhook(raw_payload, bot_id)
+
+    def _from_socket(self, payload: dict[str, Any], bot_id: str) -> IncomingMessage | None:
+        data = payload.get("data") or {}
+        try:
+            post = json.loads(data.get("post", "{}"))
+        except json.JSONDecodeError, TypeError:
+            return None
+
+        # A bot's own posts come back down the same socket. Answering them is an
+        # infinite loop with a bill attached.
+        props = post.get("props") or {}
+        if props.get("from_bot") == "true" or props.get("from_webhook") == "true":
+            return None
+
+        attachments = self._attachments(post, base_url=self._base_urls.get(bot_id, ""))
+        text = (post.get("message") or "").strip()
+        if not text and not attachments:
+            return None
+
+        root_id = post.get("root_id") or ""
+        channel_id = post.get("channel_id", "")
+        # "D" is Mattermost's direct-message channel type; anything else is a
+        # channel somebody put the bot in.
+        channel_type = str(data.get("channel_type") or "")
+
+        return IncomingMessage(
+            platform=self.platform,
+            bot_id=bot_id,
+            platform_user_id=post.get("user_id", ""),
+            platform_chat_id=thread_key(
+                channel_id,
+                thread_id=root_id,
+                message_id=post.get("id"),
+            ),
+            chat_type="private" if channel_type == "D" else "group",
+            # Stripped after `_addressed`, which reads the platform's own mention
+            # list rather than the text - so the order does not matter for the
+            # gate, and this keeps the two facts in one place.
+            text=self._without_own_mention(text, bot_id),
+            raw=payload,
+            platform_username=data.get("sender_name", "").lstrip("@") or None,
+            platform_display_name=data.get("sender_name") or None,
+            message_id=post.get("id"),
+            attachments=attachments,
+            broadcast_mention=broadcast_mentioned(self.platform, text),
+            addressed=self._direct_addressed(data, bot_id, text),
+        )
+
+    def _direct_addressed(self, data: dict[str, Any], bot_id: str, text: str) -> bool | None:
+        addressed = self._addressed(data, bot_id)
+        if not broadcast_mentioned(self.platform, text):
+            return addressed
+        own = self._own_names.get(bot_id)
+        return bool(
+            addressed is True
+            and own
+            and re.search(rf"(?<!\w)@{re.escape(own)}(?![\w.-])", mentionable_text(text), re.I)
+        )
+
+    def _addressed(self, data: dict[str, Any], bot_id: str) -> bool | None:
+        """Whether this post named the bot, from the event's own mention list.
+
+        Mattermost puts the mentioned account ids in `data.mentions`, as JSON in a
+        string. Read from there rather than from the text: `@ada` is a mention of
+        somebody whose display name the bot cannot resolve, and matching on text
+        would make a bot called `bot` answer the word "robot".
+
+        `None` where the bot's own id was never resolved, which the router reads as
+        "the platform did not say" and answers as it did before. A *missing*
+        `mentions` key with a known id is `False`: the event carries the list
+        whenever there is one, so its absence means nobody was mentioned.
+        """
+        own = self._own_ids.get(bot_id)
+        if own is None:
+            return None
+        raw = data.get("mentions")
+        if raw is None:
+            return False
+        try:
+            mentioned = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError, TypeError:
+            return False
+        return own in mentioned if isinstance(mentioned, list) else False
+
+    def _attachments(self, post: dict[str, Any], *, base_url: str) -> list[IncomingAttachment]:
+        """The files on a Mattermost post, as handles.
+
+        A post carries `file_ids` and, on the socket, `metadata.files` with the
+        name, size and MIME type beside each. The ids alone would mean a lookup
+        per file before anything could be validated, so the metadata is used where
+        it is there and an id with none is carried as a handle with nothing
+        claimed - which the size check then reads as zero and lets through, to be
+        caught against the bytes after the download.
+
+        Both spellings of `file_ids` are read here, because Mattermost has two:
+        the socket sends a list, the outgoing webhook one comma-separated string.
+        Handing the flat webhook body to a reader that only knew the list form
+        would have iterated the string a character at a time (#547).
+        """
+        metadata = (post.get("metadata") or {}).get("files") or []
+        described = {str(entry.get("id")): entry for entry in metadata if isinstance(entry, dict)}
+        raw_ids = post.get("file_ids") or []
+        file_ids = (
+            [part for part in raw_ids.split(",") if part] if isinstance(raw_ids, str) else raw_ids
+        )
+
+        # The handle is the full URL, resolved from the server this bot was told
+        # about - by the stream when it opened, or by the webhook receiver per
+        # delivery (#692). Every Mattermost deployment is somebody's own server,
+        # so the id alone is not enough to fetch anything - and the download
+        # signature carries a token, not a bot.
+
+        found: list[IncomingAttachment] = []
+        for file_id in file_ids:
+            entry = described.get(str(file_id), {})
+            name = entry.get("name") or str(file_id)
+            found.append(
+                IncomingAttachment(
+                    filename=name,
+                    # Typed from the extension when the server sent none, so an
+                    # untyped `.mp3` is heard rather than stored (`routed_type`).
+                    mime_type=routed_type(
+                        entry.get("mime_type"), name, extension=entry.get("extension")
+                    ),
+                    size=int(entry.get("size") or 0),
+                    handle=f"{base_url}/api/v4/files/{file_id}" if base_url else "",
+                )
+            )
+        return found
+
+    async def download_attachment(self, bot_token: str, attachment: IncomingAttachment) -> bytes:
+        """Fetch a Mattermost file from the URL the parser resolved.
+
+        Empty means this bot's server was not known when the message arrived -
+        the bot row carries no `api_base_url` - and that is reported rather than
+        guessed at, because guessing a Mattermost address is guessing which
+        company's server to send a bot token to.
+        """
+        if not attachment.handle:
+            raise ValueError(
+                "This Mattermost bot has no server URL recorded, so its files cannot be fetched."
+            )
+
+        async with self._client() as client:
+            response = await client.get(attachment.handle, headers=self._headers(bot_token))
+        response.raise_for_status()
+        return response.content
+
+    async def describe_attachments(
+        self, bot_token: str, attachments: list[IncomingAttachment]
+    ) -> list[IncomingAttachment]:
+        """Look up the files an outgoing webhook named by id alone.
+
+        The webhook body carries `file_ids` and nothing about them, so the
+        parser could only call each file by its id and claim no type - and an
+        untyped file is never taken for a voice note. `GET /files/{id}/info`
+        answers the name, extension, size and type the socket would have sent.
+        Only files the parser could not describe are asked about, which on the
+        event stream is none.
+
+        A lookup that fails keeps the file as parsed: it is still delivered as
+        an ordinary attachment, exactly as before this existed, and the log says
+        why it was not recognised. An answer that is not the object it should
+        be - a list, a `size` that is not a number - is a failed lookup too,
+        rather than an exception that would drop the whole turn.
+
+        The lookups run together, at most `_FILE_INFO_CONCURRENCY` at a time:
+        a post carries up to ten files, and asking about them one by one put
+        ten round trips in front of the answer.
+        """
+        gate = asyncio.Semaphore(_FILE_INFO_CONCURRENCY)
+        async with self._client() as client:
+            return list(
+                await asyncio.gather(
+                    *(
+                        self._describe_one(client, gate, bot_token, attachment)
+                        for attachment in attachments
+                    )
+                )
+            )
+
+    async def _describe_one(
+        self,
+        client: httpx.AsyncClient,
+        gate: asyncio.Semaphore,
+        bot_token: str,
+        attachment: IncomingAttachment,
+    ) -> IncomingAttachment:
+        """One file's details from `GET /files/{id}/info`, or the file as parsed."""
+        # `_attachments` names a file with no metadata after its id, which
+        # is the last segment of its handle.
+        if not attachment.handle or not attachment.handle.endswith(f"/{attachment.filename}"):
+            return attachment
+        try:
+            async with gate:
+                response = await client.get(
+                    f"{attachment.handle}/info", headers=self._headers(bot_token)
+                )
+            response.raise_for_status()
+            info = response.json()
+            name = str(info.get("name") or attachment.filename)
+            claimed, extension = info.get("mime_type"), info.get("extension")
+            return IncomingAttachment(
+                filename=name,
+                mime_type=routed_type(
+                    claimed if isinstance(claimed, str) else None,
+                    name,
+                    extension=extension if isinstance(extension, str) else None,
+                ),
+                size=int(info.get("size") or 0),
+                handle=attachment.handle,
+            )
+        # Beside the transport's own failures: an answer that is not an object
+        # has no `.get` (AttributeError), and a `size` that is a word, a list or
+        # not finite does not convert (ValueError, TypeError, OverflowError).
+        except httpx.HTTPError, ValueError, TypeError, OverflowError, AttributeError:
+            logger.warning(
+                "Could not look up a Mattermost file's details: file=%s",
+                attachment.filename,
+                exc_info=True,
+            )
+            return attachment
+
+    def _from_webhook(self, payload: dict[str, Any], bot_id: str) -> IncomingMessage | None:
+        """Normalise one outgoing-webhook body.
+
+        The addressing rule is the socket's, read off what this payload actually
+        carries. An outgoing-webhook body has no mention list - Mattermost sends
+        the post, not who it notified - so the bot's own account cannot be looked
+        for in it, and this path left `addressed` unset. The router reads unset as
+        "the platform did not say" and answers, which put the bot back in the
+        position the socket's rule took it out of: replying to colleagues talking
+        to each other in a channel it was merely invited to (#662).
+
+        What the payload does say is `trigger_word` - the word an operator
+        configured *this integration* to fire on, which is Mattermost's own record
+        that the post was for us. Empty means the webhook fired on its channel
+        filter alone, and a channel filter delivers every post exactly as the
+        socket does, so it is `False` for the same reason a `posted` event with no
+        mentions is.
+
+        The consequence worth knowing before choosing this transport: `@the-bot`
+        is not readable here, because nothing in the body says which account the
+        bot is. Set the trigger word to the bot's handle if that is how people
+        should reach it; an `@agent-slug` needs nothing, since the router reads a
+        slug out of the text.
+        """
+        # Mattermost sends the bot's own posts to an outgoing webhook only when
+        # explicitly configured to, but a loop is expensive enough to check for.
+        if payload.get("user_name") in {"", None} or str(payload.get("user_id") or "") == "":
+            return None
+
+        attachments = self._attachments(payload, base_url=self._base_urls.get(bot_id, ""))
+        text = str(payload.get("text") or "").strip()
+        if not text and not attachments:
+            return None
+
+        channel_id = str(payload.get("channel_id") or "")
+        channel_name = str(payload.get("channel_name") or "")
+        # No type field in this payload: Mattermost names a direct-message
+        # channel after both user ids joined by two underscores.
+        chat_type = "private" if "__" in channel_name else "group"
+
+        return IncomingMessage(
+            platform=self.platform,
+            bot_id=bot_id,
+            platform_user_id=str(payload.get("user_id") or ""),
+            platform_chat_id=thread_key(
+                channel_id,
+                thread_id="",
+                message_id=str(payload.get("post_id") or "") or None,
+            ),
+            chat_type=chat_type,
+            # A no-op on this transport unless the same deployment also runs a
+            # stream for some bot: nothing in a webhook body says which account
+            # the bot is, so the handle is usually unknown here. Applied anyway
+            # rather than skipped, because where it *is* known the trigger word
+            # people type is the handle, and it is the envelope there too.
+            text=self._without_own_mention(text, bot_id),
+            raw=payload,
+            platform_username=str(payload.get("user_name") or "") or None,
+            platform_display_name=str(payload.get("user_name") or "") or None,
+            message_id=str(payload.get("post_id") or "") or None,
+            attachments=attachments,
+            broadcast_mention=broadcast_mentioned(self.platform, text),
+            addressed=bool(str(payload.get("trigger_word") or "").strip())
+            and str(payload.get("trigger_word") or "").strip().lstrip("@").casefold()
+            not in {"all", "here", "channel", "everyone"},
+        )

@@ -1,0 +1,417 @@
+"""Deleting a tracked document removes its vectors, whichever route asked.
+
+#992. `RAGDocumentService.delete_document` took `ingestion_service: Any = None`
+and removed vectors only when a caller happened to pass one. `DELETE
+/rag/documents/{doc_id}` did; `DELETE /kb/{kb_id}/documents/{doc_id}` - the one
+the Documents tab uses - did not. So deleting a document from the tab removed its
+row and left the content searchable, and for a *synced* document that was
+permanent: the next `new_only` run matched its unchanged hash and skipped it, so
+the row never came back. The document became searchable, invisible and
+undeletable again, through the delete button.
+
+The argument has no default now, which is the structural half: a third route
+cannot repeat this without the type checker saying so. These are the behavioural
+half.
+"""
+
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.core import background
+from app.db.vector_tables import VectorScope
+from app.repositories import rag_document_repo
+from app.services.rag_document import RAGDocumentService
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_tasks():
+    """A deferred unlink one test starts must not be drained by the next."""
+    background._running.clear()
+    yield
+    background._running.clear()
+
+
+def _deferring_db() -> MagicMock:
+    """A session stand-in whose `info` is a real dict, so `spawn_after_commit`
+    queues on it the way a live session's does."""
+    db = MagicMock()
+    db.info = {}
+    return db
+
+
+async def _run_deferred(db: MagicMock) -> None:
+    """What `_managed_session` does the instant its commit returns."""
+    background.start_deferred(db)
+    await background.drain(timeout=5.0)
+
+
+def _patch_dispatch(monkeypatch) -> AsyncMock:
+    """Stand in for the durable cleanup dispatch, so a test can assert what a
+    committed delete queues as a cleanup job."""
+    dispatch = AsyncMock()
+    monkeypatch.setattr("app.worker.tasks.teardown_tasks.queue_external_state_cleanup", dispatch)
+    return dispatch
+
+
+def _row(*, vector_document_id: str | None, storage_path: str = "") -> MagicMock:
+    return MagicMock(
+        id=uuid.uuid4(),
+        collection_name="docs",
+        vector_document_id=vector_document_id,
+        storage_path=storage_path,
+        # No knowledge base, so the vector delete's scope is deployment-wide - a
+        # document with no base; the delete carries that scope so it cannot
+        # reach another org's rows in a shared-named collection (#1684).
+        knowledge_base_id=None,
+    )
+
+
+def _deletes(row: MagicMock) -> AsyncMock:
+    """The row's delete, answering with what the deleted row held."""
+    return AsyncMock(
+        return_value=rag_document_repo.DeletedDocuments(
+            storage_paths=[row.storage_path] if row.storage_path else [],
+            vector_document_ids=[row.vector_document_id] if row.vector_document_id else [],
+        )
+    )
+
+
+class TestDeletingATrackedDocument:
+    @pytest.mark.parametrize("loaded_vector_id", [None, "previous-vector"])
+    async def test_a_concurrently_settled_vector_is_queued_durably(
+        self, monkeypatch: pytest.MonkeyPatch, loaded_vector_id: str | None
+    ) -> None:
+        row = _row(vector_document_id=loaded_vector_id)
+        monkeypatch.setattr(rag_document_repo, "get_by_id", AsyncMock(return_value=row))
+        monkeypatch.setattr(
+            rag_document_repo,
+            "delete_with_vectors",
+            AsyncMock(
+                return_value=rag_document_repo.DeletedDocuments(
+                    storage_paths=[], vector_document_ids=["new-vector"]
+                )
+            ),
+        )
+        queued = AsyncMock()
+        monkeypatch.setattr("app.services.rag_document.enqueue", queued)
+        ingestion = MagicMock(remove_document=AsyncMock())
+        db = _deferring_db()
+
+        await RAGDocumentService(db).delete_document(str(row.id), ingestion)
+
+        from app.worker.jobs import DISCARD_VECTOR_DOCUMENT, DiscardVectorDocument
+
+        assert queued.await_args.args == (
+            db,
+            DISCARD_VECTOR_DOCUMENT,
+            DiscardVectorDocument(
+                collection="docs",
+                vector_document_id="new-vector",
+                tenant=None,
+                knowledge_base_id=None,
+            ),
+        )
+        await _run_deferred(db)
+        ingestion.remove_document.assert_not_awaited()
+
+    async def test_the_vectors_go_after_the_row_commits(self, monkeypatch):
+        """The vector removal is deferred past the commit, so a rolled-back delete
+        keeps the vectors beside the row it restores (#1347)."""
+        row = _row(vector_document_id="vector-doc-1")
+        monkeypatch.setattr(rag_document_repo, "get_by_id", AsyncMock(return_value=row))
+        monkeypatch.setattr(rag_document_repo, "delete_with_vectors", _deletes(row))
+        ingestion = MagicMock(remove_document=AsyncMock(return_value=True))
+        db = _deferring_db()
+
+        await RAGDocumentService(db).delete_document(str(row.id), ingestion)
+        ingestion.remove_document.assert_not_awaited()
+
+        await _run_deferred(db)
+        ingestion.remove_document.assert_awaited_once_with(
+            "docs", "vector-doc-1", scope=VectorScope(tenant=None)
+        )
+
+    @pytest.mark.security
+    async def test_the_vectors_go_under_the_base_the_document_is_filed_under(self, monkeypatch):
+        """Its base's own scope - tenant and base - so the delete reaches this
+        document's chunks and nothing of a same-named base (#2537)."""
+        from app.repositories import knowledge_base_repo
+
+        row = _row(vector_document_id="vector-doc-1")
+        row.knowledge_base_id = uuid.uuid4()
+        scope = VectorScope(tenant=uuid.uuid4(), knowledge_base_id=row.knowledge_base_id)
+        monkeypatch.setattr(rag_document_repo, "get_by_id", AsyncMock(return_value=row))
+        monkeypatch.setattr(rag_document_repo, "delete_with_vectors", _deletes(row))
+        monkeypatch.setattr(
+            knowledge_base_repo, "get_by_id", AsyncMock(return_value=MagicMock(vector_scope=scope))
+        )
+        ingestion = MagicMock(remove_document=AsyncMock(return_value=True))
+        db = _deferring_db()
+
+        await RAGDocumentService(db).delete_document(str(row.id), ingestion)
+        await _run_deferred(db)
+
+        ingestion.remove_document.assert_awaited_once_with("docs", "vector-doc-1", scope=scope)
+
+    async def test_a_document_with_no_vectors_asks_for_nothing(self, monkeypatch):
+        """One that failed to index. There is nothing in the store to remove, and
+        asking would be a query about a document that was never written."""
+        row = _row(vector_document_id=None)
+        monkeypatch.setattr(rag_document_repo, "get_by_id", AsyncMock(return_value=row))
+        monkeypatch.setattr(rag_document_repo, "delete_with_vectors", _deletes(row))
+        ingestion = MagicMock(remove_document=AsyncMock())
+
+        await RAGDocumentService(MagicMock()).delete_document(str(row.id), ingestion)
+
+        ingestion.remove_document.assert_not_awaited()
+
+    async def test_the_stored_file_is_unlinked_after_the_commit(self, monkeypatch):
+        """The row goes in the transaction; its vectors and its file are removed only
+        once it commits, so a rollback keeps both beside the restored row (#1293, #1347)."""
+        row = _row(vector_document_id="vector-doc-1", storage_path="rag/docs/report.pdf")
+        monkeypatch.setattr(rag_document_repo, "get_by_id", AsyncMock(return_value=row))
+        monkeypatch.setattr(rag_document_repo, "delete_with_vectors", _deletes(row))
+        storage = MagicMock(delete=AsyncMock())
+        monkeypatch.setattr("app.services.file_storage.get_file_storage", lambda: storage)
+        ingestion = MagicMock(remove_document=AsyncMock(return_value=True))
+        db = _deferring_db()
+
+        await RAGDocumentService(db).delete_document(str(row.id), ingestion)
+        storage.delete.assert_not_awaited()
+
+        await _run_deferred(db)
+        storage.delete.assert_awaited_once_with("rag/docs/report.pdf")
+
+    async def test_a_rolled_back_delete_keeps_the_vectors_and_the_file(self, monkeypatch):
+        """Both side effects are discarded when the transaction that removed the row
+        did not commit, so the restored row still points at its vectors and its file
+        (#1293, #1347)."""
+        row = _row(vector_document_id="vector-doc-1", storage_path="rag/docs/report.pdf")
+        monkeypatch.setattr(rag_document_repo, "get_by_id", AsyncMock(return_value=row))
+        monkeypatch.setattr(rag_document_repo, "delete_with_vectors", _deletes(row))
+        storage = MagicMock(delete=AsyncMock())
+        monkeypatch.setattr("app.services.file_storage.get_file_storage", lambda: storage)
+        ingestion = MagicMock(remove_document=AsyncMock(return_value=True))
+        db = _deferring_db()
+
+        await RAGDocumentService(db).delete_document(str(row.id), ingestion)
+        background.discard_deferred(db)
+        await background.drain(timeout=5.0)
+
+        ingestion.remove_document.assert_not_awaited()
+        storage.delete.assert_not_awaited()
+
+
+class TestTheRouteThatTheDocumentsTabUses:
+    async def test_the_kb_delete_route_hands_over_an_ingestion_service(self):
+        """The route signature is the fix, so this asserts on the wiring: a
+        `DELETE` through the knowledge base reaches `delete_document` with a
+        service that can remove vectors, not with `None`."""
+        from app.api.routes.v1 import knowledge_bases
+
+        org = uuid.uuid4()
+        kb = MagicMock(collection_name="docs", organization_id=org)
+        doc = MagicMock(id=uuid.uuid4(), collection_name="docs", organization_id=org)
+        service = MagicMock(get_for_write=AsyncMock(return_value=kb))
+        documents = MagicMock(delete_document=AsyncMock())
+        ingestion = MagicMock(remove_document=AsyncMock())
+
+        await knowledge_bases.delete_kb_document(
+            kb_id=uuid.uuid4(),
+            doc_id=doc.id,
+            service=service,
+            rag_doc_service=documents,
+            ingestion_service=ingestion,
+            access=MagicMock(kb_document=AsyncMock(return_value=doc)),
+            ctx=MagicMock(),
+        )
+
+        documents.delete_document.assert_awaited_once_with(str(doc.id), ingestion)
+
+    async def test_a_document_from_another_knowledge_base_is_not_deleted(self):
+        """The check that was already here, kept under test because the signature
+        around it moved: without it a KB owner could pass any doc_id. Whether a
+        document is the base's is `CollectionAccessService.kb_document`'s
+        (`tests/test_collection_access.py`); what the route owes is to ask it
+        before deleting anything."""
+        from app.api.routes.v1 import knowledge_bases
+        from app.core.exceptions import NotFoundError
+
+        kb = MagicMock(collection_name="docs")
+        documents = MagicMock(delete_document=AsyncMock())
+        access = MagicMock(
+            kb_document=AsyncMock(side_effect=NotFoundError(message="Document not found"))
+        )
+
+        with pytest.raises(NotFoundError):
+            await knowledge_bases.delete_kb_document(
+                kb_id=uuid.uuid4(),
+                doc_id=uuid.uuid4(),
+                service=MagicMock(get_for_write=AsyncMock(return_value=kb)),
+                rag_doc_service=documents,
+                ingestion_service=MagicMock(),
+                access=access,
+                ctx=MagicMock(),
+            )
+
+        assert access.kb_document.await_args.args[0] is kb
+        documents.delete_document.assert_not_awaited()
+
+
+class TestRetiringAPreviousAttempt:
+    """A file that failed one sync and succeeded the next left both rows (#996).
+
+    `complete_ingestion`'s retirement matches on `vector_document_id`, and a
+    failed parse writes none - so the succeeding run had nothing to name, both
+    rows survived, and the collection's `document_count` was inflated for good by
+    every repeated failure.
+
+    It cannot be matched by filename instead, which is why `rag_documents` gained
+    a `source_path`: `a/readme.md` and `b/readme.md` in one bucket share a
+    basename, and matching by name would delete the other file's row - the
+    collision #990 removed on the vector side.
+    """
+
+    async def test_a_previous_attempt_at_the_same_file_is_discarded(self, monkeypatch):
+        discard = AsyncMock(return_value=1)
+        monkeypatch.setattr(rag_document_repo, "discard_failed", discard)
+        monkeypatch.setattr(rag_document_repo, "create", AsyncMock(return_value=MagicMock()))
+
+        await RAGDocumentService(MagicMock()).create_document(
+            collection_name="docs",
+            filename="readme.md",
+            filesize=4,
+            filetype="md",
+            source_path="s3://bucket/a/readme.md",
+        )
+
+        assert discard.await_args.kwargs == {
+            "collection_name": "docs",
+            "source_path": "s3://bucket/a/readme.md",
+        }
+
+    async def test_an_upload_retires_nothing(self, monkeypatch):
+        """An upload's only name is a basename, which is not an address: two
+        people can upload different `report.pdf`s and, with `replace=false`, mean
+        both to exist. Retiring by that name would delete the first one's failed
+        row - its diagnosis, its retry and its stored file - for a caller who
+        asked for no such thing."""
+        discard = AsyncMock()
+        monkeypatch.setattr(rag_document_repo, "discard_failed", discard)
+        monkeypatch.setattr(rag_document_repo, "create", AsyncMock(return_value=MagicMock()))
+        monkeypatch.setattr(
+            "app.services.rag_document.get_file_storage",
+            lambda: MagicMock(save=AsyncMock(return_value="rag/docs/report.pdf")),
+        )
+
+        await RAGDocumentService(MagicMock()).create_document(
+            collection_name="docs",
+            filename="report.pdf",
+            filesize=4,
+            filetype="pdf",
+            storage_path="rag/docs/report.pdf",
+        )
+
+        discard.assert_not_awaited()
+
+    async def test_a_row_with_no_address_discards_nothing(self, monkeypatch):
+        """One written before the column existed, or by a path that has no
+        address to give. Guessing an address from its filename is the guess the
+        column exists to avoid."""
+        discard = AsyncMock()
+        monkeypatch.setattr(rag_document_repo, "discard_failed", discard)
+        monkeypatch.setattr(rag_document_repo, "create", AsyncMock(return_value=MagicMock()))
+
+        await RAGDocumentService(MagicMock()).create_document(
+            collection_name="docs", filename="readme.md", filesize=4, filetype="md"
+        )
+
+        discard.assert_not_awaited()
+
+    async def test_the_address_is_recorded_on_the_row(self, monkeypatch):
+        monkeypatch.setattr(rag_document_repo, "discard_failed", AsyncMock(return_value=0))
+        created = AsyncMock(return_value=MagicMock())
+        monkeypatch.setattr(rag_document_repo, "create", created)
+
+        await RAGDocumentService(MagicMock()).create_document(
+            collection_name="docs",
+            filename="readme.md",
+            filesize=4,
+            filetype="md",
+            source_path="gdrive://file-1",
+        )
+
+        assert created.await_args.kwargs["source_path"] == "gdrive://file-1"
+
+
+class TestTheCLISync:
+    """`agenticos cmd rag-ingest` is the third ingest path, and it was the one
+    left out. Its rows got `NULL` for an address, so a file failing there
+    repeatedly kept inflating the collection's count - the defect #996 fixed for
+    the two worker flows (found reviewing #1001)."""
+
+    async def test_it_records_the_address_it_already_looks_documents_up_by(
+        self, monkeypatch, tmp_path
+    ):
+        from app.commands import rag as rag_command
+
+        (tmp_path / "handbook.md").write_text("body")
+        created = AsyncMock(return_value=MagicMock(id=uuid.uuid4()))
+        documents = MagicMock(
+            create_document=created,
+            hold_ingestion_name=AsyncMock(),
+            complete_ingestion=AsyncMock(),
+            fail_ingestion=AsyncMock(),
+        )
+        ingestion = MagicMock(
+            existing_document=AsyncMock(
+                return_value=MagicMock(document_id=None, content_hash=None)
+            ),
+            ingest_file=AsyncMock(
+                return_value=MagicMock(
+                    status=MagicMock(value="done"),
+                    document_id="vector-doc-1",
+                    chunk_count=2,
+                    replaced_document_id=None,
+                    message="Successfully ingested 'handbook.md'",
+                    error_message=None,
+                )
+            ),
+        )
+
+        @asynccontextmanager
+        async def _db() -> Any:
+            yield MagicMock()
+
+        monkeypatch.setattr(rag_command, "get_db_context", _db)
+        monkeypatch.setattr(rag_command, "RAGDocumentService", lambda _db: documents)
+        monkeypatch.setattr(
+            rag_command,
+            "RAGSyncService",
+            lambda _db: MagicMock(
+                create_sync_log=AsyncMock(return_value=MagicMock(id=uuid.uuid4())),
+                complete_sync=AsyncMock(),
+            ),
+        )
+
+        await rag_command.ingest_path_async(
+            path=str(tmp_path),
+            collection="docs",
+            recursive=True,
+            vector_store=MagicMock(create_collection=AsyncMock()),
+            processor=MagicMock(),
+            ingestion=ingestion,
+        )
+
+        expected = str((tmp_path / "handbook.md").resolve())
+        assert created.await_args.kwargs["source_path"] == expected
+        assert ingestion.ingest_file.await_args.kwargs["rag_document_id"] == created.return_value.id
+        # And the stored document identifies itself the same way, so the row and
+        # the vector agree on which file this is.
+        assert ingestion.ingest_file.await_args.kwargs["source_path"] == expected

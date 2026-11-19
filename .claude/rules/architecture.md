@@ -1,0 +1,167 @@
+---
+description: Layered architecture patterns — Routes, Services, Repositories, DI
+paths: ["backend/app/**/*.py"]
+---
+
+# Architecture
+
+## Layered Architecture: Routes → Services → Repositories
+
+Routes NEVER import or call repositories directly. Always go through a service.
+
+## Repositories (`app/repositories/`)
+
+Pure data access — stateless functions (not classes):
+
+```python
+async def get_by_id(db: AsyncSession, entity_id: UUID) -> Entity | None:
+    result = await db.execute(select(Entity).where(Entity.id == entity_id))
+    return result.scalar_one_or_none()
+
+async def create(db: AsyncSession, *, field1: str, field2: str) -> Entity:
+    entity = Entity(field1=field1, field2=field2)
+    db.add(entity)
+    await db.flush()
+    await db.refresh(entity)
+    return entity
+
+async def update(db: AsyncSession, *, db_entity: Entity, update_data: dict[str, Any]) -> Entity:
+    for field, value in update_data.items():
+        setattr(db_entity, field, value)
+    await db.flush()
+    await db.refresh(db_entity)
+    return db_entity
+
+async def delete(db: AsyncSession, entity_id: UUID) -> Entity | None:
+    entity = await get_by_id(db, entity_id)
+    if entity:
+        await db.delete(entity)
+        await db.flush()
+    return entity
+```
+
+Rules:
+- ALWAYS `db.flush()` + `db.refresh()`, NEVER `db.commit()` — the request's session commits once, after the route returns and *before* the response is written (`docs/architecture.md#the-requests-transaction`). Four sanctioned exceptions: the agent run path (`AgentRunnerService._run` and `ChatAgentRunner.run` commit before the model call and again in the terminal `finally`, #12, #3); the voice call path (`VoiceCallStarter.start` commits the call row and its run before the call connects, so approval rows, heartbeats and the reaper can see them, and `VoiceCallSession`'s teardown commits again; per-turn messages, heartbeats and approval writes use their own `get_db_context()` sessions, #54); `SessionService.detect_refresh_reuse`, whose caller raises a 401 immediately afterwards — uncommitted, the rollback would undo the revocation and the audit entry the refusal exists to record (#1519); and `WorkflowExposureService._answer`, which commits a webhook's admission, and its first dispatch job with it, so the run can reach the Respond to webhook step the request waits for (#1949)
+- Use keyword-only args after `db`: `create(db, *, email: str, name: str)`
+- Return the entity (or None for get/delete), never return IDs or dicts
+- Functions are async (PostgreSQL via asyncpg)
+
+## Services (`app/services/`)
+
+Business logic — class-based with DB session:
+
+```python
+class UserService:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def get_by_id(self, user_id: UUID) -> User:
+        user = await user_repo.get_by_id(self.db, user_id)
+        if not user:
+            raise NotFoundError(message="User not found", details={"user_id": user_id})
+        return user
+
+    async def create(self, data: UserCreate) -> User:
+        existing = await user_repo.get_by_email(self.db, data.email)
+        if existing:
+            raise AlreadyExistsError(message="Email already registered", details={"email": data.email})
+        hashed_password = get_password_hash(data.password)
+        return await user_repo.create(self.db, email=data.email, hashed_password=hashed_password)
+```
+
+Rules:
+- Raise domain exceptions, NEVER return error codes or None for "not found"
+- Services call repo functions, never build raw queries
+- One service per domain entity
+
+## Thin vs. thick domains
+
+Services come in two shapes — choose based on whether the domain owns infrastructure (clients, adapters, pipelines, parsers, templates):
+
+**Thin domain → flat module (`app/services/<domain>.py`).** Default. Just a class with `db`, repo calls, and domain exceptions. Examples: `user.py`, `conversation.py`, `invitation.py`.
+
+**Thick domain → subpackage (`app/services/<domain>/`).** When the domain has its own infra. The subpackage contains both the service classes AND the infra (clients, adapters, pipeline modules, domain-specific exceptions). External callers only import from the package root — sub-modules are package-internal.
+
+```
+app/services/billing/
+├── __init__.py            # re-exports BillingService (the public facade)
+├── facade.py              # BillingService — the only thing routes see
+├── checkout_service.py    # internal sub-service
+├── credit_service.py
+├── subscription_service.py
+├── webhook_handler.py
+├── stripe_client.py       # external API client (infra)
+├── pricing.py             # pure data
+├── exceptions.py          # domain-specific, inherits from core/exceptions
+└── handlers/              # event handler modules (infra)
+```
+
+Other thick domains using the same shape: `services/rag/` (ingestion + vectorstore + embeddings + connectors), `services/channels/` (Slack + Telegram adapters + router), `services/email/` (providers + templates).
+
+Rules for thick subpackages:
+- Public API: only the top-level facade exported from `__init__.py`. Routes/workers never import sub-modules directly.
+- Domain-specific exceptions live in the subpackage and inherit from `core/exceptions.py` base classes.
+- Top-level `app/` is reserved for framework concerns (`api/`, `core/`, `db/`, `repositories/`, `schemas/`, `services/`, `worker/`, `agents/`, `workflows/`, `commands/`, `clients/`). No new top-level domain packages beyond these. `agents/` and `workflows/` are the two sanctioned exceptions to "thick domain → `services/<domain>/`": each is a whole execution model (an agent's own run loop and capability registry; a workflow graph's own node registry and validator) that other top-level packages depend on and that predates or parallels `services/` itself, not a services-shaped subpackage that happened to grow large.
+
+## Dependency Injection (`app/api/deps.py`)
+
+Use `Annotated` type aliases — never raw `Depends()` in route signatures:
+
+```python
+DBSession = Annotated[AsyncSession, Depends(get_db_session, scope="function")]
+UserSvc = Annotated[UserService, Depends(get_user_service)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
+CurrentAppAdmin = Annotated[User, Depends(_require_app_admin)]
+Auth = Annotated[AuthContext, Depends(get_auth_context)]
+```
+
+`scope="function"` on `DBSession` is load-bearing. It is what commits the
+transaction *before* the response is written, so a 2xx means the write is
+readable; FastAPI's default for a dependency with `yield` puts the commit after
+the answer has gone out, which is #353. A bare `Depends(get_db_session)`
+anywhere reintroduces it, and `tests/api/test_db_session_scope.py` fails on one.
+
+Service factories take `DBSession` and return service instances:
+
+```python
+def get_user_service(db: DBSession) -> UserService:
+    return UserService(db)
+```
+
+## Routes (`app/api/routes/v1/`)
+
+HTTP layer only — validate, delegate, return:
+
+```python
+@router.get("/{user_id}", response_model=UserRead)
+async def get_user(user_id: UUID, service: UserSvc, user: CurrentUser) -> Any:
+    return await service.get_by_id(user_id)
+```
+
+Rules:
+- Return type is always `-> Any` (response_model handles serialization)
+- Use `status_code=status.HTTP_201_CREATED` for POST, `HTTP_204_NO_CONTENT` for DELETE
+- DELETE endpoints: `response_model=None`
+- Pagination: `skip: int = Query(0, ge=0)`, `limit: int = Query(50, ge=1, le=100)`
+
+### A route module holds routers, not helpers
+
+The HTTP layer validates, delegates and returns; the logic it delegates to lives
+in a service, and the dependencies it needs live in `api/deps.py`. A plain helper
+that lands in a route file — a loader, a parser, a formatter — is business logic in
+the one place the architecture says holds none, and it arrives quietly because
+nothing complains.
+
+`scripts/check_routes.py` is that complaint, run by `make lint`. In an **endpoint
+module**, a top-level function must be a route handler (`@router.get(...)` &c.) or a
+router factory (annotated `-> APIRouter`, like `build_sharing_router`). Anything
+else is reported, and the fix is to **move it**: a parser or loader to the service
+that owns the domain (`RunStatus.parse_csv` left `runs.py` this way), a dependency
+to `deps.py`, and anything genuinely route-adjacent to a `_`-prefixed helper module
+beside the endpoints — `_workspace_bytes.py`, `_sharing_loaders.py`. Those `_*.py`
+modules are skipped by the guard; they are the sanctioned home for route-adjacent
+code that is not an endpoint.
+
+There is a last resort — `# routes-helper: <reason>` on or above the `def`, the same
+bargain as `i18n-exempt` — but it is for a helper that genuinely cannot move, not
+for dodging the move. Reach for it last; the default is to move the code out.

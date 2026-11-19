@@ -1,0 +1,141 @@
+"""RAGDocument model - tracks documents ingested into RAG collections."""
+
+import enum
+import uuid
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base, TimestampMixin
+
+
+class DocumentStatus(enum.StrEnum):
+    """Where a tracked document is in its ingestion.
+
+    Three values, and the column holds nothing else: a row is created
+    `PROCESSING` by the upload, and the pipeline moves it to `DONE` or `ERROR`.
+    It is an enum because it was not one - the listing's `indexed` count
+    filtered on a fourth value, `"completed"`, that nothing has ever written, so
+    every knowledge base in the product reported `indexed_count: 0` however many
+    documents had finished (#148).
+    """
+
+    PROCESSING = "processing"
+    DONE = "done"
+    ERROR = "error"
+
+
+class RAGDocument(TimestampMixin, Base):
+    """Tracks ingested documents with processing status."""
+
+    __tablename__ = "rag_documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    collection_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    filesize: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    filetype: Mapped[str] = mapped_column(String(20), nullable=False)
+    storage_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Which file this row tracks, as the ingest addressed it: `gdrive://<id>`,
+    # `s3://bucket/key`, or an absolute path for a local or CLI sync. An upload
+    # has no address - its only name is a basename, which two different files can
+    # share - so it stores none (#996).
+    #
+    # `Text`, because an address has no length this can promise: an S3 key alone
+    # reaches 1024 bytes before the scheme and bucket are added, and a filesystem
+    # path reaches 4096. A `String(n)` here is a truncation error on a file that
+    # used to ingest fine.
+    #
+    # The index is a **hash** index for the same reason. Equality is the only way
+    # this column is ever read - `discard_failed` and nothing else - and a btree
+    # refuses a key over about 2700 bytes at insert time, which would turn a long
+    # path into the error the `Text` was chosen to avoid.
+    source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Which sync sources list this document is `RAGDocumentClaim`'s, a row per
+    # source: two sources feeding one collection can both list an address, and
+    # one of them no longer listing it is not reason enough to remove it (#1879).
+
+    __table_args__ = (
+        Index("rag_documents_source_path_idx", "source_path", postgresql_using="hash"),
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=DocumentStatus.PROCESSING
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vector_document_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # A collection's configuration changes; a document does not get re-parsed
+    # when it does. Without these columns "why is this one chunked differently"
+    # has no answer, and a per-upload override would be invisible the moment the
+    # request that carried it finished.
+    #
+    # `ingestion_config` is the *resolved* configuration - the collection's,
+    # with the upload's override already applied. `ingestion_override` is what
+    # the uploader asked to differ, and is null when they asked for nothing.
+    ingestion_config: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    ingestion_override: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # The model that described the images in this document, as `provider:model`.
+    # Null means none did - either the configuration had image description off,
+    # or the document predates this column. Stored resolved rather than as the
+    # profile id, because a profile can be edited or deleted and what read this
+    # document must not change when it is.
+    image_description_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The embedding model this document's vectors were produced by, copied from
+    # the collection at ingestion.
+    embedding_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Which part of the organization this document belongs to - the FA-039
+    # dimension a retrieval may narrow on. Recorded on the row rather than passed
+    # to the flow for the same reason the resolved ingestion configuration is:
+    # the worker reads what this upload decided, and a parameter added to the
+    # flow signature would be lost by a run queued before it existed. `None`
+    # leaves the dimension absent on every chunk, which is what they all carried
+    # before (#1777).
+    organizational_unit: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    knowledge_base_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Who to notify about this document's outcome (#1598) - set from the
+    # caller's AuthContext at upload time, an upload always has one. SET NULL:
+    # deleting the uploader must not delete their document, only make its
+    # completion/failure notification fall back to the collection's admins.
+    initiated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Bumped by `retry_ingestion` at dispatch time, threaded through to
+    # `complete_ingestion`/`fail_ingestion` as an explicit parameter rather than
+    # read back from this column at settlement (#1598). `retry_ingestion`
+    # reparses the same document id, so without a counter a second failure
+    # would share its predecessor's notification dedup key
+    # `(doc_id, ingestion_attempt)` and be silently suppressed by the unique
+    # constraint - exactly when a person most wants to hear the retry failed
+    # too. Reading this column back at settlement, instead of carrying the
+    # dispatched value through the call, would let a slow attempt that
+    # finishes after a newer retry has already bumped it settle under the
+    # newer attempt's number; `complete_ingestion`/`fail_ingestion` reject a
+    # settlement whose passed attempt no longer matches this column.
+    ingestion_attempt: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )

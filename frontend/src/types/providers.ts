@@ -1,0 +1,282 @@
+/**
+ * Types for the provider catalog and an organization's model profiles.
+ *
+ * `provider` is a plain string, not a union. The platform ships two dozen
+ * providers and gains one whenever Pydantic AI does; a union here would be a
+ * second list to keep in step with `GET /providers/catalog`, and the two would
+ * disagree. The catalog is the list - and it is also what a credential form
+ * branches on, because it says which shape of credential each provider takes.
+ */
+
+import type { AgentUsage } from "./agents";
+
+import type { SecretKind } from "./secrets";
+
+/** Which of OpenAI's two APIs a profile's requests go to. */
+export type ModelApi = "chat" | "responses";
+
+/** One selectable provider, as the credential form reads it. */
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  /** Which shape of credential this provider needs - see `/secrets/kinds`. */
+  secret_kind: SecretKind;
+  /** False means a custom endpoint would be ignored, so storing one is refused. */
+  supports_base_url: boolean;
+  /**
+   * Whether this provider can run with no credential at all. True only for
+   * self-hosted servers, and a keyless credential still has to carry a
+   * `base_url` - otherwise it is aimed at the vendor's public API with nothing
+   * to authenticate it.
+   */
+  keyless: boolean;
+  /**
+   * The APIs a profile on this provider chooses between: both of OpenAI's for
+   * `openai` and `azure`, none for every other provider.
+   */
+  apis: ModelApi[];
+  /**
+   * What a profile gets on the provider's own endpoint when it names no API.
+   * With a `base_url` the default is `chat`, which every OpenAI-compatible server
+   * implements. Null where `apis` is empty.
+   */
+  native_api: ModelApi | null;
+}
+
+export interface ProviderCatalog {
+  items: ProviderInfo[];
+  total: number;
+}
+
+/** One named model a provider key is behind. */
+export interface ModelProfile {
+  id: string;
+  label: string;
+  provider: string;
+  model: string;
+  /**
+   * The vault secret this model is keyed by, and the only key it has.
+   *
+   * Null on a self-hosted profile, which authenticates against nothing, and on
+   * one whose key was deleted - the foreign key is `ON DELETE SET NULL`. Those
+   * two look the same here and are told apart by `base_url`, which is what the
+   * resolver does.
+   */
+  secret_id: string | null;
+  /**
+   * Where requests go, when it is not the provider's public API: a gateway, a
+   * LiteLLM proxy, a model server on this network. Absent for most profiles.
+   *
+   * On the profile rather than the key because a key says what authenticates and
+   * this says where it is sent - the same key can front a staging proxy and a
+   * production one as two profiles.
+   */
+  base_url?: string | null;
+  /** Which API the requests go to. Null on every provider that serves one. */
+  api?: ModelApi | null;
+  params: Record<string, unknown>;
+  fallback_profile_ids: string[];
+  /**
+   * Tokens this model accepts, as its provider's listing said when the profile
+   * was created.
+   *
+   * Null means *not recorded* - a profile older than the column, a provider that
+   * publishes no length, a listing that could not be reached - and not that the
+   * model accepts none. Re-adding the model records it; nothing backfills a row
+   * that already exists.
+   */
+  context_length?: number | null;
+  /**
+   * Whether an agent can run on this model (#2487). False only for one the
+   * platform knows is something else - text to speech, transcription, image,
+   * video or embeddings. Absent reads as true: a model nothing classifies is
+   * never hidden.
+   */
+  chat_capable?: boolean;
+  /**
+   * Whether it has nothing to authenticate with, so no run can use it (#2478):
+   * its key was deleted from the vault or never set, on a provider that needs
+   * one. A keyless provider with an endpoint is false. Absent reads as false.
+   */
+  missing_key?: boolean;
+  created_at?: string;
+}
+
+export interface ModelProfileList {
+  items: ModelProfile[];
+  total: number;
+}
+
+/** One file a skill carries, as a listing names it - without the body. */
+export interface SkillResourceSummary {
+  id: string;
+  name: string;
+  description: string | null;
+  size_bytes: number;
+}
+
+/** One file with its body, fetched when somebody opens it. */
+export interface SkillResource extends SkillResourceSummary {
+  content: string;
+}
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  /** A grouping label for people ("marketing", "devops"); null is uncategorized. */
+  category: string | null;
+  version: number;
+  visibility: string;
+  owner_user_id: string | null;
+  /**
+   * The files beyond the body, without their contents. Optional because a
+   * backend older than the resources endpoint omits it entirely, and a client
+   * that assumed the field would crash rather than degrade.
+   */
+  resources?: SkillResourceSummary[];
+}
+
+export interface SkillSummary {
+  /** Effective edit access in listings; absent on older deployments or write responses. */
+  can_edit?: boolean;
+  id: string;
+  name: string;
+  description: string;
+  category: string | null;
+  /** `org` is everyone; `private` is its owner and whoever it is shared with. */
+  visibility: string;
+  /** How many files the skill carries beyond its body. */
+  file_count: number;
+  /** Whether this skill shipped with the deployment, matched by library name. */
+  built_in: boolean;
+  /** The body's first lines, front matter dropped - what the card's page shows. */
+  excerpt: string;
+  /**
+   * The agents whose draft binds this, among those the caller may see (#2075).
+   * Optional because only the listings carry it.
+   */
+  used_by?: AgentUsage[];
+  /** The groups it is shared with, by name (#2072). Only the listings carry it. */
+  shared_groups?: string[];
+}
+
+export interface SkillList {
+  items: SkillSummary[];
+  total: number;
+  /**
+   * Every distinct category in the organization - the filter's choices,
+   * unaffected by the search and paging that shaped `items`.
+   */
+  categories: string[];
+  /** The deployment's predefined shelf names - picker suggestions, never a constraint. */
+  suggested_categories: string[];
+}
+
+/** How a context file reaches the model - injected into the prompt, or read on demand. */
+export type ContextMode = "inject" | "link";
+
+/** One piece of an organization's standing context, body included. */
+export interface ContextFile {
+  id: string;
+  name: string;
+  description: string | null;
+  content: string;
+  /** A rendering hint (`md`, `txt`, `json`, `yaml`, `csv`), not a constraint. */
+  format: string;
+  mode: ContextMode;
+  enabled: boolean;
+  visibility: string;
+  owner_user_id: string | null;
+}
+
+/** A context file as the listing shows it - the body is a byte count only. */
+export interface ContextFileSummary {
+  /** Effective edit access in listings; absent on older deployments or write responses. */
+  can_edit?: boolean;
+  id: string;
+  name: string;
+  description: string | null;
+  format: string;
+  mode: ContextMode;
+  enabled: boolean;
+  /** `org` is everyone; `private` is its owner and whoever it is shared with. */
+  visibility: string;
+  size_bytes: number;
+  /** The body's first lines, front matter dropped - what the card's page shows. */
+  excerpt: string;
+  /**
+   * The agents whose draft binds this, among those the caller may see (#2075).
+   * Optional because only the listings carry it.
+   */
+  used_by?: AgentUsage[];
+  /** The groups it is shared with, by name (#2072). Only the listings carry it. */
+  shared_groups?: string[];
+}
+
+export interface ContextFileList {
+  items: ContextFileSummary[];
+  total: number;
+}
+
+/** One skill on a gallery shelf - the picker's row, never the body. */
+export interface GallerySkill {
+  /** `<industry>/<folder>` - what an install request names. */
+  key: string;
+  name: string;
+  description: string;
+  category: string | null;
+  /** Whether this organization already has a skill by this name. */
+  installed: boolean;
+}
+
+/** One industry shelf and what is on it. */
+export interface GalleryIndustry {
+  id: string;
+  skills: GallerySkill[];
+}
+
+export interface SkillGallery {
+  industries: GalleryIndustry[];
+}
+
+/** What an install did, per key, so a partial result is legible. */
+export interface GalleryInstallResult {
+  installed: string[];
+  skipped: string[];
+  unknown: string[];
+}
+
+/** One shipped agent template as the picker shows it. */
+export interface AgentTemplate {
+  key: string;
+  name: string;
+  description: string;
+  capabilities: string[];
+  skills: string[];
+  mcp: string[];
+  /** What a person still has to attach before publishing. */
+  attach: string[];
+  budget_usd: number | null;
+  installed: boolean;
+}
+
+export interface TemplateIndustry {
+  id: string;
+  templates: AgentTemplate[];
+}
+
+export interface AgentTemplateCatalog {
+  industries: TemplateIndustry[];
+}
+
+/** What installing a template created, and what is left to do. */
+export interface TemplateInstallResult {
+  agent_id: string;
+  slug: string;
+  name: string;
+  skills_installed: string[];
+  attach: string[];
+  suggested_mcp: string[];
+}

@@ -1,0 +1,1166 @@
+"""Tests for the capability registry - the code/configuration boundary.
+
+What is guarded: configuration may reach only what code registered, a capability
+that contributes nothing is not attached, and a spec asking for something
+ungranted fails while a person is looking at a form rather than mid-run.
+"""
+
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+from pydantic import SecretStr, ValidationError
+from pydantic_ai import Agent as PydanticAgent
+from pydantic_ai.models.test import TestModel
+
+from app.agents.capabilities import (
+    REGISTRY,
+    CapabilityBinding,
+    CapabilityBuildContext,
+    CapabilityToolInfo,
+    ProviderExecuted,
+    ToolOverride,
+    all_capabilities,
+    build,
+    get,
+    load_builtins,
+    register,
+)
+from app.agents.capabilities.channel_tools import CHANNEL_DIRECTORY_RESOURCE
+from app.agents.capabilities.charts import Charts
+from app.agents.capabilities.clock import Clock
+from app.agents.capabilities.code_execution import CodeExecution, CodeExecutionConfig
+from app.agents.capabilities.knowledge import Knowledge, KnowledgeConfig
+from app.agents.capabilities.skills import SAFE_SKILL_TOOLS, Skills
+from app.agents.capabilities.web_research import WebResearch, WebResearchConfig
+from app.agents.hand_off import HAND_OFF_TOOL
+from app.agents.subagent_runtime import (
+    SUBAGENT_RUNTIME_RESOURCE,
+    DynamicSpecialists,
+    ResolvedSubagent,
+    SubagentRuntime,
+)
+from app.core.exceptions import BadRequestError
+from app.core.secret_kinds import ApiKeySecret, SecretKind, StorableSecret
+from app.services.agent_registry import DEFAULT_GRANTED_SCOPES
+from app.services.capability_contracts import probe_context, real_tool_definition
+
+
+@pytest.fixture(autouse=True)
+def _builtins_loaded():
+    load_builtins()
+
+
+class TestSelfLoading:
+    """The registry must not depend on the caller having warmed it up.
+
+    It used to: `load_builtins()` ran in the FastAPI lifespan and nowhere
+    else, so the CLI, a worker or a script got an empty registry and every
+    publish failed with "Unknown capability" - naming a capability that is in
+    the repository, listed in the picker and documented. The gap only showed up
+    when somebody actually ran `make platform-bootstrap`.
+    """
+
+    @staticmethod
+    def _in_a_fresh_process(source: str) -> str:
+        """Run a snippet in a new interpreter and return what it printed.
+
+        A subprocess is the only honest way to test this. Clearing `REGISTRY`
+        inside this one proves nothing: the capability modules are already
+        imported, so re-importing them is a no-op and their decorators never run
+        again. Only a process that has not imported them can show what a CLI
+        invocation actually sees.
+        """
+        result = subprocess.run(
+            [sys.executable, "-c", source],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=Path(__file__).resolve().parent.parent,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    def test_a_lookup_in_a_fresh_process_finds_a_builtin(self):
+        assert (
+            self._in_a_fresh_process(
+                "from app.agents.capabilities import get; print(get('clock').id)"
+            )
+            == "clock"
+        )
+
+    def test_listing_in_a_fresh_process_is_not_empty(self):
+        """The Builder's picker is a listing, and an empty one is a broken page."""
+        listed = self._in_a_fresh_process(
+            "from app.agents.capabilities import all_capabilities\n"
+            "print(','.join(sorted(d.id for d in all_capabilities())))"
+        )
+
+        assert {"clock", "knowledge"} <= set(listed.split(","))
+
+    def test_loading_twice_does_not_raise_on_duplicate_ids(self):
+        """`register` refuses a duplicate id, so a second load must be a no-op."""
+        load_builtins()
+        load_builtins()
+
+        assert get("clock").id == "clock"
+
+
+def test_every_builtin_is_granted_the_scopes_it_declares():
+    """A builtin needing a scope this deployment does not grant is refused at
+    every publish - listed in the Builder, documented, and unusable."""
+    ungranted = {
+        definition.id: sorted(definition.scopes - DEFAULT_GRANTED_SCOPES)
+        for definition in all_capabilities()
+        if definition.scopes - DEFAULT_GRANTED_SCOPES
+    }
+
+    assert ungranted == {}
+
+
+class TestToolDeclarations:
+    """A tool's declared identity is what the approval gate keys on."""
+
+    def test_a_tool_is_seen_under_the_name_it_was_declared_with(self):
+        tool = CapabilityToolInfo(id="send_email", description="Sends mail.")
+
+        assert (tool.id, tool.name) == ("send_email", "send_email")
+
+    def test_a_renamed_tool_keeps_the_id_the_gate_matches_on(self):
+        """The whole reason id and name are separate.
+
+        `tool_approval` is keyed by id, so renaming what the model sees cannot
+        quietly drop the gate an operator put on it.
+        """
+        tool = CapabilityToolInfo(
+            id="search_documents", name="search_orders", description="Search."
+        )
+
+        assert (tool.id, tool.name) == ("search_documents", "search_orders")
+
+    def test_a_declaration_that_is_not_a_mapping_is_left_to_pydantic(self):
+        """The before-validator must not swallow a malformed declaration."""
+        with pytest.raises(ValidationError):
+            CapabilityToolInfo.model_validate(["send_email"])
+
+    # Enough for *every* capability to build, which is load-bearing rather than
+    # convenient - see `test_no_capability_escapes_the_drift_check`. The
+    # assertions here are about names, not about search results.
+    RESOURCES = {
+        "kb_collection_names": ["kb_1"],
+        # The credential the runner mints for the person a run acts for; without
+        # one `platform` builds nothing, and its tools would escape the check.
+        "platform_credential": SecretStr("aos_0123abcdsecret"),
+        # Any object at all: `channel_tools` builds when a run is in a channel
+        # and contributes nothing when it is not, and this test is about the
+        # names it offers rather than what a platform answers.
+        CHANNEL_DIRECTORY_RESOURCE: SimpleNamespace(),
+        # A skill that ships a file, which is the widest shape: `skills` offers
+        # `read_skill_resource` only when at least one skill has something to
+        # read, and a skill with no resources offers no tool at all.
+        "skills": [
+            SimpleNamespace(
+                name="refunds",
+                description="How refunds work.",
+                content="…",
+                resources=[
+                    SimpleNamespace(
+                        name="template.md",
+                        description="Reply template",
+                        content="Dear {name},",
+                    )
+                ],
+            )
+        ],
+        # A linked file, so `context` offers both its tools - the widest shape,
+        # for the same reason the delegate below is at its widest.
+        "context_files": [
+            SimpleNamespace(
+                id=uuid4(),
+                name="glossary",
+                description="What the words mean.",
+                content="SLA: service level agreement.",
+                mode="link",
+                format="md",
+            )
+        ],
+        # A delegating agent at its widest: one resolved delegate *and* permission
+        # to invent specialists, because `subagents` is the one capability whose
+        # tool list is not fixed - `create_agent` and `delegate` are offered only
+        # to an agent whose author asked for them. The widest configuration is the
+        # one worth checking: an undeclared tool can only appear where the most
+        # tools do.
+        SUBAGENT_RUNTIME_RESOURCE: SubagentRuntime(
+            subagents=(
+                ResolvedSubagent(
+                    name="researcher",
+                    description="Researches a topic.",
+                    # Never called: this test lists tools, and a delegate's agent
+                    # is built on its first delegation.
+                    build=lambda: PydanticAgent(TestModel()),
+                ),
+            ),
+            record=None,
+            depth_remaining=1,
+            dynamic=DynamicSpecialists(
+                # Never called either, for the same reason.
+                build=lambda **_: PydanticAgent(TestModel()),
+                allowed_models=("GPT-4.1 (prod)",),
+            ),
+        ),
+    }
+    """Everything every registered capability needs in order to build.
+
+    Wide rather than minimal on purpose. There used to be a
+    `CapabilityDef.drift_config` field naming a configuration nothing read, and
+    then an `UNWIRED_TOOLS` table naming `create_agent` and `delegate` as declared
+    and not implemented - both ways of saying "this capability is partly outside
+    the check", and both removed by wiring the tools. What stands in their place is
+    resources wide enough that no capability has an excuse for not building.
+    """
+
+    DECLARED_AND_NOT_OFFERED: dict[str, frozenset[str]] = {
+        "subagents": frozenset({"answer_subagent"}),
+        # Stored synthetic calls retain their identity; no main model offers them.
+        "follow_ups": frozenset({"suggest_next_steps"}),
+        # Pydantic AI contributes `load_capability` to any run carrying a
+        # deferred capability, and every skill is one. `skills` declares it
+        # because it is the call that opens a skill and therefore the only place
+        # an approval on loading one can sit - nothing here builds it (#1704).
+        "skills": frozenset({"load_capability"}),
+    }
+    """Tools a capability declares and deliberately offers no model.
+
+    The one legitimate reason to declare a tool that never reaches a model: the
+    library owning it adds it unconditionally, nothing in this deployment can put
+    it in a state where it does anything, and dropping it from `tools=` would take
+    it out of reach of the approval policy and of a binding's rename. `subagents`
+    declares `answer_subagent` for exactly that reason -
+    `app.agents.capabilities.subagents._capability.UNREACHABLE_TOOLS` has the whole
+    of it, including why agenticos#184 would not empty this table on its own.
+
+    Follow-ups also retains the recorded identity of synthetic next-step calls,
+    while no main model is allowed to offer the tool.
+
+    Spelt out here rather than imported from the capability, and subtracted rather
+    than skipped. An imported set would make the check below a tautology, and
+    skipping the capability would put it back outside the drift test the way
+    `drift_config` and `UNWIRED_TOOLS` did - an undeclared tool could then appear
+    beside the exempt one and nothing would notice. Everything else about the
+    capability is still compared in both directions, and
+    `test_the_exemption_table_names_tools_that_are_still_declared` is what stops
+    an entry outliving its reason.
+    """
+
+    def _expected(self, definition_id: str) -> frozenset[str]:
+        """The tool ids this capability's model should be offered, exemptions applied."""
+        return get(definition_id).tool_ids - self.DECLARED_AND_NOT_OFFERED.get(
+            definition_id, frozenset()
+        )
+
+    CONFIGS: dict[str, dict[str, Any]] = {
+        # The only capability whose *tools* are configuration rather than a fixed
+        # list: a binding names which lookups it allows, so the widest
+        # configuration is the one that allows all of them. Same reason the
+        # subagents resource above is at its widest - an undeclared tool can only
+        # appear where the most tools do.
+        "channel_tools": {"tools": sorted(get("channel_tools").tool_ids)},
+        # Builds `None` from an empty blob on purpose - enabling the capability
+        # without turning on an edge attaches no guardrail. One edge on is what
+        # makes it build here; it offers no tools either way.
+        "guardrails": {"blocked_keywords_in": "secret"},
+        # Its three subtask tools are offered only when this is set, so the widest
+        # configuration is the one that switches them on. The default (a flat
+        # checklist) offers the six core tools and would hide the other three from
+        # the comparison rather than check them.
+        "planning": {"enable_subtasks": True},
+        # Builds `None` from an empty blob on purpose - binding the capability
+        # without setting a reminder attaches nothing. One reminder on is what
+        # makes it build here; it offers no tools either way.
+        "system_reminders": {"goal_reanchor": {}},
+        # Builds `None` with no table granted and creation off, and offers
+        # `create_table` only with `allow_create`: the widest shape grants a table
+        # every operation and turns creation on.
+        "virtual_tables": {
+            "tables": [
+                {
+                    "table_id": "00000000-0000-0000-0000-000000000001",
+                    "operations": ["read", "create", "update", "delete"],
+                }
+            ],
+            "allow_create": True,
+        },
+        # Builds `None` naming no workflow: one named is what makes it offer its tools.
+        "workflows": {"workflow_ids": ["00000000-0000-0000-0000-000000000002"]},
+    }
+    """Configurations a capability needs before it offers anything.
+
+    Absent for almost everything: a capability builds from an empty blob and
+    applies its own defaults, which is the configuration most agents run. An
+    entry here says the defaults leave tools switched off, and names the widest
+    setting instead - never a narrower one, which would hide a tool from the
+    comparison below rather than check it.
+    """
+
+    def _built(self, definition_id: str) -> Any:
+        definition = get(definition_id)
+        blob = self.CONFIGS.get(definition_id, {})
+        config = definition.validate_config(blob)
+        # A capability that cannot build without a credential gets one, the same
+        # way the override test below does. Without this a secret-requiring
+        # capability builds as `None` and falls out of the drift check entirely -
+        # which is the hole this class's first test exists to close.
+        secret_id, secrets = self._secret_binding(definition, blob)
+        return definition.builder(
+            CapabilityBuildContext(
+                binding=CapabilityBinding(
+                    capability_id=definition_id, config=blob, secret_id=secret_id
+                ),
+                config=config,
+                resources=self.RESOURCES,
+                secret=secrets.get(secret_id) if secret_id else None,
+            )
+        )
+
+    @staticmethod
+    def _secret_binding(
+        definition: Any, config: dict[str, Any]
+    ) -> tuple[UUID | None, dict[UUID, StorableSecret]]:
+        """A secret this capability's default config makes it require, if any.
+
+        The parallel of `RESOURCES`: a capability that cannot build without a
+        credential is given one here, so the drift check goes through `build()`
+        for it too rather than skipping it. Only `API_KEY` is handled because it
+        is the only kind any capability requires unconditionally; another kind
+        arriving unconditionally should fail here loudly rather than be skipped.
+        """
+        requirement = definition.secret
+        if requirement is None or not definition.needs_secret(definition.validate_config(config)):
+            return None, {}
+        assert requirement.kind is SecretKind.API_KEY, definition.id
+        secret_id = uuid4()
+        return secret_id, {secret_id: ApiKeySecret(api_key="test-key")}
+
+    def test_no_capability_escapes_the_drift_check(self):
+        """A capability that cannot be built here is a capability nothing checks.
+
+        The two tests below compare what a capability declares against what it
+        offers, and both used to answer `continue` for a builder that returned
+        `None` - which is how `subagents` sat outside the check entirely while
+        appearing to be covered by it. A capability could have added an
+        undeclared, side-effecting tool and no shared test would have noticed.
+
+        So the resources above exist to make every registered capability
+        buildable, and this is the assertion that keeps them that way: a new
+        capability needing a run-time resource fails *here*, naming itself,
+        rather than quietly opting out.
+        """
+        unbuildable = [
+            definition.id for definition in all_capabilities() if self._built(definition.id) is None
+        ]
+
+        assert unbuildable == [], (
+            "add whatever these need to TestToolDeclarations.RESOURCES; a capability "
+            "the drift check cannot build is a capability it does not check"
+        )
+
+    @staticmethod
+    async def _offered(built: Any) -> frozenset[str]:
+        """The tool names a built capability actually hands its model.
+
+        Asked of the toolset rather than read off a `.tools` mapping: a wrapper -
+        which is what a capability wrapping a library's toolset is, and what a
+        renaming binding produces - resolves its tools per run context and has no
+        such mapping at all.
+        """
+        toolset = built.get_toolset()
+        if toolset is None:
+            return frozenset()
+        return frozenset(await toolset.get_tools(probe_context(built)))
+
+    @staticmethod
+    async def _offered_descriptions(built: Any) -> dict[str, str]:
+        """The real description behind each offered tool - what the model reads.
+
+        Same source `_offered` reads, one field wider: `get_tools` rather than a
+        `.tools` mapping, for the same reason - a wrapped or filtered toolset has
+        no such mapping. `real_tool_definition` is the one place that knows how
+        a `Tool` wraps its `ToolDefinition` - `capability_contracts.py` reads a
+        tool's description the same way, so a change to that shape fails in one
+        place rather than silently drifting between the two readers.
+        """
+        toolset = built.get_toolset()
+        if toolset is None:
+            return {}
+        offered = await toolset.get_tools(probe_context(built))
+        return {
+            name: getattr(real_tool_definition(tool), "description", "") or ""
+            for name, tool in offered.items()
+        }
+
+    def test_the_exemption_table_names_tools_that_are_still_declared(self):
+        """An exemption that outlived its tool would quietly widen the check.
+
+        Both halves matter. An id no longer declared - renamed, or removed with the
+        capability it belonged to - subtracts nothing and reads as if it did, so the
+        next tool that *is* wrongly unoffered looks exempt. And a capability listed
+        with an empty set is an entry that says "partly outside the check" while
+        exempting nothing at all.
+
+        The other direction needs no test: a tool that becomes genuinely offered
+        while still named here fails the comparison below, because the offered set
+        then holds something the expectation subtracted.
+        """
+        for capability_id, exempt in self.DECLARED_AND_NOT_OFFERED.items():
+            assert exempt, capability_id
+            assert exempt <= get(capability_id).tool_ids, capability_id
+
+    @pytest.mark.anyio
+    async def test_every_builtin_declares_the_tools_it_actually_offers(self):
+        """Declaration feeds the Builder; the toolset is the truth.
+
+        A declared tool that does not exist offers approval for nothing. The
+        dangerous direction is the other one: a real tool nobody declared is a
+        tool the Builder cannot gate, and a side-effecting one would run
+        unattended with no way to say otherwise.
+        """
+        for definition in all_capabilities():
+            built = self._built(definition.id)
+            assert built is not None, definition.id
+
+            assert await self._offered(built) == self._expected(definition.id), definition.id
+
+    @pytest.mark.anyio
+    async def test_every_declared_description_tracks_what_the_model_reads(self):
+        """The catalog's one-liner is a prefix of the real thing, not a paraphrase.
+
+        `CapabilityToolInfo.description` is what the Toolbox showed before it
+        learned to read the built toolset instead (#1473) - it is still what a
+        capability declares, and it still has to stay honest, or the person
+        editing a tool override sees a value the model was never actually sent.
+        The real description is the whole docstring, sometimes wrapped in
+        `<summary>` when the tool has a `Returns:` section - stripped from both
+        sides before comparing, because a declared description is sometimes the
+        whole wrapped string verbatim (`subagents`' library-sourced constants
+        copy it in full) and sometimes just the opening sentence (everything
+        else); stripping the wrapper from both reduces both cases to the same
+        prefix check.
+        """
+        for definition in all_capabilities():
+            built = self._built(definition.id)
+            assert built is not None, definition.id
+            descriptions = await self._offered_descriptions(built)
+
+            for tool in definition.tools:
+                if tool.id not in self._expected(definition.id):
+                    continue
+                real = descriptions[tool.name].removeprefix("<summary>")
+                declared = tool.description.removeprefix("<summary>")
+                assert real.startswith(declared), (definition.id, tool.id)
+
+    @pytest.mark.anyio
+    async def test_renaming_every_tool_cannot_hide_an_undeclared_one(self):
+        """The same check, through a binding that renames all of it.
+
+        Renaming is the one thing that makes "declared" and "offered" legitimately
+        different strings, so the check above could have been satisfied by
+        loosening it - and a loosened version would stop catching the failure it
+        exists for. Instead the expectation moves with the rename: every declared
+        tool must arrive under its new name, and a tool nobody declared has no new
+        name to arrive under, so it still shows up as a difference.
+
+        A tool in `DECLARED_AND_NOT_OFFERED` must not arrive under either name. It
+        is renamed here like every other - a binding may name a tool the model is
+        not shown, and publishing accepts it - so this is also the check that the
+        rename cannot smuggle it back in: the filter keys on the stable id, inside
+        the wrapper that renames.
+        """
+        for definition in all_capabilities():
+            overrides = {
+                tool.id: ToolOverride(name=f"{tool.id}_as_this_agent_calls_it")
+                for tool in definition.tools
+            }
+            config = self.CONFIGS.get(definition.id, {})
+            secret_id, secrets = self._secret_binding(definition, config)
+            built = build(
+                [
+                    CapabilityBinding(
+                        capability_id=definition.id,
+                        config=config,
+                        tool_overrides=overrides,
+                        secret_id=secret_id,
+                    )
+                ],
+                resources=self.RESOURCES,
+                secrets=secrets,
+            )
+            assert built, definition.id
+            offered = await self._offered(built[0])
+
+            expected = frozenset(
+                tool.name
+                for tool in definition.effective_tools(overrides)
+                if tool.id in self._expected(definition.id)
+            )
+            assert offered == expected, definition.id
+
+
+class TestEffectiveTools:
+    """What the model will see, which is not always what the source says."""
+
+    def test_without_an_override_the_declaration_stands(self):
+        assert get("knowledge").effective_tools({}) == get("knowledge").tools
+
+    def test_a_rename_keeps_the_id_and_the_declared_description(self):
+        """Half an override is an override: the other half falls back to code."""
+        (tool,) = get("knowledge").effective_tools(
+            {"search_documents": ToolOverride(name="search_refund_policy")}
+        )
+
+        assert (tool.id, tool.name) == ("search_documents", "search_refund_policy")
+        assert tool.description == get("knowledge").tools[0].description
+
+    def test_a_reworded_description_keeps_the_declared_name(self):
+        (tool,) = get("knowledge").effective_tools(
+            {"search_documents": ToolOverride(description="Look up the refund policy.")}
+        )
+
+        assert (tool.name, tool.description) == (
+            "search_documents",
+            "Look up the refund policy.",
+        )
+
+    def test_an_override_for_a_tool_that_does_not_exist_changes_nothing(self):
+        """It is refused at publish; here it must not corrupt the answer."""
+        assert (
+            get("knowledge").effective_tools({"search_docuemnts": ToolOverride(name="typo")})
+            == get("knowledge").tools
+        )
+
+
+class TestProviderExecutedDeclarations:
+    """What a capability says the model provider runs on its own side.
+
+    Publish validation refuses approval on those tools, because `ApprovalGate`
+    wraps tool execution and there is no call of ours to hold (#857). Both halves
+    of a declaration are silent when they are wrong: a tool id nobody registers
+    refuses nothing, and a config field the schema does not have reads as `None`,
+    matches no value, and refuses nothing either - which is the same silent
+    ungated tool the declaration exists to prevent.
+    """
+
+    @staticmethod
+    def _declaring():
+        return [d for d in all_capabilities() if d.provider_executed is not None]
+
+    def test_every_declaration_names_tools_and_a_config_field_that_exist(self):
+        for definition in self._declaring():
+            declared = definition.provider_executed
+            assert declared is not None
+            assert frozenset(declared.tools) <= definition.tool_ids, definition.id
+            assert definition.config_schema is not None, definition.id
+            assert declared.field in definition.config_schema.model_fields, definition.id
+
+    def test_the_capabilities_that_declare_one_are_the_ones_with_a_native_method(self):
+        assert sorted(d.id for d in self._declaring()) == ["web_fetch", "web_research"]
+
+    @staticmethod
+    def _declared(capability_id: str) -> ProviderExecuted:
+        declared = get(capability_id).provider_executed
+        assert declared is not None
+        return declared
+
+    def test_a_binding_with_no_config_at_all_hands_nothing_over(self):
+        """A capability with no config schema validates to `None`, not to a default."""
+        assert self._declared("web_fetch").tools_for(None) == frozenset()
+
+    def test_a_method_this_deployment_runs_hands_nothing_over(self):
+        declared = self._declared("web_research")
+        assert declared.tools_for(WebResearchConfig(method="duckduckgo")) == frozenset()
+
+    def test_a_native_method_hands_the_declared_tools_over(self):
+        declared = self._declared("web_research")
+        assert declared.tools_for(WebResearchConfig(method="native")) == frozenset({"web_search"})
+
+
+class TestRegistration:
+    def test_builtin_capabilities_are_registered(self):
+        assert {
+            "knowledge",
+            "web_research",
+            "charts",
+            "code_execution",
+            "clock",
+            "skills",
+            "thinking",
+            "tool_search",
+        } <= set(REGISTRY)
+
+    def test_catalog_is_ordered_for_a_stable_picker(self):
+        entries = all_capabilities()
+        assert entries == sorted(entries, key=lambda d: (d.category, d.name))
+
+    def test_registering_a_duplicate_id_is_refused(self):
+        """Import order must not decide what an agent can do."""
+        with pytest.raises(RuntimeError, match="already registered"):
+
+            @register(id="clock", name="Clashing", category="test", description="", tools=())
+            def _clashing(ctx):
+                return None
+
+    def test_unknown_capability_names_what_is_available(self):
+        with pytest.raises(BadRequestError) as exc:
+            get("no_such_capability")
+        assert exc.value.details is not None
+        assert "available" in exc.value.details
+
+
+class TestAdvancedSettings:
+    """Fields the Builder folds under "Advanced settings" (#2070)."""
+
+    def test_a_folded_field_is_never_one_publishing_needs(self):
+        """A required field behind a fold is a refusal at publish with nothing on
+        screen to answer it."""
+        for definition in all_capabilities():
+            schema = definition.config_json_schema() or {}
+            required = set(schema.get("required", []))
+            for name, field in schema.get("properties", {}).items():
+                if field.get("x-advanced"):
+                    assert name not in required, (definition.id, name)
+
+    def test_tuning_is_folded_and_the_choices_are_not(self):
+        knowledge = get("knowledge").config_json_schema() or {}
+        properties = knowledge["properties"]
+
+        assert properties["default_top_k"].get("x-advanced") is True
+        assert "x-advanced" not in properties["query_analysis_mode"]
+
+
+class TestConfigValidation:
+    def test_valid_config_is_parsed_into_its_schema(self):
+        config = get("knowledge").validate_config({"default_top_k": 8})
+        assert isinstance(config, KnowledgeConfig)
+        assert config.default_top_k == 8
+
+    def test_a_valid_parent_context_mode_is_parsed(self):
+        config = get("knowledge").validate_config({"parent_context": "window"})
+        assert isinstance(config, KnowledgeConfig)
+        assert config.parent_context == "window"
+
+    def test_parent_context_defaults_to_off_when_omitted(self):
+        """An old spec whose config predates the field takes the default (#1651)."""
+        config = get("knowledge").validate_config({"default_top_k": 5})
+        assert isinstance(config, KnowledgeConfig)
+        assert config.parent_context == "off"
+
+    def test_the_builder_is_offered_the_parent_context_modes_as_a_choice(self):
+        """An inline `enum` is what the schema form renders as a select; an enum
+        class reaches the schema as a `$ref` and became a free-text box."""
+        field = KnowledgeConfig.model_json_schema()["properties"]["parent_context"]
+        assert field["enum"] == ["off", "window", "parent"]
+        assert set(field["x-enum-labels"]) == {"off", "window", "parent"}
+
+    def test_an_unknown_parent_context_mode_is_refused_at_publish(self):
+        """The Builder marks the field rather than a run failing later."""
+        with pytest.raises(BadRequestError) as exc:
+            get("knowledge").validate_config({"parent_context": "everything"})
+        assert exc.value.details is not None
+        assert exc.value.details["capability_id"] == "knowledge"
+        assert [problem["field"] for problem in exc.value.details["fields"]] == [
+            "config.parent_context"
+        ]
+
+    def test_invalid_config_reports_field_errors(self):
+        """The Builder needs field-level errors to point at the right input.
+
+        In `details["fields"]`, which is the only shape `fieldProblems` reads:
+        under `errors` this refusal marked nothing, and the capability it is
+        about was the only part of it a form could act on (#882).
+        """
+        with pytest.raises(BadRequestError) as exc:
+            get("knowledge").validate_config({"default_top_k": 999})
+        assert exc.value.details is not None
+        assert exc.value.details["capability_id"] == "knowledge"
+        assert [problem["field"] for problem in exc.value.details["fields"]] == [
+            "config.default_top_k"
+        ]
+
+    def test_a_rule_about_two_settings_is_attributed_to_the_config_itself(self):
+        """A `model_validator(mode="after")` names no field, so the refusal
+        falls back to the blob it was about - `image_generation` refusing a
+        provider and a model that do not go together is about the pair."""
+        with pytest.raises(BadRequestError) as exc:
+            get("image_generation").validate_config({"provider": "openai", "model": "not-a-model"})
+        assert exc.value.details is not None
+        assert [problem["field"] for problem in exc.value.details["fields"]] == ["config"]
+
+    def test_the_rejected_value_is_not_echoed_back(self):
+        """`details` reaches the caller verbatim, so it carries the diagnosis
+        rather than a copy of what was posted (agenticos#307)."""
+        with pytest.raises(BadRequestError) as exc:
+            get("knowledge").validate_config({"default_top_k": 999})
+        assert exc.value.details is not None
+        assert all(set(problem) == {"field", "message"} for problem in exc.value.details["fields"])
+
+    def test_query_analysis_config_is_validated_and_bounded(self):
+        config = get("knowledge").validate_config(
+            {"query_analysis_mode": "multi_query", "query_analysis_max_variants": 4}
+        )
+        assert isinstance(config, KnowledgeConfig)
+        assert (config.query_analysis_mode, config.query_analysis_max_variants) == (
+            "multi_query",
+            4,
+        )
+        with pytest.raises(BadRequestError):
+            get("knowledge").validate_config({"query_analysis_mode": "translate"})
+        # Not spec format: with no lexical leg running it could only embed a
+        # different string, and a published mode can never be taken back.
+        with pytest.raises(BadRequestError):
+            get("knowledge").validate_config({"query_analysis_mode": "keywords"})
+        with pytest.raises(BadRequestError):
+            get("knowledge").validate_config({"query_analysis_max_variants": 99})
+
+    def test_query_analysis_defaults_off(self):
+        """A stored spec that predates the field loads with expansion off."""
+        assert get("knowledge").validate_config({}).query_analysis_mode == "off"
+
+    def test_query_analysis_fields_are_in_the_form_schema(self):
+        schema = get("knowledge").config_json_schema()
+        assert schema is not None
+        assert "query_analysis_mode" in schema["properties"]
+        assert "query_analysis_max_variants" in schema["properties"]
+
+    def test_capabilities_without_a_schema_accept_nothing(self):
+        assert get("charts").validate_config({}) is None
+
+    def test_sandbox_limits_are_validated_where_the_form_is(self):
+        """A limit outside the cap is refused at configuration time, not
+        discovered as an unkillable program at run time."""
+        config = get("code_execution").validate_config({"timeout_secs": 30, "max_memory_mb": 512})
+        assert isinstance(config, CodeExecutionConfig)
+        assert (config.timeout_secs, config.max_memory_mb) == (30, 512)
+
+        with pytest.raises(BadRequestError):
+            get("code_execution").validate_config({"timeout_secs": 0})
+        with pytest.raises(BadRequestError):
+            get("code_execution").validate_config({"max_memory_mb": 8})
+
+    def test_config_schema_is_exposed_as_json_schema(self):
+        """The configuration form is generated from this, never hand-written."""
+        schema = get("knowledge").config_json_schema()
+        assert schema is not None
+        assert "default_top_k" in schema["properties"]
+
+    def test_capabilities_without_a_schema_expose_none(self):
+        assert get("charts").config_json_schema() is None
+
+
+class TestBuilding:
+    def test_disabled_bindings_are_skipped(self):
+        assert build([CapabilityBinding(capability_id="clock", enabled=False)]) == []
+
+    def test_builds_in_binding_order(self):
+        built = build(
+            [
+                CapabilityBinding(capability_id="charts"),
+                CapabilityBinding(capability_id="clock"),
+            ]
+        )
+        assert [type(c) for c in built] == [Charts, Clock]
+
+    def test_knowledge_is_not_attached_without_collections(self):
+        """A search tool that always returns empty is worse than none - the model keeps trying."""
+        built = build(
+            [CapabilityBinding(capability_id="knowledge")],
+            granted_scopes=frozenset({"knowledge:read"}),
+        )
+        assert built == []
+
+    def test_knowledge_is_attached_when_collections_are_bound(self):
+        built = build(
+            [CapabilityBinding(capability_id="knowledge")],
+            granted_scopes=frozenset({"knowledge:read"}),
+            resources={"kb_collection_names": ["kb_1"]},
+        )
+        assert isinstance(built[0], Knowledge)
+
+    def test_knowledge_carries_its_query_analysis_config(self):
+        """The binding's mode and bound reach the built capability, so it is what
+        actually runs rather than the default."""
+        built = build(
+            [
+                CapabilityBinding(
+                    capability_id="knowledge",
+                    config={"query_analysis_mode": "hyde", "query_analysis_max_variants": 4},
+                )
+            ],
+            granted_scopes=frozenset({"knowledge:read"}),
+            resources={"kb_collection_names": ["kb_1"]},
+        )
+        assert isinstance(built[0], Knowledge)
+        assert built[0].query_analysis_mode == "hyde"
+        assert built[0].query_analysis_max_variants == 4
+
+    def test_config_reaches_the_capability(self):
+        built = build(
+            [CapabilityBinding(capability_id="knowledge", config={"default_top_k": 9})],
+            resources={"kb_collection_names": ["kb_1"]},
+        )
+        capability = built[0]
+        assert isinstance(capability, Knowledge)
+        assert capability.default_top_k == 9
+        assert list(capability.get_toolset().tools) == ["search_documents"]
+
+    def test_sandbox_limits_reach_the_capability_and_default_when_absent(self):
+        """Both halves of the config contract: a stated limit is carried, and a
+        binding that says nothing gets the defaults rather than a crash."""
+        configured, bare = build(
+            [
+                CapabilityBinding(
+                    capability_id="code_execution",
+                    config={"timeout_secs": 30, "max_memory_mb": 512},
+                ),
+                CapabilityBinding(capability_id="code_execution"),
+            ],
+            granted_scopes=frozenset({"code:execute"}),
+        )
+        assert isinstance(configured, CodeExecution)
+        assert (configured.timeout_secs, configured.max_memory_mb) == (30, 512)
+        assert isinstance(bare, CodeExecution)
+        assert (bare.timeout_secs, bare.max_memory_mb) == (
+            CodeExecutionConfig().timeout_secs,
+            CodeExecutionConfig().max_memory_mb,
+        )
+
+    def test_a_binding_that_overrides_nothing_is_left_unwrapped(self):
+        """An override wrapper around a capability that changes nothing is noise.
+
+        `BuiltAgent.capabilities` is introspected by surfaces that want to say
+        what an agent can do; making them see through a transparent wrapper is a
+        cost paid by every agent to serve the few that rename anything.
+        """
+        built = build(
+            [
+                CapabilityBinding(
+                    capability_id="knowledge",
+                    tool_overrides={"search_documents": ToolOverride()},
+                )
+            ],
+            resources={"kb_collection_names": ["kb_1"]},
+        )
+
+        assert isinstance(built[0], Knowledge)
+
+    def test_missing_scope_is_refused_at_build_time(self):
+        with pytest.raises(BadRequestError) as exc:
+            build(
+                [CapabilityBinding(capability_id="code_execution")],
+                granted_scopes=frozenset(),
+            )
+        assert exc.value.details is not None
+        assert exc.value.details["missing_scopes"] == ["code:execute"]
+
+    def test_granted_scope_allows_the_capability(self):
+        built = build(
+            [CapabilityBinding(capability_id="code_execution")],
+            granted_scopes=frozenset({"code:execute"}),
+        )
+        assert isinstance(built[0], CodeExecution)
+
+    def test_scope_check_is_skipped_only_when_explicitly_disabled(self):
+        """None means "internal run"; it must not become the accidental default."""
+        assert build([CapabilityBinding(capability_id="code_execution")])
+
+
+class TestToolsets:
+    def test_the_clock_exposes_no_tools(self):
+        """It contributes instructions instead; see tests/test_clock.py."""
+        assert Clock().get_toolset() is None
+
+    def test_charts_exposes_create_chart(self):
+        assert list(Charts().get_toolset().tools) == ["create_chart"]
+
+    def test_code_execution_exposes_run_python(self):
+        assert list(CodeExecution().get_toolset().tools) == ["run_python"]
+
+    def test_web_research_exposes_web_search(self):
+        assert list(WebResearch().get_toolset().tools) == ["web_search"]
+
+    def test_knowledge_default_tool_name(self):
+        assert list(Knowledge().get_toolset().tools) == ["search_documents"]
+
+    def test_toolsets_are_built_once_per_instance(self):
+        capability = Clock()
+        assert capability.get_toolset() is capability.get_toolset()
+
+    def test_skills_exclude_script_execution(self):
+        """Without a sandbox, run_skill_script is remote code execution."""
+
+        class _Resource:
+            name = "template.md"
+            description = "Reply template"
+            content = "Dear {name},"
+
+        class _Skill:
+            name = "refunds"
+            description = "How refunds work."
+            content = "# Refunds"
+            resources: list[object] = [_Resource()]
+
+        toolset = Skills(skills=[_Skill()]).get_toolset()
+        assert toolset is not None
+        assert set(toolset.tools) == set(SAFE_SKILL_TOOLS)
+
+
+CATALOG_PATH = Path(__file__).resolve().parents[2] / "frontend" / "src" / "lib" / "tool-catalog.ts"
+
+
+def _frontend_tool_ids() -> frozenset[str]:
+    """The ids the web chat has a row for, read out of `TOOL_CATALOG`.
+
+    Parsed rather than generated. A generated file is a file somebody regenerates,
+    and the failure this guards against is exactly the one where nobody did - so the
+    check reads what a reviewer reads, and the only thing it depends on is that
+    prettier keeps the object's own keys at two spaces of indentation.
+    """
+    source = CATALOG_PATH.read_text(encoding="utf-8")
+    ids: set[str] = set()
+    # `FRAMEWORK_TOOLS` is a table of its own because Pydantic AI, not a
+    # capability, contributes those tools - but `skills` declares
+    # `load_capability` so that an approval can sit on the call that opens a
+    # skill, so the two tables together are what the chat can draw.
+    for name in ("TOOL_CATALOG", "FRAMEWORK_TOOLS"):
+        start = source.index(f"export const {name}")
+        body = source[source.index("{", start) : source.index("\n};", start)]
+        ids |= set(re.findall(r"^  ([a-z][a-z0-9_]*): \{", body, flags=re.MULTILINE))
+    return frozenset(ids)
+
+
+ART_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "frontend"
+    / "src"
+    / "components"
+    / "agents"
+    / "capability-art"
+)
+
+
+def _capabilities_with_art() -> frozenset[str]:
+    """The capability ids the Toolbox has a scene for, read out of the two art tables.
+
+    `art.generated.ts` is the design canvas's export, one key per scene at two
+    spaces; `art.drawn.ts` holds the scenes drawn by hand since, in `DRAWN_ART`.
+    """
+    generated = (ART_DIR / "art.generated.ts").read_text(encoding="utf-8")
+    drawn = (ART_DIR / "art.drawn.ts").read_text(encoding="utf-8")
+    table = drawn[drawn.index("export const DRAWN_ART") :]
+    return frozenset(
+        re.findall(r"^  ([a-z0-9_]+):\n    '<svg", generated, re.MULTILINE)
+    ) | frozenset(re.findall(r"^  ([a-z0-9_]+): [A-Z0-9_]+,$", table, re.MULTILINE))
+
+
+class TestToolboxArt:
+    def test_every_capability_has_a_scene_and_every_scene_a_capability(self):
+        """A capability with no scene shows a lone initial among the dioramas -
+        `background_tools` did, unnoticed, because nothing compared the two."""
+        registered = frozenset(definition.id for definition in all_capabilities())
+        drawn = _capabilities_with_art()
+
+        assert sorted(registered - drawn) == [], (
+            "draw a scene for each of these in capability-art/art.drawn.ts"
+        )
+        assert sorted(drawn - registered) == [], "these scenes draw no capability"
+
+
+class TestFrontendToolCatalog:
+    """The web chat's tool table holds exactly the tools capabilities register.
+
+    The registry is the source of truth on both sides of the wire, and until #144
+    nothing said so. `web_search` and `create_chart` were renamed in the backend
+    (b56ba1f), three frontend files went on matching the names they had before, and
+    both calls rendered as pretty-printed JSON for five weeks - beside the renderers
+    written for them, with a green frontend suite, because those tests constructed
+    tool calls under the old names too.
+
+    So this is the drift check across the boundary, and it is the *backend's* because
+    the registry is. Both directions matter and they fail for different reasons: a
+    missing row is a call whose result a person never sees, and a surplus row is a
+    renderer nothing will ever reach - which is the half that hid the bug, since a
+    frontend test can assert happily on a name no backend has emitted since July.
+
+    A name arriving from somewhere other than the registry - an MCP tool, or one a
+    binding renamed - is not in scope for either direction: it has no row, falls back
+    to the generic renderer, and that is the honest answer for it.
+    """
+
+    def test_the_frontend_catalog_matches_the_registry_exactly(self):
+        registered = frozenset(
+            tool.id for definition in all_capabilities() for tool in definition.tools
+        )
+        listed = _frontend_tool_ids()
+
+        assert sorted(registered - listed) == [], (
+            f"add a row to {CATALOG_PATH.name} for each of these - an icon, what the "
+            "step says while it runs, and which renderer opens under it"
+        )
+        assert sorted(listed - registered) == [], (
+            f"{CATALOG_PATH.name} has a row for a tool no capability registers; "
+            "nothing will ever render it"
+        )
+
+    def test_the_tool_a_call_adds_has_its_own_row(self):
+        """`hand_off` is no capability's, so the check above cannot see it (#54)."""
+        source = CATALOG_PATH.read_text(encoding="utf-8")
+        start = source.index("export const CALL_TOOLS")
+        body = source[source.index("{", start) : source.index("\n};", start)]
+        assert re.findall(r"^  ([a-z][a-z0-9_]*): \{", body, flags=re.MULTILINE) == [HAND_OFF_TOOL]
+
+
+def test_exactly_the_capabilities_a_call_cannot_run_live_say_so():
+    """#54: a realtime session cannot carry these, so a call hands them to the
+    agent's text twin; the Builder's Voice card lists them.
+
+    `channel_tools` alone is never in a call, which is never made on a channel;
+    `docs/reference/capabilities.md` says the same of each.
+    """
+    load_builtins()
+    by_support = {
+        support: {d.id for d in all_capabilities() if d.voice == support}
+        for support in ("hand_off", "never")
+    }
+    assert by_support == {
+        "hand_off": {
+            "sandbox",
+            "browser_use",
+            "computer_use",
+            "subagents",
+            "background_tools",
+            "coding_agent",
+            "video_generation",
+            "monitor",
+        },
+        "never": {"channel_tools", "follow_ups"},
+    }
+
+
+MESSAGES_PATH = Path(__file__).resolve().parents[2] / "frontend" / "messages"
+
+
+class TestCapabilitySettingsCopy:
+    """Every capability setting is named for a person, in every language (#2098).
+
+    The Builder generates a capability's settings form from its config schema, and
+    with no `title` Pydantic writes one from the field name - "Redact Pii In",
+    "Max Result Chars" - in English under every locale. So each field carries a
+    title of its own, and `capabilityConfig.<capability>.<field>` in each catalog
+    carries its title and description. The English entry is the schema's own words,
+    kept equal here, so changing one without the other fails rather than drifting.
+    """
+
+    @staticmethod
+    def _schema_copy() -> dict[str, dict[str, dict[str, str]]]:
+        copy: dict[str, dict[str, dict[str, str]]] = {}
+        for definition in all_capabilities():
+            schema = definition.config_json_schema()
+            if schema is None:
+                continue
+            copy[definition.id] = {
+                field: {"title": prop["title"], "description": prop["description"]}
+                for field, prop in schema["properties"].items()
+            }
+        return copy
+
+    @staticmethod
+    def _catalog(locale: str) -> dict[str, dict[str, dict[str, str]]]:
+        catalog = json.loads((MESSAGES_PATH / f"{locale}.json").read_text(encoding="utf-8"))
+        return catalog["capabilityConfig"]
+
+    def test_every_setting_has_a_title_written_for_it(self):
+        untitled = [
+            f"{definition.id}.{field}"
+            for definition in all_capabilities()
+            if definition.config_schema is not None
+            for field, info in definition.config_schema.model_fields.items()
+            if info.title is None
+        ]
+
+        assert untitled == [], "give each a Field(title=...) a person can read"
+
+    def test_the_english_catalog_says_what_the_schema_says(self):
+        assert self._catalog("en") == self._schema_copy()
+
+    def test_every_language_covers_every_setting_and_nothing_else(self):
+        expected = {
+            cap_id: {field: {"title", "description"} for field in fields}
+            for cap_id, fields in self._schema_copy().items()
+        }
+        for locale in ("pl", "de"):
+            catalog = self._catalog(locale)
+            covered = {
+                cap_id: {field: set(entry) for field, entry in fields.items()}
+                for cap_id, fields in catalog.items()
+            }
+            assert covered == expected, locale
+
+
+class TestConsoleCapabilityGuide:
+    """The console explains every capability, under the registry's own name (#2070).
+
+    The console reads a capability's name and its plain-language guide from its
+    message catalogs, so a person reads it in their language. That copy is a second
+    place a capability is named: a capability added here with no entry there is shown
+    to a Polish reader in English with no examples, and one renamed here keeps its old
+    name in the Builder while the API, the AI Architect and the docs use the new one.
+    """
+
+    @staticmethod
+    def _guide(locale: str) -> dict[str, dict[str, str]]:
+        catalog = json.loads((MESSAGES_PATH / f"{locale}.json").read_text(encoding="utf-8"))
+        return catalog["capabilityGuide"]
+
+    def test_every_capability_has_an_entry_and_no_entry_is_orphaned(self):
+        registered = sorted(definition.id for definition in all_capabilities())
+
+        for locale in ("en", "pl", "de"):
+            assert sorted(self._guide(locale)) == registered, locale
+
+    def test_the_english_name_is_the_registry_name(self):
+        guide = self._guide("en")
+
+        assert {d.id: d.name for d in all_capabilities()} == {
+            cap_id: entry["name"] for cap_id, entry in guide.items()
+        }
+
+    def test_the_glossary_names_each_capability_as_the_console_does(self):
+        """`docs/reference/glossary*.md` is the one list of names (#2075); a
+        capability renamed or added in the console and not there is a glossary
+        that has started to disagree with the screen it explains."""
+        docs = MESSAGES_PATH.parents[1] / "docs" / "reference"
+        for locale, page in (
+            ("en", "glossary.md"),
+            ("pl", "glossary.pl.md"),
+            ("de", "glossary.de.md"),
+        ):
+            text = (docs / page).read_text(encoding="utf-8")
+            rows = {
+                cap_id: name.strip()
+                for name, cap_id in re.findall(r"^\| ([^|`]+) \| `([a-z_0-9]+)` \|$", text, re.M)
+            }
+            assert rows == {
+                cap_id: entry["name"] for cap_id, entry in self._guide(locale).items()
+            }, locale
+
+    def test_each_entry_says_what_it_does_needs_and_never_does_with_examples(self):
+        for locale in ("en", "pl", "de"):
+            for cap_id, entry in self._guide(locale).items():
+                assert {"name", "does", "needs", "never", "example1"} <= entry.keys(), (
+                    locale,
+                    cap_id,
+                )

@@ -1,0 +1,897 @@
+import { act, createEvent, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { FileDropZone } from "@/components/rag/file-drop-zone";
+import { FileExplorer, WorkspaceExplorer, treeOf } from "./workspace-explorer";
+import type { WorkspaceFile, WorkspaceFiles } from "@/lib/sandbox-workspaces-api";
+
+const state = vi.hoisted(() => ({
+  files: null as WorkspaceFiles | null,
+  filesLoading: false,
+  filesError: null as string | null,
+  file: null as { path: string; content: string; truncated: boolean } | null,
+  fileLoading: false,
+  fileError: null as string | null,
+  bytesUrl: null as string | null,
+  bytesMediaType: "image/png" as string | null,
+  bytesLoading: false,
+  bytesError: null as string | null,
+  downloaded: [] as [string, string][],
+  downloadError: null as string | null,
+}));
+
+/**
+ * The access the explorer builds, with its address left readable.
+ *
+ * What this test is about is the tree: which files a folder shows, what search
+ * reaches, and that a click opens the viewer on the file that was clicked. How that
+ * file then *renders* is `components/files`, tested once there rather than once per
+ * surface - which is the whole point of there being one viewer.
+ */
+vi.mock("@/lib/workspace-files", () => ({
+  workspaceFileAccess: (source: { id: string }, path: string) => ({
+    id: source.id,
+    path,
+    textKey: ["text", path],
+    bytesKey: ["bytes", path],
+    download: () => {
+      state.downloaded.push([source.id, path]);
+      return Promise.resolve();
+    },
+  }),
+}));
+
+vi.mock("@/hooks", () => ({
+  useWorkspaceFiles: () => ({
+    files: state.files,
+    isLoading: state.filesLoading,
+    error: state.filesError,
+  }),
+  useFileText: () => ({
+    file: state.file,
+    isLoading: state.fileLoading,
+    error: state.fileError,
+  }),
+  useFileBytes: () => ({
+    url: state.bytesUrl,
+    mediaType: state.bytesMediaType,
+    isLoading: state.bytesLoading,
+    error: state.bytesError,
+  }),
+  useFileActions: (access: { id: string; path: string }) => ({
+    download: () => state.downloaded.push([access.id, access.path]),
+    openInNewTab: () => {},
+    error: state.downloadError,
+  }),
+}));
+
+vi.mock("@/components/chat/markdown-content", () => ({
+  MarkdownContent: ({ content }: { content: string }) => (
+    <div data-testid="rendered">{content}</div>
+  ),
+}));
+
+function file(path: string, overrides: Partial<WorkspaceFile> = {}): WorkspaceFile {
+  return { path, size: 128, is_dir: false, modified_at: null, ...overrides };
+}
+
+function listing(items: WorkspaceFile[], overrides: Partial<WorkspaceFiles> = {}): WorkspaceFiles {
+  return {
+    scope: "conversation",
+    backend: "state",
+    owner_label: "This conversation",
+    items,
+    total: items.length,
+    bytes_total: 4096,
+    unreadable_reason: null,
+    truncated: false,
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  state.files = listing([
+    file("/report.md"),
+    file("/skills/code-review/SKILL.md"),
+    file("/skills/code-review/checklist.md"),
+    file("/chart.png"),
+  ]);
+  state.filesLoading = false;
+  state.filesError = null;
+  state.file = { path: "/report.md", content: "# Report", truncated: false };
+  state.fileLoading = false;
+  state.fileError = null;
+  state.bytesUrl = "blob:chart";
+  state.bytesMediaType = "image/png";
+  state.bytesLoading = false;
+  state.bytesError = null;
+  state.downloaded = [];
+  state.downloadError = null;
+});
+
+/**
+ * One workspace, folder by folder.
+ *
+ * The listing carries every path, so a folder is a filter rather than a request -
+ * which is also what makes search immediate and whole-tree. The two properties worth
+ * pinning: walking in and out lands where you expect, and search is not scoped to
+ * the folder on screen, because "where is that CSV" is the question this is opened
+ * to answer.
+ */
+describe("the workspace explorer", () => {
+  it("shows every level at once, open, rather than one folder at a time", () => {
+    // The drill-down it replaces showed one level and a breadcrumb, so a workspace
+    // whose only folder was `uploads` opened on a list of one row and hid every
+    // file it held.
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("skills")).toBeVisible();
+    expect(screen.getByText("report.md")).toBeVisible();
+    expect(screen.getByText("SKILL.md")).toBeVisible();
+  });
+
+  it("says whose files these are, and what they weigh", () => {
+    // Under `agent` scope one workspace is shared, so somebody opens this and finds
+    // a file they never created; a tree of paths with no statement of who can see
+    // them is the wrong thing to hand somebody auditing it.
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText(/This conversation/)).toBeVisible();
+    expect(screen.getByText(/4\.0 KB stored/)).toBeVisible();
+  });
+
+  it("says nothing about size for a workspace kept on a host", () => {
+    // `bytes_total` is the stored document's size; for a container it is zero and
+    // would read as an empty workspace.
+    state.files = listing([file("/report.md")], { backend: "service", bytes_total: 0 });
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.queryByText(/stored/)).toBeNull();
+  });
+
+  it("closes a folder, and opens it again", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+    const folder = () => screen.getByRole("treeitem", { name: /skills/ });
+
+    expect(folder()).toHaveAttribute("aria-expanded", "true");
+
+    await userEvent.click(screen.getByText("skills"));
+
+    expect(folder()).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("SKILL.md")).toBeNull();
+
+    await userEvent.click(screen.getByText("skills"));
+
+    expect(screen.getByText("SKILL.md")).toBeVisible();
+  });
+
+  it("keeps a closed folder closed across a search", async () => {
+    // Searching replaces the tree with a flat list of matches, so the fold state
+    // has to live above it: kept in the tree, clearing the box would hand the
+    // reader the defaults back and reopen everything they closed.
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+    await userEvent.click(screen.getByText("skills"));
+    expect(screen.getByRole("treeitem", { name: /skills/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+
+    await userEvent.type(screen.getByLabelText("Search files by name"), "checklist");
+    await userEvent.clear(screen.getByLabelText("Search files by name"));
+
+    expect(screen.getByRole("treeitem", { name: /skills/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("shows the folder hierarchy without redundant file counts", () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    const folder = screen.getByRole("treeitem", { name: /skills/ });
+
+    expect(folder).not.toHaveTextContent(/\d+ files/);
+    expect(screen.getByRole("button", { name: "SKILL.md" })).toBeVisible();
+  });
+
+  it("indents each level, which is what says what is inside what", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    const indent = (name: string) => screen.getByText(name).closest("button")!.style.paddingLeft;
+
+    expect(indent("skills")).toBe("0.5rem");
+    expect(indent("code-review")).toBe("1.375rem");
+    expect(indent("SKILL.md")).toBe("3.5rem");
+  });
+
+  it("is a tree to a screen reader, not a list of buttons", async () => {
+    // The meaning of a row is its left margin, and a margin is not something a
+    // screen reader can read out.
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByRole("tree")).toBeInTheDocument();
+    expect(screen.getAllByRole("treeitem").length).toBeGreaterThan(3);
+  });
+
+  it("renders the file beside the tree rather than over it", async () => {
+    // A dialog closes the list every time, and reading a workspace means reading
+    // several files in turn - so the tree stays and the file renders next to it
+    // (#1039). `FileViewer` is still what the flat "all files" list opens, where
+    // one file is the whole errand.
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    await userEvent.click(screen.getByRole("button", { name: "report.md" }));
+
+    expect(await screen.findByTestId("rendered")).toHaveTextContent("# Report");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // The tree is still there, which is the whole reason for the shape.
+    expect(screen.getByRole("button", { name: "chart.png" })).toBeVisible();
+  });
+
+  it("keeps the selected file and source mode when expanding and returning to folders", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+    await userEvent.click(screen.getByRole("button", { name: "report.md" }));
+    await userEvent.click(screen.getByRole("button", { name: "Source" }));
+    await userEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(screen.getByRole("dialog", { name: "/report.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Preview" })).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Preview" })).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    await userEvent.click(screen.getByRole("button", { name: "Folders" }));
+    expect(screen.getByRole("button", { name: "report.md" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Preview" })).not.toBeInTheDocument();
+  });
+
+  it("offers markdown as source, and offers nothing to toggle on an image", async () => {
+    // The toggle exists where there are two renderings to choose between. On a PNG
+    // it would offer to show the same thing twice.
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    await userEvent.click(screen.getByRole("button", { name: "report.md" }));
+    await userEvent.click(screen.getByRole("button", { name: "Source" }));
+
+    expect(screen.getByRole("button", { name: "Preview" })).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.click(screen.getByRole("button", { name: "chart.png" }));
+
+    expect(screen.queryByRole("button", { name: /Source|Preview/ })).toBeNull();
+  });
+
+  it("opens the next file on its preview, whatever the last one showed", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+    await userEvent.click(screen.getByRole("button", { name: "report.md" }));
+    await userEvent.click(screen.getByRole("button", { name: "Source" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "chart.png" }));
+    await userEvent.click(screen.getByRole("button", { name: "report.md" }));
+
+    expect(screen.getByRole("button", { name: "Source" })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("moves between two files in one click", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+    await userEvent.click(screen.getByRole("button", { name: "report.md" }));
+    await screen.findByTestId("rendered");
+
+    await userEvent.click(screen.getByRole("button", { name: "chart.png" }));
+
+    expect(screen.getByRole("button", { name: "chart.png" })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "report.md" })).toHaveAttribute(
+      "aria-current",
+      "false",
+    );
+  });
+
+  it("searches the whole tree rather than the folder on screen", async () => {
+    // Which is the point of searching here at all: "where is that checklist" is
+    // asked by somebody who does not know which folder holds it, and a search
+    // scoped to the open folder answers that question only by luck.
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    await userEvent.type(screen.getByLabelText("Search files by name"), "checklist");
+
+    expect(screen.getByText("/skills/code-review/checklist.md")).toBeVisible();
+    expect(screen.queryByText("report.md")).toBeNull();
+    // The full path, because a name on its own does not say which folder matched.
+    expect(screen.queryByRole("treeitem")).toBeNull();
+  });
+
+  it("says so when a search matches nothing, rather than showing an empty tree", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    await userEvent.type(screen.getByLabelText("Search files by name"), "invoice");
+
+    expect(screen.getByText(/Nothing in this workspace matches/)).toBeVisible();
+  });
+
+  it("opens a file found by searching", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+    await userEvent.type(screen.getByLabelText("Search files by name"), "report");
+
+    await userEvent.click(screen.getByRole("button", { name: "/report.md" }));
+
+    expect(await screen.findByTestId("rendered")).toBeVisible();
+  });
+
+  it("reads an opened file with no measured size as unmeasured", async () => {
+    // A host that lists a file without a size is not a host reporting zero bytes.
+    state.files = listing([file("/report.md", { size: null })]);
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    await userEvent.click(screen.getByRole("button", { name: "report.md" }));
+
+    expect(await screen.findByTestId("rendered")).toBeVisible();
+    // Twice: on the row in the tree, and in the header of the reader beside it.
+    expect(screen.getAllByText("—")).toHaveLength(2);
+  });
+
+  it("reads a search result with no measured size as unmeasured", async () => {
+    state.files = listing([file("/uploads/report.csv", { size: null })]);
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    await userEvent.type(screen.getByLabelText("Search files by name"), "report");
+
+    expect(screen.getByText("—")).toBeVisible();
+  });
+
+  it("offers a search result's download without opening it", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+    await userEvent.type(screen.getByLabelText("Search files by name"), "checklist");
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Download /skills/code-review/checklist.md" }),
+    );
+
+    expect(state.downloaded).toEqual([["w-1", "/skills/code-review/checklist.md"]]);
+  });
+
+  it("offers a download without opening the file first", async () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Download /report.md" }));
+
+    expect(state.downloaded).toEqual([["w-1", "/report.md"]]);
+  });
+
+  it("explains a host that keeps nothing on disk instead of alarming somebody", () => {
+    state.files = listing([], { unreadable_reason: "This host keeps no workspaces on disk." });
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("This host keeps no workspaces on disk.")).toBeVisible();
+    expect(screen.getByText(/Nothing could be listed here/)).toBeVisible();
+  });
+
+  it("says when the tree is not the whole workspace", () => {
+    // An agent that ran an install has more than the walk lists, and a tree that
+    // does not say so is one somebody reads as everything the agent is keeping.
+    state.files = listing([file("/report.md")], { truncated: true });
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText(/This is not every file/)).toBeVisible();
+  });
+
+  it("says nothing of the kind for a workspace listed whole", () => {
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.queryByText(/This is not every file/)).toBeNull();
+  });
+
+  it("says a folder is empty when it is", () => {
+    state.files = listing([]);
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("This folder is empty.")).toBeVisible();
+  });
+
+  it("waits without claiming the workspace is empty", () => {
+    state.files = null;
+    state.filesLoading = true;
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.queryByText(/This folder is empty/)).toBeNull();
+  });
+
+  it("reports a listing that failed", () => {
+    state.files = null;
+    state.filesError = "That workspace could not be read";
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("That workspace could not be read")).toBeVisible();
+  });
+
+  it("reads a file with no measured size as unmeasured", () => {
+    state.files = listing([file("/report.md", { size: null })]);
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("—")).toBeVisible();
+  });
+
+  it("reads sizes in the units a person uses", () => {
+    state.files = listing([
+      file("/small.txt", { size: 12 }),
+      file("/mid.csv", { size: 2048 }),
+      file("/big.bin", { size: 2_097_152 }),
+    ]);
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("12 B")).toBeVisible();
+    expect(screen.getByText("2.0 KB")).toBeVisible();
+    expect(screen.getByText("2.0 MB")).toBeVisible();
+  });
+});
+
+/**
+ * The tree itself, which the component only ever renders.
+ *
+ * Worth its own tests because the awkward cases are all off-screen: a folder the
+ * listing never named, a directory entry that it did, and the order two readers of
+ * the same workspace have to see.
+ */
+describe("the tree built from the paths", () => {
+  const paths = (nodes: ReturnType<typeof treeOf>): string[] =>
+    nodes.flatMap((node) => [node.path, ...paths(node.children)]);
+
+  it("drops an entry that names no file at all", () => {
+    // A host answering with the working directory itself - `/`, or `.` - carries
+    // no segments, and a node with an empty name is a row nothing can open.
+    expect(treeOf([file("/"), file("/report.md")]).map((node) => node.path)).toEqual([
+      "/report.md",
+    ]);
+  });
+
+  it("invents a folder the listing never named", () => {
+    // A host that returns `uploads/x.pdf` and no directory row still has an
+    // `uploads`, and a tree built only from `is_dir` rows would hide the file
+    // under a folder it never drew.
+    const tree = treeOf([file("/uploads/x.pdf")]);
+
+    expect(tree).toHaveLength(1);
+    expect(tree[0]!.isDir).toBe(true);
+    expect(tree[0]!.label).toBe("uploads");
+    expect(tree[0]!.children.map((child) => child.label)).toEqual(["x.pdf"]);
+  });
+
+  it("uses the directory row where the listing includes one, not two folders", () => {
+    const tree = treeOf([file("/a", { is_dir: true }), file("/a/one.txt")]);
+
+    expect(paths(tree)).toEqual(["a", "/a/one.txt"]);
+  });
+
+  it("nests as deep as the paths do", () => {
+    const tree = treeOf([file("/skills/deploy/run.sh")]);
+
+    expect(paths(tree)).toEqual(["skills", "skills/deploy", "/skills/deploy/run.sh"]);
+  });
+
+  it("puts folders above files, each alphabetical", () => {
+    // The order every file manager uses, and the one that puts what can be opened
+    // where a reader looks first.
+    const tree = treeOf([file("/z.txt"), file("/a.txt"), file("/m/one.txt")]);
+
+    expect(tree.map((node) => node.label)).toEqual(["m", "a.txt", "z.txt"]);
+  });
+
+  it("keeps two folders apart", () => {
+    const tree = treeOf([file("/a/one.txt"), file("/b/two.txt")]);
+
+    expect(tree.map((node) => node.label)).toEqual(["a", "b"]);
+    expect(tree[0]!.children.map((child) => child.path)).toEqual(["/a/one.txt"]);
+  });
+});
+
+describe("the height it occupies", () => {
+  it("fills the page rather than being as tall as its content", () => {
+    // Two panes 300px tall under 600px of empty page: `min-h-[24rem]` was the only
+    // height in the chain and nothing above it passed one down. Every link has to
+    // carry `min-h-0`, or a flex child's default minimum is its content and the
+    // panes grow the page instead of scrolling inside it.
+    const { container } = render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    const root = container.firstElementChild!;
+
+    expect(root.className).toContain("flex-1");
+    expect(root.className).toContain("min-h-0");
+
+    const grid = container.querySelector(".grid")!;
+
+    expect(grid.className).toContain("flex-1");
+    expect(grid.className).toContain("min-h-0");
+  });
+
+  it("scrolls each pane inside its own share", () => {
+    // A workspace with two hundred files scrolls the list, not the page - and the
+    // reader's file stays where they left it.
+    const { container } = render(<WorkspaceExplorer workspaceId="w-1" />);
+    const [tree, reader] = [...container.querySelectorAll(".grid > div")];
+
+    expect(tree!.className).toContain("overflow-y-auto");
+    expect(reader!.className).toContain("overflow-hidden");
+  });
+});
+
+describe("which folders start open", () => {
+  it("opens every folder of a small workspace", () => {
+    // A workspace nests three deep at most and usually holds a handful of files, so
+    // a tree that starts closed hides the only thing on the page - `uploads` was
+    // one click away from being the only visible row.
+    state.files = listing([file("/uploads/ksionszka.pdf"), file("/skills/deploy/run.sh")]);
+
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("ksionszka.pdf")).toBeVisible();
+    expect(screen.getByText("run.sh")).toBeVisible();
+  });
+
+  it("opens only the top level of a workspace too large to draw whole", () => {
+    // A thousand rows rendered at once is a different failure from a hidden one.
+    state.files = listing([
+      ...Array.from({ length: 201 }, (_, n) => file(`/uploads/scan-${n}.pdf`)),
+      file("/uploads/deep/one.txt"),
+    ]);
+
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("deep")).toBeVisible();
+    expect(screen.queryByText("one.txt")).toBeNull();
+  });
+
+  it("shows an empty folder as an empty folder rather than as nothing", () => {
+    // A host that lists a directory row with nothing inside it: the drill-down
+    // answered "This folder is empty" on a page with no other content, which reads
+    // as a broken workspace.
+    state.files = listing([file("/uploads", { is_dir: true }), file("/report.md")]);
+
+    render(<WorkspaceExplorer workspaceId="w-1" />);
+
+    expect(screen.getByText("uploads")).toBeVisible();
+    expect(screen.getByText("report.md")).toBeVisible();
+  });
+});
+
+describe("a set of files somebody may change", () => {
+  const source = { kind: "project", id: "p-1" } as const;
+
+  it("draws the caller's controls and removes a file, a folder or a search hit", async () => {
+    const onRemove = vi.fn();
+    render(
+      <FileExplorer
+        source={source}
+        files={state.files}
+        isLoading={false}
+        error={null}
+        toolbar={<button type="button">Upload</button>}
+        onRemove={onRemove}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Upload" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove /report.md" }));
+    expect(onRemove).toHaveBeenLastCalledWith("/report.md");
+    await userEvent.click(screen.getByRole("button", { name: "Remove skills" }));
+    expect(onRemove).toHaveBeenLastCalledWith("skills");
+
+    await userEvent.type(screen.getByRole("textbox"), "chart");
+    await userEvent.click(screen.getByRole("button", { name: "Remove /chart.png" }));
+    expect(onRemove).toHaveBeenLastCalledWith("/chart.png");
+  });
+
+  it("offers no removal where the caller passed none", () => {
+    render(<FileExplorer source={source} files={state.files} isLoading={false} error={null} />);
+    expect(screen.queryByRole("button", { name: /^Remove/ })).toBeNull();
+  });
+});
+
+it("keeps both file explorer panes while the listing loads", () => {
+  const files = state.files;
+  state.files = null;
+  state.filesLoading = true;
+  const { container, rerender } = render(<WorkspaceExplorer workspaceId="ws-1" />);
+  const grid = container.querySelector(".lg\\:grid-cols-\\[20rem_1fr\\]");
+  expect(grid).not.toBeNull();
+  const panes = Array.from(grid?.children ?? []);
+  expect(panes).toHaveLength(2);
+  expect(screen.getByRole("textbox")).toBeDisabled();
+  state.files = files;
+  state.filesLoading = false;
+  rerender(<WorkspaceExplorer workspaceId="ws-1" />);
+  expect(Array.from(grid?.children ?? [])).toEqual(panes);
+  expect(screen.getByRole("textbox")).toBeEnabled();
+});
+
+it("moves a file into a folder and back to the project root through drag and drop", async () => {
+  const move = vi.fn().mockResolvedValue(undefined);
+  const files = listing([file("notes", { is_dir: true }), file("brief.md")]);
+  render(
+    <FileExplorer
+      source={{ kind: "project", id: "p-1" }}
+      files={files}
+      isLoading={false}
+      error={null}
+      onMove={move}
+    />,
+  );
+  const dataTransfer = {
+    types: ["application/x-agenticos-project-path"],
+    getData: () => "brief.md",
+    setData: vi.fn(),
+    effectAllowed: "",
+    dropEffect: "",
+  };
+  const row = screen.getByRole("button", { name: "brief.md" }).closest("li");
+  if (!row) throw new Error("Missing file row");
+  await userEvent.click(screen.getByRole("button", { name: "brief.md" }));
+  fireEvent.dragStart(row, { dataTransfer });
+  expect(dataTransfer.setData).toHaveBeenCalledWith(
+    "application/x-agenticos-project-path",
+    "brief.md",
+  );
+  const folder = screen.getByRole("button", { name: "notes" }).parentElement;
+  if (!folder) throw new Error("Missing folder row");
+  fireEvent.dragOver(folder, { dataTransfer });
+  fireEvent.drop(folder, { dataTransfer });
+  await waitFor(() => expect(move).toHaveBeenCalledWith("brief.md", "notes/brief.md"));
+  fireEvent.dragLeave(folder, { dataTransfer });
+  fireEvent.dragEnd(row, { dataTransfer });
+  fireEvent.dragOver(screen.getByRole("button", { name: "Project files" }), { dataTransfer });
+  fireEvent.drop(screen.getByRole("button", { name: "Project files" }), {
+    dataTransfer: { ...dataTransfer, getData: () => "notes/brief.md" },
+  });
+  await waitFor(() => expect(move).toHaveBeenCalledWith("notes/brief.md", "brief.md"));
+  fireEvent.dragLeave(screen.getByRole("button", { name: "Project files" }), { dataTransfer });
+  await userEvent.click(screen.getByRole("button", { name: "Project files" }));
+  fireEvent.drop(folder, { dataTransfer: { ...dataTransfer, types: ["Files"] } });
+  fireEvent.drop(folder, { dataTransfer: { ...dataTransfer, getData: () => "notes" } });
+  move.mockRejectedValueOnce(new Error("conflict"));
+  fireEvent.drop(folder, { dataTransfer });
+  await waitFor(() => expect(move).toHaveBeenCalledTimes(3));
+  await userEvent.type(screen.getByRole("textbox", { name: "Search files by name" }), "brief");
+  expect(screen.getByRole("button", { name: "Actions for brief.md" })).toBeInTheDocument();
+});
+
+it("uploads into the hovered folder once and dismisses the outer drop hint", () => {
+  const upload = vi.fn();
+  const rootUpload = vi.fn();
+  render(
+    <FileDropZone collectionName="Project" onFiles={rootUpload}>
+      <FileExplorer
+        source={{ kind: "project", id: "p-1" }}
+        files={listing([file("notes", { is_dir: true })])}
+        isLoading={false}
+        error={null}
+        onUpload={upload}
+        onMove={vi.fn()}
+      />
+    </FileDropZone>,
+  );
+  const folder = screen.getByRole("button", { name: "notes" });
+  const dragged = new File(["hello"], "brief.md");
+  const dataTransfer = { types: ["Files"], files: [dragged], dropEffect: "" };
+  fireEvent.dragEnter(folder, { dataTransfer });
+  expect(screen.getByTestId("project-file-drop-overlay")).toBeInTheDocument();
+  fireEvent.dragOver(folder, { dataTransfer });
+  expect(dataTransfer.dropEffect).toBe("copy");
+  const row = folder.parentElement;
+  if (!row) throw new Error("Missing row");
+  const highlight = row.style.backgroundColor;
+  expect(highlight).not.toBe("");
+  const leave = createEvent.dragLeave(row, { dataTransfer });
+  Object.defineProperty(leave, "relatedTarget", { value: folder });
+  fireEvent(row, leave);
+  expect(row.style.backgroundColor).toBe(highlight);
+  vi.spyOn(row, "getBoundingClientRect").mockReturnValue(new DOMRect(10, 10, 200, 100));
+  const webkitLeave = createEvent.dragLeave(row, { dataTransfer });
+  Object.defineProperties(webkitLeave, {
+    relatedTarget: { value: null },
+    clientX: { value: 50 },
+    clientY: { value: 60 },
+  });
+  fireEvent(row, webkitLeave);
+  expect(row.style.backgroundColor).toBe(highlight);
+  fireEvent.drop(folder, { dataTransfer });
+  expect(upload).toHaveBeenCalledExactlyOnceWith([dragged], "notes");
+  expect(rootUpload).not.toHaveBeenCalled();
+  expect(screen.queryByTestId("project-file-drop-overlay")).not.toBeInTheDocument();
+});
+
+it("opens a collapsed destination after hovering, and cancels a hover on leave", () => {
+  vi.useFakeTimers();
+  try {
+    render(
+      <FileExplorer
+        source={{ kind: "project", id: "p-1" }}
+        files={listing([file("notes/brief.md")])}
+        isLoading={false}
+        error={null}
+        onUpload={vi.fn()}
+      />,
+    );
+    const folder = screen.getByRole("button", { name: "notes" });
+    fireEvent.click(folder);
+    expect(screen.queryByRole("button", { name: "brief.md" })).not.toBeInTheDocument();
+    const dataTransfer = { types: ["Files"], files: [], dropEffect: "" };
+    fireEvent.dragOver(folder, { dataTransfer });
+    fireEvent.dragLeave(folder, { dataTransfer });
+    act(() => vi.advanceTimersByTime(700));
+    expect(screen.queryByRole("button", { name: "brief.md" })).not.toBeInTheDocument();
+    fireEvent.dragOver(folder, { dataTransfer });
+    act(() => vi.advanceTimersByTime(600));
+    expect(screen.getByRole("button", { name: "brief.md" })).toBeVisible();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("uses the file's containing folder as a drop destination", async () => {
+  const upload = vi.fn();
+  const move = vi.fn().mockResolvedValue(undefined);
+  render(
+    <FileExplorer
+      source={{ kind: "project", id: "p-1" }}
+      files={listing([file("notes/existing.md"), file("brief.md")])}
+      isLoading={false}
+      error={null}
+      onUpload={upload}
+      onMove={move}
+    />,
+  );
+  const target = screen.getByRole("button", { name: "existing.md" });
+  const dragged = new File(["new"], "new.txt");
+  fireEvent.dragOver(target, {
+    dataTransfer: { types: ["Files"], files: [dragged], dropEffect: "" },
+  });
+  fireEvent.drop(target, { dataTransfer: { types: ["Files"], files: [dragged] } });
+  expect(upload).toHaveBeenCalledExactlyOnceWith([dragged], "notes");
+  fireEvent.drop(target, {
+    dataTransfer: { types: ["application/x-agenticos-project-path"], getData: () => "brief.md" },
+  });
+  await waitFor(() => expect(move).toHaveBeenCalledExactlyOnceWith("brief.md", "notes/brief.md"));
+});
+
+it("accepts root drops on empty space in either pane instead of requiring the root label", async () => {
+  const upload = vi.fn();
+  const move = vi.fn().mockResolvedValue(undefined);
+  render(
+    <FileExplorer
+      source={{ kind: "project", id: "p-1" }}
+      files={listing([file("notes/brief.md")])}
+      isLoading={false}
+      error={null}
+      onUpload={upload}
+      onMove={move}
+    />,
+  );
+  const tree = screen.getByRole("tree");
+  const pane = tree.parentElement;
+  const grid = pane?.parentElement;
+  if (!pane || !grid) throw new Error("Missing file panes");
+  const dragged = new File(["new"], "new.txt");
+  fireEvent.drop(pane, { dataTransfer: { types: ["Files"], files: [dragged] } });
+  expect(upload).toHaveBeenCalledExactlyOnceWith([dragged], "");
+  fireEvent.drop(grid.lastElementChild ?? grid, {
+    dataTransfer: {
+      types: ["application/x-agenticos-project-path"],
+      getData: () => "notes/brief.md",
+    },
+  });
+  await waitFor(() => expect(move).toHaveBeenCalledExactlyOnceWith("notes/brief.md", "brief.md"));
+});
+
+it("refuses dragging a file onto its current folder and accepts root hover", async () => {
+  const move = vi.fn().mockResolvedValue(undefined);
+  render(
+    <FileExplorer
+      source={{ kind: "project", id: "p-1" }}
+      files={listing([file("notes/brief.md")])}
+      isLoading={false}
+      error={null}
+      onMove={move}
+    />,
+  );
+  const folder = screen.getByRole("button", { name: "notes" });
+  const row = screen.getByRole("button", { name: "brief.md" }).closest("li");
+  if (!row) throw new Error("Missing file row");
+  const dataTransfer = {
+    types: ["application/x-agenticos-project-path"],
+    setData: vi.fn(),
+    getData: () => "notes/brief.md",
+    dropEffect: "",
+    effectAllowed: "",
+  };
+  fireEvent.dragStart(row, { dataTransfer });
+  fireEvent.dragOver(folder, { dataTransfer });
+  expect(dataTransfer.dropEffect).toBe("none");
+  expect(move).not.toHaveBeenCalled();
+  const grid = screen.getByRole("tree").parentElement?.parentElement;
+  if (!grid) throw new Error("Missing explorer grid");
+  fireEvent.dragOver(grid, { dataTransfer });
+  expect(dataTransfer.dropEffect).toBe("move");
+  fireEvent.dragLeave(grid, { dataTransfer });
+  fireEvent.dragOver(grid, { dataTransfer: null });
+  fireEvent.dragOver(grid, { dataTransfer: { types: ["text/plain"] } });
+  fireEvent.drop(grid, { dataTransfer: null });
+});
+
+it("merges dot-prefixed directories while retaining each file's opening path", () => {
+  const original = file("./uploads/first.pdf");
+  const tree = treeOf([file("."), original, file("uploads/second.pdf")]);
+  expect(tree.map((node) => node.label)).toEqual(["uploads"]);
+  expect(tree[0]?.children.map((node) => node.path)).toEqual([
+    "./uploads/first.pdf",
+    "uploads/second.pdf",
+  ]);
+  expect(tree[0]?.children[0]?.file).toBe(original);
+});
+
+it("releases fullscreen when a refreshed listing no longer contains the selected file", async () => {
+  const props = {
+    source: { kind: "project" as const, id: "p-1" },
+    isLoading: false,
+    error: null,
+  };
+  const { rerender } = render(<FileExplorer {...props} files={listing([file("brief.md")])} />);
+  const treePane = screen.getByRole("tree").parentElement;
+  await userEvent.click(screen.getByRole("button", { name: "brief.md" }));
+  await userEvent.click(screen.getByRole("button", { name: "Full screen" }));
+  expect(treePane?.inert).toBe(true);
+  expect(document.body.style.overflow).toBe("hidden");
+  rerender(<FileExplorer {...props} files={listing([])} />);
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(document.body.style.overflow).not.toBe("hidden");
+  expect(treePane?.inert).toBe(false);
+});
+
+it("releases the shell when a listing fails while the file reader is expanded", async () => {
+  const props = {
+    source: { kind: "project" as const, id: "p-1" },
+    files: listing([file("brief.md")]),
+    isLoading: false,
+  };
+  const { rerender } = render(<FileExplorer {...props} error={null} />);
+  const treePane = screen.getByRole("tree").parentElement;
+  await userEvent.click(screen.getByRole("button", { name: "brief.md" }));
+  await userEvent.click(screen.getByRole("button", { name: "Full screen" }));
+  expect(treePane?.inert).toBe(true);
+  rerender(<FileExplorer {...props} error="Listing unavailable" />);
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(screen.getByText("Listing unavailable")).toBeVisible();
+  expect(document.body.style.overflow).not.toBe("hidden");
+  expect(treePane?.inert).toBe(false);
+});
+
+it("opens a selected project file in the full-screen reader on a phone", async () => {
+  const media = vi.spyOn(window, "matchMedia").mockReturnValue({
+    matches: true,
+    media: "(max-width: 767px)",
+    onchange: null,
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(() => true),
+  });
+  try {
+    render(
+      <FileExplorer
+        source={{ kind: "project", id: "p-1" }}
+        files={listing([file("brief.md")])}
+        isLoading={false}
+        error={null}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "brief.md" }));
+    const reader = screen.getByRole("dialog", { name: "brief.md" });
+    expect(reader.contains(document.activeElement)).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Folders" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("button", { name: "brief.md" })).toHaveFocus();
+    expect(document.body.style.overflow).not.toBe("hidden");
+  } finally {
+    media.mockRestore();
+  }
+});

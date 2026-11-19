@@ -1,0 +1,1989 @@
+"use client";
+
+import { useResourceCreation, mergeResourceChoices } from "@/components/agents/resource-creation";
+import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import {
+  AlertCircle,
+  SlidersHorizontal,
+  Wrench,
+  ShieldCheck,
+  Archive,
+  ArchiveRestore,
+  Copy,
+  Download,
+  FlaskConical,
+  History,
+  ImagePlus,
+  MessageSquare,
+  MoreHorizontal,
+  Network,
+  Plug,
+  Trash2,
+  Upload,
+  Workflow,
+  Radio,
+  UserPlus,
+  X,
+} from "lucide-react";
+
+import { PinAgentButton } from "@/components/agents/pin-agent-button";
+import { AgentAvatar } from "@/components/agents/agent-avatar";
+import {
+  AgentMap,
+  capabilityMark,
+  MAP_ICONS,
+  MAP_ITEM_ICONS,
+  surfaceMark,
+  type MapDelegate,
+  type MapNode,
+} from "@/components/agents/agent-map";
+import { MODE_LABEL } from "@/components/agents/agent-map-nodes";
+import { entryForConnection } from "@/lib/mcp-servers";
+import { askedToTest, readTestPanel, writeTestPanel } from "@/lib/test-panel-state";
+import { toMapDelegates } from "@/components/agents/agent-map-tree";
+import { AgentStatusBadge } from "@/components/agents/status-badge";
+import { RemoteChangeBanner } from "@/components/live-updates/remote-change-banner";
+import { ContextHelp } from "@/components/ui/context-help";
+import { InstructionsEditor } from "@/components/agents/instructions-editor";
+import { PromptVariablesPanel } from "@/components/agents/prompt-variables-panel";
+import { StartersPanel } from "@/components/agents/starters-panel";
+import { usableForAgents } from "@/lib/model-profiles";
+import { glideOrJump } from "@/lib/motion";
+import { insertVariable } from "@/lib/variable-completion";
+import { useRemoteDraft } from "@/hooks/use-remote-draft";
+import { AlertsPanel } from "@/components/agents/alerts-panel";
+import { LoopGuardFields } from "@/components/agents/loop-guard-fields";
+import { ReviewersCard } from "@/components/agents/reviewers-card";
+import { CodeModeField } from "@/components/agents/code-mode-field";
+import { CapabilityWorkbench } from "@/components/agents/capability-workbench";
+import { A2aPanel } from "@/components/agents/a2a-panel";
+import { EmbedsPanel } from "@/components/agents/embeds-panel";
+import { ExposuresPanel } from "@/components/agents/exposures-panel";
+import { TriggersPanel } from "@/components/triggers/triggers-panel";
+import type { McpCatalogEntry } from "@/types/mcp";
+import {
+  ConnectOwnServerDialog,
+  ConnectServerDialog,
+  useConnectEntry,
+  useSignInOwn,
+} from "@/components/agents/connect-server-dialog";
+import { hereForMcpOAuthReturn } from "@/lib/mcp-oauth";
+import { McpToolPickerDialog } from "@/components/mcp/mcp-tool-picker-dialog";
+import type { ToolPickerState } from "@/components/mcp/mcp-server-list-types";
+import { bindingKey, McpServerPicker } from "@/components/agents/mcp-server-picker";
+import { McpToolLoadNotice } from "@/components/agents/mcp-tool-load-notice";
+import { StaleReferences } from "@/components/agents/stale-references";
+import { McpServerList } from "@/components/mcp/mcp-server-list";
+import { MetadataEditor } from "@/components/agents/metadata-editor";
+import { ModelProfilePicker } from "@/components/agents/model-profile-picker";
+import { ObservabilityCard } from "@/components/agents/observability-card";
+import { VoiceCard } from "@/components/agents/voice-card";
+import { PublishDialog } from "@/components/agents/publish-dialog";
+import { PublishState } from "@/components/agents/publish-state";
+import { ModelSettingsForm } from "@/components/agents/model-settings-form";
+import { AnswerFormatForm } from "@/components/agents/answer-format-form";
+import { ThinkingSetting } from "@/components/agents/thinking-setting";
+import { EnvironmentsPanel } from "@/components/agents/environments-panel";
+import { TestPanel } from "@/components/agents/test-panel/test-panel";
+import { useTestShortcut } from "@/components/agents/test-panel/use-test-shortcut";
+import { VersionHistory } from "@/components/agents/version-history";
+import { PageHeader } from "@/components/dashboard/page-header";
+import { SharingPanel } from "@/components/sharing/sharing-panel";
+import {
+  Badge,
+  Button,
+  ConfirmDialog,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  AvatarColorPicker,
+  IconButton,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuItemText,
+  DESCRIBED_ITEM,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  Input,
+  Label,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  MarkdownModeToggle,
+  type MarkdownMode,
+  Textarea,
+  Alert,
+  AlertDescription,
+} from "@/components/ui";
+import {
+  useAgent,
+  useAgentEnvironments,
+  useAgents,
+  useAgentVersions,
+  useCapabilityCatalog,
+  usePromptVariables,
+  useDelegationTree,
+  useEmbeds,
+  useExposures,
+  useKnowledgeBases,
+  useMcpCatalog,
+  useMcpConnections,
+  useModelProviders,
+  useOrgMcpConnections,
+  usePermissions,
+  useSkills,
+  useUrlState,
+} from "@/hooks";
+import {
+  readSubagentsConfig,
+  PERSONAL_CAPABILITIES,
+  SANDBOX_ID,
+  SUBAGENTS_ID,
+  THINKING_ID,
+  withCapability,
+  withContextFiles,
+  withSkills,
+  withVisuals,
+  VISUALS_ID,
+} from "@/lib/agent-spec";
+import { useContextFiles } from "@/hooks/use-context";
+import { getErrorMessage, type FieldProblem } from "@/lib/api-error";
+import { toolsForBinding } from "@/lib/binding-tools";
+import { ROUTES } from "@/lib/constants";
+import { useAgentSelectionStore, useConversationStore } from "@/stores";
+import { cn } from "@/lib/utils";
+import type { AgentSpec, CapabilityBindingSpec, McpServerRef } from "@/types/agents";
+import type { OrgMcpConnectionRecord } from "@/lib/org-mcp-connections-api";
+import { Perm } from "@/types/permissions";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { DIALOG_CANVAS, DIALOG_FORM, DIALOG_SCROLL } from "@/lib/dialog-sizes";
+import { narrowedSelection } from "@/lib/mcp-servers";
+
+interface PageProps {
+  params: Promise<{ id: string }>;
+}
+
+/**
+ * What the tool picker opens with for one binding.
+ *
+ * The tools come from the connection's **last successful probe** rather than a
+ * fresh one: probing dials out to a third party and is gated on
+ * `connections:manage`, which an agent author need not hold (#1341).
+ *
+ * A connection nothing has probed yet has no catalogue, and a binding that
+ * already names tools would then read "0 of 0 on" while its card says three -
+ * so the names it holds stand in. They came from the server once, they are what
+ * the agent is bound to, and they can at least be narrowed further without a
+ * probe. The dialog says where to get the real list.
+ */
+function toolChoice(
+  ref: McpServerRef,
+  connection: OrgMcpConnectionRecord,
+  name: string,
+): ToolPickerState {
+  const probed = connection.last_tools;
+  const tools =
+    probed ?? (ref.allowed_tools ?? []).map((tool) => ({ name: tool, description: "" }));
+  return {
+    scope: "organization",
+    // The server's name, not the connection's: a binding to each person's own
+    // account borrows an organization connection's probe for the catalogue of
+    // tools and is not a narrowing of that connection.
+    name,
+    connection,
+    tools,
+    checked: new Set(ref.allowed_tools ?? tools.map((one) => one.name)),
+    appliesTo: "agent",
+  };
+}
+
+/** The Builder's tabs, as `?tab=` names them; anything else is the first. */
+const BUILDER_TABS = new Set(["build", "toolbox", "mcp", "limits", "availability", "history"]);
+
+export default function AgentBuilderPage({ params }: PageProps) {
+  const t = useTranslations("pages.agents");
+  const tMenu = useTranslations("agents");
+  // The reader's own MCP accounts: the tools of a server bound only through each
+  // person's account are listed from theirs.
+  const { connections: myMcpConnections, remove: removeMyMcpConnection } = useMcpConnections();
+  const tc = useTranslations("common");
+  const tSharing = useTranslations("sharing");
+  const tAgents = useTranslations("agents");
+  const tErrors = useTranslations("errors");
+  const tAnswer = useTranslations("answerFormat");
+  const { id } = use(params);
+  const router = useRouter();
+  const {
+    agent,
+    isLoading,
+    fetchedAt,
+    saveDraft,
+    validate,
+    publish,
+    rollback,
+    setAvatar,
+    setColor,
+  } = useAgent(id);
+  const { environments, promote } = useAgentEnvironments(id);
+  const { agents, clone, archive, unarchive, remove } = useAgents();
+  const { capabilities } = useCapabilityCatalog();
+  const { variables: promptVariables } = usePromptVariables();
+  const instructionsBox = useRef<HTMLTextAreaElement>(null);
+  const [instructionsMode, setInstructionsMode] = useState<MarkdownMode>("source");
+  const { profiles, profilesStatus } = useModelProviders();
+  // The Builder holds the set rather than paging it: the gallery has to know
+  // which selected skills still exist, and it can only tell that from what it
+  // has. 100 is the endpoint's ceiling; `total` says when that is not all.
+  const {
+    skills,
+    total: skillCount,
+    isLoading: skillsLoading,
+    error: skillsError,
+  } = useSkills({ limit: 100 });
+  const {
+    files: contextFiles,
+    total: contextCount,
+    isLoading: contextLoading,
+    error: contextError,
+  } = useContextFiles({ limit: 100 });
+  const {
+    kbs: collections,
+    isLoading: collectionsLoading,
+    listError: collectionsError,
+  } = useKnowledgeBases();
+  // Only the newest, and only for the number below: the history card pages the
+  // rest itself, so a page that fetched fifty to read one would be fetching a
+  // list nothing on it renders.
+  const { versions } = useAgentVersions(id, { limit: 1 });
+  const { can, isLoaded: permissionsLoaded } = usePermissions();
+  // The organization's servers, never the author's own: a personal connection
+  // is refused at publish, so offering one would be offering a choice that
+  // cannot be published. `useMcpCatalog` only supplies the names and logos -
+  // the ids the spec stores belong to the connections.
+  const {
+    connections: mcpConnections,
+    test: probeMcpConnection,
+    isLoading: connectionsLoading,
+    error: connectionsError,
+  } = useOrgMcpConnections();
+  const [connectingServer, setConnectingServer] = useState<McpCatalogEntry | null>(null);
+  const [connectingOwnServer, setConnectingOwnServer] = useState<McpCatalogEntry | null>(null);
+  const connectServer = useConnectEntry("organization", {
+    openForm: setConnectingServer,
+    held: mcpConnections,
+  });
+  const signInOwnServer = useSignInOwn({ returnTo: hereForMcpOAuthReturn() });
+  const connectOwnServer = useConnectEntry("personal", {
+    returnTo: hereForMcpOAuthReturn(),
+    openForm: setConnectingOwnServer,
+    held: myMcpConnections,
+  });
+  const [toolPicker, setToolPicker] = useState<ToolPickerState | null>(null);
+  // Which binding the open tool picker narrows, by `bindingKey`. Kept beside the
+  // picker state rather than inside it because the dialog is shared with the
+  // servers page, where a binding is not a thing.
+  const [toolBinding, setToolBinding] = useState<string | null>(null);
+  const { exposures } = useExposures(id);
+  const { embeds } = useEmbeds(id);
+  const { servers: mcpCatalog, isLoading: catalogLoading, error: catalogError } = useMcpCatalog();
+  const selectAgentForChat = useAgentSelectionStore((state) => state.select);
+  const resetConversation = useConversationStore((state) => state.reset);
+
+  const [spec, setSpec] = useState<AgentSpec | null>(null);
+  const [problems, setProblems] = useState<string[]>([]);
+  // The subset of them that names an input, so the capability whose
+  // configuration was refused marks the box rather than only saying so in
+  // the list above the form (#882).
+  const [configProblems, setConfigProblems] = useState<FieldProblem[]>([]);
+  const [confirming, setConfirming] = useState<"archive" | "delete" | null>(null);
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [mapOpen, setMapOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  // In the address, so a reload or a shared link lands on the same tab.
+  const [tabParam, changeTab] = useUrlState("tab");
+  const tab = tabParam !== null && BUILDER_TABS.has(tabParam) ? tabParam : "build";
+  const setTab = (next: string) => changeTab(next === "build" ? null : next);
+  // The Model card, which "No model selected" takes its reader to (#2483).
+  // From another tab the card mounts a render after the tab changes, so the
+  // scroll waits for the card to attach rather than for the tab.
+  const modelCard = useRef<HTMLDivElement | null>(null);
+  const revealModel = useRef(false);
+  const attachModelCard = useCallback((node: HTMLDivElement | null) => {
+    modelCard.current = node;
+    if (node && revealModel.current) {
+      revealModel.current = false;
+      node.scrollIntoView({ behavior: glideOrJump(), block: "start" });
+    }
+  }, []);
+  const goToModel = () => {
+    if (tab === "build" && modelCard.current) {
+      modelCard.current.scrollIntoView({ behavior: glideOrJump(), block: "start" });
+      return;
+    }
+    revealModel.current = true;
+    setTab("build");
+  };
+  // Set by the first publish only: the moment an agent can be reached is the
+  // moment to say where it can be reached from, which people did not find on
+  // their own (#2131).
+  const [firstPublished, setFirstPublished] = useState(false);
+  // Fetched only while the map shows it: the server resolves and
+  // access-checks every pinned version to build this.
+  const {
+    tree,
+    isLoading: treeLoading,
+    error: treeError,
+  } = useDelegationTree(id, { enabled: mapOpen });
+  const [connectingMcp, setConnectingMcp] = useState(false);
+  // Open or shut per agent, remembered with the panel's width and pinned prompts.
+  const [testing, setTesting] = useState(() => readTestPanel(id).open || askedToTest());
+  const toggleTesting = (open: boolean) => {
+    writeTestPanel(id, { ...readTestPanel(id), open });
+    setTesting(open);
+  };
+
+  // Bumped after an upload so the <img> src changes; the URL is otherwise
+  // identical and the browser would keep showing the picture it replaced.
+  const [avatarVersion, setAvatarVersion] = useState(0);
+  const avatarInput = useRef<HTMLInputElement>(null);
+
+  // Adopt the server's draft whenever there is nothing local, and not
+  // otherwise: every autosave invalidates the agent query, and re-adopting the
+  // answer would overwrite whatever was typed while the save was in flight.
+  // `setSpec(null)` is how a flow that really does replace the draft (rollback)
+  // asks to adopt again - so the condition is the absent spec, not a changed
+  // draft. Rolling back to a version structurally equal to the current draft
+  // leaves React Query holding the same reference, and gating on the reference
+  // moving left the page on its skeleton with no way out.
+  if (agent?.draft_spec && spec === null) {
+    setSpec(agent.draft_spec);
+  }
+
+  // A workflow step's own agent is changed in that step, so nothing here edits it.
+  const ownedByWorkflow = agent?.workflow_id ?? null;
+  const canEdit = can(Perm.agentsEdit) && ownedByWorkflow === null;
+  const canPublish = can(Perm.agentsPublish) && ownedByWorkflow === null;
+  const resourceCreation = useResourceCreation({
+    mayCreateSkill: canEdit && can(Perm.skillsEdit),
+    mayCreateContext: canEdit && can(Perm.contextEdit),
+    setSpec,
+  });
+  useTestShortcut(canEdit, () => toggleTesting(!testing));
+
+  // The stale-reference check reads a reference as dead when its id is absent
+  // from a list, so it must not run until every list it consults has *succeeded*:
+  // each defaults to `[]` while loading and stays `[]` when the request fails, so
+  // gating on "no longer loading" alone would still declare every reference stale
+  // when a list 403s - which the org-connections read does for an editor without
+  // `connections:manage` (#1472).
+  const referenceListsLoaded =
+    !collectionsLoading &&
+    !collectionsError &&
+    !contextLoading &&
+    !contextError &&
+    !skillsLoading &&
+    !skillsError &&
+    !connectionsLoading &&
+    !connectionsError &&
+    !catalogLoading &&
+    !catalogError;
+
+  // A builder who cannot add a model, in an organization that has none, can
+  // create a draft they can never make work. Both halves are read from a
+  // *settled* query rather than from "no longer loading": a profiles read that
+  // failed or is still in flight also answers `[]` - hence `"loaded"` rather
+  // than "not pending" - and `can()` answers false until the set is in, so
+  // either alone tells a caller who has models, or who may add one, they are stuck.
+  const modelDeadEnd =
+    profilesStatus === "loaded" &&
+    !profiles.some(usableForAgents) &&
+    permissionsLoaded &&
+    !can(Perm.connectionsManage);
+
+  // A draft differs from what is live the moment anything is edited. Showing
+  // that difference is what stops someone testing a change that never shipped.
+  const isDirty = useMemo(
+    () => JSON.stringify(spec) !== JSON.stringify(agent?.draft_spec),
+    [spec, agent?.draft_spec],
+  );
+
+  // The draft stores itself. A Builder with a Save button is a Builder where
+  // the tab closed on twenty minutes of instructions; the debounce means a
+  // burst of typing is one request.
+  //
+  // `storing` is a dependency because a save *settling* is what decides whether
+  // another is owed, and nothing else reports it. This effect used to depend on
+  // the edit alone and claim it re-armed "after every invalidation until the
+  // spec and the stored draft agree" - which it did not: when a save does not
+  // land, the refetch that follows returns data deeply equal to what is cached,
+  // React Query hands back the same object, and no dependency here changes. One
+  // missed save therefore left the Builder saying "Unsaved" for as long as the
+  // page stayed open, with nothing retrying and nothing else to click, until
+  // the next edit happened to carry the lost one along.
+  //
+  // Two attempts per distinct spec, and the count is per payload rather than
+  // per render: the second covers a save that failed or did not take, and
+  // stopping there keeps a spec the API genuinely refuses from becoming a
+  // request every 1.2 seconds. When both are spent the badge keeps saying
+  // "Unsaved", which by then is the truth.
+  const { mutateAsync: storeDraft, isPending: storing } = saveDraft;
+  // A change to this draft made through the API, MCP, the assistant or another
+  // console holds the autosave: storing the spec on this page would otherwise
+  // overwrite it unseen, because the refetch it causes makes this page "dirty"
+  // against the new stored draft (#2061).
+  const remote = useRemoteDraft({
+    resource: "agent",
+    id,
+    local: spec,
+    stored: agent?.draft_spec,
+    fetchedAt,
+    adopt: setSpec,
+  });
+  const attempts = useRef<{ payload: string; tries: number }>({ payload: "", tries: 0 });
+  useEffect(() => {
+    // A blank name is a 422 from the spec, so it waits here with the field
+    // saying why rather than spending both attempts on a refusal.
+    if (
+      !canEdit ||
+      !spec ||
+      !agent?.draft_spec ||
+      !isDirty ||
+      storing ||
+      remote.held ||
+      !spec.name.trim()
+    )
+      return;
+    const payload = JSON.stringify(spec);
+    if (payload === attempts.current.payload && attempts.current.tries >= 2) return;
+    const timer = setTimeout(() => {
+      attempts.current =
+        payload === attempts.current.payload
+          ? { payload, tries: attempts.current.tries + 1 }
+          : { payload, tries: 1 };
+      // Errors already toast in the hook; the badge only needs to keep saying
+      // "unsaved", which `isDirty` staying true does on its own.
+      void storeDraft(spec).catch(() => null);
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [spec, agent?.draft_spec, isDirty, canEdit, storeDraft, storing, remote.held]);
+
+  // Names, never ids: the map exists to be read, and a row of uuids is the
+  // thing it replaces. Anything the spec references but the organization no
+  // longer has is named as missing rather than dropped - a silently shorter
+  // list hides exactly the problem that refuses at publish.
+  //
+  // Four directions, each its own question (#518): what reaches the agent on
+  // the left, what it runs as on top, what it reaches for on the right, and
+  // what it hands work to at the bottom.
+  const mapNodes = useMemo<MapNode[]>(() => {
+    if (!spec) return [];
+    const name = <T extends { id: string; name: string }>(pool: T[], id: string) =>
+      pool.find((entry) => entry.id === id)?.name ?? t("namedMissing", { name: id });
+    const chosen = profiles.find((entry) => entry.id === spec.model_profile_id);
+    // The label already names the model on every profile the picker creates, so
+    // appending it unconditionally read as "OpenRouter · claude-haiku-4.5 ·
+    // claude-haiku-4.5" - which truncation used to hide and a wrapped tile does
+    // not. Appended only where the label leaves it out.
+    const profile = spec.model_profile_id
+      ? chosen
+        ? chosen.label.includes(chosen.model)
+          ? chosen.label
+          : `${chosen.label} · ${chosen.model}`
+        : t("namedMissing", { name: spec.model_profile_id })
+      : t("organizationDefault");
+
+    const nodes: MapNode[] = [
+      {
+        key: "surfaces",
+        title: t("mapSurfaces"),
+        icon: MAP_ICONS.surfaces,
+        side: "left",
+        // The standing surfaces first - every agent is reachable from the
+        // dashboard, the API and the raw socket - then whatever this one was
+        // published as: widgets, and each channel binding. Each wears the mark
+        // its surface wears in run history, from the one table that owns them.
+        items: [
+          { key: "chat", label: t("surfaceChat"), icon: surfaceMark("web") },
+          { key: "api", label: t("surfaceApi"), icon: surfaceMark("api") },
+          { key: "socket", label: t("surfaceSocket"), icon: MAP_ITEM_ICONS.socket },
+          ...embeds.map((embed) => ({
+            key: `embed-${embed.id}`,
+            label: embed.name,
+            icon: surfaceMark("embed"),
+          })),
+          ...exposures.map((exposure) => ({
+            key: `exposure-${exposure.id}`,
+            label: exposure.channel_bot_name,
+            icon: surfaceMark(exposure.surface),
+            // Bound but not answering. Drawn dimmed rather than annotated: a
+            // paused binding is still a place this agent is published to.
+            muted: !exposure.is_active,
+          })),
+        ],
+        empty: t("chatOnlyNotSlack"),
+      },
+      {
+        key: "model",
+        title: t("model"),
+        icon: MAP_ICONS.model,
+        side: "top",
+        items: [{ key: "model", label: profile, icon: MAP_ICONS.model }],
+        empty: t("noModel"),
+      },
+      {
+        key: "budget",
+        title: t("budget"),
+        icon: MAP_ICONS.budget,
+        side: "top",
+        items: spec.budget?.monthly_usd
+          ? [
+              {
+                key: "budget",
+                label: t("perMonth", { amount: spec.budget.monthly_usd }),
+                icon: MAP_ICONS.budget,
+              },
+            ]
+          : [],
+        empty: t("spendsWithoutCeilingIts"),
+      },
+      {
+        key: "capabilities",
+        title: t("toolbox"),
+        icon: MAP_ICONS.capabilities,
+        side: "right",
+        items: spec.capabilities
+          .filter((binding) => binding.enabled)
+          .map((binding) => ({
+            key: binding.id,
+            label: name(capabilities, binding.id),
+            // What this capability's tools do, from the table the chat's own
+            // step list reads - so a capability wears the same mark whether it
+            // is being configured here or watched running there.
+            icon: capabilityMark(capabilities.find((entry) => entry.id === binding.id)),
+          })),
+        empty: t("noCapabilitiesEnabled"),
+      },
+      {
+        key: "mcp",
+        title: t("mcpServers"),
+        icon: MAP_ICONS.mcp,
+        side: "right",
+        items: spec.mcp_servers.map((ref) => {
+          if (ref.account === "platform") {
+            // This deployment's own server - what the AI Architect works through.
+            return {
+              key: bindingKey(ref),
+              label: t("thisPlatformMcp"),
+              mcp: { icon: null, name: t("thisPlatformMcp") },
+            };
+          }
+          if (ref.account === "personal") {
+            // Named after the service, because there is no connection to name:
+            // whose answers is decided when somebody talks to the agent.
+            const entry = mcpCatalog.find((one) => one.key === ref.catalog_key);
+            const name = entry?.name ?? ref.catalog_key;
+            return {
+              key: bindingKey(ref),
+              label: t("eachPersonsOwnNamed", { name }),
+              mcp: { icon: entry?.icon ?? null, name, url: entry?.url ?? null },
+            };
+          }
+          const connection = mcpConnections.find((row) => row.id === ref.connection_id);
+          // The mark belongs to the *catalog* entry a connection matches, not to
+          // the connection - which is how the picker resolves it, and the same
+          // three-source fallback `McpServerIcon` applies underneath.
+          const known =
+            connection === undefined ? null : entryForConnection(connection, mcpCatalog);
+          return {
+            key: bindingKey(ref),
+            label: connection?.name ?? t("namedMissing", { name: ref.connection_id }),
+            mcp: {
+              icon: known?.icon ?? null,
+              name: connection?.name ?? ref.connection_id,
+              url: connection?.url ?? null,
+            },
+          };
+        }),
+        empty: t("noMcpServersAttached"),
+      },
+      {
+        key: "knowledge",
+        title: t("knowledge"),
+        icon: MAP_ICONS.knowledge,
+        side: "right",
+        items: spec.collection_ids.map((entry) => ({
+          key: entry,
+          label: name(collections, entry),
+          icon: MAP_ICONS.knowledge,
+        })),
+        empty: t("noCollectionsAttached"),
+      },
+      {
+        key: "skills",
+        title: t("skills"),
+        icon: MAP_ICONS.skills,
+        side: "right",
+        items: spec.skill_ids.map((entry) => ({
+          key: entry,
+          label: name(skills, entry),
+          icon: MAP_ICONS.skills,
+        })),
+        empty: t("noSkillsAttached"),
+      },
+    ];
+
+    // The delegation policy, next to the delegates it governs. `allow_dynamic`
+    // is the setting with the widest consequences on this page - an agent that
+    // may invent specialists mid-run - so the map says it either way.
+    const subagentsBinding = spec.capabilities.find((binding) => binding.id === SUBAGENTS_ID);
+    if (subagentsBinding?.enabled) {
+      const config = readSubagentsConfig(subagentsBinding);
+      nodes.push({
+        key: "delegation",
+        title: tAgents("delegation"),
+        icon: MAP_ICONS.delegation,
+        side: "bottom",
+        items: [
+          {
+            key: "mode",
+            label: tAgents("mapHandsBack", { mode: tAgents(MODE_LABEL[config.mode]) }),
+            icon: MAP_ITEM_ICONS.mode,
+          },
+          {
+            key: "dynamic",
+            label: config.allow_dynamic ? t("mapMayInventSpecialists") : t("mapFixedRosterOnly"),
+            icon: MAP_ITEM_ICONS.roster,
+          },
+          {
+            key: "depth",
+            label: t("mapDepthLimit", { depth: config.max_depth }),
+            icon: MAP_ITEM_ICONS.limit,
+          },
+          {
+            key: "fanout",
+            label: t("mapFanoutLimit", { fanout: config.max_fanout }),
+            icon: MAP_ITEM_ICONS.limit,
+          },
+        ],
+        empty: "",
+      });
+    }
+
+    return nodes;
+  }, [
+    spec,
+    exposures,
+    embeds,
+    collections,
+    profiles,
+    capabilities,
+    mcpConnections,
+    mcpCatalog,
+    skills,
+    t,
+    tAgents,
+  ]);
+
+  // Subagents as their own kind of node - another agent this one reaches for,
+  // not a tool. A pinned delegate carries a link to its own page and, when the
+  // server has walked the tree, its own delegates as children - recursively, so
+  // the whole delegation tree reads on one map (#276). An inline specialist has
+  // no page and no link. A delegate the organization no longer has, or that
+  // this caller cannot see, is named as unreachable rather than dropped - the
+  // same silence that hides what publishing will refuse.
+  //
+  // The first level stays built from the local draft rather than the server
+  // tree, because the draft on screen may be ahead of the stored one by an
+  // autosave; the server's answer is matched onto it by agent id, which
+  // `_one_pin_per_delegate` makes unique on anything publishable.
+  const delegateNodes = useMemo<MapDelegate[]>(() => {
+    if (!spec) return [];
+    const inline = readSubagentsConfig(
+      spec.capabilities.find((binding) => binding.id === SUBAGENTS_ID),
+    ).inline;
+    const walked = new Map(
+      (tree?.nodes ?? [])
+        .filter((node) => node.kind === "delegate" && node.agent_id !== null)
+        .map((node) => [node.agent_id, node] as const),
+    );
+    // The index is part of the key because a draft can carry a duplicate before
+    // publishing refuses it - two pins of one agent, or two specialists sharing
+    // a name - and two nodes under one key would collide in the ref map the
+    // edges are measured from, dropping one silently. `delegate-list` keys the
+    // same way, for the same reason.
+    const delegates: MapDelegate[] = (spec.subagents ?? []).map((ref, index) => {
+      const agent = agents.find((entry) => entry.id === ref.agent_id);
+      const key = `delegate:${ref.agent_id}:${index}`;
+      const node = walked.get(ref.agent_id);
+      return {
+        key,
+        // The walk's name first: it is access-checked, and it reaches rows the
+        // agent list does not carry. An archived delegate is the one that
+        // matters - it is not in the list, so the list alone calls it "an agent
+        // you cannot see" while the badge beside it says "Archived".
+        name: node?.name ?? agent?.name ?? t("delegateUnreachable"),
+        kind: "delegate",
+        mode: ref.preferred_mode ?? null,
+        href: agent ? ROUTES.AGENT_DETAIL(ref.agent_id) : undefined,
+        problem: node && node.status !== "ok" ? node.status : undefined,
+        stale: node?.stale || undefined,
+        truncated: node?.truncated || undefined,
+        children:
+          node && node.children.length > 0
+            ? toMapDelegates(node.children, tAgents, key)
+            : undefined,
+      };
+    });
+    const specialists: MapDelegate[] = inline.map((specialist, index) => ({
+      key: `specialist:${index}`,
+      name: specialist.name || t("unnamedSpecialist"),
+      kind: "specialist",
+      mode: specialist.preferred_mode ?? null,
+    }));
+    return [...delegates, ...specialists];
+  }, [spec, agents, tree, t, tAgents]);
+
+  // One line under the delegation heading whenever what is drawn is not the
+  // whole tree. The loading half matters as much as the other two: until the
+  // walk answers, every first-level delegate renders childless, which is what a
+  // leaf looks like - so a map that says nothing is a map claiming a tree it has
+  // not read yet.
+  const delegationNotice = treeLoading
+    ? tAgents("mapTreeLoading")
+    : treeError
+      ? tAgents("mapTreeUnavailable")
+      : tree?.truncated
+        ? tAgents("mapTreeTruncated")
+        : null;
+
+  // Thinking is the one capability kept off this list, because a second control
+  // for one field is a control that disagrees with the first: it sits with the
+  // model settings, contributes no tools, and changes how the model runs rather
+  // than what the agent can do.
+  //
+  // Skills used to be kept off it too, on the grounds that its own tab owned both
+  // halves of the decision. That tab is gone: the gallery is in this capability's
+  // panel, so switching it off is exactly what unpicking every skill already did,
+  // and there was no way to grant the tools without picking one first.
+  const grantable = useMemo(
+    () => capabilities.filter((entry) => entry.id !== THINKING_ID),
+    [capabilities],
+  );
+
+  if (isLoading || !spec || !agent) return <BuilderSkeleton />;
+
+  const isPublished = agent.status === "published";
+
+  // The Memory tab exists only when the capability is bound; a bare binding reads as
+  // what the builder returns for one (native, both shapes on).
+
+  const update = (changes: Partial<AgentSpec>) => setSpec({ ...spec, ...changes });
+  /** A variable from the panel, put where the caret is in the instructions. */
+  const insertVariableAtCaret = (name: string) => {
+    const field = instructionsBox.current;
+    const caret = field ? field.selectionStart : spec.instructions.length;
+    update({ instructions: insertVariable(spec.instructions, caret, null, name).text });
+  };
+
+  const toggleCapability = (capabilityId: string) => {
+    const on = spec.capabilities.some((binding) => binding.id === capabilityId);
+    if (capabilityId === VISUALS_ID && !on) {
+      update(withVisuals(spec, skills));
+      return;
+    }
+    update({ capabilities: withCapability(spec.capabilities, capabilityId, !on) });
+  };
+
+  const updateCapability = (updated: CapabilityBindingSpec) =>
+    update({
+      capabilities: spec.capabilities.map((capability) =>
+        capability.id === updated.id ? updated : capability,
+      ),
+    });
+
+  const toggleId = (list: string[], value: string) =>
+    list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
+
+  const setSkills = (skillIds: string[]) => update(withSkills(spec, skillIds));
+  const setContext = (contextIds: string[]) => update(withContextFiles(spec, contextIds));
+
+  /**
+   * Store the draft, and stop if it did not store.
+   *
+   * `validate` asks the server about the draft it holds, so running it after a
+   * failed save reports on a spec nobody is looking at - and reports it as the
+   * verdict on the one on screen. `saveDraft` has already said what went wrong.
+   */
+  async function persist(): Promise<boolean> {
+    if (!spec) return false;
+    try {
+      await saveDraft.mutateAsync(spec);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Store, validate, and then *ask* - publishing is the one click on this page
+   * that changes what every channel, widget and API call answers with, and the
+   * dialog is where that is said before it happens rather than after.
+   */
+  async function handlePublish() {
+    if (!(await persist())) return;
+    const found = await validate();
+    setProblems(found.problems);
+    setConfigProblems(found.fields);
+    if (found.problems.length === 0) setPublishOpen(true);
+  }
+
+  // What the next publish will be called. The server owns the number; this
+  // predicts it the only way a sentence shown *before* the publish can - one
+  // past the newest version, or v1 when there is none.
+  const nextVersion = versions.reduce((max, entry) => Math.max(max, entry.version), 0) + 1;
+
+  /**
+   * Address the chat to this agent, then open it on a fresh thread.
+   *
+   * Selecting first is the whole point: the chat sends whichever agent the
+   * selection names. Resetting the conversation matters just as much - the
+   * store keeps whichever thread was open last, and landing in an old
+   * conversation reads as the agent answering with somebody else's context.
+   */
+  function openInChat() {
+    selectAgentForChat(id);
+    resetConversation();
+    router.push(ROUTES.CHAT);
+  }
+
+  async function handleAvatar(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    // Cleared before awaiting, so picking the same file twice in a row still
+    // fires a change event - otherwise a failed upload cannot be retried with
+    // the same image.
+    event.target.value = "";
+    if (!file) return;
+    await setAvatar.mutateAsync(file).catch(() => null);
+    setAvatarVersion((version) => version + 1);
+  }
+
+  return (
+    // Beside the Builder rather than over it: the test panel shares the width
+    // (#2074), so the Builder stays usable while the agent is being tried.
+    <div className="flex items-start gap-4">
+      <div className="min-w-0 flex-1 space-y-3 sm:space-y-4">
+        <PageHeader
+          title={
+            <span className="flex min-w-0 items-center gap-3">
+              <span className="group relative shrink-0">
+                <AgentAvatar
+                  agentId={id}
+                  slug={agent.slug}
+                  hasAvatar={agent.has_avatar}
+                  colorSlot={agent.avatar_color}
+                  size="lg"
+                  version={avatarVersion}
+                />
+                {canEdit && (
+                  <button
+                    type="button"
+                    onClick={() => avatarInput.current?.click()}
+                    disabled={setAvatar.isPending}
+                    aria-label={agent.has_avatar ? t("replaceAvatar") : t("uploadAvatar")}
+                    title={t("squareImagesLookBest")}
+                    className="bg-background/70 text-foreground absolute inset-0 flex items-center justify-center rounded-full opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed"
+                  >
+                    <ImagePlus className="h-5 w-5" />
+                  </button>
+                )}
+              </span>
+              {/* One line, whatever the width: the actions wrap under it before
+                the name is broken, and a name longer than the column ends in
+                an ellipsis with the whole of it on hover. */}
+              <span className="truncate" title={agent.name}>
+                {agent.name}
+              </span>
+            </span>
+          }
+          badges={
+            <>
+              <AgentStatusBadge status={agent.status} />
+              {/* Two badges, two different questions. This one: is the stored
+                draft what published surfaces are answering with - computed
+                from the server's copies, so the autosave settling cannot clear
+                it into a page that reads as finished while every channel is
+                still on the old version (#519). */}
+              <PublishState
+                agentId={id}
+                currentVersionId={agent.current_version_id}
+                draftSpec={agent.draft_spec}
+              />
+              {/* And this one: is my edit stored. The draft saves itself; this
+                says where that stands. Quiet when everything is stored -
+                "saved" as a permanent label reads as a button. */}
+              {canEdit &&
+                (saveDraft.isPending ? (
+                  <Badge variant="secondary">{t("saving")}</Badge>
+                ) : (
+                  isDirty && <Badge variant="secondary">{t("unsaved")}</Badge>
+                ))}
+              {/* Its labels beside its status, under the name, rather than a row
+                of their own between the header and the tabs. */}
+              {[...(agent.categories ?? []), ...(agent.tags ?? [])].map((label, index) => (
+                <Badge
+                  key={`${index}:${label}`}
+                  variant="outline"
+                  className="text-muted-foreground font-normal"
+                >
+                  {label}
+                </Badge>
+              ))}
+            </>
+          }
+          description={agent.description ?? undefined}
+          breadcrumbs={[{ label: t("agents"), href: ROUTES.AGENTS }, { label: agent.name }]}
+          secondaryActions={
+            <>
+              {/* Trying the agent happens in the chat, which streams, keeps the
+                conversation and can hand a tool call to the approval queue.
+                Only a published agent has a version to run - the chat's own
+                picker offers no others - so a draft says what unlocks it
+                instead of opening a chat that would answer as somebody else. */}
+              {/* Trying it here, beside the Builder, needs nothing published: the
+                draft answers as a test (#2074). */}
+              {canEdit && (
+                <Button
+                  variant={testing ? "secondary" : "outline"}
+                  onClick={() => toggleTesting(!testing)}
+                  aria-pressed={testing}
+                  title={t("testPanelShortcut")}
+                  aria-keyshortcuts="T"
+                  data-tour="agent-test"
+                >
+                  <FlaskConical className="h-4 w-4" />
+                  {t("testPanelOpen")}
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                onClick={openInChat}
+                disabled={!isPublished}
+                title={isPublished ? undefined : t("publishAgentChatWith")}
+              >
+                <MessageSquare className="h-4 w-4" />
+                {t("openChat")}
+              </Button>
+              {/* In the apps: the Dock's or tray's "New Chat With", or the home screen. */}
+              <PinAgentButton
+                agent={{
+                  id,
+                  name: agent.name,
+                  slug: agent.slug,
+                  hasAvatar: agent.has_avatar ?? false,
+                  colorSlot: agent.avatar_color ?? null,
+                }}
+                disabled={!isPublished}
+              />
+              {/* Beside the chat button rather than in the overflow menu: the
+                map answers "what is this agent" and that question comes up
+                before publishing, not after somebody goes looking for it. */}
+              <Button variant="outline" onClick={() => setMapOpen(true)}>
+                <Network className="h-4 w-4" />
+                {t("visualMap")}
+              </Button>
+              {/* For whoever cannot open the overflow menu, which is where an
+                  editor finds the export - a header of six buttons asked for
+                  every decision at once. */}
+              {!canEdit && (
+                <Button variant="outline" asChild>
+                  <a href={`/api/agents/${id}/spec.yaml`} download>
+                    <Download className="h-4 w-4" />
+                    {t("exportYaml")}
+                  </a>
+                </Button>
+              )}
+              {/* Who reaches this agent, the way a document is shared: one
+                  button, one dialog, instead of two cards at the foot of a tab. */}
+              <Button variant="outline" onClick={() => setShareOpen(true)} data-tour="agent-share">
+                <UserPlus className="h-4 w-4" />
+                {tSharing("share")}
+              </Button>
+
+              {canEdit && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="icon" aria-label={t("moreActions")}>
+                      <MoreHorizontal className="h-4 w-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-64">
+                    <DropdownMenuItem asChild className={DESCRIBED_ITEM}>
+                      <a href={`/api/agents/${id}/spec.yaml`} download>
+                        <Download className="h-4 w-4" />
+                        <DropdownMenuItemText
+                          label={t("exportYaml")}
+                          description={tMenu("menuExportHint")}
+                        />
+                      </a>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      className={DESCRIBED_ITEM}
+                      onSelect={() =>
+                        clone.mutate(id, {
+                          onSuccess: (created) => router.push(ROUTES.AGENT_DETAIL(created.id)),
+                        })
+                      }
+                    >
+                      <Copy className="h-4 w-4" />
+                      <DropdownMenuItemText
+                        label={t("duplicate")}
+                        description={tMenu("menuDuplicateHint")}
+                      />
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      className={DESCRIBED_ITEM}
+                      onSelect={() => avatarInput.current?.click()}
+                    >
+                      <ImagePlus className="h-4 w-4" />
+                      <DropdownMenuItemText
+                        label={agent.has_avatar ? t("replaceAvatar2") : t("uploadAvatar2")}
+                        description={tMenu("menuAvatarHint")}
+                      />
+                    </DropdownMenuItem>
+                    <DropdownMenuLabel className="text-muted-foreground text-xs font-normal">
+                      {t("avatarColour")}
+                    </DropdownMenuLabel>
+                    {/* Not menu items: a swatch click picks a colour and leaves the
+                      menu open, where selecting an item would close it. */}
+                    <div className="px-2 pb-1.5">
+                      <AvatarColorPicker
+                        value={agent.avatar_color ?? null}
+                        onChange={(slot) => setColor.mutate(slot)}
+                        disabled={setColor.isPending}
+                      />
+                    </div>
+                    <DropdownMenuSeparator />
+                    {agent.status === "archived" ? (
+                      <DropdownMenuItem
+                        className={DESCRIBED_ITEM}
+                        onSelect={() => unarchive.mutate(id)}
+                      >
+                        <ArchiveRestore className="h-4 w-4" />
+                        <DropdownMenuItemText
+                          label={t("restore")}
+                          description={tMenu("menuRestoreHint")}
+                        />
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuItem
+                        className={DESCRIBED_ITEM}
+                        onSelect={() => setConfirming("archive")}
+                      >
+                        <Archive className="h-4 w-4" />
+                        <DropdownMenuItemText
+                          label={t("archive")}
+                          description={tMenu("menuArchiveHint")}
+                        />
+                      </DropdownMenuItem>
+                    )}
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      className={cn(DESCRIBED_ITEM, "text-destructive focus:text-destructive")}
+                      onSelect={() => setConfirming("delete")}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                      <DropdownMenuItemText
+                        label={t("deletePermanently")}
+                        description={tMenu("menuDeleteHint")}
+                      />
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+              <input
+                ref={avatarInput}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                className="hidden"
+                onChange={handleAvatar}
+              />
+            </>
+          }
+          actions={
+            canPublish && (
+              <Button
+                onClick={handlePublish}
+                disabled={publish.isPending || !spec?.name.trim()}
+                data-tour="agent-publish"
+              >
+                <Upload className="h-4 w-4" />
+                {t("publish")}
+              </Button>
+            )
+          }
+        />
+
+        {remote.conflict && (
+          <RemoteChangeBanner
+            change={remote.conflict}
+            onReload={remote.reload}
+            onKeepMine={remote.keepMine}
+          />
+        )}
+
+        <Dialog open={shareOpen} onOpenChange={setShareOpen}>
+          <DialogContent className={cn(DIALOG_SCROLL, DIALOG_FORM)}>
+            <DialogHeader>
+              <DialogTitle>{tSharing("shareNamed", { name: agent.name })}</DialogTitle>
+            </DialogHeader>
+            <SharingPanel resourceType="agent" resourceId={id} canManage={canEdit} />
+          </DialogContent>
+        </Dialog>
+
+        <Dialog open={mapOpen} onOpenChange={setMapOpen}>
+          <DialogContent className={cn(DIALOG_SCROLL, DIALOG_CANVAS)}>
+            <DialogHeader>
+              <DialogTitle>{t("visualMap")}</DialogTitle>
+              <DialogDescription>{t("draftAsStandsWhat")}</DialogDescription>
+            </DialogHeader>
+            <AgentMap
+              agentName={spec.name}
+              instructions={spec.instructions}
+              nodes={mapNodes}
+              delegates={delegateNodes}
+              delegationNotice={delegationNotice}
+            />
+          </DialogContent>
+        </Dialog>
+
+        {/* The catalog itself, not a second connect form beside it. `McpServerList`
+          reads and writes the same query cache the picker above does, so a server
+          connected in here appears in the picker as soon as the dialog closes -
+          without a refetch, and without this page knowing how a connection is
+          made. */}
+        <Dialog open={connectingMcp} onOpenChange={setConnectingMcp}>
+          <DialogContent className={cn(DIALOG_SCROLL, DIALOG_CANVAS)}>
+            <DialogHeader>
+              <DialogTitle>{t("connectMcpServer")}</DialogTitle>
+              <DialogDescription>{t("connectServerOrganizationBecomes")}</DialogDescription>
+            </DialogHeader>
+            <McpServerList canManageOrganization={can(Perm.connectionsManage)} />
+          </DialogContent>
+        </Dialog>
+
+        <McpToolPickerDialog
+          toolPicker={toolPicker}
+          setToolPicker={setToolPicker}
+          submitting={false}
+          // Written into the spec rather than onto the connection: this is the
+          // agent's narrowing, and the connection's own allowlist is everybody's.
+          // Every tool checked means "no narrowing from here", which is null - not
+          // a list that would freeze out a tool the server adds later.
+          onSave={() => {
+            if (toolPicker === null) return;
+            const allowed = narrowedSelection(
+              toolPicker.checked,
+              toolPicker.tools,
+              // Only a real probe can mean "everything": where the catalogue is
+              // the binding's own names, all-checked is true by construction.
+              toolPicker.connection.last_tools !== null,
+            );
+            update({
+              mcp_servers: spec.mcp_servers.map((ref) =>
+                bindingKey(ref) === toolBinding ? { ...ref, allowed_tools: allowed } : ref,
+              ),
+            });
+            setToolPicker(null);
+            setToolBinding(null);
+          }}
+        />
+
+        {/* The builder's own account, for a server bound through each person's:
+            back here when the consent lands, and its tools list from it. */}
+        <ConnectOwnServerDialog
+          entry={connectingOwnServer}
+          onClose={() => setConnectingOwnServer(null)}
+          returnTo={hereForMcpOAuthReturn()}
+        />
+
+        <ConnectServerDialog
+          entry={connectingServer}
+          onClose={() => setConnectingServer(null)}
+          // Bound as soon as it exists: somebody who connected a server from
+          // inside the Builder was going to tick it next. Its tools come up at
+          // once, from the check that connecting just ran - one path from "I want
+          // Notion" to the tools this agent may call (#2073).
+          onConnected={(connection) => {
+            const ref: McpServerRef = {
+              account: "organization",
+              connection_id: connection.id,
+              allowed_tools: null,
+              approval: "none",
+            };
+            update({ mcp_servers: [...spec.mcp_servers, ref] });
+            setToolBinding(bindingKey(ref));
+            setToolPicker(toolChoice(ref, connection, connection.label ?? connection.name));
+          }}
+        />
+
+        <PublishDialog
+          open={publishOpen}
+          onOpenChange={setPublishOpen}
+          version={nextVersion}
+          environments={environments}
+          publishing={publish.isPending}
+          onConfirm={async () => {
+            try {
+              await publish.mutateAsync(null);
+              setPublishOpen(false);
+              if (nextVersion === 1) setFirstPublished(true);
+            } catch {
+              // The hook already toasts the refusal; the dialog stays open so
+              // the retry is one click rather than a re-run of validation.
+            }
+          }}
+        />
+
+        {confirming === "archive" && (
+          <ConfirmDialog
+            open
+            onOpenChange={() => setConfirming(null)}
+            title={tc("archiveNamedConfirm", { name: agent.name })}
+            description={t("stopsAnsweringEverywhereAvailable")}
+            confirmLabel={t("archive")}
+            loading={archive.isPending}
+            onConfirm={async () => {
+              await archive.mutateAsync(id);
+              setConfirming(null);
+            }}
+          />
+        )}
+
+        {confirming === "delete" && (
+          <ConfirmDialog
+            open
+            onOpenChange={() => setConfirming(null)}
+            title={tc("deleteNamedConfirm", { name: agent.name })}
+            description={t("removesAgentEveryVersion")}
+            confirmLabel={t("delete")}
+            confirmText={agent.slug}
+            destructive
+            loading={remove.isPending}
+            onConfirm={async () => {
+              await remove.mutateAsync(id);
+              router.push(ROUTES.AGENTS);
+            }}
+          />
+        )}
+
+        {problems.length > 0 && (
+          <Card className="border-destructive/40 bg-destructive/5">
+            <CardContent className="space-y-2 p-4">
+              <p className="flex items-center gap-2 text-sm font-medium">
+                <AlertCircle className="h-4 w-4" />
+                {t("agentCannotBePublished")}
+              </p>
+              <ul className="text-muted-foreground list-inside list-disc space-y-1 text-sm">
+                {problems.map((problem) => (
+                  <li key={problem}>
+                    {problem}
+                    {/* Publish marks the missing model on its field, and the
+                        field lives on a tab the reader may not be on. */}
+                    {configProblems.some(
+                      (found) => found.field === "model_profile_id" && found.message === problem,
+                    ) && (
+                      <Button
+                        variant="link"
+                        size="sm"
+                        className="ml-2 h-auto p-0"
+                        onClick={goToModel}
+                      >
+                        {t("goToModel")}
+                      </Button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Tabs, because the alternative was a single column of eleven cards and
+          a page of scroll between the instructions and the version history.
+          Grouped by the question being answered, not by implementation. */}
+        {ownedByWorkflow !== null && (
+          <Alert>
+            <Workflow className="h-4 w-4" />
+            <AlertDescription className="flex flex-wrap items-center gap-3">
+              <span className="min-w-0 flex-1">{t("ownedByWorkflow")}</span>
+              <Button asChild size="sm" variant="outline">
+                <Link href={ROUTES.WORKFLOW_DETAIL(ownedByWorkflow)}>{t("openWorkflow")}</Link>
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Above the tabs, whatever tab is open: a reference to something deleted
+          is refused at publish, and the panel that would have listed it belongs
+          to a capability the agent may not even have switched on. */}
+        <StaleReferences
+          spec={spec}
+          collections={collections}
+          contextFiles={contextFiles}
+          contextTotal={contextCount}
+          skills={skills}
+          skillTotal={skillCount}
+          connections={mcpConnections}
+          catalog={mcpCatalog}
+          loaded={referenceListsLoaded}
+          onRemove={update}
+          disabled={!canEdit}
+        />
+
+        {firstPublished && (
+          <div className="border-border bg-muted/40 mb-6 flex flex-wrap items-center gap-3 rounded-xl border px-4 py-3">
+            <Radio className="text-muted-foreground size-4 shrink-0" aria-hidden />
+            <p className="min-w-0 flex-1 text-sm">{t("firstPublishNext")}</p>
+            <Button
+              size="sm"
+              onClick={() => {
+                setTab("availability");
+                setFirstPublished(false);
+              }}
+            >
+              {t("openAvailability")}
+            </Button>
+            <IconButton aria-label={tc("dismiss")} onClick={() => setFirstPublished(false)}>
+              <X />
+            </IconButton>
+          </div>
+        )}
+
+        <Tabs value={tab} onValueChange={setTab}>
+          <TabsList>
+            <TabsTrigger value="build" data-tour="agent-tab-build">
+              <SlidersHorizontal className="mr-1.5 size-4 shrink-0" aria-hidden />
+              {t("build")}
+            </TabsTrigger>
+            <TabsTrigger value="toolbox" data-tour="agent-tab-toolbox">
+              <Wrench className="mr-1.5 size-4 shrink-0" aria-hidden />
+              {t("toolbox")}
+            </TabsTrigger>
+            <TabsTrigger value="mcp" data-tour="agent-tab-mcp">
+              <Plug className="mr-1.5 size-4 shrink-0" aria-hidden />
+              {t("mcpServers")}
+            </TabsTrigger>
+            <TabsTrigger value="limits" data-tour="agent-tab-limits">
+              <ShieldCheck className="mr-1.5 size-4 shrink-0" aria-hidden />
+              {t("limits")}
+            </TabsTrigger>
+            <TabsTrigger value="availability" data-tour="agent-tab-availability">
+              <Radio className="mr-1.5 size-4 shrink-0" aria-hidden />
+              {t("availability")}
+            </TabsTrigger>
+            <TabsTrigger value="history" data-tour="agent-tab-history">
+              <History className="mr-1.5 size-4 shrink-0" aria-hidden />
+              {t("history")}
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="build" className="mt-4 space-y-4">
+            <Card data-tour="agent-instructions">
+              <CardContent className="p-4 sm:p-5">
+                <InstructionsEditor
+                  // Named, because a placeholder is not a label: it is the only
+                  // accessible name this control had, and it is the one thing that
+                  // disappears the moment somebody types into it.
+                  label={t("instructions2")}
+                  toolbar={
+                    <>
+                      <div
+                        data-tour="agent-instructions-header"
+                        className="flex min-w-0 flex-1 items-center gap-1"
+                      >
+                        <CardTitle className="min-w-0 truncate text-sm">
+                          {t("instructions")}
+                        </CardTitle>
+                        <ContextHelp>{t("agentAposSBehaviour")}</ContextHelp>
+                      </div>
+                      <MarkdownModeToggle mode={instructionsMode} onChange={setInstructionsMode} />
+                    </>
+                  }
+                  value={spec.instructions}
+                  onChange={(instructions) => update({ instructions })}
+                  disabled={!canEdit}
+                  placeholder={t("youAreSupportCopilot")}
+                  textareaRef={instructionsBox}
+                  mode={instructionsMode}
+                  variables={[
+                    ...promptVariables,
+                    ...(spec.variables ?? []).map((variable) => ({
+                      name: variable.name,
+                      description: variable.description ?? variable.value,
+                    })),
+                  ]}
+                />
+              </CardContent>
+            </Card>
+
+            <PromptVariablesPanel
+              system={promptVariables}
+              custom={spec.variables ?? []}
+              timeZone={spec.time_zone ?? "system"}
+              disabled={!canEdit}
+              onInsert={insertVariableAtCaret}
+              onCustomChange={(variables) => update({ variables })}
+              onTimeZoneChange={(time_zone) => update({ time_zone })}
+            />
+
+            <StartersPanel
+              starters={spec.starters ?? []}
+              disabled={!canEdit}
+              onChange={(starters) => update({ starters })}
+            />
+
+            {/* The model, then how it is asked: one card, apart from the
+                instructions, which are a thing to read rather than to set. */}
+            <Card ref={attachModelCard} data-tour="agent-model" className="scroll-mt-4">
+              <CardHeader>
+                <CardTitle>{t("model")}</CardTitle>
+                <CardDescription>{t("howAgentAsksIts")}</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2" data-tour="agent-model-picker">
+                  <ModelProfilePicker
+                    // A model profile is `connections:manage`, which somebody who
+                    // may edit this agent need not hold - and both halves of this
+                    // panel write one: the form posts `/providers/model-profiles`
+                    // and the bin deletes one from under every agent pointed at
+                    // it. Ungated, they were a 403 dressed as a control, the same
+                    // way Connect server below would be without its own gate.
+                    allowAdd={can(Perm.connectionsManage)}
+                    // The Builder is where an organization's models are managed,
+                    // so it is the one panel that also takes one away.
+                    allowRemove={can(Perm.connectionsManage)}
+                    profiles={profiles}
+                    profilesStatus={profilesStatus}
+                    value={spec.model_profile_id ?? null}
+                    onChange={(model_profile_id) => update({ model_profile_id })}
+                    disabled={!canEdit}
+                  />
+                  {/* Said where the missing control would be, because publish
+                    would otherwise be the first thing to say it. */}
+                  {modelDeadEnd && (
+                    <p className="text-muted-foreground text-xs">{t("noModelNeedsConnections")}</p>
+                  )}
+                </div>
+                <ModelSettingsForm
+                  value={spec.model_settings}
+                  onChange={(model_settings) => update({ model_settings })}
+                  disabled={!canEdit}
+                />
+                <ThinkingSetting
+                  definition={capabilities.find((entry) => entry.id === THINKING_ID)}
+                  binding={spec.capabilities.find((binding) => binding.id === THINKING_ID)}
+                  onToggle={() => toggleCapability(THINKING_ID)}
+                  onChange={updateCapability}
+                  disabled={!canEdit}
+                />
+              </CardContent>
+            </Card>
+
+            <Card data-tour="agent-answer-format">
+              <CardHeader>
+                <CardTitle>{tAnswer("title")}</CardTitle>
+                <CardDescription>{tAnswer("description")}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <AnswerFormatForm
+                  value={spec.output_schema ?? null}
+                  onChange={(output_schema) => update({ output_schema })}
+                  disabled={!canEdit}
+                />
+              </CardContent>
+            </Card>
+
+            <VoiceCard
+              value={spec.speech_to_text}
+              onChange={(speech_to_text) => update({ speech_to_text })}
+              conversation={{
+                agentId: id,
+                value: spec.voice,
+                onChange: (voice) => update({ voice }),
+                hasGuardrails: spec.capabilities.some(
+                  (binding) => binding.id === "guardrails" && binding.enabled !== false,
+                ),
+              }}
+              disabled={!canEdit}
+            />
+
+            {/* Discovery metadata, not the spec: it autosaves at once like the
+              avatar, so it hangs off the same role-level `canEdit` every other
+              editing control on this page does. */}
+            {canEdit && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>{t("discovery")}</CardTitle>
+                  <CardDescription>{t("discoveryHelp")}</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <MetadataEditor
+                    agentId={id}
+                    categories={agent.categories ?? []}
+                    tags={agent.tags ?? []}
+                  />
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Last on the tab: what the agent does comes first, what it is called is
+                set once. The name is spec like everything else here, and autosaves with it:
+                a duplicate arrives as "<name> (copy)" and this is where it stops
+                being one. The handle is the row's, fixed at creation, so renaming
+                never breaks a delegation or an @mention wired to it. */}
+            <Card data-tour="agent-identity">
+              <CardHeader>
+                <CardTitle>{t("identity")}</CardTitle>
+                <CardDescription>{t("identityHelp", { slug: agent.slug })}</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="agent-name">{t("agentNameLabel")}</Label>
+                  <Input
+                    id="agent-name"
+                    value={spec.name}
+                    maxLength={128}
+                    disabled={!canEdit}
+                    aria-invalid={!spec.name.trim()}
+                    aria-describedby={spec.name.trim() ? undefined : "agent-name-error"}
+                    onChange={(event) => update({ name: event.target.value })}
+                  />
+                  {!spec.name.trim() && (
+                    <p id="agent-name-error" className="text-destructive text-xs">
+                      {t("agentNameRequired")}
+                    </p>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="agent-description">{t("agentDescriptionLabel")}</Label>
+                  <Textarea
+                    id="agent-description"
+                    value={spec.description ?? ""}
+                    maxLength={1000}
+                    rows={2}
+                    disabled={!canEdit}
+                    onChange={(event) => update({ description: event.target.value || null })}
+                  />
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="toolbox" className="mt-4 space-y-4">
+            <Card data-tour="agent-capabilities">
+              <CardHeader data-tour="agent-capabilities-header">
+                <CardTitle>{t("capabilities")}</CardTitle>
+                <CardDescription>{t("whatAgentCanDo")}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <CapabilityWorkbench
+                  agentId={id}
+                  catalog={grantable}
+                  selected={spec.capabilities}
+                  onToggle={toggleCapability}
+                  onChange={updateCapability}
+                  // Delegates are top level on the spec rather than inside the
+                  // delegation capability's config, so the panel that edits them
+                  // is handed that slice as well as the binding.
+                  subagents={spec.subagents ?? []}
+                  onSubagentsChange={(subagents) => update({ subagents })}
+                  externalAgents={spec.external_agents ?? []}
+                  onExternalAgentsChange={(external_agents) => update({ external_agents })}
+                  // What the agent is *given*, picked in the panel of the
+                  // capability that reads it. Each setter switches that capability
+                  // on with the first pick, because bound without it the resources
+                  // are resolved and then discarded.
+                  resources={{
+                    contextFiles: mergeResourceChoices(contextFiles, resourceCreation.context),
+                    onCreateContext: resourceCreation.createContext,
+                    contextTotal: contextCount,
+                    contextIds: spec.context_ids,
+                    onContextToggle: (fileId: string) =>
+                      setContext(toggleId(spec.context_ids, fileId)),
+                    collections,
+                    collectionIds: spec.collection_ids,
+                    onCollectionToggle: (collectionId: string) =>
+                      update({ collection_ids: toggleId(spec.collection_ids, collectionId) }),
+                    skills: mergeResourceChoices(skills, resourceCreation.skills),
+                    onCreateSkill: resourceCreation.createSkill,
+                    skillTotal: skillCount,
+                    skillIds: spec.skill_ids,
+                    onSkillToggle: (skillId: string) =>
+                      setSkills(toggleId(spec.skill_ids, skillId)),
+                  }}
+                  // So promoting a specialist that runs on the parent's model can
+                  // resolve one for the standalone agent it becomes.
+                  modelProfileId={spec.model_profile_id ?? null}
+                  disabled={!canEdit}
+                  configProblems={configProblems}
+                />
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* Its own tab rather than the tail of the Toolbox. The two answer
+            different questions - what this agent can do, and what it reaches
+            outside the deployment for - and the picker embeds the whole server
+            catalog, so it pushed the capability workbench off the top of the
+            screen on any organization with more than a handful of servers. */}
+          <TabsContent value="mcp" className="mt-4 space-y-4">
+            <Card data-tour="agent-mcp">
+              {/* The passive tour points here rather than at the card: the picker
+                below embeds the whole server catalog, so the card runs well past
+                the bottom of the screen and a spotlight on it lit the entire
+                viewport — a highlight that highlights nothing, with the caption
+                stranded in the one dim strip left (#624). The card keeps its own
+                anchor for the guided flow, which needs the list itself reachable
+                so the reader can tick a server. */}
+              <CardHeader data-tour="agent-mcp-intro">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0 space-y-1.5">
+                    <CardTitle>{t("mcpServers")}</CardTitle>
+                    <CardDescription>
+                      {t.rich("mcpServersDescription", {
+                        servers: (chunks) => (
+                          <Link href={ROUTES.MCP_SERVERS} className="underline">
+                            {chunks}
+                          </Link>
+                        ),
+                      })}
+                    </CardDescription>
+                  </div>
+                  {/* Connecting a server was a different page, and the trip was
+                    the problem: the moment you need one is while binding tools
+                    to an agent, and leaving the Builder to get it meant leaving
+                    an unsaved draft. The dialog holds the real catalog rather
+                    than a second copy of the connect form - one flow, one set
+                    of refusals, and the connection it creates lands in the same
+                    cache this picker reads. */}
+                  {can(Perm.connectionsManage) && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      data-tour="agent-mcp-connect"
+                      onClick={() => setConnectingMcp(true)}
+                    >
+                      <Plug className="h-3.5 w-3.5" />
+                      {t("connectServer")}
+                    </Button>
+                  )}
+                </div>
+              </CardHeader>
+              <CardContent>
+                <McpToolLoadNotice
+                  className="mb-4"
+                  spec={spec}
+                  connections={mcpConnections}
+                  personalConnections={myMcpConnections}
+                  onEnableToolSearch={() =>
+                    update({ capabilities: withCapability(spec.capabilities, "tool_search", true) })
+                  }
+                  disabled={!canEdit}
+                />
+                <McpServerPicker
+                  connections={mcpConnections}
+                  catalog={mcpCatalog}
+                  value={spec.mcp_servers}
+                  onChange={(mcp_servers) => update({ mcp_servers })}
+                  personalConnections={myMcpConnections}
+                  onConnectOwn={connectOwnServer}
+                  onSignInOwn={signInOwnServer}
+                  onDisconnectOwn={(connection) => {
+                    removeMyMcpConnection(connection.id).catch((caught: unknown) =>
+                      toast.error(getErrorMessage(caught, tErrors)),
+                    );
+                  }}
+                  onConfigure={(entry, scope) => {
+                    if (scope === "organization") setConnectingServer(entry);
+                    else setConnectingOwnServer(entry);
+                  }}
+                  onTools={async (ref, connection, name) => {
+                    setToolBinding(bindingKey(ref));
+                    // A connection nobody has checked has no tool list; check it
+                    // here for whoever may, rather than sending them to the servers
+                    // page to press the button and find their way back.
+                    try {
+                      const { connection: probed, error } = await toolsForBinding(
+                        connection,
+                        can(Perm.connectionsManage) ? probeMcpConnection : null,
+                      );
+                      if (error !== null) toast.error(error);
+                      setToolPicker(toolChoice(ref, probed, name));
+                    } catch (caught) {
+                      toast.error(getErrorMessage(caught, tErrors));
+                      setToolPicker(toolChoice(ref, connection, name));
+                    }
+                  }}
+                  onConnect={connectServer}
+                  disabled={!canEdit}
+                />
+                <p className="text-muted-foreground mt-4 text-xs">{t("twoLimitsWorthKnowing")}</p>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="limits" className="mt-4 space-y-4">
+            <Card data-tour="agent-limits">
+              <CardHeader>
+                <CardTitle>{t("runLimits")}</CardTitle>
+                <CardDescription>{t("agentAposSOwn")}</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="monthly">{t("monthlyUsd")}</Label>
+                  <div className="relative">
+                    <span
+                      aria-hidden
+                      className="text-muted-foreground pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm"
+                    >
+                      $
+                    </span>
+                    <Input
+                      id="monthly"
+                      type="number"
+                      step="1"
+                      min="0"
+                      value={spec.budget?.monthly_usd ?? ""}
+                      disabled={!canEdit}
+                      onChange={(event) =>
+                        update({
+                          budget: {
+                            ...spec.budget,
+                            monthly_usd: event.target.value ? Number(event.target.value) : null,
+                          },
+                        })
+                      }
+                      placeholder={t("noLimit")}
+                      aria-describedby="monthly-hint"
+                      className="pl-7"
+                    />
+                  </div>
+                  <p id="monthly-hint" className="text-muted-foreground text-xs">
+                    {t("monthlyUsdHint")}
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="max-steps">{t("maxStepsPerRun")}</Label>
+                  <Input
+                    id="max-steps"
+                    type="number"
+                    step="1"
+                    min="1"
+                    max="200"
+                    value={spec.max_steps ?? ""}
+                    disabled={!canEdit}
+                    onChange={(event) =>
+                      update({ max_steps: event.target.value ? Number(event.target.value) : null })
+                    }
+                    placeholder={t("n100Default")}
+                    aria-describedby="max-steps-hint"
+                  />
+                  <p id="max-steps-hint" className="text-muted-foreground text-xs">
+                    {t("howManyModelRequests")}
+                  </p>
+                </div>
+                <LoopGuardFields
+                  value={spec.loop_guard}
+                  onChange={(loop_guard) => update({ loop_guard })}
+                  disabled={!canEdit}
+                />
+                <CodeModeField
+                  value={spec.code_mode}
+                  onChange={(code_mode) => update({ code_mode })}
+                  disabled={!canEdit}
+                />
+              </CardContent>
+            </Card>
+            {/* Beside the budget rather than in a settings page of its own: the two
+              questions are "how much may this agent spend" and "who is told when
+              it stops", and answering the first without the second is how a run
+              stops quietly. */}
+            <ReviewersCard
+              value={spec.reviewers}
+              onChange={(reviewers) => update({ reviewers })}
+              disabled={!canEdit}
+            />
+            <AlertsPanel
+              value={spec.notifications}
+              onChange={(notifications) => update({ notifications })}
+              disabled={!canEdit}
+            />
+            <ObservabilityCard
+              value={spec.observability}
+              onChange={(observability) => update({ observability })}
+              disabled={!canEdit}
+              agentName={spec.name}
+            />
+          </TabsContent>
+
+          <TabsContent value="availability" className="mt-4 space-y-4">
+            {/* Where people reach it first - a website, a page, the API - then the
+                chat apps, then what runs it on its own. Two cards here were both
+                called "where", and the one most people came for was last. */}
+            <div data-tour="agent-availability">
+              <EmbedsPanel agentId={id} canManage={canPublish} />
+            </div>
+            <ExposuresPanel
+              agentId={id}
+              canManage={canPublish}
+              hasWorkspace={spec.capabilities.some(
+                (binding) => binding.id === SANDBOX_ID && binding.enabled !== false,
+              )}
+            />
+            <A2aPanel agent={agent} canManage={canPublish} />
+            {/* Managing a trigger is the same floor as running the agent, not
+              publishing it - the server resolves `agents:run` per row. */}
+            <TriggersPanel
+              agentId={id}
+              canCreate={agent.can_run}
+              reachesPersonal={
+                spec.capabilities.some(
+                  (binding) =>
+                    PERSONAL_CAPABILITIES.includes(binding.id) && binding.enabled !== false,
+                ) || spec.mcp_servers.some((server) => server.account === "personal")
+              }
+            />
+          </TabsContent>
+
+          <TabsContent value="history" className="mt-4 space-y-4">
+            {/* The first publish mints `production`; before it there is nothing
+                to point anywhere, and a card of explanation with nothing under
+                it read as a page that failed to load. */}
+            {agent.current_version_id !== null && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>{t("environments")}</CardTitle>
+                  <CardDescription>{t("namedPointersAtPublished")}</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <EnvironmentsPanel agentId={id} canManage={canPublish} />
+                </CardContent>
+              </Card>
+            )}
+
+            <Card data-tour="agent-history">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <History className="h-4 w-4" />
+                  {t("versions")}
+                </CardTitle>
+                <CardDescription>{t("eachPublishFreezesSpec")}</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                <VersionHistory
+                  agentId={id}
+                  currentVersionId={agent.current_version_id}
+                  draftSpec={spec}
+                  canRestore={canPublish}
+                  onRestore={(versionId) =>
+                    // Restoring replaces the draft server-side; clearing the local
+                    // spec is the once-only adoption effect's cue to take the new one.
+                    rollback.mutate(versionId, { onSuccess: () => setSpec(null) })
+                  }
+                  restoring={rollback.isPending}
+                  environments={environments}
+                  onPromote={(environmentId, versionId) =>
+                    promote.mutate({ environmentId, versionId })
+                  }
+                  promoting={promote.isPending}
+                />
+              </CardContent>
+            </Card>
+          </TabsContent>
+        </Tabs>
+      </div>
+      {resourceCreation.dialogs}
+      {testing && canEdit && (
+        <TestPanel
+          agentId={id}
+          currentVersionId={agent.current_version_id}
+          environments={environments}
+          draftSpec={spec}
+          saving={isDirty || saveDraft.isPending}
+          onClose={() => toggleTesting(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The Builder's own skeleton.
+ *
+ * None of the shared variants fit: this page is a breadcrumbed header with four
+ * actions, a seven-tab strip, and a card whose body is dominated by a ten-row
+ * textarea. Approximating that with a card grid would move the tab strip the
+ * moment the agent arrived, which is the jump the skeleton exists to prevent.
+ * `ConversationSkeleton` in `chat-container.tsx` is the same argument.
+ */
+function BuilderSkeleton() {
+  const t = useTranslations("pages.agents");
+  return (
+    <div role="status" aria-label={t("loading")} className="space-y-6">
+      <div className="mb-6 md:mb-8">
+        <div className="bg-foreground/8 mb-3 h-3 w-40 animate-pulse rounded" />
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+          <div className="min-w-0 space-y-2">
+            <div className="bg-foreground/10 h-5 w-52 animate-pulse rounded" />
+            <div className="bg-foreground/8 h-3.5 w-80 max-w-full animate-pulse rounded" />
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {["w-32", "w-28", "w-24", "w-20"].map((width, index) => (
+              <div
+                key={index}
+                className={cn("bg-foreground/10 h-9 animate-pulse rounded-md", width)}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Tab strip - one placeholder per tab, at the width its label takes.
+          Keyed by position rather than by the width class: the classes repeat,
+          which React reported as duplicate keys on every load of this page. */}
+      <div className="bg-muted inline-flex h-9 items-center gap-1 rounded-lg p-1">
+        {["w-12", "w-20", "w-28", "w-16", "w-24", "w-16"].map((width, index) => (
+          <div key={index} className={cn("bg-foreground/10 h-7 animate-pulse rounded-md", width)} />
+        ))}
+      </div>
+
+      <Card>
+        <CardHeader className="space-y-2">
+          <div className="bg-foreground/10 h-4 w-28 animate-pulse rounded" />
+          <div className="bg-foreground/8 h-3 w-full max-w-xl animate-pulse rounded" />
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* The instructions textarea: rows={10} at the same border and radius. */}
+          <div className="border-input bg-foreground/[0.04] h-52 animate-pulse rounded-md border" />
+          <div className="space-y-2">
+            <div className="bg-foreground/10 h-3 w-16 animate-pulse rounded" />
+            <div className="border-input bg-foreground/[0.04] h-9 w-full animate-pulse rounded-md border" />
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

@@ -1,0 +1,850 @@
+import type { ChatPerson } from "./conversation";
+import type { Mentionable } from "./mention";
+
+export type MessageRole = "user" | "assistant" | "system";
+/** Rating values for message feedback. */
+export enum RatingValue {
+  LIKE = 1,
+  DISLIKE = -1,
+}
+
+export type UserRating = RatingValue.LIKE | RatingValue.DISLIKE | null;
+
+export interface ChatMessageFile {
+  id: string;
+  filename: string;
+  mime_type: string;
+  /** "image" | "pdf" | "docx" | "text" - derived from MIME on upload. */
+  file_type: string;
+}
+
+/**
+ * A message typed while the agent was busy or the network was gone, held above
+ * the composer until it can be sent - and, in the apps, kept sealed on the
+ * device so closing the app does not lose it (#2097).
+ */
+export interface QueuedMessage {
+  id: string;
+  content: string;
+  fileIds?: string[];
+  files?: ChatMessageFile[];
+  /** What the person pointed the agent at with `@`, sent with the message (#2189). */
+  mentions?: Mentionable[];
+  /**
+   * Why the server refused it before saving it, when it did: the message is
+   * held, marked, until the person sends it again or drops it.
+   */
+  refused?: string;
+}
+
+/** The earlier message a turn answers, quoted above it. */
+export interface MessageReply {
+  messageId: string;
+  role: MessageRole;
+  /** A short line of it: whitespace folded, the tail cut. */
+  excerpt: string;
+  /** Who wrote it, for a person's message; absent for the agent's. */
+  sender?: ChatPerson;
+  /** The agent that wrote it, for an answer. */
+  agentId?: string;
+  /** Its name, where the reply was chosen on screen and the name was at hand. */
+  agentName?: string;
+}
+
+/** The workspace selected for a turn, retained after Work on changes. */
+export type TurnFileSource =
+  | { readonly kind: "local"; readonly id: string }
+  | { readonly kind: "conversation"; readonly id: string };
+
+export interface ChatMessage {
+  /** Submission correlation, retained when the persistence frame was lost. */
+  clientMessageId?: string;
+  /** A saved bubble still addressed by its local id while deltas arrive. */
+  persistedId?: string;
+  id: string;
+  role: MessageRole;
+  content: string;
+  timestamp: Date;
+  toolCalls?: ToolCall[];
+  isStreaming?: boolean;
+  /** Group ID for related messages in a multi-agent chain. */
+  groupId?: string;
+  /** IDs of attached files - kept for sending. Use `files` for rendering. */
+  fileIds?: string[];
+  /** Full file metadata for rendering attachments. */
+  files?: ChatMessageFile[];
+  /** What a person's message pointed the agent at with `@`, drawn as chips (#2189). */
+  mentions?: Mentionable[];
+  /** The source recorded when this turn ran. Absent on older transcripts. */
+  fileSource?: TurnFileSource;
+  /** Conversation ID for this message */
+  conversationId?: string;
+  /** Who typed a user turn, when it was somebody signed in. In a project's chat
+   *  that is not always the reader, so the turn says whose words they are. */
+  sender?: ChatPerson;
+  /** A project chat's turn whose writer's account is gone: theirs, not the
+   *  reader's, and nobody left to name. */
+  senderGone?: boolean;
+  /** The message this turn answers, where somebody replied to one. */
+  replyTo?: MessageReply;
+  /** The published agent that produced this assistant turn. Absent means the
+   *  general assistant, which is what a turn sent without an `agent_id` runs.
+   *  Recorded per message on both paths - live and reloaded - because the
+   *  picker can be changed mid-conversation, and one agent per thread would
+   *  relabel every earlier answer as whoever is selected now. */
+  agentId?: string;
+  /** Which frozen spec answered. An agent is rewritten; what it said then was
+   *  said by one version of it, and a transcript that named only the agent
+   *  attributed old words to today's instructions. */
+  agentVersion?: number;
+  /** The run that produced this turn.
+   *
+   *  One run can leave several messages: it parks on an approval, somebody
+   *  decides, it runs again, and each of those segments is written as it happens
+   *  rather than folded back into the message before it. They are one turn and
+   *  are drawn as one - see `MessageList`, which reads exactly this field.
+   *
+   *  Absent means "not recorded", never "its own turn": a turn written outside a
+   *  run has none, and a live turn only learns its run id if something on the
+   *  wire says so. Absent never groups. */
+  runId?: string;
+  /**
+   * Whether the run that produced this turn was stopped part-way through.
+   *
+   * A cancelled run leaves whatever the agent had written when the socket closed
+   * or `stop` was pressed, and that reads exactly like a finished answer — so a
+   * reader takes a truncated one as everything the agent had to say. Only
+   * `cancelled` sets this: a completed run needs no marker, and a run still going
+   * has no answer on screen to mark.
+   */
+  wasStopped?: boolean;
+  /** A spoken turn's id within its voice call (#54). Absent for a typed turn. */
+  turnId?: string;
+  /** The caller talked over this spoken answer, so it is trimmed to roughly what was heard. */
+  interrupted?: boolean;
+  /**
+   * How long the run behind this turn was open, from the stored run. Absent on a
+   * live turn, which times itself, and on a turn written outside a run.
+   */
+  runDurationMs?: number;
+  /** True if message ID is a temporary client-minted id, not yet replaced by server ID */
+  isTemporaryId?: boolean;
+  /**
+   * The temporary id a streamed message was rendered under, kept when the database
+   * id replaces it. The transcript keys on this first: a new key is a new bubble,
+   * and a remount at the end of a turn cut the reveal off mid-sentence.
+   */
+  renderKey?: string;
+  /** Current user's rating */
+  user_rating?: UserRating;
+  /** Aggregate rating counts */
+  rating_count?: { likes: number; dislikes: number } | null;
+  /** Reasoning trace from extended-thinking models. Rendered dimmed +
+   *  collapsible above the final response. */
+  thinking?: string;
+  /** Ordered timeline of the assistant turn: reasoning, text and tool
+   *  calls in the exact order they occurred. Rendered in sequence so a
+   *  multi-step turn (think → tools → text → think → tools → text) shows
+   *  correctly. `content`/`thinking`/`toolCalls` are kept in sync as
+   *  flat aggregates for copy/persist/rating. */
+  parts?: MessagePart[];
+  /** What this turn cost, on the turn that cost it.
+   *
+   *  Live turns only, and deliberately: it is measured when the run finishes and
+   *  is not persisted per message, so a reloaded conversation has none. Absent
+   *  therefore means "not recorded", never "free". */
+  usage?: TurnUsage;
+}
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+  result?: unknown;
+  status:
+    | "pending"
+    | "running"
+    | "completed"
+    | "error"
+    | "awaiting_approval"
+    /** A question its person left unanswered; answering it continues the run (#2064). */
+    | "awaiting_answer"
+    | "unfinished";
+  /**
+   * `awaiting_approval` is its own state, not a kind of running. A parked call
+   * produces no result *ever* until somebody decides, so a spinner is a lie that
+   * never resolves — which is what the card did before.
+   *
+   * `unfinished` is what a *replayed* call in flight becomes. The transcript
+   * stores a call as running until something records its outcome, and some never
+   * get one — an approval that expired, a run that broke mid-call. Read back, that
+   * row animated forever under a conversation that ended days ago, promising a
+   * result nothing was ever going to deliver. It is not an error and not a
+   * success: it is the outcome nobody wrote down.
+   */
+}
+
+/** The kinds of segment a turn is built from, live and replayed alike. */
+export type MessagePartType = "thinking" | "text" | "tool" | "ask_user" | "steer" | "workflow_run";
+
+/** A workflow answering a chat turn: which run it is and where it stands. */
+export interface WorkflowRunPart {
+  workflowId: string;
+  /** What the workflow was called when it answered. */
+  workflowName: string | null;
+  /** Null until the socket has admitted the run. */
+  runId: string | null;
+  status: string;
+  error: string | null;
+}
+
+/** One ordered segment of an assistant turn. */
+export interface MessagePart {
+  id: string;
+  type: MessagePartType;
+  /** Text for "thinking"/"text" parts, and what the person added for a "steer" (#2087). */
+  content?: string;
+  /** Tool invocation for "tool" parts. */
+  toolCall?: ToolCall;
+  /** What the agent asked, for an "ask_user" part. */
+  question?: string;
+  /** What the person answered, for an "ask_user" part. */
+  answer?: string;
+  /**
+   * Which delegate asked, for an "ask_user" part. Absent where the main agent
+   * asked it itself, and on every question stored before the field existed.
+   */
+  askedBy?: string;
+  /** The run, for a "workflow_run" part. */
+  workflowRun?: WorkflowRunPart;
+}
+
+export type ChartType = "line" | "bar" | "pie" | "area" | "scatter";
+
+export interface ChartSeries {
+  key: string;
+  label?: string | null;
+  color?: string | null;
+}
+
+export interface ChartStyle {
+  palette?: string[] | null;
+  grid?: boolean;
+  legend?: boolean;
+  x_label?: string | null;
+  y_label?: string | null;
+  stacked?: boolean;
+}
+
+/** Structured chart payload produced by the agent's `create_chart` tool. */
+export interface ChartSpec {
+  kind: "chart";
+  chart_type: ChartType;
+  title: string;
+  data: Array<Record<string, unknown>>;
+  x_key: string;
+  series: ChartSeries[];
+  style: ChartStyle;
+}
+
+/**
+ * Every frame the dashboard chat WebSocket sends, and nothing else.
+ *
+ * One member per `send_event(...)` in `backend/app/services/agent_session.py` plus one
+ * per literal in `app/agents/subagent_events.py`. That is an exact set rather than a
+ * best guess: `agent_session.py` decides every frame this socket sends, and it is held
+ * at 100% coverage and type-checked in the gate.
+ *
+ * Grouped by whether `use-chat.ts` reads a frame, because the flat list could not say.
+ * `llm_started`, `llm_completed`, `todo_event`, `context_usage` and `context_compacted`
+ * sat in it naming frames no surface has ever emitted - two of them with a live-looking
+ * `case` arm and a test asserting it behaved - so the union read as "the frames that
+ * exist" while being part contract and part wish, and the next person adding one could
+ * not tell which. That is the note under the delegation frames below, from the other
+ * side: the same union carried the warning it was violating.
+ */
+export type WSEventType =
+  // Read by `use-chat.ts`.
+  | "conversation_created"
+  | "message_saved"
+  | "next_steps"
+  | "user_prompt"
+  | "session_ready"
+  | "model_request_start"
+  | "text_delta"
+  | "thinking_delta"
+  | "part_start"
+  | "tool_call_delta"
+  | "visual_images"
+  | "tool_call"
+  | "tool_result"
+  | "final_result"
+  | "complete"
+  | "error"
+  | "tool_approval_required"
+  | "ask_user"
+  | "steer_applied"
+  | "steer_unapplied"
+  | "connect_account"
+  | "compaction_started"
+  | "compaction_finished"
+  | "compaction_impossible"
+  | "personal_services_unavailable"
+  // The run's sandbox is still being opened - usually its runtime image being built
+  // after an update (#2222) - and then that it is open, or failed to open.
+  | "sandbox_preparing"
+  | "sandbox_ready"
+  // Following a turn another socket is writing - the reader came back to a
+  // conversation whose agent was still answering (`app/services/live_turn.py`).
+  | "turn_attached"
+  | "turn_prompt"
+  | "presence"
+  | "typing"
+  | "turn_followed_to_end"
+  // Sent on every turn and deliberately unread, because each only announces a step
+  // the frame after it already carries: `model_request_start` opens the assistant
+  // message, so `user_prompt_processed` has nothing left to do,
+  // and `text_delta`/`tool_call` carry the content that `call_tools_start` and
+  // `final_result_start` merely precede. Named anyway - they are on the wire, and a
+  // union that omitted them would be as misleading in the other direction. A run
+  // timeline is the surface that would read them. `part_start` and
+  // `tool_call_delta` left this group once a tool call whose arguments took minutes
+  // to stream showed that `tool_call` arrives too late to be the first sign of it.
+  | "user_prompt_processed"
+  | "call_tools_start"
+  | "final_result_start"
+  // One per literal in `app/agents/subagent_events.py`. They replace
+  // `subagent_status` / `subagent_message`, which nothing ever emitted and
+  // nothing ever handled - two vocabularies for one subsystem is how a client
+  // ends up listening for a frame the server stopped sending.
+  | "subagent_start"
+  | "subagent_text_delta"
+  | "subagent_thinking_delta"
+  | "subagent_tool_call"
+  | "subagent_tool_result"
+  | "subagent_awaiting_approval"
+  | "subagent_complete"
+  // One per literal in `app/agents/browser_events.py`. The narration and the
+  // picture are separate frames on purpose: a screenshot is two orders of
+  // magnitude larger than the sentence describing the step, and encoding one
+  // must never hold up the other.
+  | "browser_opened"
+  | "browser_step"
+  | "browser_frame"
+  | "browser_finished"
+  | "browser_held"
+  | "browser_released"
+  | "browser_needs_person"
+  | "browser_pointer"
+  | "browser_control_error";
+
+/**
+ * How a browse ended, and all four are ordinary.
+ *
+ * `blocked` is the one worth knowing about: it is the engine saying the page
+ * offers no action that serves the goal - a sign-in wall, a consent gate, a
+ * captcha - which is an answer about the page rather than a failure to retry.
+ */
+export type BrowseOutcome = "done" | "blocked" | "exhausted" | "failed";
+
+/**
+ * One frame from a browse in progress, mirroring `app/agents/browser_events.py`
+ * field for field.
+ *
+ * Everything but `kind`, `call_id` and `step` is optional because one shape
+ * carries four frames, and which fields are set is what `kind` says. `step` is on
+ * every one of them: frames share this socket with the turn's text, so a picture
+ * can arrive after the step that followed it, and a client ordering by arrival
+ * would caption the wrong page.
+ */
+export interface BrowserFrame {
+  kind:
+    | "browser_opened"
+    | "browser_step"
+    | "browser_frame"
+    | "browser_finished"
+    | "browser_held"
+    | "browser_released"
+    | "browser_needs_person"
+    | "browser_pointer"
+    | "browser_control_error";
+  /** Which `browse_web` call this belongs to; one turn can browse twice. */
+  call_id: string;
+  step: number;
+  url?: string | null;
+  title?: string | null;
+  tab_id?: string | null;
+  native_id?: string | null;
+  resumable?: boolean;
+  navigable?: boolean;
+  /** On the opening frame: the ceiling, so progress reads as 3/25. */
+  max_steps?: number | null;
+  /** On the opening frame: the task the model handed over. */
+  goal?: string | null;
+  /** CLICK, TYPE_TEXT, SELECT, SCROLL, NAVIGATE, BACK, WAIT, DONE or BLOCKED. */
+  operation?: string | null;
+  /** The element as the page labelled it, or the address opened - never an index. */
+  target?: string | null;
+  /** What the browsing model said the step is for. Model-written, rendered as data. */
+  reason?: string | null;
+  /** On the opening frame: the run, which with `call_id` addresses the live view. */
+  run_id?: string | null;
+  /** On `browser_held`: who took the browser over. */
+  by?: string | null;
+  /** Who took the browser over, by id - how a viewer tells it is them. */
+  by_user_id?: string | null;
+  /** On `browser_pointer`: where the agent is about to press, as fractions of the viewport. */
+  x?: number | null;
+  y?: number | null;
+  /** On `browser_frame`: the viewport as a `data:` URL. */
+  image?: string | null;
+  outcome?: BrowseOutcome | null;
+  /** Page-derived text, so it is rendered as data and never as markup. */
+  detail?: string | null;
+}
+
+/**
+ * What one turn cost, and how full the workspace behind it is.
+ *
+ * Numbers rather than a formatted line: the chat draws a bar and a tooltip, and a
+ * server-composed string would have to be parsed back apart. `null` is "nothing
+ * was measured", which is a different thing to draw from zero.
+ */
+export interface TurnUsage {
+  input_tokens: number;
+  output_tokens: number;
+  /** Of `input_tokens`, those read from the provider's cache - priced at a fraction. */
+  cache_read_tokens?: number | null;
+  /** Of `input_tokens`, those written to the provider's cache - priced above it. */
+  cache_write_tokens?: number | null;
+  /** The turn's cost as a Decimal string, the shape every REST surface uses. */
+  cost_usd: string;
+  /**
+   * Whether `cost_usd` is a floor rather than the whole of it.
+   *
+   * True when the turn reached a model with no price entry: the ledger books
+   * that request at zero, so the figure is short by however much it cost. Drawn
+   * as a caveat rather than dropped - a number nobody can act on is still worth
+   * more than nothing, provided it does not claim to be exact.
+   */
+  cost_is_partial: boolean;
+  budget_percent: number | null;
+  /** This agent's own monthly cap, which is the one an author can raise. */
+  agent_budget_percent: number | null;
+  sandbox: {
+    kind: string;
+    percent: number | null;
+    bytes_used: number | null;
+    bytes_limit: number | null;
+    memory_bytes: number | null;
+    memory_limit_bytes: number | null;
+  } | null;
+  /**
+   * How full the model's context window was on this turn's last request.
+   *
+   * The ceiling nobody sees coming: a budget refuses with a message and a
+   * workspace refuses a write, but a context window is refused by the provider
+   * mid-answer. `null` when no model request was made.
+   */
+  context: {
+    /**
+     * Tokens the history sent with this turn occupied, after any compaction.
+     *
+     * The count only. What share of a window that is depends on the model
+     * answering *next*, which the chat lets somebody switch between turns, so
+     * the denominator is resolved where the selection is known.
+     */
+    used_tokens: number;
+  } | null;
+}
+
+export interface WSEvent {
+  type: WSEventType;
+  data?: unknown;
+  timestamp?: string;
+}
+
+/* `TextDeltaEvent`, `ToolCallEvent`, `ToolResultEvent` and `FinalResultEvent` stood
+   here, one per-frame envelope apiece, and every one of them was wrong about the wire:
+   `TextDeltaEvent` declared `data.delta` where `agent_session.py` has always sent
+   `content`, and `ToolResultEvent` declared `tool_name` and `result` where it sends
+   `tool_call_id` and `content`. Nothing imported any of the four, so nothing ever
+   disagreed with them - `use-chat.ts` narrows each payload inline at the `case` that
+   reads it, which is the only place that knows the shape. A type that misdescribes a
+   frame and has no reader is the same defect as a `case` arm for a frame nobody sends:
+   it makes the boundary look documented. `ChatState` went with them, unread since
+   `stores/chat-store.ts` declared its own.
+
+   Making `WSEvent` a discriminated union over correct payloads is still the honest
+   version of this and still a different change - it rewrites every branch in the
+   handler. Deleting four wrong ones is not that refactor. */
+
+export interface ActionRequest {
+  /** The `approvals` row. What a decision is recorded against. */
+  id: string;
+  /** The model's own id for the call, so the card drawn for it can be resolved. */
+  tool_call_id: string;
+  tool_name: string;
+  args: Record<string, unknown>;
+  /**
+   * The stable id the capability declares the tool under - `update_record` for a
+   * binding that renamed it `change_order`. The card's sentence is looked up by
+   * this, never by `tool_name`. Null or absent for a tool no capability owns.
+   */
+  capability_tool_id?: string | null;
+  /**
+   * The ids in `args` as names the run's person may see - `{table}` for
+   * `update_record` - for the sentence the card leads with. Null or absent when the
+   * tool has no describer or describing it failed; the card then shows the
+   * arguments alone, as it always did.
+   */
+  context?: Record<string, string> | null;
+  /** Which of a service's accounts the call acts as, where its binding names one. */
+  account?: string | null;
+}
+
+export interface ReviewConfig {
+  tool_name: string;
+  /** Whether to allow editing the tool arguments */
+  allow_edit?: boolean;
+  /** Maximum time to wait for decision (seconds) */
+  timeout?: number;
+}
+
+export interface PendingApproval {
+  actionRequests: ActionRequest[];
+  reviewConfigs: ReviewConfig[];
+  /** The run to continue once every call has been decided. */
+  runId: string;
+  /**
+   * The turn the parked calls are drawn in, captured when the approval arrived.
+   *
+   * Not read off the live "current message" when the decision is made: the park is
+   * followed immediately by `complete`, which ends the turn and clears that ref - so
+   * by the time somebody clicks Approve there is no current message, every
+   * `updateToolCallPart` is skipped, and the step sits at "waiting for approval"
+   * forever while the run has in fact resumed and answered.
+   */
+  messageId: string | null;
+}
+
+export type DecisionType = "approve" | "edit" | "reject";
+
+export interface Decision {
+  type: DecisionType;
+  editedAction?: {
+    id: string;
+    tool_name: string;
+    args: Record<string, unknown>;
+  };
+}
+
+export interface AskUserChoice {
+  label: string;
+  description?: string | null;
+}
+
+export interface AskUserQuestion {
+  question: string;
+  /** A short label for the question, shown as a chip (#2064). */
+  header?: string | null;
+  options: AskUserChoice[];
+  /** Whether several options may be picked. */
+  multiSelect?: boolean;
+  /** Whether the user may type a free-form answer instead of picking an option. */
+  allowCustom: boolean;
+}
+
+export interface AskUserAnswer {
+  answer: string;
+  /** The labels picked, when the person chose from the options. */
+  selected?: string[];
+  skipped: boolean;
+}
+
+/* `SubagentMessage` and `SubagentMessageType` stood here, the payload of the
+   `subagent_message` event that this file used to declare. Nothing ever emitted it
+   and nothing ever handled it, so removing that name from `WSEventType` left these
+   two with no reader at all - and a second delegation vocabulary sitting beside the
+   real one is precisely how a client ends up listening for a frame the server never
+   sends.
+
+   The rest of that vocabulary has now followed, for the same reason one frame at a
+   time: `TodoEventFrame` was the payload of `todo_event`, and no backend surface has
+   ever sent one - there is no todo subsystem in `backend/app/`, so `ResearchTodo` and
+   `ResearchTodoStatus` described a wire that does not exist. `SubagentStatus` and
+   `SubagentTaskStatus` outlived it only through `ResearchReplay`, which only
+   `MessagePart.research` read, which nothing ever constructed: `conversation-to-chat.ts`
+   builds `thinking`, `tool` and `text` parts and `message-item.tsx` renders those
+   three. `ContextUsage` was the payload of `context_usage`, which nothing sends either.
+   A delegation is `Delegation` and `SubagentFrame` below - that is the one vocabulary,
+   and it is the one the backend actually speaks. */
+
+/* ------------------------------------------------------------------------- *
+ * Delegation - a second agent's whole conversation inside one turn of this one.
+ *
+ * The six frames below mirror `backend/app/agents/subagent_events.py` field for
+ * field, and they are a discriminated union on `kind` for the same reason the
+ * backend's is: a surface has to switch on it. A text delta appends, a tool call
+ * opens a row, the terminal frame closes the panel and writes the cost.
+ *
+ * `WSEvent` above is left as `{ type; data?: unknown }` on purpose. Making the whole
+ * envelope a union means rewriting all twenty-odd branches in `use-chat.ts`, which is
+ * a refactor worth doing and not this one. (The dead per-event interfaces that used to
+ * sit beside it, each declaring a payload the wire does not send, have gone - see the
+ * note above `ActionRequest`.) So the union stops at the delegation payload: every
+ * frame carries `kind` inside `data` as well as in the envelope's `type`, so
+ * `data as SubagentFrame` narrows honestly from there.
+ * ------------------------------------------------------------------------- */
+
+/** Whether the parent waits for the delegate, or carries on while it works. */
+export type SubagentMode = "sync" | "async";
+
+interface SubagentFrameBase {
+  /** Unique per delegation. What keeps three concurrent specialists apart. */
+  task_id: string;
+  /** The delegate or specialist name its author gave it. */
+  subagent: string;
+  /** 0 is a specialist this run's own agent called; 1 is one that specialist called. */
+  depth: number;
+}
+
+/**
+ * The whole of a specialist a model invented mid-run, carried so it can be kept.
+ *
+ * Present on the opening frame of a *dynamic* delegation and nowhere else: a
+ * delegate is published and an inline specialist lives in its parent's spec, but
+ * one a model wrote at run time is persisted nowhere, so this streamed copy is the
+ * only place its definition is legible - and only while the run is on screen. It
+ * mirrors the backend `SpecialistDefinition`, and is everything such a specialist
+ * has: instructions and a model, no capabilities, knowledge or delegates.
+ */
+export interface SpecialistDefinition {
+  description: string;
+  instructions: string;
+  /** The label of the model profile the specialist named, resolved on promotion. */
+  model: string;
+}
+
+export interface SubagentStartFrame extends SubagentFrameBase {
+  kind: "subagent_start";
+  mode: SubagentMode;
+  prompt: string;
+  /**
+   * The delegation this one was started from, null when the run's own agent made it.
+   *
+   * Read from the journal at `begin`, which is the only moment both delegations
+   * exist, and it is what nests a panel without guessing. `depth` alone cannot:
+   * two specialists running at once are both one level up from a nested start.
+   */
+  parent_task_id: string | null;
+  /**
+   * A dynamic specialist's definition, or null for a delegate or inline specialist.
+   *
+   * Set only for a specialist the model invented at run time - the one kind nothing
+   * else keeps - so a surface can offer to promote it while the run is on screen.
+   */
+  specialist: SpecialistDefinition | null;
+  /**
+   * Set when the worker is Claude Code or Codex, started by the `coding_agent`
+   * capability rather than delegated to an agent, so the panel draws its mark.
+   */
+  harness?: CodingHarness | null;
+}
+
+/** The coding harnesses the `coding_agent` capability runs. */
+export type CodingHarness = "claude_code" | "codex";
+
+export interface SubagentTextDeltaFrame extends SubagentFrameBase {
+  kind: "subagent_text_delta";
+  delta: string;
+}
+
+export interface SubagentThinkingDeltaFrame extends SubagentFrameBase {
+  kind: "subagent_thinking_delta";
+  delta: string;
+}
+
+export interface SubagentToolCallFrame extends SubagentFrameBase {
+  kind: "subagent_tool_call";
+  tool_name: string;
+  tool_call_id: string;
+  /** What the step is about - a file, a command - where the worker says; a coding harness does. */
+  title?: string | null;
+}
+
+export interface SubagentToolResultFrame extends SubagentFrameBase {
+  kind: "subagent_tool_result";
+  tool_name: string;
+  tool_call_id: string;
+  /** False when the tool raised, which is all the frame carries about it. */
+  ok: boolean;
+}
+
+export interface SubagentAwaitingApprovalFrame extends SubagentFrameBase {
+  /**
+   * A sync delegate stopped for a person; the answer is still coming.
+   *
+   * Not a `subagent_complete`: nothing is recorded and no cost is known yet - the
+   * continuation writes the outcome when the person decides. It closes the panel
+   * with a "waiting for a person" state so it stops reading "working", and carries
+   * no cost or run id because there is none. See `SubagentAwaitingApproval` in
+   * `backend/app/agents/subagent_events.py`.
+   */
+  kind: "subagent_awaiting_approval";
+}
+
+export interface SubagentCompleteFrame extends SubagentFrameBase {
+  kind: "subagent_complete";
+  status: "completed" | "failed" | "cancelled";
+  /** Present for a delegation to a published agent, which gets a run row. */
+  run_id: string | null;
+  /** What this delegation added to the parent run's ledger, as a Decimal string. */
+  cost_usd: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  error: string | null;
+}
+
+/**
+ * A summary of the run's own history, while it is being written.
+ *
+ * Compaction happens between two of a turn's model requests, where nothing else
+ * streams — and summarising is a whole request over a history that is by
+ * definition long. Without a frame for it the chat simply stops for the length of
+ * it, which is what makes somebody reload the page and lose the turn.
+ *
+ * Only the summarising strategy sends these. The ones that edit a list and return
+ * would be a spinner that appeared and vanished within a frame.
+ */
+export interface Compaction {
+  kind: "compaction_started" | "compaction_finished" | "compaction_impossible";
+  /** How many messages the history held when it started. */
+  messages_before: number | null;
+  /** How many it holds now. Null while it is running, and null if it failed. */
+  messages_after: number | null;
+  /** On `compaction_impossible`: what every request carries before any message. */
+  overhead_tokens?: number | null;
+  /** On `compaction_impossible`: the window the trigger was measured against. */
+  window_tokens?: number | null;
+}
+
+/** What a whole conversation has cost, as `GET /conversations/{id}/messages` totals it. */
+export interface ConversationCost {
+  input_tokens: number;
+  output_tokens: number;
+  /** A string on the wire, because money is `Numeric`. */
+  cost_usd: string | number;
+  /** Null where no turn recorded the flag - "nobody knows", not "exact". */
+  cost_is_partial: boolean | null;
+}
+
+export type SubagentFrame =
+  | SubagentStartFrame
+  | SubagentTextDeltaFrame
+  | SubagentThinkingDeltaFrame
+  | SubagentToolCallFrame
+  | SubagentToolResultFrame
+  | SubagentAwaitingApprovalFrame
+  | SubagentCompleteFrame;
+
+/**
+ * `running` is this surface's own: no frame says it, the absence of a terminal one does.
+ *
+ * `awaiting_approval` is not terminal - the delegate stopped for a person and the
+ * run can still resume it - but it closes the panel all the same, because a panel
+ * reading "working" through a wait that may never end is the bug the state exists
+ * to fix (agenticos#173).
+ */
+export type DelegationStatus =
+  "running" | "completed" | "failed" | "cancelled" | "awaiting_approval";
+
+/**
+ * One of the delegate's own tool calls.
+ *
+ * A name and whether it worked, and nothing else - which is the contract, not a
+ * rendering choice: `SubagentToolCall` carries no arguments and
+ * `SubagentToolResult` carries no content, so a delegate's step is a line of
+ * narration rather than something to open. `ok` is null until its result lands.
+ */
+export interface DelegationStep {
+  id: string;
+  name: string;
+  ok: boolean | null;
+  /** The file or command the step was about, when the frame said; see `SubagentToolCallFrame`. */
+  title: string | null;
+}
+
+/** One delegation, assembled from its frames - the thing a panel draws. */
+export interface Delegation {
+  taskId: string;
+  subagent: string;
+  depth: number;
+  mode: SubagentMode;
+  prompt: string;
+  /**
+   * The delegation this one was started from, or null at the top.
+   *
+   * Named by the start frame's `parent_task_id`, never inferred. See `parentIn` in
+   * `lib/delegations.ts` for the two cases that read as a root panel instead.
+   */
+  parentTaskId: string | null;
+  status: DelegationStatus;
+  /**
+   * The definition of a specialist the model invented, or null for anything already
+   * keepable. Set from the start frame; what a "promote to a draft agent" action in
+   * chat reads, and what its absence hides that action for. See `SpecialistDefinition`.
+   */
+  specialist: SpecialistDefinition | null;
+  /** Claude Code or Codex, when the worker is a coding harness rather than an agent. */
+  harness: CodingHarness | null;
+  text: string;
+  thinking: string;
+  steps: DelegationStep[];
+  /**
+   * The run row the delegate produced, once it reports one, and null until then.
+   *
+   * Only a delegation to a published agent gets a run row, so it stays null for a
+   * specialist defined inline on the parent's spec. Carried because it is the only
+   * link between a panel and the run history entry behind it - see
+   * `DelegationRecorder` in `backend/app/agents/capabilities/subagents/`.
+   */
+  runId: string | null;
+  costUsd: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  error: string | null;
+}
+
+/** Why a personal MCP service could not be reached on this turn. */
+export type PersonalServiceGapKind = "nobody_to_speak_as" | "not_connected" | "unauthorized";
+
+/**
+ * One of the agent's personal MCP services this person cannot reach yet.
+ *
+ * Sent once per turn, before the model answers, as `personal_services_unavailable`.
+ * The catalog key rather than a built URL: the card resolves the catalog entry
+ * itself and navigates in the app, so the link keeps the viewer's locale prefix
+ * instead of quoting a path a runner had no way to build. Not persisted: it is
+ * true of this person at this moment, not of the transcript.
+ */
+export interface PersonalServiceGap {
+  catalog_key: string;
+  /** As the catalog names it; the key where the catalog no longer holds it. */
+  name: string;
+  gap: PersonalServiceGapKind;
+}
+
+/**
+ * A run paused on `connect_account`: the agent needs one of the person's own
+ * services, and waits while they connect it.
+ *
+ * Sent as `connect_account` only when the agent reaches for the service, never
+ * up front; answered with `connect_account_response`. Never "nobody to speak
+ * as" - a run with nobody signed in cannot wait for anybody.
+ */
+export interface ConnectionRequest {
+  catalog_key: string;
+  name: string;
+  gap: Exclude<PersonalServiceGapKind, "nobody_to_speak_as">;
+}

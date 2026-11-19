@@ -1,0 +1,1575 @@
+"""Tests for skills - organizational know-how handed to agents.
+
+The things worth guarding: script execution stays off until there is a sandbox,
+a skill that disappears after publish degrades the agent rather than breaking
+the run, and an uploaded file is refused unless the model could actually read
+it - by name and by content both.
+"""
+
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
+
+import pytest
+from sqlalchemy.exc import IntegrityError
+
+from app.agents.capabilities.skills import SAFE_SKILL_TOOLS, Skills
+from app.core.exceptions import AlreadyExistsError, BadRequestError, NotFoundError
+from app.core.permissions import AuthContext, OrgRoleName
+from app.db.models.resource_grant import GrantLevel, Visibility
+from app.db.models.skill import Skill
+from app.schemas.skill import SkillResourceUpdate, SkillUpdate
+from app.services import skill_library
+from app.services.skill_library import LibraryResource, LibrarySkill
+from app.services.skills import (
+    MAX_RESOURCE_BYTES,
+    SUGGESTED_CATEGORIES,
+    SkillService,
+    _clean_resource_path,
+    _decode_text,
+)
+
+SKILLS_PATH = "app.services.skills"
+
+
+@pytest.fixture(autouse=True)
+def _used_nowhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No agent binds anything here; `test_resource_usage` covers the query."""
+
+    async def nowhere(*_args: object, resource_ids: list[UUID], **_kwargs: object):
+        return {resource_id: [] for resource_id in resource_ids}
+
+    monkeypatch.setattr("app.services.skills.agents_using", nowhere)
+    monkeypatch.setattr("app.services.skills.groups_sharing", nowhere)
+
+
+def _ctx(role: str = OrgRoleName.OWNER, *, org_id=None, user_id=None) -> AuthContext:
+    return AuthContext(
+        user_id=user_id or uuid.uuid4(),
+        organization_id=org_id or uuid.uuid4(),
+        role=role,
+    )
+
+
+def _skill(name="refunds", resources=None, *, ctx=None, owner_user_id=None):
+    """A skill row; given a `ctx` it is one the caller owns, so role scope reaches it."""
+    skill = MagicMock()
+    skill.id = uuid.uuid4()
+    skill.organization_id = ctx.organization_id if ctx else uuid.uuid4()
+    skill.owner_user_id = owner_user_id or (ctx.user_id if ctx else uuid.uuid4())
+    skill.visibility = Visibility.PRIVATE.value
+    skill.name = name
+    skill.description = "How refunds are handled."
+    skill.content = "# Refunds\n\nCheck the order first."
+    skill.version = 1
+    skill.resources = resources or []
+    return skill
+
+
+def _row(name: str) -> Skill:
+    """A real ORM row, for the tests that go through the response schema.
+
+    Deliberately not the `MagicMock` above: a mock answers every attribute,
+    including `built_in` and `file_count`, which are not on the row at all -
+    so an assertion about them would hold against a response that never
+    carried them.
+    """
+    return Skill(
+        id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        name=name,
+        description="How refunds are handled.",
+        content="---\nname: x\n---\n\n# Refunds\n\nCheck the order first.",
+        category=None,
+        visibility="org",
+        resources=[],
+    )
+
+
+def _bundled(key: str, *, resources: tuple[str, ...] = ()) -> LibrarySkill:
+    """One folder of the shipped library, as `skill_library.library()` reads it.
+
+    The real dataclass rather than a mock: `size_bytes` is derived from the
+    content, and a mock would answer with something for it whether the service
+    passed the file through or not.
+    """
+    return LibrarySkill(
+        key=key,
+        name=key,
+        description=f"What {key} is for.",
+        category=None,
+        content=f"# {key}",
+        resources=tuple(LibraryResource(name=name, content="body") for name in resources),
+    )
+
+
+def _resource(name="template.md", content="Dear {name},"):
+    """One of a skill's files, as the repository hands it back."""
+    resource = MagicMock()
+    resource.id = uuid.uuid4()
+    resource.name = name
+    resource.description = None
+    resource.content = content
+    return resource
+
+
+def _db():
+    db = MagicMock()
+    db.flush = AsyncMock()
+    db.refresh = AsyncMock()
+    # `record_audit` reads the chain head and takes the per-org lock, both via
+    # `execute`; the mock must await and answer the head read with an empty chain.
+    db.execute = AsyncMock()
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    return db
+
+
+class TestCatalogConstruction:
+    """Each skill is a deferred capability; only its files are a tool."""
+
+    def test_each_skill_is_a_capability_of_its_own(self):
+        """The model reads the catalog in its own capability list, not in a tool."""
+        catalog = Skills(skills=[_skill(), _skill(name="tone-of-voice")])
+        assert catalog.skill_names == ["refunds", "tone-of-voice"]
+
+    def test_a_skill_carries_its_body_and_is_loaded_on_demand(self):
+        """Names and descriptions up front; the body only once it is asked for."""
+        leaves = []
+        Skills(skills=[_skill()]).apply(leaves.append)
+
+        (skill,) = [leaf for leaf in leaves if leaf.id == "refunds"]
+        assert skill.defer_loading is True
+        assert skill.get_description() == "How refunds are handled."
+        assert "Check the order first." in "".join(skill.get_instructions())
+
+    def test_script_execution_is_not_exposed(self):
+        """Without a sandbox, run_skill_script is remote code execution."""
+        toolset = Skills(skills=[_skill(resources=[_resource()])]).get_toolset()
+        assert toolset is not None
+        assert "run_skill_script" not in toolset.tools
+        assert set(SAFE_SKILL_TOOLS) == set(toolset.tools)
+
+    def test_skills_with_no_files_carry_no_tool(self):
+        """A tool that could only ever answer "nothing here" is context wasted."""
+        assert Skills(skills=[_skill()]).get_toolset() is None
+
+    def test_skills_are_passed_in_memory(self):
+        """No temp directory, so no cleanup, no race and no path surface."""
+        catalog = Skills(skills=[_skill(), _skill(name="tone-of-voice")])
+        assert catalog.directories == ()
+        assert catalog.registries == ()
+
+    def test_resources_travel_with_their_skill(self):
+        resource = MagicMock()
+        resource.name = "template.md"
+        resource.description = "Reply template"
+        resource.content = "Dear {name},"
+        catalog = Skills(skills=[_skill(resources=[resource])])
+        assert [file.name for file in catalog.packages["refunds"].resources] == ["template.md"]
+
+
+class TestAgentBinding:
+    @pytest.mark.anyio
+    async def test_an_agent_bound_to_no_skills_asks_the_database_nothing(self):
+        """Most agents have no skills; that must not cost a query per run."""
+        with patch("app.services.skills.skill_repo.get_many", new=AsyncMock()) as get_many:
+            assert await SkillService(_db()).resolve_for_agent(_ctx(), []) == []
+
+        assert get_many.await_count == 0
+
+    @pytest.mark.anyio
+    async def test_a_deleted_skill_degrades_the_agent_not_the_run(self):
+        ctx = _ctx()
+        present = _skill()
+        missing_id = uuid.uuid4()
+
+        with patch(
+            "app.services.skills.skill_repo.get_many",
+            new=AsyncMock(return_value={present.id: present}),
+        ):
+            resolved = await SkillService(_db()).resolve_for_agent(ctx, [present.id, missing_id])
+
+        assert resolved == [present]
+
+    @pytest.mark.anyio
+    async def test_a_run_reads_a_skill_the_runner_could_not_reach_themselves(self):
+        """Binding is lending, and the gate is publish - deliberately not the run.
+
+        A member's role reaches shared skills only, so this one is a skill they
+        could not open in the UI. The agent still reads it, exactly as it still
+        searches a collection nobody shared with the person asking: the publisher
+        was checked when the version was frozen
+        (`AgentRegistryService._skill_problems`), and re-checking per runner would
+        make one published version answer differently for two colleagues.
+        """
+        ctx = _ctx(OrgRoleName.MEMBER)
+        private = _skill(ctx=ctx, owner_user_id=uuid.uuid4())
+
+        with patch(
+            f"{SKILLS_PATH}.skill_repo.get_many",
+            new=AsyncMock(return_value={private.id: private}),
+        ):
+            assert await SkillService(_db()).resolve_for_agent(ctx, [private.id]) == [private]
+
+    @pytest.mark.anyio
+    async def test_a_run_with_no_subject_still_reads_the_agents_skills(self):
+        """The concrete reason a per-runner check here would be wrong.
+
+        An API key, an embedded widget and a channel message all run on a context
+        with no subject, and `resolve_access` refuses every one of those by
+        design - so a runner-scoped check would strip every skill from exactly the
+        surfaces a published agent exists to be reached through.
+        """
+        ctx = AuthContext.anonymous(uuid.uuid4())
+        skill = _skill(ctx=ctx)
+
+        with patch(
+            f"{SKILLS_PATH}.skill_repo.get_many", new=AsyncMock(return_value={skill.id: skill})
+        ):
+            assert await SkillService(_db()).resolve_for_agent(ctx, [skill.id]) == [skill]
+
+    @pytest.mark.anyio
+    async def test_binding_order_is_preserved(self):
+        """The order skills appear in is the order the model sees them listed."""
+        ctx = _ctx()
+        first, second = _skill(name="a"), _skill(name="b")
+
+        with patch(
+            "app.services.skills.skill_repo.get_many",
+            new=AsyncMock(return_value={first.id: first, second.id: second}),
+        ):
+            resolved = await SkillService(_db()).resolve_for_agent(ctx, [second.id, first.id])
+
+        assert [skill.name for skill in resolved] == ["b", "a"]
+
+
+class TestSkillManagement:
+    @pytest.mark.anyio
+    async def test_duplicate_names_are_refused(self):
+        """The name is how the model refers to a skill; two is an ambiguity."""
+        with (
+            patch(
+                "app.services.skills.skill_repo.get_by_name",
+                new=AsyncMock(return_value=_skill()),
+            ),
+            pytest.raises(AlreadyExistsError) as refused,
+        ):
+            await SkillService(_db()).create(_ctx(), name="refunds", description="x", content="")
+
+        assert refused.value.details == {"name": "refunds"}
+        # The refusal is expected, recoverable and one keystroke from being
+        # resolved, so it has to name both ways out rather than only report
+        # that the name is taken.
+        assert "refunds" in refused.value.message
+        assert "choose a different one" in refused.value.message
+        assert "edit it" in refused.value.message
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("name", ["Refund Policy", "planning"])
+    async def test_the_service_refuses_a_name_the_schema_would(self, name):
+        """An applied skill proposal creates a skill from an agent's directory
+        name with no `SkillCreate` in between, so the service checks it too."""
+        create = AsyncMock()
+        with (
+            patch("app.services.skills.skill_repo.get_by_name", new=AsyncMock(return_value=None)),
+            patch("app.services.skills.skill_repo.create", new=create),
+            pytest.raises(BadRequestError) as refused,
+        ):
+            await SkillService(_db()).create(_ctx(), name=name, description="x", content="")
+
+        assert refused.value.details == {"name": name}
+        create.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_creation_is_audited(self):
+        with (
+            patch("app.services.skills.skill_repo.get_by_name", new=AsyncMock(return_value=None)),
+            patch(
+                "app.services.skills.skill_repo.create",
+                new=AsyncMock(return_value=_skill()),
+            ),
+            patch("app.services.skills.record_audit", new=AsyncMock()) as audit,
+        ):
+            await SkillService(_db()).create(
+                _ctx(), name="refunds", description="How refunds work", content="# Refunds"
+            )
+        assert audit.call_args.kwargs["action"] == "skill.created"
+
+    @pytest.mark.anyio
+    async def test_a_skill_you_cannot_reach_is_indistinguishable_from_one_that_is_not_there(self):
+        """Otherwise the error message becomes an oracle for enumerating skill ids.
+
+        Another organization's skill never comes back from the org-scoped
+        lookup at all; one inside the organization that the caller may not see
+        is refused after it. Both must read exactly the same, down to the
+        details, or a member can probe for skills they were never shown.
+        """
+        ctx = _ctx(OrgRoleName.MEMBER)
+        forbidden = _skill(ctx=ctx, owner_user_id=uuid.uuid4())
+
+        with (
+            patch("app.services.skills.skill_repo.get", new=AsyncMock(return_value=forbidden)),
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            pytest.raises(NotFoundError) as refused,
+        ):
+            await SkillService(_db()).get(ctx, forbidden.id)
+
+        with (
+            patch("app.services.skills.skill_repo.get", new=AsyncMock(return_value=None)),
+            pytest.raises(NotFoundError) as absent,
+        ):
+            await SkillService(_db()).get(ctx, forbidden.id)
+
+        assert refused.value.message == absent.value.message
+        assert refused.value.details == absent.value.details == {"skill_id": str(forbidden.id)}
+
+    @pytest.mark.anyio
+    async def test_the_organizations_skills_are_listed(self):
+        ctx = _ctx()
+        mine = _skill(ctx=ctx)
+
+        with patch(
+            "app.services.skills.skill_repo.list_visible", new=AsyncMock(return_value=([mine], 1))
+        ) as list_visible:
+            listed, total = await SkillService(_db()).list_skills(ctx)
+
+        assert listed == [mine]
+        assert total == 1
+        assert list_visible.call_args.kwargs["organization_id"] == ctx.organization_id
+
+    @pytest.mark.anyio
+    async def test_the_listing_marks_a_skill_installed_from_the_library(self):
+        """`built_in` is a name match, because an install keeps nothing else.
+
+        A row that came from the shipped library and one somebody typed are the
+        same shape; only the name says which, so an install that renamed on the
+        way in would be indistinguishable from local work.
+        """
+        ctx = _ctx()
+        installed, local = _row("refunds"), _row("our-own-thing")
+        bundled = MagicMock()
+        bundled.name = "refunds"
+
+        with (
+            patch(
+                f"{SKILLS_PATH}.skill_repo.list_visible",
+                new=AsyncMock(return_value=([installed, local], 2)),
+            ),
+            patch(f"{SKILLS_PATH}.skill_repo.list_categories", new=AsyncMock(return_value=[])),
+            patch(
+                f"{SKILLS_PATH}.skill_repo.list_names",
+                new=AsyncMock(return_value={"refunds", "our-own-thing"}),
+            ),
+            patch(f"{SKILLS_PATH}.skill_library.library", return_value=[bundled]),
+        ):
+            listing = await SkillService(_db()).list_readable(ctx)
+
+        assert [item.built_in for item in listing.items] == [True, False]
+        # The card peeks at the body without the listing carrying it: front
+        # matter is dropped, because the card already shows the name.
+        assert listing.items[0].excerpt == "# Refunds\n\nCheck the order first."
+
+    @pytest.mark.anyio
+    async def test_the_listing_carries_the_filters_the_page_cannot(self):
+        """`total`, `categories` and the suggestions all outlive the page.
+
+        Paging or searching narrows `items` and must not narrow any of them: a
+        pager needs the count before paging, and a filter chip that vanished
+        with the page it filtered would strand whoever pressed it.
+        """
+        ctx = _ctx()
+
+        with (
+            patch(
+                f"{SKILLS_PATH}.skill_repo.list_visible",
+                new=AsyncMock(return_value=([_row("refunds")], 87)),
+            ),
+            patch(
+                f"{SKILLS_PATH}.skill_repo.list_categories",
+                new=AsyncMock(return_value=["devops", "support"]),
+            ),
+            patch(f"{SKILLS_PATH}.skill_repo.list_names", new=AsyncMock(return_value=set())),
+            patch(f"{SKILLS_PATH}.skill_library.library", return_value=[]),
+        ):
+            listing = await SkillService(_db()).list_readable(ctx, search="refund", limit=1)
+
+        assert len(listing.items) == 1
+        assert listing.total == 87
+        assert listing.categories == ["devops", "support"]
+        assert listing.suggested_categories == list(SUGGESTED_CATEGORIES)
+
+    @pytest.mark.anyio
+    async def test_a_role_that_sees_everything_never_looks_up_grants(self):
+        """A query per listing, on every page, for a set that cannot widen anything."""
+        ctx = _ctx(OrgRoleName.OWNER)
+
+        with (
+            patch(
+                "app.services.access.resource_grant_repo.list_shared_ids", new=AsyncMock()
+            ) as shared_ids,
+            patch(
+                "app.services.skills.skill_repo.list_visible",
+                new=AsyncMock(return_value=([], 0)),
+            ) as list_visible,
+        ):
+            await SkillService(_db()).list_skills(ctx)
+
+        assert shared_ids.await_count == 0
+        assert list_visible.call_args.kwargs["see_all"] is True
+        assert list_visible.call_args.kwargs["shared_ids"] == []
+
+    @pytest.mark.anyio
+    async def test_a_narrower_role_lists_only_theirs_plus_what_was_shared(self):
+        """The listing must admit exactly the rows resolve_access would, one by one.
+
+        A viewer's role scope is "mine plus what was shared with me", so the
+        query gets their user id for the ownership predicate and the granted
+        ids for the shared one - and never the whole organization.
+        """
+        ctx = _ctx(OrgRoleName.VIEWER)
+        shared = uuid.uuid4()
+
+        with (
+            patch(
+                "app.services.access.resource_grant_repo.list_shared_ids",
+                new=AsyncMock(return_value=[shared]),
+            ) as shared_ids,
+            patch(
+                "app.services.skills.skill_repo.list_visible",
+                new=AsyncMock(return_value=([], 0)),
+            ) as list_visible,
+        ):
+            await SkillService(_db()).list_skills(ctx)
+
+        assert shared_ids.call_args.kwargs["minimum_level"] is GrantLevel.READ
+        assert list_visible.call_args.kwargs["see_all"] is False
+        assert list_visible.call_args.kwargs["shared_ids"] == [shared]
+        assert list_visible.call_args.kwargs["user_id"] == ctx.user_id
+
+    @pytest.mark.anyio
+    async def test_shared_with_me_for_a_wide_role_still_looks_up_grants(self):
+        """ "Shared with me" is about grants and visibility, not reach."""
+        ctx = _ctx(OrgRoleName.OWNER)
+        granted = uuid.uuid4()
+
+        with (
+            patch(
+                "app.services.skills.resource_grant_repo.list_shared_ids",
+                new=AsyncMock(return_value=[granted]),
+            ) as shared_ids,
+            patch(
+                "app.services.skills.skill_repo.list_visible",
+                new=AsyncMock(return_value=([], 0)),
+            ) as list_visible,
+        ):
+            await SkillService(_db()).list_skills(ctx, shared_with_me=True)
+
+        assert shared_ids.await_count == 1
+        assert list_visible.call_args.kwargs["see_all"] is True
+        assert list_visible.call_args.kwargs["shared_with_me"] is True
+        assert list_visible.call_args.kwargs["shared_ids"] == [granted]
+
+    @pytest.mark.anyio
+    async def test_shared_with_me_for_a_narrow_role_reuses_its_grant_lookup(self):
+        """One grants query per listing, not two."""
+        ctx = _ctx(OrgRoleName.MEMBER)
+        granted = uuid.uuid4()
+
+        with (
+            patch(
+                "app.services.access.resource_grant_repo.list_shared_ids",
+                new=AsyncMock(return_value=[granted]),
+            ) as shared_ids,
+            patch(
+                "app.services.skills.skill_repo.list_visible",
+                new=AsyncMock(return_value=([], 0)),
+            ) as list_visible,
+        ):
+            await SkillService(_db()).list_skills(ctx, shared_with_me=True)
+
+        assert shared_ids.await_count == 1
+        assert list_visible.call_args.kwargs["see_all"] is False
+        assert list_visible.call_args.kwargs["shared_with_me"] is True
+        assert list_visible.call_args.kwargs["shared_ids"] == [granted]
+
+    @pytest.mark.anyio
+    async def test_the_search_is_the_databases_and_so_is_the_page(self):
+        """The client never holds an organization's whole set, so it cannot filter one."""
+        ctx = _ctx()
+
+        with patch(
+            "app.services.skills.skill_repo.list_visible", new=AsyncMock(return_value=([], 0))
+        ) as list_visible:
+            await SkillService(_db()).list_skills(ctx, search="refund", skip=50, limit=25)
+
+        assert list_visible.call_args.kwargs["search"] == "refund"
+        assert list_visible.call_args.kwargs["skip"] == 50
+        assert list_visible.call_args.kwargs["limit"] == 25
+
+    @pytest.mark.anyio
+    async def test_the_category_filter_and_the_sort_are_the_databases_too(self):
+        """Same reason as the search: a page of fifty cannot be regrouped client-side.
+
+        Plural: the filter is a multi-select, and "either shelf" has to reach
+        the query as the whole list, not as whichever entry won.
+        """
+        ctx = _ctx()
+
+        with patch(
+            "app.services.skills.skill_repo.list_visible", new=AsyncMock(return_value=([], 0))
+        ) as list_visible:
+            await SkillService(_db()).list_skills(
+                ctx, categories=["devops", "data"], sort="updated"
+            )
+
+        assert list_visible.call_args.kwargs["categories"] == ["devops", "data"]
+        assert list_visible.call_args.kwargs["sort"] == "updated"
+
+    def test_a_skill_cannot_take_the_name_of_a_capability(self):
+        """A skill is a deferred capability, filed under its name in the same
+        namespace as `planning` and the rest - so this name could be created and
+        then made any agent that also had that capability unrunnable, refused by
+        the library before the first token (#1704 review)."""
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        from app.schemas.skill import SkillCreate
+
+        with _pytest.raises(ValidationError):
+            SkillCreate(name="planning", description="d")
+
+        assert SkillCreate(name="refunds", description="d").name == "refunds"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Product description writer",
+            "Refund-Policy",
+            "refund_policy",
+            "refund policy",
+            "-refunds",
+            "refunds-",
+            "refund--policy",
+        ],
+    )
+    def test_a_skill_name_must_be_an_agent_skills_id(self, name):
+        """The name is the id a model loads the skill by, written the way models
+        write it: lowercase letters and digits joined by single hyphens (#1911)."""
+        from pydantic import ValidationError
+
+        from app.schemas.skill import SkillCreate
+
+        with pytest.raises(ValidationError, match="lowercase letters, digits and hyphens"):
+            SkillCreate(name=name, description="d")
+
+    def test_digits_and_single_hyphens_are_a_valid_skill_name(self):
+        from app.schemas.skill import SkillCreate
+
+        assert SkillCreate(name="iso-27001-audit", description="d").name == "iso-27001-audit"
+
+    def test_every_suggested_category_is_storable(self):
+        """The pickers offer these before an organization invents its own; a
+        suggestion the create endpoint would then refuse is a trap, so each one
+        must pass the same validation a typed category does."""
+        from app.schemas.skill import SkillCreate
+        from app.services.skills import SUGGESTED_CATEGORIES
+
+        assert SUGGESTED_CATEGORIES
+        assert len(set(SUGGESTED_CATEGORIES)) == len(SUGGESTED_CATEGORIES)
+        for name in SUGGESTED_CATEGORIES:
+            SkillCreate(name="x", description="d", category=name)
+
+    @pytest.mark.anyio
+    async def test_the_category_choices_come_from_the_whole_organization(self):
+        """The chips must not shrink to what the current page happens to show."""
+        ctx = _ctx()
+
+        with patch(
+            "app.services.skills.skill_repo.list_categories",
+            new=AsyncMock(return_value=["devops", "marketing"]),
+        ) as list_categories:
+            categories = await SkillService(_db()).list_categories(ctx)
+
+        assert categories == ["devops", "marketing"]
+        assert list_categories.call_args.kwargs["organization_id"] == ctx.organization_id
+
+    @pytest.mark.anyio
+    async def test_a_skill_is_created_on_the_shelf_it_was_given(self):
+        with (
+            patch("app.services.skills.skill_repo.get_by_name", new=AsyncMock(return_value=None)),
+            patch(
+                "app.services.skills.skill_repo.create", new=AsyncMock(return_value=_skill())
+            ) as create,
+            patch("app.services.skills.record_audit", new=AsyncMock()),
+        ):
+            await SkillService(_db()).create(
+                _ctx(), name="refunds", description="x", content="", category="support"
+            )
+
+        assert create.call_args.kwargs["category"] == "support"
+
+    @pytest.mark.anyio
+    async def test_an_edit_bumps_the_version_agents_are_told_about(self):
+        """Agents bind to a skill, not a version, so the bump is how an edit is noticed."""
+        ctx = _ctx()
+        skill = _skill(ctx=ctx)
+
+        with (
+            patch("app.services.skills.skill_repo.get", new=AsyncMock(return_value=skill)),
+            patch(
+                "app.services.skills.skill_repo.update", new=AsyncMock(return_value=skill)
+            ) as update,
+        ):
+            updated = await SkillService(_db()).update(
+                ctx, skill.id, SkillUpdate(content="# New policy")
+            )
+
+        assert update.call_args.kwargs["update_data"] == {
+            "content": "# New policy",
+            "version": skill.version + 1,
+        }
+        assert update.call_args.kwargs["skill"] is skill
+        assert updated is skill
+
+    @pytest.mark.anyio
+    async def test_an_edit_is_audited_with_what_changed(self):
+        """The highest-consequence of the three skill events.
+
+        Creating and deleting a skill were already audited; editing one changes
+        what every bound agent executes on its next run without changing which
+        agents are affected, so it is the one most worth attributing later.
+        """
+        ctx = _ctx()
+        skill = _skill(ctx=ctx)
+
+        with (
+            patch("app.services.skills.skill_repo.get", new=AsyncMock(return_value=skill)),
+            patch("app.services.skills.skill_repo.update", new=AsyncMock(return_value=skill)),
+            patch("app.services.skills.record_audit", new=AsyncMock()) as audit,
+        ):
+            await SkillService(_db()).update(ctx, skill.id, SkillUpdate(content="# New policy"))
+
+        recorded = audit.call_args.kwargs
+        assert recorded["action"] == "skill.updated"
+        assert recorded["target_id"] == str(skill.id)
+        assert "content" in recorded["details"]["fields"]
+
+    @pytest.mark.anyio
+    async def test_editing_a_skill_you_cannot_edit_writes_nothing(self):
+        """Viewing and editing are separate permissions; the edit check is the one that counts."""
+        ctx = _ctx(OrgRoleName.VIEWER)
+        skill = _skill(ctx=ctx, owner_user_id=uuid.uuid4())
+
+        with (
+            patch("app.services.skills.skill_repo.get", new=AsyncMock(return_value=skill)),
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("app.services.skills.skill_repo.update", new=AsyncMock()) as update,
+            pytest.raises(NotFoundError),
+        ):
+            await SkillService(_db()).update(ctx, skill.id, SkillUpdate(content="# Rewritten"))
+
+        assert update.await_count == 0
+
+    @pytest.mark.anyio
+    async def test_deleting_a_skill_takes_the_grants_that_pointed_at_it(self):
+        """The grant table is generic - no foreign key, so nothing cascades for it.
+
+        Left behind, those rows share an id that no longer means anything, and
+        they would silently apply to whatever reuses it.
+        """
+        ctx = _ctx()
+        skill = _skill(ctx=ctx)
+
+        with (
+            patch("app.services.skills.skill_repo.get", new=AsyncMock(return_value=skill)),
+            patch(
+                "app.services.skills.resource_grant_repo.delete_for_resource", new=AsyncMock()
+            ) as drop_grants,
+            patch("app.services.skills.skill_repo.delete", new=AsyncMock()) as delete,
+            patch("app.services.skills.record_audit", new=AsyncMock()) as audit,
+        ):
+            await SkillService(_db()).delete(ctx, skill.id)
+
+        assert drop_grants.call_args.kwargs["resource_type"] == "skill"
+        assert drop_grants.call_args.kwargs["resource_id"] == skill.id
+        assert drop_grants.call_args.kwargs["organization_id"] == ctx.organization_id
+        assert delete.call_args.args[1] is skill
+        assert audit.call_args.kwargs["action"] == "skill.deleted"
+        assert audit.call_args.kwargs["target_id"] == str(skill.id)
+
+
+class TestTheListingOnlyReads:
+    """A listing answers with what is there; it does not write while it reads.
+
+    It used to top itself up, copying in any bundled skill the organization did
+    not have - so a deleted one came back on the next visit, and the only way to
+    retire a shipped skill was to disable it. The gallery is where a skill is
+    chosen now, and `seed-skills` is how a deployment pushes a new bundled one
+    out on purpose.
+    """
+
+    @pytest.mark.anyio
+    async def test_a_deleted_bundled_skill_stays_deleted(self, mock_db_session: AsyncMock) -> None:
+        # No skills at all, which is what an organization whose owner deleted
+        # the shipped three looks like. Nothing is written to fill the gap.
+        service = SkillService(mock_db_session)
+        with (
+            patch(f"{SKILLS_PATH}.skill_repo.list_visible", new=AsyncMock(return_value=([], 0))),
+            patch(f"{SKILLS_PATH}.skill_repo.list_categories", new=AsyncMock(return_value=[])),
+            patch.object(service, "install_from_library", new=AsyncMock()) as install,
+        ):
+            page = await service.list_readable(_ctx())
+
+        assert page.items == []
+        install.assert_not_awaited()
+
+
+class TestSkillLibrary:
+    """The skills this deployment ships with, and what installing one does."""
+
+    def test_every_bundled_skill_reads(self):
+        """A folder that cannot be parsed is skipped and logged, so a broken one
+        would show up here as an absence rather than as an exception."""
+        from app.services import skill_library
+
+        keys = {skill.key for skill in skill_library.library()}
+
+        assert {"code-review", "incident-report", "refund-policy"} <= keys
+
+    def test_a_bundled_skill_carries_its_files(self):
+        """The whole point of the folder shape: a skill is a body plus the
+        detail it loads on demand."""
+        from app.services import skill_library
+
+        skill = skill_library.get("code-review")
+
+        assert skill is not None
+        assert skill.description
+        assert {resource.name for resource in skill.resources} == {
+            "checklist.md",
+            "review-comment.md",
+        }
+        assert all(resource.size_bytes > 0 for resource in skill.resources)
+
+    def test_every_bundled_skill_names_its_shelf(self):
+        """The listing groups by category, and a shipped skill that arrived
+        uncategorized would sit outside every chip from its first day."""
+        from app.services import skill_library
+
+        by_key = {skill.key: skill.category for skill in skill_library.library()}
+
+        assert by_key["code-review"] == "engineering"
+        assert by_key["incident-report"] == "operations"
+        assert by_key["refund-policy"] == "support"
+
+    def test_a_manifest_without_a_category_is_simply_uncategorized(self, tmp_path):
+        """The column is nullable for the same reason: no category is a state,
+        not an error."""
+        from app.services.skill_library import _read
+
+        folder = tmp_path / "plain"
+        folder.mkdir()
+        (folder / "SKILL.md").write_text("---\ndescription: Plain.\n---\n\nBody.\n")
+
+        assert _read(folder).category is None
+
+    def test_the_frontmatter_is_not_left_in_the_body(self):
+        """The model reads the body; a YAML header in it is noise it has to
+        parse around."""
+        from app.services import skill_library
+
+        skill = skill_library.get("refund-policy")
+
+        assert skill is not None
+        assert not skill.content.startswith("---")
+        assert "# Refunds" in skill.content
+
+    def test_a_manifest_without_frontmatter_still_yields_a_skill(self, tmp_path):
+        """Refusing would turn a missing header into a missing skill."""
+        from app.services.skill_library import _read
+
+        folder = tmp_path / "plain"
+        folder.mkdir()
+        (folder / "SKILL.md").write_text("---\ndescription: Plain.\n---\n\nBody.\n")
+
+        skill = _read(folder)
+
+        assert (skill.key, skill.name, skill.content) == ("plain", "plain", "Body.")
+
+    def test_a_manifest_with_no_description_is_refused(self, tmp_path):
+        """The description is what the model reads before deciding to load the
+        body - a skill without one can never be chosen."""
+        from app.services.skill_library import _read
+
+        folder = tmp_path / "nameless"
+        folder.mkdir()
+        (folder / "SKILL.md").write_text("---\nname: nameless\n---\n\nBody.\n")
+
+        with pytest.raises(ValueError, match="no description"):
+            _read(folder)
+
+    @pytest.mark.anyio
+    async def test_installing_copies_the_body_and_every_file(self):
+        ctx = _ctx()
+        created = MagicMock(id=uuid.uuid4(), name="code-review")
+
+        with (
+            patch(f"{SKILLS_PATH}.skill_repo.get_by_name", new=AsyncMock(return_value=None)),
+            patch(
+                f"{SKILLS_PATH}.skill_repo.create", new=AsyncMock(return_value=created)
+            ) as create,
+            patch(f"{SKILLS_PATH}.skill_repo.create_resource", new=AsyncMock()) as add_resource,
+            patch(f"{SKILLS_PATH}.record_audit", new=AsyncMock()) as audit,
+        ):
+            await SkillService(_db()).install_from_library(ctx, "code-review")
+
+        assert create.call_args.kwargs["name"] == "code-review"
+        assert create.call_args.kwargs["content"]
+        # The copy keeps the shelf the library put it on, and lands visible to
+        # the whole organization - seeding is for everybody, not the seeder.
+        assert create.call_args.kwargs["category"] == "engineering"
+        assert create.call_args.kwargs["visibility"] == Visibility.ORG
+        assert {call.kwargs["name"] for call in add_resource.await_args_list} == {
+            "checklist.md",
+            "review-comment.md",
+        }
+        assert [call.kwargs["action"] for call in audit.await_args_list] == [
+            "skill.created",
+            "skill.installed",
+        ]
+        # The actor on a seeded install is the first owner as an attribution,
+        # not as a person who acted - the marker is what keeps the entry honest.
+        assert audit.await_args_list[-1].kwargs["details"]["seeded"] is True
+
+    def test_a_fingerprint_changes_with_what_a_skill_says_and_not_with_file_order(self):
+        from app.services.skill_library import fingerprint
+
+        base = {"description": "d", "category": None, "content": "Body."}
+        files = [("a.md", "one", None), ("b.md", "two", None)]
+
+        assert fingerprint(**base, resources=files) == fingerprint(
+            **base, resources=reversed(files)
+        )
+        assert fingerprint(**base, resources=files) != fingerprint(
+            **base, resources=[("a.md", "one", None), ("b.md", "changed", None)]
+        )
+        assert fingerprint(**base, resources=files) != fingerprint(
+            **{**base, "category": "design"}, resources=files
+        )
+        # Saving through the API trims a final newline; that is not an edit.
+        assert fingerprint(**base, resources=files) == fingerprint(
+            **{**base, "content": "Body.\n"},
+            resources=[("a.md", "one\n", None), ("b.md", "two", "")],
+        )
+        # A description written on a copy's file is an edit; the shipped files have none.
+        assert fingerprint(**base, resources=files) != fingerprint(
+            **base, resources=[("a.md", "one", "Ours"), ("b.md", "two", None)]
+        )
+
+    @pytest.mark.anyio
+    async def test_installing_stamps_the_copy_with_the_folder_it_came_from(self):
+        """So a later `seed-skills` can tell an untouched copy from an edited one."""
+        created = MagicMock(id=uuid.uuid4(), name="code-review")
+
+        with (
+            patch(f"{SKILLS_PATH}.skill_repo.get_by_name", new=AsyncMock(return_value=None)),
+            patch(
+                f"{SKILLS_PATH}.skill_repo.create", new=AsyncMock(return_value=created)
+            ) as create,
+            patch(f"{SKILLS_PATH}.skill_repo.create_resource", new=AsyncMock()),
+            patch(f"{SKILLS_PATH}.record_audit", new=AsyncMock()),
+        ):
+            await SkillService(_db()).install_from_library(_ctx(), "code-review")
+
+        bundled = skill_library.get("code-review")
+        assert bundled is not None
+        assert create.call_args.kwargs["library_fingerprint"] == bundled.fingerprint
+
+    @pytest.mark.anyio
+    async def test_refreshing_something_that_does_not_ship_is_refused(self):
+        with pytest.raises(NotFoundError, match="No such bundled skill"):
+            await SkillService(_db()).refresh_from_library(_ctx(), "not-a-skill")
+
+    @pytest.mark.anyio
+    async def test_installing_something_that_does_not_ship_is_refused(self):
+        with pytest.raises(NotFoundError, match="No such bundled skill"):
+            await SkillService(_db()).install_from_library(_ctx(), "not-a-skill")
+
+    @pytest.mark.anyio
+    async def test_installing_twice_is_refused_by_name(self):
+        """Two skills of one name is a reference the model cannot resolve, and
+        the second install would silently produce one."""
+        ctx = _ctx()
+
+        with (
+            patch(
+                f"{SKILLS_PATH}.skill_repo.get_by_name",
+                new=AsyncMock(return_value=MagicMock()),
+            ),
+            patch(f"{SKILLS_PATH}.skill_repo.create_resource", new=AsyncMock()) as add_resource,
+            patch(f"{SKILLS_PATH}.record_audit", new=AsyncMock()),
+            pytest.raises(AlreadyExistsError),
+        ):
+            await SkillService(_db()).install_from_library(ctx, "code-review")
+
+        assert add_resource.await_count == 0
+
+
+class TestResourceNames:
+    """What an uploaded file may be called.
+
+    A resource name is a key in a table rather than a location on disk, so
+    nothing here escapes anything today. It is refused anyway, for two reasons:
+    a name that *reads* as an escape is one nobody reviewing a skill can reason
+    about, and this refusal is the only thing standing between an upload and
+    the filesystem the day one of these names is joined onto a path.
+    """
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "../secrets.md",
+            "references/../../etc/passwd",
+            "..\\..\\windows\\hosts",
+            "./../x.md",
+            "references/..",
+        ],
+    )
+    def test_a_name_that_steps_outside_the_skill_is_refused(self, raw):
+        with pytest.raises(BadRequestError) as refused:
+            _clean_resource_path(raw)
+
+        assert "cannot step outside" in refused.value.message
+        assert refused.value.details == {"name": raw}
+
+    @pytest.mark.parametrize("raw", ["notes..md", "references/..hidden.md", "a/b..c/d.md"])
+    def test_two_dots_inside_a_segment_are_part_of_a_file_name_not_a_step(self, raw):
+        """The check is on whole segments. Refusing every name containing two
+        dots would reject files people really have and teach them the rule is
+        about characters rather than about stepping out of the skill."""
+        assert _clean_resource_path(raw) == raw
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("references\\workflows.md", "references/workflows.md"),
+            ("/skill/./references//workflows.md", "skill/references/workflows.md"),
+        ],
+    )
+    def test_whatever_the_browser_sent_normalizes_to_one_name(self, raw, expected):
+        """A directory picker adds a leading folder and Windows sends
+        backslashes. The same file uploaded from two machines has to land on
+        one row, because the name is what the model asks for."""
+        assert _clean_resource_path(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["", "/", ".", "./", "//"])
+    def test_a_name_that_normalizes_to_nothing_is_refused(self, raw):
+        """A row keyed on the empty string is a file no model can ever ask for."""
+        with pytest.raises(BadRequestError) as refused:
+            _clean_resource_path(raw)
+
+        assert refused.value.message == "A file needs a name"
+        assert refused.value.details == {"name": raw}
+
+    def test_a_path_longer_than_the_column_is_refused_rather_than_truncated(self):
+        """`skill_resources.name` is 128 characters. Truncating would collapse
+        two deep paths onto one name, and the second upload would then silently
+        overwrite the first."""
+        assert len(_clean_resource_path("a" * 128)) == 128
+
+        with pytest.raises(BadRequestError, match="128 characters"):
+            _clean_resource_path("references/" + "a" * 118)
+
+
+class TestResourceContents:
+    """The other half of the guard: what a file may contain."""
+
+    def test_a_file_the_model_could_not_read_is_refused_rather_than_stored_as_noise(self):
+        """A skill's files are handed to the model as text. A PDF stored here
+        arrives as mojibake - a file the agent is told it has and cannot use,
+        which is worse than not having it - so the refusal names the file and
+        says what to do instead."""
+        with pytest.raises(BadRequestError) as refused:
+            _decode_text("report.pdf", b"%PDF-1.7\n\xff\xfe\x00\x01")
+
+        assert "not text" in refused.value.message
+        assert "URL" in refused.value.message
+        assert refused.value.details == {"name": "report.pdf"}
+
+    def test_the_guard_is_utf_8_and_not_ascii(self):
+        """A checklist written in Polish is an ordinary skill file, and the
+        bytes that make it non-ASCII must not read as a binary."""
+        assert _decode_text("kroki.md", "Zwrot 50 zł - sprawdź ✓".encode()) == (
+            "Zwrot 50 zł - sprawdź ✓"
+        )
+
+    def test_a_file_over_the_size_limit_is_refused(self):
+        """Everything attached to a skill is loaded into a prompt, so the limit
+        is what keeps one dropped archive from filling an agent's context. The
+        last byte that fits still fits - a limit that refused it would be a
+        different limit than the message states."""
+        assert _decode_text("big.md", b"a" * MAX_RESOURCE_BYTES) == "a" * MAX_RESOURCE_BYTES
+
+        with pytest.raises(BadRequestError, match="512 KB") as refused:
+            _decode_text("big.md", b"a" * (MAX_RESOURCE_BYTES + 1))
+
+        assert refused.value.details == {"name": "big.md"}
+
+
+class TestSkillFiles:
+    """A skill's files: the reference table, the template, the worked example.
+
+    Two invariants run through all of it. Every write bumps the version, because
+    a file is part of the skill as far as a bound agent is concerned; and every
+    refusal writes nothing at all, because a version that moved for an upload
+    the database then discarded says an agent changed when it did not.
+    """
+
+    @pytest.fixture
+    def repo(self, monkeypatch):
+        repo = MagicMock()
+        repo.get = AsyncMock()
+        repo.get_resource = AsyncMock(return_value=None)
+        repo.get_resource_by_name = AsyncMock(return_value=None)
+        repo.create_resource = AsyncMock()
+        repo.update_resource = AsyncMock()
+        repo.delete_resource = AsyncMock()
+        repo.update = AsyncMock()
+        monkeypatch.setattr(f"{SKILLS_PATH}.skill_repo", repo)
+        return repo
+
+    @pytest.fixture
+    def audit(self, monkeypatch):
+        recorder = AsyncMock()
+        monkeypatch.setattr(f"{SKILLS_PATH}.record_audit", recorder)
+        return recorder
+
+    @pytest.fixture
+    def ctx(self) -> AuthContext:
+        return _ctx()
+
+    @pytest.fixture
+    def service(self) -> SkillService:
+        return SkillService(_db())
+
+    @pytest.fixture
+    def skill(self, ctx, repo):
+        """A skill the caller owns, already found by the repository."""
+        owned = _skill(ctx=ctx)
+        repo.get.return_value = owned
+        return owned
+
+    # -- attaching one file ---------------------------------------------
+
+    @pytest.mark.anyio
+    async def test_attaching_a_file_bumps_the_version_and_names_it_in_the_audit(
+        self, service, ctx, repo, audit, skill
+    ):
+        """A file is part of the skill as far as a bound agent is concerned, so
+        adding one is the same kind of event as rewriting the body. A version
+        that only moved for the body would report an agent as unchanged while
+        its reference table was being replaced."""
+        stored = _resource(name="template.md")
+        repo.create_resource.return_value = stored
+
+        created = await service.add_resource(
+            ctx, skill.id, name="template.md", description="Reply template", content="Dear {name},"
+        )
+
+        assert created is stored
+        assert repo.create_resource.await_args.kwargs["skill_id"] == skill.id
+        assert repo.update.await_args.kwargs["update_data"] == {"version": skill.version + 1}
+        recorded = audit.await_args.kwargs
+        assert recorded["action"] == "skill.resource_added"
+        assert recorded["details"] == {"name": skill.name, "resource": "template.md"}
+
+    @pytest.mark.anyio
+    async def test_a_second_file_of_the_same_name_is_refused_and_nothing_is_written(
+        self, service, ctx, repo, audit, skill
+    ):
+        """The name is what the model asks for, so two of them is a reference
+        nothing can resolve."""
+        repo.get_resource_by_name.return_value = _resource(name="template.md")
+
+        with pytest.raises(AlreadyExistsError) as refused:
+            await service.add_resource(
+                ctx, skill.id, name="template.md", description=None, content="Dear {name},"
+            )
+
+        assert refused.value.details == {"name": "template.md"}
+        repo.create_resource.assert_not_awaited()
+        repo.update.assert_not_awaited()
+        audit.assert_not_awaited()
+
+    # -- uploading a set of them ----------------------------------------
+
+    @pytest.mark.anyio
+    async def test_a_folder_upload_keeps_its_shape_in_the_names_it_stores(
+        self, service, ctx, repo, audit, skill
+    ):
+        """There is deliberately no folder table: a folder is a prefix some file
+        has, which is why an empty one cannot exist and nothing has to keep the
+        two in step."""
+        repo.create_resource.side_effect = [
+            _resource(name="skill/references/workflows.md"),
+            _resource(name="skill/SKILL.md"),
+        ]
+
+        await service.put_resources(
+            ctx,
+            skill.id,
+            [("skill\\references/workflows.md", b"# Workflows"), ("./skill/SKILL.md", b"# Body")],
+        )
+
+        assert [call.kwargs["name"] for call in repo.create_resource.await_args_list] == [
+            "skill/references/workflows.md",
+            "skill/SKILL.md",
+        ]
+        assert audit.await_args.kwargs["details"] == {
+            "name": skill.name,
+            "files": ["skill/references/workflows.md", "skill/SKILL.md"],
+        }
+
+    @pytest.mark.anyio
+    async def test_re_uploading_a_folder_replaces_the_file_that_changed(
+        self, service, ctx, repo, audit, skill
+    ):
+        """This is the upload path: somebody dragging a corrected folder in
+        means the corrected version. Refusing the paths that already exist would
+        ask them to do the merge by hand."""
+        existing = _resource(name="checklist.md", content="old")
+        added = _resource(name="template.md")
+        repo.get_resource_by_name.side_effect = [existing, None]
+        repo.update_resource.return_value = existing
+        repo.create_resource.return_value = added
+
+        written = await service.put_resources(
+            ctx, skill.id, [("checklist.md", b"new"), ("template.md", b"Dear {name},")]
+        )
+
+        assert written == [existing, added]
+        assert repo.update_resource.await_args.kwargs == {
+            "resource": existing,
+            "update_data": {"content": "new"},
+        }
+        assert repo.create_resource.await_count == 1
+
+    @pytest.mark.anyio
+    async def test_the_version_moves_once_for_the_whole_upload(
+        self, service, ctx, repo, audit, skill
+    ):
+        """Three files dropped in together are one edit. A bump per file would
+        make the version a count of files rather than a mark that what bound
+        agents execute has changed."""
+        await service.put_resources(ctx, skill.id, [("a.md", b"a"), ("b.md", b"b"), ("c.md", b"c")])
+
+        repo.update.assert_awaited_once_with(
+            service.db, skill=skill, update_data={"version": skill.version + 1}
+        )
+
+    @pytest.mark.anyio
+    async def test_a_path_that_steps_outside_the_skill_never_reaches_the_repository(
+        self, service, ctx, repo, audit, skill
+    ):
+        """The refusal has to happen before the write rather than beside it: a
+        name the service rejected and stored anyway is the guard undone."""
+        with pytest.raises(BadRequestError, match="cannot step outside"):
+            await service.put_resources(
+                ctx, skill.id, [("../../etc/passwd", b"root:x:0:0"), ("notes.md", b"fine")]
+            )
+
+        repo.create_resource.assert_not_awaited()
+        repo.update_resource.assert_not_awaited()
+        repo.update.assert_not_awaited()
+        audit.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_refused_upload_leaves_the_version_and_the_audit_trail_alone(
+        self, service, ctx, repo, audit, skill
+    ):
+        """The offending file can arrive after a good one, and the request is
+        still refused whole. What was already written rolls back with the
+        request's transaction - but a version bumped on the way past would
+        survive nothing and describe an edit that never landed."""
+        with pytest.raises(BadRequestError, match="cannot step outside"):
+            await service.put_resources(
+                ctx, skill.id, [("notes.md", b"fine"), ("../../etc/passwd", b"root:x:0:0")]
+            )
+
+        assert [call.kwargs["name"] for call in repo.create_resource.await_args_list] == [
+            "notes.md"
+        ]
+        repo.update.assert_not_awaited()
+        audit.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_binary_file_refuses_the_upload_rather_than_storing_noise(
+        self, service, ctx, repo, audit, skill
+    ):
+        """What the model receives is a string, so a PNG would arrive as noise
+        the agent is told it has and cannot read."""
+        with pytest.raises(BadRequestError, match="not text") as refused:
+            await service.put_resources(ctx, skill.id, [("logo.png", b"\x89PNG\r\n\x1a\n\xff\xfe")])
+
+        assert refused.value.details == {"name": "logo.png"}
+        repo.create_resource.assert_not_awaited()
+        repo.update.assert_not_awaited()
+        audit.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_uploading_to_a_skill_you_may_read_but_not_edit_writes_nothing(
+        self, service, repo, audit
+    ):
+        """Viewing and editing are separate permissions and a Builder sees every
+        skill in the organization while editing only their own. Files are an
+        edit: the body says how the work is done, the files are the detail it
+        works from, and both reach every bound agent on its next run."""
+        ctx = _ctx(OrgRoleName.BUILDER)
+        someone_elses = _skill(ctx=ctx, owner_user_id=uuid.uuid4())
+        repo.get.return_value = someone_elses
+
+        with (
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            pytest.raises(NotFoundError),
+        ):
+            await service.put_resources(ctx, someone_elses.id, [("notes.md", b"fine")])
+
+        repo.create_resource.assert_not_awaited()
+        repo.update.assert_not_awaited()
+
+        # What was refused is the edit, not the row: the same Builder reading
+        # the same skill's files goes through.
+        readable = _resource()
+        repo.get_resource.return_value = readable
+        assert await service.get_resource(ctx, someone_elses.id, readable.id) is readable
+
+    # -- reading, editing and removing one ------------------------------
+
+    @pytest.mark.anyio
+    async def test_a_file_is_looked_up_inside_the_skill_that_owns_it(
+        self, service, ctx, repo, skill
+    ):
+        """The caller proved they may reach *this skill*. A resource id from
+        another one must not be readable through it, and the scoped lookup is
+        what enforces that - the id alone proves nothing."""
+        stored = _resource()
+        repo.get_resource.return_value = stored
+
+        found = await service.get_resource(ctx, skill.id, stored.id)
+
+        assert found is stored
+        assert repo.get_resource.await_args.args[1] == stored.id
+        assert repo.get_resource.await_args.kwargs == {"skill_id": skill.id}
+
+    @pytest.mark.anyio
+    async def test_a_file_id_that_belongs_to_another_skill_is_not_found(
+        self, service, ctx, repo, skill
+    ):
+        repo.get_resource.return_value = None
+        resource_id = uuid.uuid4()
+
+        with pytest.raises(NotFoundError) as refused:
+            await service.get_resource(ctx, skill.id, resource_id)
+
+        assert refused.value.details == {"resource_id": str(resource_id)}
+
+    @pytest.mark.anyio
+    async def test_editing_a_file_bumps_the_version_and_is_audited(
+        self, service, ctx, repo, audit, skill
+    ):
+        stored = _resource(name="checklist.md")
+        repo.get_resource.return_value = stored
+        repo.update_resource.return_value = stored
+
+        updated = await service.update_resource(
+            ctx, skill.id, stored.id, SkillResourceUpdate(content="# New")
+        )
+
+        assert updated is stored
+        assert repo.update_resource.await_args.kwargs["update_data"] == {"content": "# New"}
+        assert repo.update.await_args.kwargs["update_data"] == {"version": skill.version + 1}
+        recorded = audit.await_args.kwargs
+        assert recorded["action"] == "skill.resource_updated"
+        assert recorded["details"] == {"name": skill.name, "resource": "checklist.md"}
+
+    @pytest.mark.anyio
+    async def test_editing_a_file_that_is_not_there_writes_nothing(
+        self, service, ctx, repo, audit, skill
+    ):
+        repo.get_resource.return_value = None
+
+        with pytest.raises(NotFoundError):
+            await service.update_resource(
+                ctx, skill.id, uuid.uuid4(), SkillResourceUpdate(content="# New")
+            )
+
+        repo.update_resource.assert_not_awaited()
+        repo.update.assert_not_awaited()
+        audit.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_removing_a_file_bumps_the_version_and_names_it_in_the_audit(
+        self, service, ctx, repo, audit, skill
+    ):
+        """The name is read before the row goes. Taken afterwards it would be
+        gone, and the entry would say which skill lost a file without saying
+        which file."""
+        stored = _resource(name="checklist.md")
+        repo.get_resource.return_value = stored
+
+        await service.remove_resource(ctx, skill.id, stored.id)
+
+        assert repo.delete_resource.await_args.args[1] is stored
+        assert repo.update.await_args.kwargs["update_data"] == {"version": skill.version + 1}
+        recorded = audit.await_args.kwargs
+        assert recorded["action"] == "skill.resource_removed"
+        assert recorded["details"] == {"name": skill.name, "resource": "checklist.md"}
+
+    @pytest.mark.anyio
+    async def test_removing_a_file_that_is_not_there_deletes_nothing(
+        self, service, ctx, repo, audit, skill
+    ):
+        repo.get_resource.return_value = None
+
+        with pytest.raises(NotFoundError):
+            await service.remove_resource(ctx, skill.id, uuid.uuid4())
+
+        repo.delete_resource.assert_not_awaited()
+        repo.update.assert_not_awaited()
+        audit.assert_not_awaited()
+
+
+class TestSkillGallery:
+    """The opt-in gallery - what it offers, and what installing one does.
+
+    The distinction the whole feature turns on: the bundled library is seeded
+    into every organization automatically, and the gallery is not. Seventy
+    industry skills arriving the way the three bundled ones do would be seventy
+    rows in every tenant on the next deploy.
+    """
+
+    @pytest.mark.anyio
+    async def test_the_gallery_marks_what_the_organization_already_has(self):
+        """`installed` is a name match, the same rule installing uses.
+
+        Keyed on name rather than on the folder, so a folder renamed in a later
+        release does not offer a second copy of a skill somebody is editing.
+        """
+        industry = MagicMock()
+        industry.id = "healthcare"
+        industry.skills = [_bundled("patient-enquiry-triage"), _bundled("consent-explainer")]
+
+        with (
+            patch(
+                f"{SKILLS_PATH}.skill_repo.list_names",
+                new=AsyncMock(return_value={"consent-explainer"}),
+            ),
+            patch(f"{SKILLS_PATH}.skill_library.gallery", return_value=[industry]),
+        ):
+            gallery = await SkillService(_db()).gallery(_ctx())
+
+        assert [i.id for i in gallery.industries] == ["healthcare"]
+        assert [(s.name, s.installed) for s in gallery.industries[0].skills] == [
+            ("patient-enquiry-triage", False),
+            ("consent-explainer", True),
+        ]
+
+    @pytest.mark.anyio
+    async def test_installing_a_shelf_skips_what_is_there_and_reports_the_rest(self):
+        """One present name must not cost the other nine their install.
+
+        A shelf is installed as one request, so an existing skill is skipped and
+        an unrecognised key is reported - never raised. A request that installs
+        nothing still answers with why.
+        """
+        present = _bundled("consent-explainer")
+        fresh = _bundled("patient-enquiry-triage")
+
+        def _get(key: str):
+            return {"healthcare/consent-explainer": present, "healthcare/intake": fresh}.get(key)
+
+        with (
+            patch(
+                f"{SKILLS_PATH}.skill_repo.list_names",
+                new=AsyncMock(return_value={"consent-explainer"}),
+            ),
+            patch(f"{SKILLS_PATH}.skill_library.gallery_get", side_effect=_get),
+            patch.object(SkillService, "_copy_library_skill", new=AsyncMock()) as copy,
+        ):
+            result = await SkillService(_db()).install_gallery(
+                _ctx(),
+                ["healthcare/consent-explainer", "healthcare/intake", "healthcare/nope"],
+            )
+
+        assert result.installed == ["patient-enquiry-triage"]
+        assert result.skipped == ["consent-explainer"]
+        assert result.unknown == ["healthcare/nope"]
+        assert copy.await_count == 1
+        assert copy.await_args.kwargs["seeded"] is False
+
+    @pytest.mark.anyio
+    async def test_a_shelf_survives_somebody_installing_the_same_skill_at_once(self):
+        """The name check is a read, so two members installing one shelf both
+        pass it. The loser's insert violated `uq_skill_org_name` unhandled,
+        rolling back every skill that request had already copied - where the
+        endpoint promises the shelf continues and the entry is `skipped`."""
+        first = _bundled("shift-handover")
+        clash = _bundled("consent-explainer")
+
+        def _get(key: str):
+            return {"healthcare/handover": first, "healthcare/consent": clash}.get(key)
+
+        async def _copy(_ctx, entry, *, seeded):
+            if entry.name == "consent-explainer":
+                raise IntegrityError("insert", {}, Exception("uq_skill_org_name"))
+
+        with (
+            patch(f"{SKILLS_PATH}.skill_repo.list_names", new=AsyncMock(return_value=set())),
+            patch(f"{SKILLS_PATH}.skill_library.gallery_get", side_effect=_get),
+            patch.object(SkillService, "_copy_library_skill", side_effect=_copy),
+        ):
+            result = await SkillService(_db()).install_gallery(
+                _ctx(), ["healthcare/handover", "healthcare/consent"]
+            )
+
+        assert result.installed == ["shift-handover"]
+        assert result.skipped == ["consent-explainer"]
+        assert result.unknown == []
+
+    @pytest.mark.anyio
+    async def test_a_key_repeated_in_one_request_installs_once(self):
+        """Deduplicated on the way in, so "install all" twice is not two copies.
+
+        The name is tracked as the loop runs rather than read once, because the
+        second occurrence would otherwise reach a unique-name violation halfway
+        through and take the rest of the shelf with it.
+        """
+        entry = _bundled("shift-handover")
+
+        with (
+            patch(f"{SKILLS_PATH}.skill_repo.list_names", new=AsyncMock(return_value=set())),
+            patch(f"{SKILLS_PATH}.skill_library.gallery_get", return_value=entry),
+            patch.object(SkillService, "_copy_library_skill", new=AsyncMock()) as copy,
+        ):
+            result = await SkillService(_db()).install_gallery(
+                _ctx(), ["manufacturing/shift-handover", "manufacturing/shift-handover"]
+            )
+
+        assert result.installed == ["shift-handover"]
+        assert copy.await_count == 1
+
+    @pytest.mark.anyio
+    async def test_a_gallery_install_is_recorded_as_a_persons_choice(self):
+        """`seeded: false`, because somebody clicked it.
+
+        The seeding paths write `seeded: true` as the organization's owner. A
+        reader tells the platform's own write from a member's by that flag, so
+        the gallery must not borrow it.
+        """
+        entry = _bundled("api-support", resources=("examples.md",))
+        service = SkillService(_db())
+        created = _skill("api-support")
+
+        with (
+            patch.object(SkillService, "create", new=AsyncMock(return_value=created)),
+            patch(f"{SKILLS_PATH}.skill_repo.create_resource", new=AsyncMock()),
+            patch(f"{SKILLS_PATH}.record_audit", new=AsyncMock()) as audit,
+        ):
+            await service._copy_library_skill(_ctx(), entry, seeded=False)
+
+        assert audit.await_args.kwargs["details"]["seeded"] is False
+        assert audit.await_args.kwargs["details"]["key"] == "api-support"
+
+
+class TestTheGalleryOnDisk:
+    """The shipped gallery folders, read by the real parser.
+
+    Not a mock anywhere: this is the guard on seventy files that no other test
+    opens. A manifest with no description, a category the console cannot filter
+    by, or a name colliding with the auto-seeded library are all silent until an
+    install produces the wrong thing in somebody's organization.
+    """
+
+    def test_every_shipped_gallery_skill_parses(self):
+        from app.services import skill_library
+
+        industries = skill_library.gallery()
+        assert industries, "the gallery directory ships with the image and must not be empty"
+        for industry in industries:
+            assert industry.skills, f"{industry.id} would render as an empty shelf"
+            for entry in industry.skills:
+                assert entry.description, f"{entry.key} has no description"
+                assert entry.content, f"{entry.key} has no body"
+                assert entry.key.startswith(f"{industry.id}/"), entry.key
+
+    def test_gallery_names_are_unique_and_do_not_shadow_the_bundled_library(self):
+        """Installing matches on name, so a collision would silently skip.
+
+        A gallery skill sharing a name with one of the auto-seeded three can
+        never be installed - the organization already has that name from the
+        moment it was created - and nothing would say so.
+        """
+        from app.services import skill_library
+
+        names = [s.name for i in skill_library.gallery() for s in i.skills]
+        assert len(names) == len(set(names)), "two gallery skills share a name"
+        bundled = {entry.name for entry in skill_library.library()}
+        assert not (set(names) & bundled), "a gallery skill is shadowed by a bundled one"
+
+    def test_every_shipped_skill_name_is_one_a_model_can_load(self):
+        """A skill's name is its `load_capability` id, and models write that id in
+        the Agent Skills form. Every gallery skill once had a title for a name,
+        and `Product description writer` was loaded as
+        `product-description-writer` until the turn ran out of retries (#1911).
+
+        Each name also has to be one `SkillCreate` would accept, so a shipped
+        skill is never something a person could not have created by hand.
+        """
+        from app.schemas.skill import SKILL_NAME_PATTERN, SkillCreate
+        from app.services import skill_library
+
+        names = [s.name for i in skill_library.gallery() for s in i.skills]
+        names += [entry.name for entry in skill_library.library()]
+        # 75 - the AgenticOS guide among them - the seven the AI Architect ships
+        # with (#2069), the bundled visual-design (#2171) and the three that build,
+        # plan and check a slide deck as a published page (#2576).
+        assert len(names) == 88
+        for name in names:
+            assert SKILL_NAME_PATTERN.fullmatch(name), name
+            SkillCreate(name=name, description="d")
+
+    def test_a_gallery_skill_is_named_after_its_folder(self):
+        """The folder is the install key's second half, so the two cannot drift
+        into naming one skill two ways."""
+        from app.services import skill_library
+
+        for industry in skill_library.gallery():
+            for entry in industry.skills:
+                assert entry.key == f"{industry.id}/{entry.name}", entry.key
+
+    def test_every_gallery_category_is_one_the_console_can_filter_by(self):
+        """A category outside the catalog is a shelf label nothing matches."""
+        import json
+
+        from app.services import skill_library
+
+        catalog = skill_library.GALLERY_ROOT.parent / "skill_categories.json"
+        allowed = set(json.loads(catalog.read_text(encoding="utf-8")))
+        used = {s.category for i in skill_library.gallery() for s in i.skills if s.category}
+        assert used <= allowed, f"unknown categories: {sorted(used - allowed)}"
+
+    def test_a_gallery_key_resolves_and_an_unknown_one_does_not(self):
+        from app.services import skill_library
+
+        first = skill_library.gallery()[0].skills[0]
+        assert skill_library.gallery_get(first.key) is first
+        assert skill_library.gallery_get("no-such-industry/no-such-skill") is None

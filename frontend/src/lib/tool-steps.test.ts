@@ -1,0 +1,274 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  basename,
+  contentArg,
+  delegationStep,
+  mcpCall,
+  mcpToolPrefix,
+  pathArg,
+  titleWords,
+  toolStep,
+} from "./tool-steps";
+import { isWorkspaceTool } from "./tool-catalog";
+
+import { createTranslator } from "next-intl";
+
+import type { Translate } from "./agent-step-captions";
+import messages from "../../messages/en.json";
+import plMessages from "../../messages/pl.json";
+// Shared with the backend `tool_prefix` test, so the two normalisers cannot drift
+// apart behind two hand-copied expectation lists (#545, the #144 shape).
+import prefixCases from "./mcp-tool-prefix.cases.json";
+
+/**
+ * The real `chat.tools` messages: a step's wording is what these tests are about, and
+ * resolving them here also proves every key the catalog table names exists.
+ *
+ * Cast because `createTranslator` types its key against the message tree while
+ * `Translate` takes the string a module table holds - the looseness #395's parser
+ * would remove.
+ */
+const t = createTranslator({ locale: "en", messages, namespace: "chat.tools" }) as Translate;
+
+/**
+ * The words a step is made of.
+ *
+ * Two properties carry the whole design. A step is written in the tense it is true in
+ * - *Writing test1.md* while it runs and *Wrote test1.md* once it has - and the subject
+ * is the file, the pattern or the command rather than the tool's function name, which
+ * is the part nobody reads.
+ */
+describe("the line for one tool call", () => {
+  it("writes a workspace call in the tense it is true in", () => {
+    const args = { path: "/workspace/notes/test1.md", content: "hej" };
+
+    expect(toolStep("write_file", args, false, t).label).toBe("Writing test1.md");
+    expect(toolStep("write_file", args, true, t).label).toBe("Wrote test1.md");
+  });
+
+  it("names the file rather than its whole path", () => {
+    // A step is a line in a narration, and `/workspace/skills/review/SKILL.md` is not
+    // a line. The whole path is in the detail it opens.
+    expect(
+      toolStep("read_file", { path: "/workspace/skills/review/SKILL.md" }, true, t).label,
+    ).toBe("Read SKILL.md");
+  });
+
+  it("keeps the whole path for a directory listing, which is what was listed", () => {
+    expect(toolStep("ls", { path: "/workspace/out" }, true, t).label).toBe("Listed /workspace/out");
+  });
+
+  it("says what a search was looking for and where", () => {
+    expect(toolStep("grep", { pattern: "TODO", path: "/src/app.py" }, true, t).label).toBe(
+      "Searched for TODO in app.py",
+    );
+    expect(toolStep("glob", { pattern: "**/*.py" }, false, t).label).toBe("Looking for **/*.py");
+  });
+
+  it("joins the pattern to the file in the reader's language (#603)", () => {
+    // The join used to be a literal `in`, English under every locale. The verb
+    // and the join both come from `pl.json` now, merged over `en.json` the way
+    // `src/i18n.ts` does it.
+    const tPl = createTranslator({
+      locale: "pl",
+      messages: { chat: { tools: { ...messages.chat.tools, ...plMessages.chat.tools } } },
+      namespace: "chat.tools",
+    }) as Translate;
+
+    expect(toolStep("grep", { pattern: "TODO", path: "/src/app.py" }, true, tPl).label).toBe(
+      "Wyszukał TODO w app.py",
+    );
+  });
+
+  it("says which command ran", () => {
+    expect(toolStep("execute", { command: "pytest -q" }, true, t).label).toBe("Ran pytest -q");
+  });
+
+  it("still reads as a sentence when the arguments carried no subject", () => {
+    // A malformed call, or one whose arguments have not streamed in yet.
+    expect(toolStep("write_file", {}, false, t).label).toBe("Writing…");
+    expect(toolStep("write_file", undefined, true, t).label).toBe("Wrote…");
+  });
+
+  it("keeps the captions the other tools had", () => {
+    expect(toolStep("search_documents", {}, false, t).label).toBe("Searching the documents");
+    expect(toolStep("search_documents", {}, true, t).label).toBe("Knowledge Base Search");
+  });
+
+  it("says what happened rather than naming the tool, where the two differ", () => {
+    // Which skill it was is the whole content of the step.
+    expect(toolStep("load_capability", { id: "refund_policy" }, true, t).label).toBe(
+      "Refund Policy",
+    );
+    expect(toolStep("load_capability", {}, true, t).label).toBe("Load Skill");
+  });
+
+  it("carries the query or the URL as the detail beside a finished call", () => {
+    expect(toolStep("web_search", { query: "refund law" }, true, t).detail).toBe("refund law");
+    expect(toolStep("post_invoice", { invoice_id: 7 }, true, t).detail).toBeNull();
+  });
+
+  it("picks the icon from what the call is about", () => {
+    expect(toolStep("write_file", {}, true, t).kind).toBe("write");
+    expect(toolStep("grep", {}, true, t).kind).toBe("search");
+    expect(toolStep("web_search", {}, true, t).kind).toBe("web");
+    expect(toolStep("create_chart", {}, true, t).kind).toBe("chart");
+    expect(toolStep("post_invoice", {}, true, t).kind).toBe("tool");
+  });
+});
+
+/**
+ * Naming a call that came from an MCP server.
+ *
+ * Nothing on a tool call says where it came from: the only trace is the prefix the
+ * backend puts on every tool of a connection, which is the connection's name. So the
+ * rule here mirrors `app/agents/mcp.py::_tool_prefix`, and drift costs a step reading
+ * "Github Work Create Issue" - which is what a miss already looks like.
+ */
+describe("a step inside a delegation", () => {
+  it("reads as the verb and the file or command a coding harness named", () => {
+    const running = delegationStep(
+      { id: "s1", name: "edit", ok: null, title: "/workspace/src/app.py" },
+      t,
+    );
+    expect(running).toEqual({ label: "Editing", detail: "src/app.py", kind: "edit" });
+    const done = delegationStep({ id: "s2", name: "command", ok: true, title: "pytest" }, t);
+    expect(done).toEqual({ label: "Ran", detail: "pytest", kind: "shell" });
+    const odd = delegationStep({ id: "s3", name: "telepathy", ok: false, title: "x" }, t);
+    expect(odd.kind).toBe("tool");
+  });
+
+  it("is captioned as any tool call where the step names nothing more", () => {
+    const step = { id: "s1", name: "search_documents", ok: true, title: null };
+    expect(delegationStep(step, t)).toEqual(toolStep("search_documents", undefined, true, t));
+  });
+});
+
+describe("a call from an MCP server", () => {
+  it.each(prefixCases)("mirrors the backend's prefix rule for $name", ({ name, prefix }) => {
+    expect(mcpToolPrefix(name)).toBe(prefix);
+  });
+
+  it("names the server and what was asked of it", () => {
+    const step = toolStep("linear_create_issue", {}, true, t, [
+      { name: "Linear", url: "https://mcp.linear.app/sse" },
+    ]);
+
+    expect(step.label).toBe("Linear · Create issue");
+    expect(step.kind).toBe("mcp");
+    expect(step.logoDomain).toBe("mcp.linear.app");
+  });
+
+  it("says what a server's tool does once, not the service twice", () => {
+    // Notion names its tools `notion-search`, and the connection was called "notion":
+    // the step read "notion · Notion-search".
+    const servers = [{ name: "notion", url: "https://mcp.notion.com/mcp" }];
+
+    expect(toolStep("notion_notion-search", {}, true, t, servers).label).toBe("Notion · Search");
+    expect(toolStep("notion_notion-create-pages", {}, true, t, servers).label).toBe(
+      "Notion · Create pages",
+    );
+    // A tool that is nothing but the service's name keeps it.
+    expect(toolStep("notion_notion_", {}, true, t, servers).label).toBe("Notion · Notion");
+    // And one with no words at all is shown as it was named.
+    expect(toolStep("notion__", {}, true, t, servers).label).toBe("Notion · _");
+  });
+
+  it("keeps a connection's name as it was written when somebody chose its case", () => {
+    const step = toolStep("github_work_create_issue", {}, true, t, [
+      { name: "GitHub work", url: "https://api.githubcopilot.com/mcp/" },
+    ]);
+
+    expect(step.label).toBe("GitHub work · Create issue");
+  });
+
+  it("prefers the longest prefix, because connection names nest", () => {
+    // "github" and "github_work" both match `github_work_create_issue`, and only the
+    // longer one is right.
+    const match = mcpCall("github_work_create_issue", [
+      { name: "github", url: "https://a.example/" },
+      { name: "github-work", url: "https://b.example/" },
+    ]);
+
+    expect(match?.server).toBe("github-work");
+    expect(match?.action).toBe("create_issue");
+  });
+
+  it("claims nothing when no server owns the prefix", () => {
+    expect(mcpCall("write_file", [{ name: "Linear", url: "https://a.example/" }])).toBeNull();
+    // The prefix alone is not a call: a tool named exactly after its connection has
+    // nothing left to be the action.
+    expect(mcpCall("linear_", [{ name: "Linear", url: "https://a.example/" }])).toBeNull();
+  });
+
+  it("has no logo to show for a URL it cannot parse", () => {
+    expect(
+      mcpCall("linear_create_issue", [{ name: "Linear", url: "not a url" }])?.domain,
+    ).toBeNull();
+  });
+
+  it("leaves the workspace tools alone even when a connection shares their name", () => {
+    // A connection called "Execute" would otherwise swallow the shell tool.
+    const step = toolStep("execute", { command: "ls" }, true, t, [
+      { name: "ls", url: "https://a.example/" },
+    ]);
+
+    expect(step.label).toBe("Ran ls");
+  });
+});
+
+describe("reading a call's arguments", () => {
+  it("finds the path under any of the names a tool uses for it", () => {
+    expect(pathArg({ path: "/a" })).toBe("/a");
+    expect(pathArg({ file_path: "/b" })).toBe("/b");
+    expect(pathArg({ filename: "/c" })).toBe("/c");
+    expect(pathArg({})).toBeNull();
+  });
+
+  it("finds the body of a write or an edit", () => {
+    expect(contentArg({ content: "a" })).toBe("a");
+    expect(contentArg({ new_string: "b" })).toBe("b");
+    expect(contentArg({ path: "/a" })).toBeNull();
+  });
+
+  it("takes the name off a path, and title-cases words", () => {
+    expect(basename("/a/b/c.md")).toBe("c.md");
+    expect(basename("plain.md")).toBe("plain.md");
+    expect(titleWords("market_data")).toBe("Market Data");
+  });
+
+  it("claims only the tools that come from the backends library", () => {
+    expect(isWorkspaceTool("edit_file")).toBe(true);
+    expect(isWorkspaceTool("create_chart")).toBe(false);
+  });
+
+  it("has no subject for a search with no pattern, and reads a command under either name", () => {
+    // A call whose arguments have not streamed in yet, and the shell tool's two
+    // spellings of the same thing.
+    expect(toolStep("grep", {}, true, t).label).toBe("Searched for…");
+    expect(toolStep("execute", { cmd: "ls -la" }, true, t).label).toBe("Ran ls -la");
+  });
+
+  it("names a skill only when the call said which", () => {
+    expect(toolStep("load_capability", { id: "  " }, true, t).label).toBe("Load Skill");
+  });
+
+  it("reads a path under any name a tool gives it, and a query when there is none", () => {
+    expect(toolStep("read_file", { file_path: "/a/b.txt" }, true, t).label).toBe("Read b.txt");
+    expect(toolStep("read_file", { filename: "c.txt" }, true, t).label).toBe("Read c.txt");
+    expect(toolStep("post_invoice", { url: "https://a.example/" }, true, t).detail).toBe(
+      "https://a.example/",
+    );
+    expect(toolStep("read_skill_resource", { skill_name: "refunds" }, false, t).detail).toBe(
+      "refunds",
+    );
+  });
+
+  it("finds a write's body under any of the names a tool uses", () => {
+    expect(contentArg({ text: "a" })).toBe("a");
+    expect(contentArg({ new_str: "b" })).toBe("b");
+    expect(contentArg(undefined)).toBeNull();
+    expect(pathArg(undefined)).toBeNull();
+  });
+});

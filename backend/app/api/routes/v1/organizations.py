@@ -1,0 +1,160 @@
+"""Organization CRUD routes."""
+
+from typing import Any
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+
+from app.api.deps import (
+    CurrentUser,
+    OrganizationSvc,
+    OrganizationTeardownSvc,
+    PathOrgAuth,
+    RetentionSvc,
+    require_in_path_org,
+)
+from app.api.public_api import PUBLIC
+from app.api.routes.v1._stored_bytes import stored_image_response
+from app.core.permissions import Perm
+from app.schemas.organization import (
+    OrganizationCreate,
+    OrganizationList,
+    OrganizationRead,
+    OrganizationUpdate,
+)
+from app.schemas.retention import RetentionRead, RetentionUpdate
+
+router = APIRouter()
+
+# Reading an organization and changing its settings are in the public API, so an
+# integration or the platform's own MCP server can do them (#2057). Creating,
+# listing and deleting organizations stay with a signed-in person: a key belongs
+# to one organization and has no business making or ending one.
+_SETTINGS = Depends(require_in_path_org(Perm.ORG_SETTINGS))
+
+
+@router.get("", response_model=OrganizationList)
+async def list_organizations(
+    service: OrganizationSvc,
+    user: CurrentUser,
+) -> Any:
+    """List all organizations the current user belongs to."""
+    return await service.list_readable_for_user(user.id)
+
+
+@router.post("", response_model=OrganizationRead, status_code=status.HTTP_201_CREATED)
+async def create_organization(
+    data: OrganizationCreate,
+    service: OrganizationSvc,
+    user: CurrentUser,
+) -> Any:
+    """Create a new organization. The requesting user becomes Owner."""
+    org = await service.create(data, owner_id=user.id)
+    return await service.read_for_user(org.id, user.id)
+
+
+@router.get("/{org_id}", response_model=OrganizationRead, dependencies=[PUBLIC])
+async def get_organization(
+    org_id: UUID,
+    service: OrganizationSvc,
+    ctx: PathOrgAuth,
+) -> Any:
+    """Get a single organization the current user is a member of."""
+    return await service.read_for_user(org_id, ctx.subject_id)
+
+
+@router.patch("/{org_id}", response_model=OrganizationRead, dependencies=[PUBLIC, _SETTINGS])
+async def update_organization(
+    org_id: UUID,
+    data: OrganizationUpdate,
+    service: OrganizationSvc,
+    ctx: PathOrgAuth,
+) -> Any:
+    """Update organization name, avatar or speech-to-text default. Requires Admin or Owner role.
+
+    The speech-to-text default - `speech_to_text_provider`,
+    `speech_to_text_model`, `speech_to_text_secret_id`, `speech_to_text_language`
+    and `dictation_max_seconds` - is checked together, and only when one of its
+    fields is in the request: the pair is both or neither and one the
+    speech-to-text catalog offers, and the language must be one transcription
+    accepts. No pair is needed here, because an agent may carry its own. A
+    refusal names the field it is about.
+    """
+    org = await service.update(org_id, data, requester_id=ctx.subject_id, key_scopes=ctx.key_scopes)
+    return await service.read_for_user(org.id, ctx.subject_id)
+
+
+@router.get("/{org_id}/retention", response_model=RetentionRead, dependencies=[PUBLIC, _SETTINGS])
+async def get_organization_retention(
+    org_id: UUID,
+    service: RetentionSvc,
+    ctx: PathOrgAuth,
+) -> Any:
+    """How long this organization keeps each class of data, and what bounds it.
+
+    Three answers rather than one: what was asked for, what actually sweeps, and
+    what the deployment allows - a page showing only the last cannot explain why
+    the number it displays is not the number somebody typed.
+    """
+    return await service.read(org_id, requester_id=ctx.subject_id)
+
+
+@router.put("/{org_id}/retention", response_model=RetentionRead, dependencies=[PUBLIC, _SETTINGS])
+async def set_organization_retention(
+    org_id: UUID,
+    data: RetentionUpdate,
+    service: RetentionSvc,
+    ctx: PathOrgAuth,
+) -> Any:
+    """Set what this organization keeps. Requires Admin or Owner role."""
+    return await service.update(org_id, data, actor_user_id=ctx.subject_id)
+
+
+@router.delete("/{org_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def delete_organization(
+    org_id: UUID,
+    service: OrganizationTeardownSvc,
+    user: CurrentUser,
+) -> None:
+    """Delete an organization. Requires Owner role. Personal orgs cannot be deleted."""
+    await service.delete(org_id, requester_id=user.id)
+
+
+@router.post("/{org_id}/avatar", response_model=OrganizationRead)
+async def upload_organization_avatar(
+    org_id: UUID,
+    service: OrganizationSvc,
+    user: CurrentUser,
+    file: UploadFile = File(...),
+) -> Any:
+    """Upload or replace the organization avatar. Requires Admin or Owner role."""
+    data = await file.read()
+    updated = await service.upload_avatar(
+        org_id,
+        requester_id=user.id,
+        file_data=data,
+        content_type=file.content_type,
+    )
+    return await service.read_for_user(updated.id, user.id)
+
+
+@router.get("/{org_id}/avatar", response_model=None)
+async def get_organization_avatar(
+    org_id: UUID,
+    service: OrganizationSvc,
+    user: CurrentUser,
+) -> Any:
+    """Stream the organization avatar image. Membership is required to view."""
+    org, _ = await service.get_for_user(org_id, user.id)
+    if not org.avatar_url:
+        raise HTTPException(status_code=404, detail="No avatar set")
+    # Pinned to an image type, and refused if it is not one: the type was guessed
+    # from the stored filename's suffix, and the upload kept whatever suffix the
+    # caller chose, so a stored `x.html` was served as `text/html` - a script on
+    # the app's own origin rather than a picture (#702).
+    response = await stored_image_response(
+        org.avatar_url, headers={"X-Content-Type-Options": "nosniff"}
+    )
+    if response is None:
+        raise HTTPException(status_code=404, detail="Avatar file missing")
+    return response

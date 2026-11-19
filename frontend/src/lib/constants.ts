@@ -1,0 +1,106 @@
+export const APP_NAME = "agenticos";
+
+export const ROUTES = {
+  HOME: "/",
+  LOGIN: "/login",
+  REGISTER: "/register",
+  // Where a staged invitation lands after sign-in: the token was exchanged for an
+  // httpOnly-cookie handle before login, so this path carries no credential (#1414).
+  INVITATION_PENDING: "/invitations/pending",
+  FORGOT_PASSWORD: "/forgot-password",
+  DASHBOARD: "/dashboard",
+  CHAT: "/chat",
+  INBOX: "/inbox",
+  PROFILE: "/profile",
+  SETTINGS: "/settings",
+  SETTINGS_PROFILE: "/settings/profile",
+  SETTINGS_MOBILE: "/settings/mobile",
+  SETTINGS_BLOBBY: "/settings/blobby",
+  SETTINGS_DESKTOP: "/settings/desktop",
+  SETTINGS_SHORTCUTS: "/settings/shortcuts",
+  SETTINGS_ACCOUNT: "/settings/account",
+  SETTINGS_NOTIFICATIONS: "/settings/notifications",
+  SETTINGS_SLASH_COMMANDS: "/settings/slash-commands",
+  SETTINGS_MEMORY: "/settings/memory",
+  SETTINGS_SIGN_INS: "/settings/sign-ins",
+  SETTINGS_API_KEYS: "/settings/api-keys",
+  SETTINGS_API_REFERENCE: "/settings/api-keys/reference",
+  SETTINGS_MCP: "/settings/mcp",
+  SETTINGS_ASSISTANT: "/settings/assistant",
+  OAUTH_CONSENT: "/oauth/consent",
+  MCP_SERVERS: "/mcp-servers",
+  CHANNELS: "/channels",
+  RAG: "/rag",
+  RAG_DETAIL: (id: string) => `/rag/${id}`,
+  RAG_SEARCH: "/rag?tab=search",
+  ADMIN: "/admin",
+  ADMIN_USERS: "/admin/users",
+  ADMIN_ORGANIZATIONS: "/admin/organizations",
+  ADMIN_SYSTEM: "/admin/system",
+  ADMIN_BACKGROUND_JOBS: "/admin/background-jobs",
+  ADMIN_SETTINGS: "/admin/settings",
+  ORGS: "/orgs",
+  ORGS_CREATE: "/orgs?create=1",
+  ORG_MEMBERS: (id: string) => `/orgs/${id}/members`,
+  ORG_ROLES: (id: string) => `/orgs/${id}/roles`,
+  ORG_RETENTION: (id: string) => `/orgs/${id}/retention`,
+  ORG_GROUPS: (id: string) => `/orgs/${id}/groups`,
+  GROUPS: "/groups",
+  GROUP_DETAIL: (id: string) => `/groups/${id}`,
+  ORG_DIRECTORY: (id: string) => `/orgs/${id}/directory`,
+  AGENTS: "/agents",
+  AGENT_DETAIL: (id: string) => `/agents/${id}`,
+  WORKFLOWS: "/workflows",
+  WORKFLOW_DETAIL: (id: string) => `/workflows/${id}`,
+  WORKFLOW_ALL_RUNS: "/workflows/runs",
+  WORKFLOW_RUNS: (id: string) => `/workflows/${id}/runs`,
+  WORKFLOW_LOGS: (id: string) => `/workflows/${id}/logs`,
+  WORKFLOW_RUN_DETAIL: (id: string, runId: string) => `/workflows/${id}/runs/${runId}`,
+  RUNS: "/runs",
+  ROUTINES: "/routines",
+  VAULT: "/vault",
+  SANDBOXES: "/sandboxes",
+  REMOTE_AGENTS: "/remote-agents",
+  DOCUMENTS: "/documents",
+  DOCUMENT_FOLDER: (id: string) => `/documents/${id}`,
+  SKILLS: "/skills",
+  CONTEXT: "/context",
+  TABLES: "/tables",
+  TABLE_DETAIL: (id: string) => `/tables/${id}`,
+  PROJECTS: "/projects",
+  PROJECT_DETAIL: (id: string) => `/projects/${id}`,
+  /** A new chat in a project, starting with its default agent. */
+  PROJECT_CHAT: (id: string) => `/chat?project=${id}`,
+  ARTIFACTS: "/apps",
+  ARTIFACT_DETAIL: (id: string) => `/apps/${id}`,
+  ORG_SETTINGS: (id: string) => `/orgs/${id}/settings`,
+  BILLING: "/billing",
+  BILLING_USAGE: "/billing/usage",
+  BILLING_CREDITS: "/billing/credits",
+  BILLING_INVOICES: "/billing/invoices",
+  BILLING_PAYMENT_METHODS: "/billing/payment-methods",
+  BILLING_SUBSCRIPTION: "/billing/subscription",
+  ONBOARDING: "/onboarding",
+  LEGAL_TERMS: "/legal/terms",
+  LEGAL_PRIVACY: "/legal/privacy",
+  LEGAL_COOKIES: "/legal/cookies",
+} as const;
+
+// The published documentation. A self-hosted deployment can serve its own copy
+// with `make docs`, but a panel cannot know whether one is running - so the
+// links point at the canonical site.
+export const DOCS_URL = "https://vstorm-co.github.io/agenticos";
+
+/**
+ * Documentation a control links to, anchored on the section that answers it.
+ *
+ * The top of a page is not an answer: somebody who followed a link from the
+ * socket URL wants the frame table, and finding it themselves is the reading
+ * this link exists to save.
+ */
+export const DOCS = {
+  RAW_WEBSOCKET: `${DOCS_URL}/channels/#the-raw-websocket`,
+  PUBLIC_API: `${DOCS_URL}/channels/#the-public-api`,
+  API_KEYS: `${DOCS_URL}/api/#organization-api-keys`,
+  MCP_SERVER: `${DOCS_URL}/mcp/#agenticos-as-an-mcp-server`,
+} as const;

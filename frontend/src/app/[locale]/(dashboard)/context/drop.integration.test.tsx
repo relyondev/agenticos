@@ -1,0 +1,214 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import ContextPage from "./page";
+
+/**
+ * Dropping files on `/context`.
+ *
+ * A context file is a body in a column, so a drop has nothing to upload: the
+ * text becomes the field somebody is about to edit, and the dialog still asks
+ * the one question a drop must not answer for them - injected into every run, or
+ * read on demand. That is why this opens the form prefilled rather than creating
+ * files behind their back.
+ *
+ * What is refused is refused with a reason and does not take the rest of the drop
+ * with it: a folder with a PDF in it should still queue the Markdown beside it.
+ */
+
+const { get, post } = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn() }));
+vi.mock("@/lib/api-client", () => ({
+  apiClient: { get, post, patch: vi.fn(), put: vi.fn(), delete: vi.fn() },
+  ApiError: class extends Error {},
+}));
+const { error } = vi.hoisted(() => ({ error: vi.fn() }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error, warning: vi.fn() } }));
+vi.mock("@/components/chat/markdown-content", () => ({
+  MarkdownContent: ({ content }: { content: string }) => (
+    <div data-testid="rendered">{content}</div>
+  ),
+}));
+vi.mock("@/hooks/use-permissions", () => ({
+  usePermissions: () => ({ can: () => true, isLoading: false }),
+}));
+
+/** A drag event as the browser delivers it - jsdom has no `DataTransfer`. */
+function drop(files: File[]): Event {
+  const event = new Event("drop", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "dataTransfer", { value: { types: ["Files"], files } });
+  return event;
+}
+
+function textFile(name: string, body: string, type = "text/markdown"): File {
+  const file = new File([body], name, { type });
+  // jsdom's File has no `text()`; the page reads the body through it.
+  Object.defineProperty(file, "text", { value: () => Promise.resolve(body) });
+  return file;
+}
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+async function mount() {
+  render(<ContextPage />, { wrapper });
+  // The listing resolves first, or the drop lands on a skeleton.
+  await screen.findByText("Context files");
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  get.mockResolvedValue({ items: [], total: 0 });
+});
+
+describe("dropping files on the context page", () => {
+  it("opens the library form with content and leaves usage settings to the agent", async () => {
+    await mount();
+
+    act(() => void window.dispatchEvent(drop([textFile("Refund Policy.md", "# Refunds")])));
+
+    // The name is the handle, without the extension it carries in `format`.
+    expect(await screen.findByDisplayValue("refund-policy")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Format")).not.toBeInTheDocument();
+    // The dialog opens on the source, so the dropped bytes are in the editor
+    // rather than in a rendering of them.
+    expect(screen.getByLabelText(/source/i)).toHaveValue("# Refunds");
+    // Importing prepares the library entry; agent-specific usage is not asked here.
+    expect(post).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Mode")).not.toBeInTheDocument();
+  });
+
+  it("takes the extension as the format, so a .txt is not called Markdown", async () => {
+    await mount();
+
+    act(() => void window.dispatchEvent(drop([textFile("notes.txt", "plain", "text/plain")])));
+
+    expect(await screen.findByDisplayValue("notes")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Format")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith(
+        "/context",
+        expect.objectContaining({ format: "txt", mode: "inject" }),
+      ),
+    );
+  });
+
+  it("queues the rest and says how many, one file at a time", async () => {
+    post.mockResolvedValue({ id: "c1", name: "one" });
+    await mount();
+
+    act(
+      () =>
+        void window.dispatchEvent(
+          drop([textFile("one.md", "first"), textFile("two.md", "second")]),
+        ),
+    );
+
+    expect(await screen.findByDisplayValue("one")).toBeInTheDocument();
+    expect(screen.getByText("1 more file waiting")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    // The second file's own form, not a closed dialog.
+    expect(await screen.findByDisplayValue("two")).toBeInTheDocument();
+    expect(screen.queryByText("1 more file waiting")).not.toBeInTheDocument();
+  });
+
+  it("refuses what is not text and keeps what is", async () => {
+    await mount();
+
+    act(
+      () =>
+        void window.dispatchEvent(
+          drop([
+            new File([new Uint8Array([1, 2])], "scan.pdf", { type: "application/pdf" }),
+            textFile("runbook.md", "steps"),
+          ]),
+        ),
+    );
+
+    expect(await screen.findByDisplayValue("runbook")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(error).toHaveBeenCalledWith("One file was not text and was skipped"),
+    );
+  });
+
+  it("refuses text whose format a context file cannot declare", async () => {
+    // Being text is not enough. `resolveFileKind` reads HTML and source files as
+    // textual, and `format` holds five words - so an HTML page arrived as a file
+    // called `page` whose body was labelled Markdown, deciding on its own how it
+    // is fenced for the model and contradicting the overlay above it.
+    await mount();
+
+    act(
+      () =>
+        void window.dispatchEvent(
+          drop([textFile("page.html", "<p>hi</p>"), textFile("runbook.md", "steps")]),
+        ),
+    );
+
+    expect(await screen.findByDisplayValue("runbook")).toBeInTheDocument();
+    expect(screen.queryByText("1 more file waiting")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(error).toHaveBeenCalledWith(
+        "One file has a format a context file cannot declare and was skipped",
+      ),
+    );
+  });
+
+  it("abandons the whole drop when the dialog is closed", async () => {
+    await mount();
+
+    act(
+      () =>
+        void window.dispatchEvent(
+          drop([textFile("one.md", "first"), textFile("two.md", "second")]),
+        ),
+    );
+    expect(await screen.findByDisplayValue("one")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // Not the next of the queue: whoever closed it closed it, and a dialog that
+    // reopens eight times is a dialog that will not go away.
+    await waitFor(() => expect(screen.queryByDisplayValue("two")).toBeNull());
+    expect(screen.queryByDisplayValue("one")).toBeNull();
+  });
+});
+
+it("recovers the context editor when its detail query fails", async () => {
+  const summary = {
+    id: "c1",
+    name: "refunds",
+    description: null,
+    format: "md",
+    mode: "inject",
+    enabled: true,
+    visibility: "org",
+    size_bytes: 10,
+    excerpt: "",
+  };
+  let failed = true;
+  get.mockImplementation(async (path: string) => {
+    if (path.startsWith("/context?")) return { items: [summary], total: 1 };
+    if (path === "/context/c1") {
+      if (failed) throw new Error("unavailable");
+      return { ...summary, content: "# Refunds", owner_user_id: null };
+    }
+    return { items: [], total: 0 };
+  });
+  await mount();
+  await userEvent.click(await screen.findByText("refunds"));
+  const retry = await screen.findByRole("button", { name: "Retry" });
+  failed = false;
+  await userEvent.click(retry);
+  expect(await screen.findByLabelText(/source/i)).toHaveValue("# Refunds");
+  expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+});

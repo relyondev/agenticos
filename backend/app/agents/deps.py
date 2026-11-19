@@ -1,0 +1,248 @@
+"""Dependencies handed to every tool call.
+
+`AgentDeps` is the only channel through which a tool learns anything the model
+did not tell it: which collections the agent may search, what the tool was
+configured with, who is asking. That separation is the security boundary - a
+tool's *parameters* are model-controlled and therefore untrusted, while its
+*deps* are resolved server-side from the agent spec and the request.
+
+The practical rule when adding a tool: if the model should not be able to choose
+it, it belongs here, not in the signature.
+"""
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+from uuid import UUID
+
+from pydantic_ai_harness.ask_user import AskUserRequest, AskUserResponse
+
+from app.agents.approval import ApprovalDecision, ApprovalRequest
+from app.agents.audience import RunAudience
+from app.agents.browser_events import BrowserEventSink
+from app.agents.compaction_events import CompactionEvent
+from app.agents.steering import SteeringInbox
+from app.agents.subagent_events import SubagentEventSink
+from app.agents.visual_reports import VisualReports
+from app.db.vector_tables import VectorScope
+
+AskUserCallback = Callable[[str, list[str]], Awaitable[str]]
+"""How a delegate reaches the person waiting on its parent, and back.
+
+One question in, one answer out, which is the shape `subagents_pydantic_ai`'s
+`ask_parent` tool calls `ctx.deps.ask_user` with - this field exists to feed that
+tool and nothing here calls it otherwise. A surface that batches its elicitation
+(the WebSocket asks a whole list at once) adapts that to this one-question shape at
+its edge; a surface that cannot hold a question open leaves it `None`, and a
+delegate that would ask is told a person could not be reached.
+"""
+
+QuestionsCallback = Callable[[AskUserRequest], Awaitable[AskUserResponse]]
+"""How the `ask_user` capability puts a batch of multiple-choice questions to the
+person running the agent, and gets their picks back (#2064).
+
+Distinct from :data:`AskUserCallback`, which is one free-text question for a
+delegate: these carry a header, options with descriptions and multi-select, and
+the answer is the picked labels or a custom answer per question. A surface that
+cannot put questions to anybody leaves it `None`, and the tool is not offered.
+"""
+
+ApprovalCallback = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
+
+CompactionSink = Callable[[CompactionEvent], Awaitable[None]]
+"""Where a surface hears that the history is being summarised, and that it is done.
+
+Only the summarising strategy reaches for this. The zero-LLM ones edit a list and
+return, so announcing them would be a spinner that appears and vanishes within a
+frame; a summary is a whole model request, and until this existed the chat simply
+stopped for the length of it with nothing said. A run whose surface cannot show
+anything leaves it `None` and the summary is silent, the way a delegation is
+silent on a surface with no `subagent_events`.
+"""
+
+
+@dataclass
+class AgentDeps:
+    """Everything a tool may need that the model must not control."""
+
+    organization_id: UUID | None = None
+    user_id: str | None = None
+    user_name: str | None = None
+    agent_id: UUID | None = None
+    run_id: UUID | None = None
+    # The thread the run answers in, where it has one. What a tool keeps between
+    # turns is the conversation's, even in a sandbox several conversations share.
+    conversation_id: UUID | None = None
+
+    # Who will hear this run - one person, a whole channel, or nobody
+    # identifiable - derived server-side in `app.agents.audience`. It decides which
+    # memory store the run may touch and whether conversation search has a corpus
+    # at all. `None` where no capability asked for it, and a capability that finds
+    # it missing has no personal reach rather than a default one.
+    audience: RunAudience | None = None
+
+    # The member who answers for what this run does, derived server-side by
+    # `app.agents.audience.run_person_for`: `None` when an outsider supplied the
+    # input or a publisher stands in for a visitor nobody can name. A tool whose
+    # action needs a person refuses when this is `None`, so the default fails
+    # closed - a deps built without it reaches nothing that needs one.
+    run_person: UUID | None = None
+
+    # Whether the run was started under an administrator's impersonation of
+    # `run_person`. Carried on the run because the request that knew is gone by
+    # the time a spawned task, a worker or a resumed approval acts: a tool that
+    # may not do something while impersonating reads it here, not the ambient
+    # request state.
+    impersonated: bool = False
+
+    # Collection names this agent may search, resolved from its bindings.
+    kb_collection_names: list[str] = field(default_factory=list)
+
+    # The bound knowledge base behind each of those names, as the vector store
+    # scopes it. A name is not unique, so searching by it would read whichever
+    # same-named base resolves first rather than the one the agent is bound to
+    # (#2537). Travels with the names wherever they do.
+    kb_vector_scopes: dict[str, VectorScope] = field(default_factory=dict)
+
+    # Set when the surface can ask the user something mid-run (WebSocket chat);
+    # None on surfaces that cannot, so tools must handle its absence.
+    ask_user: AskUserCallback | None = None
+
+    # Set when somebody is watching the run and may add to it mid-way (#2087):
+    # what they send lands here and reaches the model at its next request. None on
+    # every surface where nobody can, and on a delegate - a correction is to the
+    # task the person asked for, which is the parent's.
+    steering: SteeringInbox | None = None
+
+    # Set when the surface can show a card of multiple-choice questions and wait
+    # for the picks (#2064); `None` hides the `ask_user` capability's tool.
+    ask_questions: QuestionsCallback | None = None
+    # Whether `ask_questions` parks the run rather than asking live - a channel's,
+    # answered later through buttons. Not handed to a delegate: its park surfaces
+    # as a deferral of the parent's `task` call with nothing to decide, and the run
+    # would wait for ever, so a delegate's question is declined instead.
+    parks_questions: bool = False
+
+    # True in a delegated run. What it shows is not the conversation's: its tool
+    # calls stay in its own run, so a tool whose result is meant to be seen there
+    # - a drawing - has to say so rather than claim the person can see it.
+    delegated: bool = False
+
+    # Bound to the current channel and workspace; delegates cannot send files.
+    send_channel_file: Callable[[str], Awaitable[str]] | None = None
+
+    # Set when the surface can hold a run for human approval. A tool that needs
+    # approval and finds this None must refuse rather than proceed unattended.
+    request_approval: ApprovalCallback | None = None
+
+    # Set when the surface can show a delegation while it is happening; None
+    # everywhere else, so the delegation still runs and simply is not narrated.
+    subagent_events: SubagentEventSink | None = None
+
+    # Set when the surface can say "still working" while the history is being
+    # summarised. None elsewhere, and the summary is then silent rather than
+    # refused - it is a progress report, not a permission.
+    on_compaction: CompactionSink | None = None
+
+    # Set when the surface can show a browse while it is happening. None
+    # everywhere else, and the browse then runs unnarrated - the frames are a
+    # progress report, not a permission, exactly as `on_compaction` is.
+    browser_events: BrowserEventSink | None = None
+
+    # Set when somebody is watching the run draw (#2171): the console reports how
+    # each visual rendered, and `draw` waits a moment to hand that to the model.
+    # None everywhere else, and a drawing is then simply not checked.
+    visual_reports: VisualReports | None = None
+
+    # The generated files this run's own tools stored, by leaf name - its
+    # provenance, recorded where the file is made rather than read back from
+    # text. The store is organization-wide and a run can be driven by somebody
+    # who is not a member, so a tool that reuses a generated file (a video
+    # starting from an image) reaches only these, never a leaf it was told.
+    generated_files: set[str] = field(default_factory=set)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def clone_for_subagent(self, max_depth: int = 0) -> AgentDeps:
+        """The deps a delegated run gets.
+
+        Required by `subagents_pydantic_ai.SubAgentDepsProtocol`, which calls it
+        for every delegation with one less than the parent's nesting budget. A
+        fresh instance rather than `self`, as the protocol demands: concurrent
+        specialists sharing one object would share whatever a tool wrote onto it.
+
+        What a delegate **inherits**, and why each is deliberate:
+
+        `organization_id`, `user_id` and `run_person` - a delegation is not a
+        privilege boundary. The publisher's `AGENTS_RUN` on every delegate was
+        checked when the parent was published; at run time a delegate acts for
+        the same person, in the same organization, exactly as a bound collection
+        or MCP connection does.
+
+        `agent_id` and `run_id` - the *parent's*, unchanged, and this is the one
+        that looks like a bug and is not. They key the workspace session, so
+        keeping them is what lets a researcher write `/workspace/notes.md` and a
+        writer read it. A delegate with a private filesystem is a delegate whose
+        work nobody can use, and every intermediate result would have to come
+        back through the parent's context - which is most of what a fan-out is
+        supposed to save. A delegation's *own* run row records its identity; deps
+        are about what its tools can reach.
+
+        `ask_user`, `ask_questions` and `request_approval` - the parent's channels. A specialist
+        that needs a person needs the person who is already waiting.
+
+        `subagent_events` - so a specialist's own delegation still narrates,
+        one `depth` further in.
+
+        `browser_events` - so a specialist that browses is watched by the same
+        person, in the same panel. A delegate whose browse is silent is the one
+        run nobody can see, and it is the one most worth seeing.
+
+        `generated_files` - the same set, not a copy, so an image a specialist
+        drew can be animated by the parent: same run, same person, and the files
+        were made by this run's own tools.
+
+        `delegated` is set, not inherited: whatever the parent is, this run is a
+        delegate, and a drawing it makes is never shown in the conversation.
+
+        What it does **not** inherit: `kb_collection_names` and `kb_vector_scopes`.
+        Those come from the delegate's own spec, and inheriting the parent's would
+        hand a specialist a collection nobody granted it. The delegate's own are put
+        back by the delegation capability, from `ResolvedSubagent.collection_names`
+        and `collection_scopes` - because
+        the deps our factory built for the child are *this* object's replacement,
+        so the collections resolved for it would otherwise be resolved and never
+        read.
+
+        Args:
+            max_depth: How much further the library will let this delegate
+                delegate, one less than the parent's `max_nesting_depth`.
+                Deliberately not stored, and this is worth saying because storing
+                it looks obviously right. Enforcement is not ours to do here: a
+                delegate's own delegates have to be resolved from the database -
+                their pinned versions, their collections, their secrets, each
+                behind `resolve_access` - and this method runs mid-run on a
+                session shared with the rest of the request, which is not
+                concurrency-safe. So the bound is applied where the resolution
+                happens, by walking the tree once before the run starts, and at
+                the bound the child is simply built without the delegation
+                capability. A copy of the number here would be a second answer
+                that nothing consults.
+        """
+        return AgentDeps(
+            organization_id=self.organization_id,
+            user_id=self.user_id,
+            user_name=self.user_name,
+            run_person=self.run_person,
+            impersonated=self.impersonated,
+            agent_id=self.agent_id,
+            run_id=self.run_id,
+            conversation_id=self.conversation_id,
+            ask_user=self.ask_user,
+            ask_questions=None if self.parks_questions else self.ask_questions,
+            request_approval=self.request_approval,
+            subagent_events=self.subagent_events,
+            browser_events=self.browser_events,
+            generated_files=self.generated_files,
+            delegated=True,
+            metadata=dict(self.metadata),
+        )

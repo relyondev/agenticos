@@ -1,0 +1,159 @@
+"""Agent environment repository (PostgreSQL async)."""
+
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.locks import LockScope, hold_subject_shared
+from app.db.models.agent_environment import AgentEnvironment
+
+
+async def lock(db: AsyncSession, environment_id: UUID) -> None:
+    """Hold the environment's row until the transaction ends.
+
+    `FOR UPDATE` conflicts with the key-share lock a new row's foreign key takes
+    on the row it references, so a run naming this environment cannot be
+    written while the lock is held - it waits, and fails on the foreign key if
+    the environment is gone by then.
+    """
+    await db.execute(
+        select(AgentEnvironment.id).where(AgentEnvironment.id == environment_id).with_for_update()
+    )
+
+
+async def get(
+    db: AsyncSession, environment_id: UUID, *, organization_id: UUID
+) -> AgentEnvironment | None:
+    result = await db.execute(
+        select(AgentEnvironment)
+        .execution_options(populate_existing=True)
+        .where(
+            AgentEnvironment.id == environment_id,
+            AgentEnvironment.organization_id == organization_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_for_agent(
+    db: AsyncSession, *, agent_id: UUID, organization_id: UUID
+) -> list[AgentEnvironment]:
+    """Every environment of one agent, default first, then by name.
+
+    A stable order because the Builder renders this as a list and the default
+    is the row everything else is compared against.
+    """
+    result = await db.execute(
+        select(AgentEnvironment)
+        .where(
+            AgentEnvironment.agent_id == agent_id,
+            AgentEnvironment.organization_id == organization_id,
+        )
+        .order_by(AgentEnvironment.is_default.desc(), AgentEnvironment.name)
+        .execution_options(populate_existing=True)
+    )
+    return list(result.scalars().all())
+
+
+async def get_default_for_agent(db: AsyncSession, *, agent_id: UUID) -> AgentEnvironment | None:
+    """The environment a surface that names none gets.
+
+    Not organization-scoped: the agent id always comes from a row already
+    loaded inside one organization, and the partial unique index means at most
+    one row can match.
+    """
+    result = await db.execute(
+        select(AgentEnvironment)
+        .execution_options(populate_existing=True)
+        .where(
+            AgentEnvironment.agent_id == agent_id,
+            AgentEnvironment.is_default.is_(True),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_by_name(db: AsyncSession, *, agent_id: UUID, name: str) -> AgentEnvironment | None:
+    """The row occupying a name, for the duplicate check that beats the
+    constraint to it - an IntegrityError is not an answer anyone can read."""
+    result = await db.execute(
+        select(AgentEnvironment).where(
+            AgentEnvironment.agent_id == agent_id,
+            AgentEnvironment.name == name,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def create(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    agent_id: UUID,
+    name: str,
+    version_id: UUID,
+    is_default: bool = False,
+    tracks_latest: bool = False,
+    created_by_user_id: UUID | None = None,
+    logfire_token_secret_id: UUID | None = None,
+    service_name: str | None = None,
+) -> AgentEnvironment:
+    # Pinning a version is how an environment comes to name its model profiles,
+    # so it is held off while one of them is being deleted (#2478).
+    await hold_subject_shared(db, LockScope.MODEL_PROFILE_REFERENCES, organization_id)
+    environment = AgentEnvironment(
+        organization_id=organization_id,
+        agent_id=agent_id,
+        tracks_latest=tracks_latest,
+        name=name,
+        version_id=version_id,
+        is_default=is_default,
+        created_by_user_id=created_by_user_id,
+        logfire_token_secret_id=logfire_token_secret_id,
+        service_name=service_name,
+    )
+    db.add(environment)
+    await db.flush()
+    await db.refresh(environment)
+    return environment
+
+
+async def update(
+    db: AsyncSession, *, environment: AgentEnvironment, update_data: dict[str, Any]
+) -> AgentEnvironment:
+    if "version_id" in update_data:
+        await hold_subject_shared(
+            db, LockScope.MODEL_PROFILE_REFERENCES, environment.organization_id
+        )
+    for field, value in update_data.items():
+        setattr(environment, field, value)
+    await db.flush()
+    await db.refresh(environment)
+    return environment
+
+
+async def following_latest(
+    db: AsyncSession, *, agent_id: UUID, organization_id: UUID
+) -> list[AgentEnvironment]:
+    """The environments a publish moves - the ones that asked to be moved.
+
+    A publish repoints these and nothing else. It used to repoint the default
+    whatever mode it was in, which made "publish" and "deploy" one word.
+    """
+    result = await db.execute(
+        select(AgentEnvironment)
+        .execution_options(populate_existing=True)
+        .where(
+            AgentEnvironment.agent_id == agent_id,
+            AgentEnvironment.organization_id == organization_id,
+            AgentEnvironment.tracks_latest.is_(True),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def delete(db: AsyncSession, *, environment: AgentEnvironment) -> None:
+    await db.delete(environment)
+    await db.flush()

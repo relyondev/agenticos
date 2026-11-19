@@ -1,0 +1,1366 @@
+"""Tests for the agent spec and the factory that instantiates it.
+
+The spec is the platform's most load-bearing type - the Builder writes it, the
+database versions it, and clients commit it to their own repositories - so what
+is guarded here is its contract: it round-trips, it refuses contradictions, and
+it never carries a secret.
+"""
+
+import uuid
+from dataclasses import replace
+from decimal import Decimal
+from importlib import import_module
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from pydantic import ValidationError
+from pydantic_ai._run_context import RunContext
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.usage import RequestUsage, RunUsage
+from pydantic_ai_harness import CodeMode
+
+from app.agents.audience import RunAudience
+from app.agents.capabilities import all_capabilities, load_builtins
+from app.agents.capabilities.approval._capability import ApprovalGate
+from app.agents.capabilities.budget import BudgetScope, SpendLimit
+from app.agents.capabilities.compaction import ReportContextSize
+from app.agents.code_mode import CodeCalls
+from app.agents.connect_on_use import ConnectionRequest, ConnectOnUse, PendingService
+from app.agents.factory import (
+    _AUDIENCE_AWARE,
+    DEFAULT_MAX_STEPS,
+    BuiltAgent,
+    _fits_schema,
+    answer_text,
+    build_agent,
+)
+from app.agents.loop_guard import LoopGuard
+from app.agents.model_resolver import ModelRequestSpec, ResolvedCredential
+from app.agents.run_reviewer import RunReviewer
+from app.agents.spec import (
+    SPEC_VERSION,
+    AgentSpec,
+    AlertAudience,
+    AlertSpec,
+    CodeModeSpec,
+    LoopGuardSpec,
+    NotificationSpec,
+    VoiceSpec,
+)
+from app.agents.tool_repair import CountedRepair
+from app.core.exceptions import BadRequestError
+from app.core.secret_kinds import ApiKeySecret
+
+
+@pytest.fixture(autouse=True)
+def _builtins_loaded():
+    load_builtins()
+
+
+def _run_context() -> RunContext[None]:
+    return RunContext(deps=None, model=TestModel(), usage=RunUsage())
+
+
+def _request_context() -> ModelRequestContext:
+    return ModelRequestContext(
+        model=TestModel(),
+        messages=[],
+        model_settings=None,
+        model_request_parameters=ModelRequestParameters(),
+    )
+
+
+def _model_spec(params: dict | None = None) -> ModelRequestSpec:
+    return ModelRequestSpec(
+        profile_id=uuid.uuid4(),
+        label="GPT-4.1 (prod)",
+        provider="openai",
+        model="gpt-4.1",
+        params=params or {},
+        credential=ResolvedCredential(
+            provider="openai", secret=ApiKeySecret(api_key="sk-test-key")
+        ),
+        fallbacks=[],
+    )
+
+
+class TestSpecContract:
+    def test_yaml_round_trips(self):
+        spec = AgentSpec(
+            name="Support Copilot",
+            description="Answers from the product wiki.",
+            instructions="Cite your sources.",
+            capabilities=[{"id": "knowledge", "config": {"default_top_k": 8}}],
+        )
+        assert AgentSpec.from_yaml(spec.to_yaml()) == spec
+
+    def test_several_accounts_of_one_server_round_trip(self):
+        """Two of the organization's Outlook connections and each person's own
+        accounts survive export and import (#2125)."""
+        spec = AgentSpec(
+            name="Inbox",
+            mcp_servers=[
+                {"account": "organization", "connection_id": str(uuid.uuid4())},
+                {"account": "organization", "connection_id": str(uuid.uuid4())},
+                {"account": "personal", "catalog_key": "outlook"},
+            ],
+        )
+
+        loaded = AgentSpec.from_yaml(spec.to_yaml())
+
+        assert loaded == spec
+
+    def test_a_tool_cannot_be_bound_twice(self):
+        """A duplicate would silently shadow itself in the toolset."""
+        with pytest.raises(ValueError, match="more than once"):
+            AgentSpec(name="x", capabilities=[{"id": "a"}, {"id": "a"}])
+
+    def test_unknown_fields_are_rejected(self):
+        """A typo in a hand-written spec must fail, not be silently dropped."""
+        with pytest.raises(ValueError):
+            AgentSpec.from_yaml("name: x\ninstrucitons: typo\n")
+
+    def test_yaml_must_be_a_mapping(self):
+        with pytest.raises(ValueError, match="mapping"):
+            AgentSpec.from_yaml("- just\n- a list\n")
+
+    def test_a_spec_from_a_newer_deployment_is_refused(self):
+        """A `spec_version` past this code's is refused, not accepted because its
+        fields happen to parse: the whole failure the number exists to catch is a
+        later deployment's constructs read as an older shape."""
+        with pytest.raises(ValueError, match="newer than this deployment"):
+            AgentSpec.from_yaml(f"name: x\nspec_version: {SPEC_VERSION + 1}\n")
+
+    def test_a_spec_at_or_below_this_version_loads(self):
+        """This deployment's own version, and an older one, both parse - the
+        refusal is one-sided."""
+        assert AgentSpec.from_yaml(f"name: x\nspec_version: {SPEC_VERSION}\n").spec_version == (
+            SPEC_VERSION
+        )
+        assert AgentSpec.from_yaml("name: x\nspec_version: 2\n").spec_version == 2
+
+    def test_spec_carries_references_not_values(self):
+        """What makes a spec safe to commit to a client's git repository."""
+        spec = AgentSpec(name="x", model_profile_id=uuid.uuid4())
+        rendered = spec.to_yaml()
+        assert "api_key" not in rendered
+        assert "sk-" not in rendered
+
+    @pytest.mark.security
+    def test_negative_budgets_are_refused(self):
+        with pytest.raises(ValueError):
+            AgentSpec(name="x", budget={"monthly_usd": 0})
+
+    def test_a_per_run_cap_is_no_longer_a_thing_a_spec_can_say(self):
+        """The platform has exactly two budget levels - the agent's month and
+        the organization's. A spec still carrying the old key must fail loudly
+        at validation, which is what the 0062 data migration exists to prevent
+        for rows written before the key was removed."""
+        with pytest.raises(ValueError):
+            AgentSpec(name="x", budget={"max_per_run_usd": 1})
+
+
+class TestSpeechToTextOverride:
+    """The agent's optional speech-to-text block (#1797).
+
+    An optional field with a default, so no `SPEC_VERSION` bump: the free row of
+    the agent-spec skill's table. What is guarded is that it stays free.
+    """
+
+    def test_a_spec_stored_before_the_field_existed_loads_with_no_override(self):
+        """A verbatim document from before the field - not one built from the
+        current model, which could not fail."""
+        stored = {
+            "spec_version": 12,
+            "name": "Support",
+            "instructions": "Be brief.",
+            "model_settings": {},
+            "capabilities": [],
+            "collection_ids": [],
+            "skill_ids": [],
+            "context_ids": [],
+            "mcp_servers": [],
+            "subagents": [],
+            "budget": None,
+            "observability": None,
+        }
+
+        assert AgentSpec.model_validate(stored).speech_to_text is None
+
+    def test_the_override_survives_a_yaml_round_trip(self):
+        spec = AgentSpec(
+            name="Support",
+            speech_to_text={"provider": "openai", "model": "whisper-1", "language": "pl"},
+        )
+
+        assert AgentSpec.from_yaml(spec.to_yaml()) == spec
+        assert spec.speech_to_text is not None
+        assert spec.speech_to_text.language == "pl"
+
+    def test_a_language_alone_is_a_valid_draft(self):
+        """The organization's provider, this agent's language."""
+        spec = AgentSpec(name="Support", speech_to_text={"language": "pl"})
+
+        assert spec.speech_to_text is not None
+        assert spec.speech_to_text.provider is None
+
+    def test_a_half_chosen_pair_is_still_a_draft_that_saves(self):
+        """The pair rule is publish's, so a draft between two clicks is not a 422."""
+        spec = AgentSpec(name="Support", speech_to_text={"provider": "openai"})
+
+        assert spec.speech_to_text is not None
+        assert spec.speech_to_text.model is None
+
+    def test_a_block_with_nothing_in_it_is_stored_as_absent(self):
+        """One spelling for "inherit everything", so a card returned to inherit
+        does not read as an unpublished change."""
+        spec = AgentSpec(
+            name="Support",
+            speech_to_text={"provider": None, "model": None, "language": None},
+        )
+
+        assert spec.speech_to_text is None
+
+    def test_the_dictation_switch_alone_is_a_block_and_off_alone_is_none(self):
+        """On, it is the whole point of the block - the organization's pair, sent to
+        its provider. Off with nothing else is the default, so it collapses too."""
+        on = AgentSpec(name="Support", speech_to_text={"dictation": True})
+        off = AgentSpec(name="Support", speech_to_text={"dictation": False, "language": None})
+
+        assert on.speech_to_text is not None and on.speech_to_text.dictation
+        assert off.speech_to_text is None
+
+    def test_an_unknown_key_in_the_block_is_refused(self):
+        """`extra="forbid"`, like every other block: a typo must not be dropped."""
+        with pytest.raises(ValidationError):
+            AgentSpec(name="Support", speech_to_text={"lang": "pl"})
+
+
+class TestStarters:
+    """First messages an empty chat offers (#2301)."""
+
+    def test_a_spec_written_before_them_has_none(self):
+        assert AgentSpec.model_validate({"name": "Support"}).starters == []
+
+    def test_a_blank_one_is_dropped_and_the_rest_trimmed(self):
+        """The Builder saves as it is typed; a starter cleared to retype it is not an error."""
+        spec = AgentSpec(name="Support", starters=["  What can you do?  ", "", "   "])
+
+        assert spec.starters == ["What can you do?"]
+
+    @pytest.mark.parametrize(
+        "starters", [["a"] * 5, ["x" * 201]], ids=["more-than-four", "longer-than-a-line"]
+    )
+    def test_more_than_a_chat_shows_is_refused(self, starters):
+        with pytest.raises(ValidationError):
+            AgentSpec(name="Support", starters=starters)
+
+    def test_they_survive_the_yaml_round_trip(self):
+        spec = AgentSpec(name="Support", starters=["What can you do?"])
+
+        assert AgentSpec.from_yaml(spec.to_yaml()) == spec
+
+
+class TestFactory:
+    def test_builds_an_agent_with_its_tools(self):
+        spec = AgentSpec(
+            name="Support",
+            instructions="Be helpful.",
+            capabilities=[{"id": "clock"}, {"id": "knowledge"}],
+        )
+        built = build_agent(
+            spec,
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            granted_scopes=frozenset({"knowledge:read"}),
+            resources={"kb_collection_names": ["kb_1"]},
+        )
+        assert built.model_label == "GPT-4.1 (prod)"
+        assert [type(c).__name__ for c in built.capabilities] == ["Clock", "Knowledge"]
+
+    def test_the_workflows_an_agent_binds_reach_page_publishing(self):
+        """A page's actions are checked against what the spec binds, never what the model
+        says: the factory hands the Workflows binding's ids to the Artifacts capability."""
+        bound = uuid.uuid4()
+        spec = AgentSpec(
+            name="Clerk",
+            capabilities=[
+                {"id": "workflows", "config": {"workflow_ids": [str(bound)]}},
+                {"id": "artifacts"},
+            ],
+        )
+
+        built = build_agent(
+            spec,
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            granted_scopes=frozenset({"workflows:run"}),
+        )
+
+        [artifacts] = [c for c in built.capabilities if type(c).__name__ == "Artifacts"]
+        assert artifacts.workflow_ids == frozenset({bound})
+
+    def test_an_agent_without_workflows_hands_publishing_none(self):
+        built = build_agent(
+            AgentSpec(name="Clerk", capabilities=[{"id": "artifacts"}]),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+        )
+
+        [artifacts] = [c for c in built.capabilities if type(c).__name__ == "Artifacts"]
+        assert artifacts.workflow_ids == frozenset()
+
+    def _audience_agent(self, *, capability: str | None = "memory_files", **identity):
+        capabilities = (
+            [{"id": "clock"}] if capability is None else [{"id": capability, "config": {}}]
+        )
+        return build_agent(
+            AgentSpec(name="Support", instructions="Remember.", capabilities=capabilities),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            **identity,
+        )
+
+    def test_an_audience_aware_agent_carries_the_audience_it_was_given(self):
+        """The factory no longer derives the audience - the runner does, because
+        only it knows whether this is a fresh request or a resume (#788). What the
+        factory owns is putting it on the deps the tools read."""
+        audience = RunAudience(user_id=uuid.uuid4(), room_key="room:slack:C1")
+        built = self._audience_agent(audience=audience)
+        assert built.deps.audience == audience
+
+    def test_every_capability_that_reads_the_audience_is_listed_as_needing_one(self):
+        """`_AUDIENCE_AWARE` is a hand-kept list and its failure is silent.
+
+        A capability whose toolset reads `deps.audience` and whose id is missing
+        from it is simply handed `None`, which every one of them reads as "nobody
+        is identified here" - so it refuses in a conversation that has a person in
+        it, with a sentence that sounds deliberate. Nothing raises, and no other
+        test sees it, because each capability's own suite constructs the deps it
+        wants.
+
+        So the check is over the source: whichever packages read the field are
+        exactly the ones the factory gives it to.
+        """
+        load_builtins()
+        readers = {
+            definition.id
+            for definition in all_capabilities()
+            if any(
+                "deps.audience" in module.read_text()
+                for module in Path(
+                    import_module(definition.builder.__module__).__file__ or ""
+                ).parent.glob("*.py")
+            )
+        }
+
+        assert readers == set(_AUDIENCE_AWARE)
+
+    def test_an_agent_that_reads_no_audience_carries_none(self):
+        """The binding is the gate: a spec that asked for none of them carries no
+        audience, whatever identity the request arrived with."""
+        built = self._audience_agent(capability=None, audience=RunAudience(user_id=uuid.uuid4()))
+        assert built.deps.audience is None
+
+    @pytest.mark.anyio
+    async def test_an_agent_that_binds_nothing_still_reports_its_context(self):
+        """The gauge is attached whatever the spec says, and this is the point.
+
+        An agent with no `compaction` binding is the one that reaches the context
+        ceiling and is refused by the provider mid-answer - there is no strategy
+        to save it, so the reading is the whole of what it gets. Bound to the
+        capability list beside the budget guard rather than inside `*configured`,
+        which is what makes it independent of the spec.
+        """
+        built = build_agent(
+            AgentSpec(name="Bare", instructions="Be brief."),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+        )
+
+        attached: list[object] = []
+        built.agent.root_capability.apply(attached.append)
+        gauge = next(c for c in attached if isinstance(c, ReportContextSize))
+
+        assert built.capabilities == []
+        await gauge.after_model_request(
+            _run_context(),
+            request_context=_request_context(),
+            response=ModelResponse(
+                parts=[TextPart(content="ok")], usage=RequestUsage(input_tokens=41_806)
+            ),
+        )
+        assert built.context.latest == 41_806
+
+    def test_an_earlier_turns_measurement_starts_the_gauge_off(self):
+        """The gauge is per run and filled by a *response*, so on a one-request
+        turn it is empty for the whole of it - and compaction, which reads it to
+        decide whether the window has room for a summary at all, could never tell
+        that case from a working one. The overhead is a property of the agent's
+        instructions and tool schemas rather than of one run, so what an earlier
+        turn measured is where this one starts (#49)."""
+        built = build_agent(
+            AgentSpec(name="Bare", instructions="Be brief."),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            recorded_overhead=3_865,
+        )
+
+        assert built.context.overhead == 3_865
+
+    def test_a_thread_that_has_measured_nothing_starts_empty(self):
+        """A first turn. Nothing is guessed here - a made-up overhead would move
+        a refusal that costs an agent its compaction."""
+        built = build_agent(
+            AgentSpec(name="Bare", instructions="Be brief."),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+        )
+
+        assert built.context.overhead is None
+
+    def test_agent_settings_override_the_profile(self):
+        """The agent is the more specific statement of intent."""
+        spec = AgentSpec(name="x", model_settings={"temperature": 0.9})
+        built = build_agent(
+            spec,
+            _model_spec({"temperature": 0.1, "max_tokens": 100}),
+            organization_id=uuid.uuid4(),
+        )
+        settings = built.agent.model_settings
+        assert settings is not None
+        assert settings["temperature"] == 0.9
+        assert settings["max_tokens"] == 100
+
+    @pytest.mark.parametrize("provider", ["anthropic", "openrouter", "bedrock", "openai", "google"])
+    def test_every_provider_is_asked_to_cache_prompts_by_default(self, provider: str):
+        """A long history re-sent uncached on every request is what drained an
+        OpenRouter account mid-run. The setting is provider-neutral, so Bedrock and
+        OpenAI are cached too, and a provider that caches implicitly ignores it (#2169)."""
+        built = build_agent(
+            AgentSpec(name="x"),
+            replace(_model_spec(), provider=provider),
+            organization_id=uuid.uuid4(),
+        )
+
+        assert built.agent.model_settings is not None
+        assert built.agent.model_settings.get("cache") is True
+        assert not [key for key in built.agent.model_settings if key.endswith("_cache_messages")]
+
+    @pytest.mark.parametrize(
+        ("params", "setting", "value"),
+        [
+            ({"cache": False}, "cache", False),
+            ({"cache": {"messages": False}}, "cache", {"messages": False}),
+            # A profile written against the old per-provider flags keeps them; Pydantic
+            # AI lets a provider-specific flag override the neutral setting.
+            ({"anthropic_cache_messages": False}, "anthropic_cache_messages", False),
+        ],
+    )
+    def test_a_profile_still_decides_its_own_caching(
+        self, params: dict[str, object], setting: str, value: object
+    ):
+        built = build_agent(
+            AgentSpec(name="x"),
+            replace(_model_spec(params), provider="anthropic"),
+            organization_id=uuid.uuid4(),
+        )
+
+        assert built.agent.model_settings is not None
+        assert built.agent.model_settings.get(setting) == value
+
+    def test_ungranted_scope_stops_the_build(self):
+        spec = AgentSpec(name="x", capabilities=[{"id": "knowledge"}])
+        with pytest.raises(BadRequestError):
+            build_agent(
+                spec, _model_spec(), organization_id=uuid.uuid4(), granted_scopes=frozenset()
+            )
+
+    def test_invalid_tool_config_stops_the_build(self):
+        spec = AgentSpec(
+            name="x", capabilities=[{"id": "knowledge", "config": {"default_top_k": 999}}]
+        )
+        with pytest.raises(BadRequestError):
+            build_agent(
+                spec,
+                _model_spec(),
+                organization_id=uuid.uuid4(),
+                granted_scopes=frozenset({"knowledge:read"}),
+            )
+
+    def test_disabled_capabilities_are_not_built(self):
+        spec = AgentSpec(
+            name="x",
+            capabilities=[{"id": "knowledge", "enabled": False}],
+        )
+        built = build_agent(
+            spec,
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            granted_scopes=frozenset({"knowledge:read"}),
+            resources={"kb_collection_names": ["kb_1"]},
+        )
+        assert built.capabilities == []
+
+
+class TestToolSearchDefersMcp:
+    """Binding `tool_search` is what hides the MCP toolsets behind discovery.
+
+    The capability and the deferral are two halves of one decision: `ToolSearch`
+    is inert with nothing deferred, and a deferred toolset with no `ToolSearch`
+    to find it is a set of tools the model can never call. So what is pinned here
+    is the pairing - the MCP toolsets are deferred exactly when the capability is
+    bound, and left alone when it is not.
+
+    A `DeferredLoadingToolset` on the agent proves the wrapper is *present*; it
+    does not prove the tools are actually hidden from the model, which is the
+    whole point of the capability - one could exist and still leak every MCP
+    schema through, and the wrapper assertions would stay green (#50). So the
+    behaviour is pinned end to end with a `FunctionModel` that records the tools
+    it is offered: when bound the MCP schemas are gone and `search_tools` stands
+    in their place, and when unbound every schema is in front of the model.
+    """
+
+    @staticmethod
+    def _mcp_toolset() -> FunctionToolset[Any]:
+        """Two named tools standing in for the schemas an MCP server exposes."""
+        toolset: FunctionToolset[Any] = FunctionToolset()
+
+        def fetch_invoice(invoice_id: str) -> str:
+            """Fetch an invoice by id."""
+            return "invoice"
+
+        def refund_payment(payment_id: str) -> str:
+            """Refund a payment by id."""
+            return "refunded"
+
+        toolset.add_function(fetch_invoice, takes_ctx=False)
+        toolset.add_function(refund_payment, takes_ctx=False)
+        return toolset
+
+    @classmethod
+    def _agent_with_mcp(cls, capabilities: list[dict[str, Any]]) -> BuiltAgent:
+        spec = AgentSpec(name="x", capabilities=capabilities)
+        return build_agent(
+            spec,
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            extra_toolsets=[cls._mcp_toolset()],
+        )
+
+    @staticmethod
+    async def _tools_the_model_sees(built: BuiltAgent) -> list[str]:
+        """The function-tool names put in front of the model on its first request."""
+        seen: list[list[str]] = []
+
+        async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            seen.append([tool.name for tool in info.function_tools])
+            return ModelResponse(parts=[TextPart("noted")])
+
+        with built.agent.override(model=FunctionModel(respond)):
+            await built.agent.run("hello", deps=built.deps)
+        return seen[0]
+
+    def test_the_mcp_toolsets_are_deferred_when_it_is_bound(self):
+        from pydantic_ai.toolsets.deferred_loading import DeferredLoadingToolset
+
+        built = self._agent_with_mcp([{"id": "tool_search"}])
+
+        assert any(isinstance(ts, DeferredLoadingToolset) for ts in built.agent.toolsets)
+
+    def test_the_mcp_toolsets_are_untouched_when_it_is_not(self):
+        """An agent that does not enable it pays nothing: its tools stay visible."""
+        from pydantic_ai.toolsets.deferred_loading import DeferredLoadingToolset
+
+        built = self._agent_with_mcp([])
+
+        assert not any(isinstance(ts, DeferredLoadingToolset) for ts in built.agent.toolsets)
+
+    @pytest.mark.anyio
+    async def test_the_mcp_schemas_are_hidden_behind_search_when_bound(self):
+        """The behaviour the wrapper only implies: on the first request the model
+        is offered `search_tools` and none of the MCP schemas it exists to hide.
+
+        `keywords` is chosen for determinism - it keeps the local `search_tools`
+        function on the wire on every provider, where `auto` would defer to a
+        provider-native builtin a `FunctionModel` does not implement and so offer
+        the model nothing to capture.
+        """
+        built = self._agent_with_mcp([{"id": "tool_search", "config": {"strategy": "keywords"}}])
+
+        offered = await self._tools_the_model_sees(built)
+
+        assert offered == ["search_tools"]
+
+    @pytest.mark.anyio
+    async def test_a_surfaces_own_capability_stays_in_view_when_bound(self):
+        """`connect_account` is how a service the person has not connected gets
+        connected; hidden behind search it is a tool the model never knows to
+        look for, so an extra capability's tools are not deferred."""
+
+        async def unused() -> str:
+            return "unreachable"
+
+        on_use = ConnectOnUse(
+            services=[
+                PendingService(
+                    request=ConnectionRequest(
+                        catalog_key="notion", name="Notion", gap="not_connected"
+                    ),
+                    resolve=unused,
+                )
+            ],
+            request_connection=AsyncMock(return_value=False),
+        )
+        built = build_agent(
+            AgentSpec(
+                name="x", capabilities=[{"id": "tool_search", "config": {"strategy": "keywords"}}]
+            ),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            extra_toolsets=[self._mcp_toolset()],
+            extra_capabilities=[on_use],
+        )
+
+        offered = await self._tools_the_model_sees(built)
+
+        assert sorted(offered) == ["connect_account", "search_tools"]
+
+    @pytest.mark.anyio
+    async def test_asking_about_everything_does_not_ask_about_connecting(self):
+        """`connect_account` is itself the question; under `ASK_ALL` it reaches
+        the person without first being put to them for approval."""
+        asked: list[str] = []
+
+        async def request_connection(request: ConnectionRequest) -> bool:
+            asked.append(request.catalog_key)
+            return False
+
+        async def unused() -> str:
+            return "unreachable"
+
+        approval = AsyncMock()
+        built = build_agent(
+            AgentSpec(name="x"),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            gate_every_tool=True,
+            request_approval=approval,
+            extra_capabilities=[
+                ConnectOnUse(
+                    services=[
+                        PendingService(
+                            request=ConnectionRequest(
+                                catalog_key="notion", name="Notion", gap="not_connected"
+                            ),
+                            resolve=unused,
+                        )
+                    ],
+                    request_connection=request_connection,
+                )
+            ],
+        )
+
+        async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if len(messages) == 1:
+                return ModelResponse(parts=[ToolCallPart("connect_account", {"service": "notion"})])
+            return ModelResponse(parts=[TextPart("done")])
+
+        with built.agent.override(model=FunctionModel(respond)):
+            await built.agent.run("hello", deps=built.deps)
+
+        assert asked == ["notion"]
+        approval.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_every_mcp_schema_is_visible_when_it_is_not_bound(self):
+        """The other direction: with nothing to defer to, every MCP schema is in
+        front of the model on the first request and there is no `search_tools`."""
+        built = self._agent_with_mcp([])
+
+        offered = await self._tools_the_model_sees(built)
+
+        assert offered == ["fetch_invoice", "refund_payment"]
+
+
+class TestBudgetComposition:
+    """Every ceiling a run is under, as its own entry with its own lookup.
+
+    The agent's monthly cap and the organization's used to be collapsed with
+    `min()` and checked against a single organization-wide total, which made
+    `AgentSpec.budget.monthly_usd` a cap on the organization: an agent with a
+    $10 limit was refused because its neighbours had spent $10. Two caps, two
+    quantities - so what these assert is not one number but which lookup each
+    cap ended up holding.
+    """
+
+    @staticmethod
+    def _limits(built) -> list[tuple[BudgetScope, Decimal]]:
+        return [(limit.scope, limit.limit_usd) for limit in built.budget.limits]
+
+    @staticmethod
+    def _lookups(built) -> dict[BudgetScope, object]:
+        return {limit.scope: limit.period_spend for limit in built.budget.limits}
+
+    def test_a_run_s_own_ceiling_is_the_narrowest_and_meters_only_the_run(self):
+        """A workflow step's `max_cost_usd`: first, so a run under several spent
+        ceilings names its own, and with no period lookup - this run's ledger only."""
+        built = build_agent(
+            AgentSpec(name="x", budget={"monthly_usd": 10}),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            org_monthly_budget_usd=Decimal("40"),
+            run_limit_usd=Decimal("0.5"),
+        )
+
+        assert self._limits(built) == [
+            (BudgetScope.RUN, Decimal("0.5")),
+            (BudgetScope.AGENT, Decimal("10")),
+            (BudgetScope.ORGANIZATION, Decimal("40")),
+        ]
+        assert self._lookups(built)[BudgetScope.RUN] is None
+        assert BudgetScope.RUN.label == "This run's"
+
+    def test_org_limit_applies_when_the_agent_sets_none(self):
+        built = build_agent(
+            AgentSpec(name="x"),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            org_monthly_budget_usd=Decimal("40"),
+        )
+        assert self._limits(built) == [(BudgetScope.ORGANIZATION, Decimal("40"))]
+
+    def test_an_agent_may_tighten_but_not_loosen_the_org_limit(self):
+        """Both stand at their own number, and both are enforced.
+
+        A $100 agent under a $40 ceiling is not "a $40 agent": its own cap is
+        still $100 on its own spend, and the organization's $40 is what stops it
+        - because the agent's spend is part of the organization's, so the
+        organization's entry always binds first when it is the smaller of the
+        two. That is the tighten-never-loosen rule, kept without a `min()`.
+        """
+        loosening = build_agent(
+            AgentSpec(name="x", budget={"monthly_usd": 100}),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            org_monthly_budget_usd=Decimal("40"),
+        )
+        assert self._limits(loosening) == [
+            (BudgetScope.AGENT, Decimal("100")),
+            (BudgetScope.ORGANIZATION, Decimal("40")),
+        ]
+
+        tightening = build_agent(
+            AgentSpec(name="x", budget={"monthly_usd": 10}),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            org_monthly_budget_usd=Decimal("40"),
+        )
+        assert self._limits(tightening) == [
+            (BudgetScope.AGENT, Decimal("10")),
+            (BudgetScope.ORGANIZATION, Decimal("40")),
+        ]
+
+    def test_a_departments_cap_sits_between_the_agents_and_the_organizations(self):
+        """Narrowest first: the agent's author, then the department's lead, then everyone (#2072)."""
+        finance = SpendLimit(scope=BudgetScope.GROUP, limit_usd=Decimal("20"))
+        built = build_agent(
+            AgentSpec(name="x", budget={"monthly_usd": 10}),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            org_monthly_budget_usd=Decimal("40"),
+            group_limits=[finance],
+        )
+        assert self._limits(built) == [
+            (BudgetScope.AGENT, Decimal("10")),
+            (BudgetScope.GROUP, Decimal("20")),
+            (BudgetScope.ORGANIZATION, Decimal("40")),
+        ]
+
+    @pytest.mark.anyio
+    async def test_each_monthly_cap_holds_the_lookup_that_meters_it(self):
+        """The defect, at the seam where it was introduced.
+
+        One lookup handed to both caps is what made an agent's limit answerable
+        by its neighbours' spending, and the two are indistinguishable by their
+        numbers alone - only by which callable each one carries.
+        """
+        agent_spend = AsyncMock(return_value=Decimal("1"))
+        org_spend = AsyncMock(return_value=Decimal("2"))
+        built = build_agent(
+            AgentSpec(name="x", budget={"monthly_usd": 10}),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            agent_period_spend=agent_spend,
+            org_period_spend=org_spend,
+            org_monthly_budget_usd=Decimal("40"),
+        )
+
+        lookups = self._lookups(built)
+        assert await lookups[BudgetScope.AGENT]() == Decimal("1")
+        assert await lookups[BudgetScope.ORGANIZATION]() == Decimal("2")
+
+    def test_budgets_are_decimal_not_float(self):
+        """Money accumulated as float drifts; the boundary ends here."""
+        built = build_agent(
+            AgentSpec(name="x", budget={"monthly_usd": 0.1}),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+        )
+        assert self._limits(built) == [(BudgetScope.AGENT, Decimal("0.1"))]
+
+    def test_an_agent_with_no_budget_under_an_uncapped_org_is_unlimited(self):
+        """Nothing to enforce is nothing to look up - and no round trip either."""
+        built = build_agent(AgentSpec(name="x"), _model_spec(), organization_id=uuid.uuid4())
+
+        assert built.budget.limits == []
+
+    def test_a_previewed_cap_meters_only_this_runs_ledger(self):
+        """No database to ask on a preview, so the cap carries no lookup and
+        binds on what this run alone has booked."""
+        built = build_agent(
+            AgentSpec(name="x", budget={"monthly_usd": 10}),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+        )
+
+        assert self._lookups(built)[BudgetScope.AGENT] is None
+
+
+class TestRepairingToolArguments:
+    """Every agent repairs malformed tool-call arguments, first of all (#2105)."""
+
+    def test_the_repair_runs_before_every_other_hook_and_counts_on_the_built_agent(self):
+        built = build_agent(AgentSpec(name="Clerk"), _model_spec(), organization_id=uuid.uuid4())
+        attached: list[object] = []
+        built.agent.root_capability.apply(attached.append)
+
+        repair = next(one for one in attached if isinstance(one, CountedRepair))
+        gate = next(one for one in attached if isinstance(one, ApprovalGate))
+        assert attached.index(repair) < attached.index(gate)
+        assert repair.tally is built.repairs
+        assert built.repairs.count == 0
+
+
+class TestStoppingToolLoops:
+    """Every agent has the loop guard, on by default (#2086)."""
+
+    def test_a_spec_written_before_it_existed_loads_with_it_on(self):
+        spec = AgentSpec.from_yaml("name: Clerk\ninstructions: Answer briefly.\n")
+        assert spec.loop_guard == LoopGuardSpec(enabled=True, repeats=4, cycles=3)
+        assert AgentSpec.from_yaml(spec.to_yaml()) == spec
+
+    def test_the_factory_attaches_it_with_the_agents_thresholds_and_not_when_off(self):
+        def guards(spec: AgentSpec) -> list[LoopGuard]:
+            built = build_agent(spec, _model_spec(), organization_id=uuid.uuid4())
+            attached: list[object] = []
+            built.agent.root_capability.apply(attached.append)
+            return [one for one in attached if isinstance(one, LoopGuard)]
+
+        (guard,) = guards(AgentSpec(name="Clerk", loop_guard=LoopGuardSpec(repeats=6, cycles=2)))
+        assert (guard.repeats, guard.cycles) == (6, 2)
+        assert guards(AgentSpec(name="Clerk", loop_guard=LoopGuardSpec(enabled=False))) == []
+
+    @pytest.mark.parametrize("field", [{"repeats": 1}, {"cycles": 11}, {"other": 1}])
+    def test_a_threshold_out_of_range_is_refused(self, field: dict[str, int]):
+        with pytest.raises(ValidationError):
+            LoopGuardSpec.model_validate(field)
+
+
+class TestRunReviewers:
+    """A second model that reviews the run while it goes (#2106)."""
+
+    def test_a_spec_written_before_reviewers_loads_with_none(self):
+        spec = AgentSpec.from_yaml("name: Clerk\ninstructions: Answer briefly.\n")
+        assert spec.reviewers == []
+
+    def test_two_reviewers_with_one_name_are_refused(self):
+        reviewer = {"name": "sources", "model_profile_id": str(uuid.uuid4()), "instructions": "x"}
+        with pytest.raises(ValidationError, match="Reviewer named more than once"):
+            AgentSpec(name="Clerk", reviewers=[reviewer, reviewer])
+
+    def _reviewers(self, spec: AgentSpec, models: dict | None = None) -> list[RunReviewer]:
+        built = build_agent(
+            spec, _model_spec(), organization_id=uuid.uuid4(), reviewer_models=models or {}
+        )
+        attached: list[object] = []
+        built.agent.root_capability.apply(attached.append)
+        return [one for one in attached if isinstance(one, RunReviewer)]
+
+    def test_an_agent_without_one_gets_no_reviewer(self):
+        assert self._reviewers(AgentSpec(name="Clerk")) == []
+
+    def test_each_reviewer_runs_on_the_model_resolved_for_it(self, caplog):
+        resolved, missing = uuid.uuid4(), uuid.uuid4()
+        model = MagicMock(params={"temperature": 0.0}, context_length=None)
+        spec = AgentSpec(
+            name="Clerk",
+            reviewers=[
+                {
+                    "name": "sources",
+                    "model_profile_id": str(resolved),
+                    "instructions": "x",
+                    "every": 4,
+                },
+                {"name": "scope", "model_profile_id": str(missing), "instructions": "y"},
+                {"name": "draft", "model_profile_id": str(resolved)},
+            ],
+        )
+
+        (reviewer,) = self._reviewers(spec, {resolved: model})
+
+        assert (reviewer.name, reviewer.every, reviewer.model) == ("sources", 4, model.build())
+        assert reviewer.model_settings == {"temperature": 0.0}
+        assert reviewer.screen is None
+        assert "scope is incomplete or unresolved" in caplog.text
+        assert "draft is incomplete or unresolved" in caplog.text
+
+    def test_the_window_is_held_to_what_the_reviewers_model_can_read(self):
+        profile = uuid.uuid4()
+        small = MagicMock(params={}, context_length=8_000)
+        spec = AgentSpec(
+            name="Clerk",
+            reviewers=[
+                {
+                    "name": "a",
+                    "model_profile_id": str(profile),
+                    "instructions": "x",
+                    "window": 20_000,
+                }
+            ],
+        )
+
+        (reviewer,) = self._reviewers(spec, {profile: small})
+
+        assert reviewer.window == 6_000
+
+    def test_corrections_are_screened_by_the_agents_input_guardrail(self):
+        profile = uuid.uuid4()
+        spec = AgentSpec(
+            name="Clerk",
+            capabilities=[{"id": "guardrails", "config": {"redact_secrets_in": True}}],
+            reviewers=[{"name": "a", "model_profile_id": str(profile), "instructions": "x"}],
+        )
+
+        (reviewer,) = self._reviewers(spec, {profile: MagicMock(params={}, context_length=None)})
+
+        assert reviewer.screen is not None
+
+
+class TestCodeMode:
+    """Many tool calls from one sandboxed script, when the spec asks for it (#2107)."""
+
+    def test_a_spec_written_before_it_existed_loads_with_it_off(self):
+        spec = AgentSpec.from_yaml("name: Clerk\ninstructions: Answer briefly.\n")
+        assert spec.code_mode == CodeModeSpec(enabled=False, max_tool_calls=100)
+
+    @staticmethod
+    def _attached(spec: AgentSpec, **kwargs: Any) -> list[object]:
+        built = build_agent(spec, _model_spec(), organization_id=uuid.uuid4(), **kwargs)
+        attached: list[object] = []
+        built.agent.root_capability.apply(attached.append)
+        return attached
+
+    def test_it_is_added_only_when_the_spec_asks(self):
+        on = AgentSpec(name="Clerk", code_mode=CodeModeSpec(enabled=True, max_tool_calls=25))
+
+        assert not [
+            one for one in self._attached(AgentSpec(name="Clerk")) if isinstance(one, CodeMode)
+        ]
+        (mode,) = [one for one in self._attached(on) if isinstance(one, CodeMode)]
+        assert mode.max_tool_calls == 25
+        assert [one for one in self._attached(on) if isinstance(one, CodeCalls)]
+
+    def test_a_session_that_asks_before_every_tool_gets_no_code_mode(self):
+        on = AgentSpec(name="Clerk", code_mode=CodeModeSpec(enabled=True))
+        attached = self._attached(on, gate_every_tool=True)
+        assert not [one for one in attached if isinstance(one, CodeMode | CodeCalls)]
+
+
+class TestAskingAboutEveryTool:
+    """`gate_every_tool` reaching the gate the factory installs.
+
+    The middle link of the chain #1326 broke. The runner decides the flag from
+    the mode a run was admitted on and the gate refuses a rejected call; between
+    them is this, and an argument that stopped arriving here would silently undo
+    both ends while each kept its own tests green.
+    """
+
+    @staticmethod
+    def _gate(built: BuiltAgent) -> ApprovalGate:
+        attached: list[object] = []
+        built.agent.root_capability.apply(attached.append)
+        return next(one for one in attached if isinstance(one, ApprovalGate))
+
+    def test_the_flag_reaches_the_gate(self):
+        built = build_agent(
+            AgentSpec(name="Clerk"),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            gate_every_tool=True,
+        )
+
+        assert self._gate(built).gate_every_tool is True
+
+    def test_it_is_off_unless_a_session_asked(self):
+        built = build_agent(AgentSpec(name="Clerk"), _model_spec(), organization_id=uuid.uuid4())
+
+        assert self._gate(built).gate_every_tool is False
+
+
+class TestAnApprovalTheGateCouldNotEnforce:
+    """A stored version whose approval the provider's own execution walks past.
+
+    Publish validation refuses the combination, but a version published before
+    that refusal existed never passes through it again: a run loads the frozen
+    `AgentVersion` and hands its spec straight here. So without a refusal at
+    assembly, every agent #839 and #857 were written for goes on fetching and
+    searching unapproved (#871). These drive the stored spec, never
+    `validate_spec`.
+    """
+
+    @staticmethod
+    def _stored(capability: dict[str, Any]) -> AgentSpec:
+        """A spec as a published version holds it: JSON, read back untouched."""
+        return AgentSpec.model_validate({"name": "Researcher", "capabilities": [capability]})
+
+    def _build(self, capability: dict[str, Any], scope: str) -> BuiltAgent:
+        return build_agent(
+            self._stored(capability),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+            granted_scopes=frozenset({scope}),
+        )
+
+    @pytest.mark.security
+    def test_a_stored_native_search_with_approval_does_not_assemble(self):
+        with pytest.raises(BadRequestError) as refused:
+            self._build(
+                {"id": "web_research", "config": {"method": "native"}, "approval": "required"},
+                "web:read",
+            )
+
+        assert any("no call to hold" in problem for problem in refused.value.details["problems"])
+
+    @pytest.mark.security
+    def test_a_stored_native_fetch_with_approval_does_not_assemble(self):
+        """#839 refused this at publish and left every version published before it."""
+        with pytest.raises(BadRequestError) as refused:
+            self._build(
+                {
+                    "id": "web_fetch",
+                    "config": {"method": "auto"},
+                    "tool_approval": {"web_fetch": "required"},
+                },
+                "web:fetch",
+            )
+
+        assert any("no call to hold" in problem for problem in refused.value.details["problems"])
+
+    def test_a_native_search_nobody_asked_to_approve_still_runs(self):
+        """The refusal is about the approval, not about the provider searching."""
+        built = self._build({"id": "web_research", "config": {"method": "native"}}, "web:read")
+
+        assert len(built.capabilities) == 1
+
+    def test_a_disabled_binding_is_not_a_reason_to_refuse(self):
+        built = self._build(
+            {
+                "id": "web_research",
+                "config": {"method": "native"},
+                "approval": "required",
+                "enabled": False,
+            },
+            "web:read",
+        )
+
+        assert built.capabilities == []
+
+
+class TestMaxSteps:
+    """A cap on model requests - what stops a tool loop that a budget only bills for."""
+
+    def test_a_spec_that_says_nothing_runs_under_the_platform_default(self):
+        # The default matches Pydantic AI's own, so making the limit explicit
+        # did not change what every existing agent was already running under.
+        built = build_agent(AgentSpec(name="a"), _model_spec(), organization_id=uuid.uuid4())
+
+        assert built.usage_limits.request_limit == DEFAULT_MAX_STEPS
+
+    def test_the_spec_decides_when_it_says(self):
+        built = build_agent(
+            AgentSpec(name="a", max_steps=8), _model_spec(), organization_id=uuid.uuid4()
+        )
+
+        assert built.usage_limits.request_limit == 8
+
+    def test_zero_steps_is_refused_rather_than_stored(self):
+        # An agent that may make no model request is an agent that cannot answer;
+        # storing it produces a published agent that fails on its first turn.
+        with pytest.raises(ValidationError):
+            AgentSpec(name="a", max_steps=0)
+
+
+class TestWhoHearsAboutAnAgent:
+    """The notification block, and the four configurations it refuses.
+
+    Each refusal is a spec somebody would write believing they had set an alert
+    up. Accepting any of them means an alert that resolves to nobody, or to
+    exactly the people it would have reached anyway - and the only place that
+    becomes visible is when the email everybody was relying on does not arrive.
+    """
+
+    def test_an_agent_published_before_this_existed_keeps_the_old_behaviour(self):
+        """The whole point of a defaulted field: nothing stored has to be migrated."""
+        spec = AgentSpec.model_validate({"name": "Legacy", "spec_version": 4})
+
+        assert spec.notifications.budget.to == [AlertAudience.ADMINS, AlertAudience.OWNER]
+        assert spec.notifications.approvals.to == [
+            AlertAudience.INITIATOR,
+            AlertAudience.ADMINS,
+        ]
+        # Off, because a per-agent report nobody asked for is one more weekly
+        # email arriving for an agent that used to send none.
+        assert spec.notifications.usage.enabled is False
+
+    def test_naming_nobody_for_a_chosen_audience_is_refused(self):
+        with pytest.raises(ValidationError, match="at least one member"):
+            AlertSpec(to=[AlertAudience.CHOSEN])
+
+    def test_naming_people_without_choosing_them_is_refused(self):
+        """Ids with no `chosen` in `to` are ids nothing reads - which reads, in
+        the Builder, exactly like a list of people who will be mailed."""
+        with pytest.raises(ValidationError, match="only read when"):
+            AlertSpec(to=[AlertAudience.ADMINS], user_ids=[uuid.uuid4()])
+
+    def test_an_enabled_alert_with_no_audience_is_refused(self):
+        with pytest.raises(ValidationError, match="at least one audience"):
+            AlertSpec(enabled=True, to=[])
+
+    def test_a_disabled_alert_needs_no_audience(self):
+        """Switching an alert off is not the same as misconfiguring it."""
+        assert AlertSpec(enabled=False, to=[]).enabled is False
+
+    def test_a_usage_report_cannot_be_sent_to_the_initiator(self):
+        """A report covers a period, not a run, so there is no such person - and an
+        audience that silently contributes nothing is the failure being prevented."""
+        with pytest.raises(ValidationError, match="no initiator"):
+            NotificationSpec(usage=AlertSpec(to=[AlertAudience.INITIATOR]))
+
+    def test_the_notification_block_survives_a_yaml_round_trip(self):
+        """A spec is exported to a client's repository and read back."""
+        spec = AgentSpec(
+            name="Support",
+            notifications=NotificationSpec(
+                approvals=AlertSpec(to=[AlertAudience.CHOSEN], user_ids=[uuid.uuid4()])
+            ),
+        )
+
+        assert AgentSpec.from_yaml(spec.to_yaml()) == spec
+
+    def test_an_alert_audience_names_people_by_reference_never_by_address(self):
+        """The spec's own first rule, applied to the one field that holds people.
+
+        `AlertSpec` carries user ids. If it ever grew an `emails` field - which is
+        the obvious shortcut for "mail this external stakeholder" - a spec exported
+        as YAML into a client's git repository would carry their staff's addresses
+        with it, and a spec imported into another organization would mail people
+        who have nothing to do with it. Ids at least resolve to nobody outside the
+        tenant, which is what the membership-scoped recipient resolver enforces.
+        """
+        fields = set(AlertSpec.model_fields)
+
+        assert fields == {"enabled", "to", "user_ids"}
+        assert not any("mail" in name or "address" in name for name in fields)
+
+    def test_a_rendered_spec_carries_no_address(self):
+        """Belt and braces on the export path, because that is where it would be
+        noticed last: a YAML file in somebody's repository."""
+        spec = AgentSpec(
+            name="Support",
+            notifications=NotificationSpec(
+                approvals=AlertSpec(to=[AlertAudience.CHOSEN], user_ids=[uuid.uuid4()])
+            ),
+        )
+
+        assert "@" not in spec.to_yaml()
+
+
+_SCORE = {
+    "type": "object",
+    "properties": {"score": {"type": "integer"}, "tier": {"type": "string"}},
+    "required": ["score"],
+    "additionalProperties": False,
+}
+
+
+class TestAStructuredAnswer:
+    def test_a_spec_from_before_answers_in_text(self):
+        """A verbatim stored document with no `output_schema` still loads, as prose."""
+        spec = AgentSpec.from_yaml("spec_version: 12\nname: Old\ninstructions: Be brief.\n")
+        assert spec.output_schema is None
+
+    def test_an_object_schema_round_trips_through_yaml(self):
+        spec = AgentSpec(name="Scorer", output_schema=_SCORE)
+        assert AgentSpec.from_yaml(spec.to_yaml()) == spec
+
+    @pytest.mark.parametrize(
+        ("schema", "message"),
+        [
+            ({"type": 42}, "not a valid JSON Schema"),
+            ({"type": "array", "items": {"type": "string"}}, 'needs "type": "object"'),
+            (
+                {"type": "object", "description": "x" * 20_000},
+                "over 16384 bytes",
+            ),
+        ],
+        ids=["invalid", "not-an-object", "too-large"],
+    )
+    def test_a_schema_that_cannot_shape_an_answer_is_refused(self, schema, message):
+        with pytest.raises(ValidationError, match=message):
+            AgentSpec(name="Scorer", output_schema=schema)
+
+    @pytest.mark.anyio
+    async def test_the_agent_answers_with_an_object_of_the_schema(self):
+        built = build_agent(
+            AgentSpec(name="Scorer", output_schema=_SCORE),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+        )
+        with built.agent.override(model=TestModel(custom_output_args={"score": 87})):
+            result = await built.agent.run("Score this lead", deps=built.deps)
+        assert result.output == {"score": 87}
+
+    @pytest.mark.anyio
+    async def test_an_answer_that_breaks_the_schema_is_sent_back_once_more(self):
+        answers = iter([{"score": "high"}, {"score": 91, "tier": "hot"}])
+        seen: list[str] = []
+
+        def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            for message in messages:
+                for part in getattr(message, "parts", []):
+                    if part.part_kind in {"retry-prompt", "retry-feedback"} or (
+                        part.part_kind == "tool-return" and part.outcome == "retried"
+                    ):
+                        seen.append(str(part.content))
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=next(answers))]
+            )
+
+        built = build_agent(
+            AgentSpec(name="Scorer", output_schema=_SCORE),
+            _model_spec(),
+            organization_id=uuid.uuid4(),
+        )
+        with built.agent.override(model=FunctionModel(respond)):
+            result = await built.agent.run("Score this lead", deps=built.deps)
+
+        assert result.output == {"score": 91, "tier": "hot"}
+        assert result.usage.requests == 2
+        assert any("score" in text for text in seen), seen
+
+    def test_a_parked_run_passes_the_schema_check_untouched(self):
+        """What a parked run ends with is not an answer, and is handed on untouched."""
+        parked = DeferredToolRequests()
+        assert _fits_schema(_SCORE)(parked) is parked
+
+    def test_a_free_text_agent_answers_in_text(self):
+        built = build_agent(AgentSpec(name="Writer"), _model_spec(), organization_id=uuid.uuid4())
+        assert built.agent.output_type == [str, DeferredToolRequests]
+
+    def test_an_object_is_shown_as_a_json_block_and_prose_as_itself(self):
+        assert answer_text("Plain.") == "Plain."
+        assert answer_text({"tier": "wärm"}) == '```json\n{\n  "tier": "wärm"\n}\n```'
+
+
+class TestVoiceSpec:
+    def test_a_spec_written_before_voice_existed_still_loads(self):
+        old = {"spec_version": 12, "name": "Support", "instructions": "Help.", "capabilities": []}
+        assert AgentSpec.model_validate(old).voice is None
+
+    def test_an_all_null_voice_block_is_stored_as_absent(self):
+        spec = AgentSpec(name="a", voice=VoiceSpec())
+        assert spec.voice is None
+
+    def test_voice_round_trips_through_yaml(self):
+        spec = AgentSpec(
+            name="a",
+            voice=VoiceSpec(
+                provider="openai",
+                model="gpt-realtime",
+                secret_id=uuid.uuid4(),
+                voice="marin",
+                max_call_seconds=300,
+                voice_note="Spell names back.",
+            ),
+        )
+        assert AgentSpec.from_yaml(spec.to_yaml()) == spec
+
+    def test_a_call_longer_than_fifty_minutes_is_refused(self):
+        with pytest.raises(ValidationError):
+            VoiceSpec(max_call_seconds=3001)
+
+    def test_the_spec_version_did_not_move(self):
+        # 13 is the browser's fold (#2127); an optional section with a default adds none.
+        assert SPEC_VERSION == 13
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ("browser_use", "system_reminders", "compaction"),
+        ("compaction", "browser_use", "system_reminders"),
+    ],
+)
+@pytest.mark.parametrize("override", ["none", "name", "description"])
+def test_browser_history_pruning_runs_after_compaction_and_before_reminders(
+    order: tuple[str, ...],
+    override: str,
+) -> None:
+    from app.agents.capabilities.browser_use import WebBrowser
+    from app.agents.capabilities.compaction import MeteredCompaction
+    from app.agents.capabilities.system_reminders import SystemReminders
+
+    spec = AgentSpec(
+        name="Browser",
+        capabilities=[
+            {
+                "id": name,
+                "tool_overrides": {"browser_click": {"name": "press"}}
+                if override == "name" and name == "browser_use"
+                else {"browser_click": {"description": "Press an element"}}
+                if override == "description" and name == "browser_use"
+                else {},
+                "config": {"reminders": [{"content": "Stay on task"}]}
+                if name == "system_reminders"
+                else {},
+            }
+            for name in order
+        ],
+    )
+    built = build_agent(
+        spec, _model_spec(), organization_id=uuid.uuid4(), granted_scopes=frozenset({"web:browse"})
+    )
+    from app.agents.capabilities._overrides import ToolOverrides
+
+    types = [
+        type(capability.wrapped if isinstance(capability, ToolOverrides) else capability)
+        for capability in built.capabilities
+    ]
+    assert types.index(MeteredCompaction) < types.index(WebBrowser) < types.index(SystemReminders)
+    browser = next(
+        capability.wrapped if isinstance(capability, ToolOverrides) else capability
+        for capability in built.capabilities
+        if isinstance(
+            capability.wrapped if isinstance(capability, ToolOverrides) else capability, WebBrowser
+        )
+    )
+    assert isinstance(browser, WebBrowser)
+    assert ("press" in browser.report_tool_names) is (override == "name")

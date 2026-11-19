@@ -1,0 +1,243 @@
+"""What this deployment calls itself, who may join it, and whether it is open.
+
+One row, for the whole installation. Not a column on `organizations`: a favicon
+is served above every tenant and a sign-in page is rendered before anybody has
+chosen one, so the answer cannot be per-organization without asking a stranger
+which tenant they meant. The deployment's own administrator (`is_app_admin`)
+owns it, which is the same authority that already administers users across
+tenants.
+
+**A null column means "the built-in", not "empty".** An operator who has never
+opened the page has no row at all, and one who clears a field is asking for the
+default back rather than for a blank sign-in header. So every identity column is
+nullable and nothing is backfilled; the effective value is resolved where it is
+rendered, and `DeploymentSettingsService.effective` is the only place that
+resolution happens on this side of the wire.
+
+The singleton is enforced by the database rather than by a convention nobody can
+see: `singleton` is unique and constrained to true, so a second row is an
+`IntegrityError` instead of a deployment that quietly has two identities and
+serves whichever one a query happened to order first.
+"""
+
+import uuid
+
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.sql import text
+
+from app.db.base import Base, TimestampMixin
+
+SIGNUP_CONSTRAINT = "deployment_settings_singleton_key"
+"""The unique constraint the singleton upsert conflicts on.
+
+Named here rather than spelled in the repository: the name is minted by
+`NAMING_CONVENTION`, so a literal in the query is a string that has to agree
+with a rule it cannot see.
+"""
+
+
+class DeploymentSettings(Base, TimestampMixin):
+    """The one row holding this installation's identity and access policy."""
+
+    __tablename__ = "deployment_settings"
+    __table_args__ = (CheckConstraint("singleton", name="singleton_true"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    singleton: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, unique=True, default=True, server_default=text("true")
+    )
+    """Always true. The unique constraint on it is what makes this table a singleton."""
+
+    app_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tagline: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(320), nullable=True)
+
+    logo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    """Where an uploaded wordmark is stored, when there is one.
+
+    A storage key, written only by `DeploymentSettingsService.set_image`, which
+    puts the bytes there itself. Never taken from a request body: the path
+    decides which file this deployment serves to anybody who loads a page, and a
+    caller who could choose it could read whatever the storage backend holds.
+    """
+
+    favicon_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    """The same, for the browser-tab icon. `logo_path`'s reasoning applies whole."""
+
+    footer_text: Mapped[str | None] = mapped_column(String(280), nullable=True)
+    terms_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    privacy_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    """Where a client's own terms and policy live, when they are not ours.
+
+    Null keeps the built-in `/legal/*` pages. Set, and every link that pointed at
+    them points outward instead — which is what a deployment under somebody
+    else's name needs, since our pages describe our terms and not theirs.
+    """
+
+    vapid_private_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """This deployment's VAPID signing key for Web Push (#2097), sealed in the
+    vault under the deployment's scope.
+
+    Generated the first time anything needs it - nobody configures Web Push -
+    and never replaced: every browser subscription is bound to the public half,
+    so a new key would silently end every subscription there is. The master
+    key's rotation re-wraps it (`vault_rotate`), which leaves the key itself,
+    and the subscriptions, as they were.
+    """
+    vapid_public_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    """The public half, base64url, as a browser's `applicationServerKey` takes it."""
+    vapid_key_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    apns_private_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The organization's own APNs signing key (a `.p8`, PEM), sealed in the
+    vault under the deployment's scope (#2097).
+
+    Push to an iPhone goes through Apple's service with the key of the Apple
+    developer account the app was signed with - the company's own, since a
+    company signs its own build. Null: no iPhone push. Set and replaced by an
+    administrator; the four columns after it say whose key it is.
+    """
+    apns_key_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    apns_key_id: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    """The key's ID in the Apple developer account (the JWT's `kid`)."""
+    apns_team_id: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    """The developer account's team ID (the JWT's `iss`)."""
+    apns_topic: Mapped[str | None] = mapped_column(String(155), nullable=True)
+    """The app's bundle identifier, which every message names."""
+    apns_sandbox: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    """Apple's development service rather than production: a build run from
+    Xcode, whose tokens production refuses."""
+    max_organizations_per_user: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """How many organizations one account may own, or null for no ceiling.
+
+    Null is "no limit" rather than "not configured", and the two are the same
+    thing here: an installation that has never opened the page is uncapped, which
+    is what a self-hosted deployment for one company wants. A number is what a
+    deployment open to sign-ups wants, where one account can otherwise mint
+    tenants without bound.
+
+    Owned, not joined: being invited into ten organizations is somebody else's
+    decision and cannot be spent by the person invited. The personal organization
+    counts, because it is one.
+    """
+
+    max_agents_per_organization: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """How many agents one organization may hold, or null for no ceiling.
+
+    Archived agents do not count: archiving is how an agent is retired, and a
+    ceiling that a retired agent went on occupying would make the only way back
+    under it a delete - which takes its version history and its run attribution
+    with it.
+    """
+
+    signup_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="open", server_default=text("'open'")
+    )
+    """`open`, `invite_only` or `closed`. See `app/services/signup_policy.py`."""
+
+    personal_organizations: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    """Whether a new account gets an organization of its own (#2156).
+
+    On by default, which is what a deployment open to independent people wants.
+    A deployment for one company turns it off, so a colleague does not start in
+    a tenant of their own - with its own keys, budget and audit trail - beside
+    the company's. Applies to accounts created afterwards; an existing personal
+    organization stays.
+    """
+
+    default_organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    """The organization every new account joins, or null for none (#2156).
+
+    It is also where a session with no organization named lands, ahead of a
+    personal one, and what the console selects when nothing else is. Deleting
+    the organization clears it rather than leaving a setting pointing nowhere.
+    """
+
+    default_organization_role: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="member", server_default=text("'member'")
+    )
+    """The role a new account joins `default_organization_id` with. Never `owner`."""
+
+    allowed_email_domains: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    """Lower-cased domains, without the `@`. Empty means every domain is allowed."""
+
+    announcement: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    announcement_level: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="info", server_default=text("'info'")
+    )
+    """`info`, `warning` or `critical` — which of three styles the banner draws."""
+
+    maintenance_mode: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    maintenance_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    notify_impersonated_users: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    """Whether a person is emailed when an administrator acts as them (#1044).
+
+    A policy, not a default: on a self-hosted deployment the operator decides
+    whether the people using it are told. Off until somebody turns it on, so an
+    upgrade sends nobody mail they were not sending before; on, every
+    impersonation emails its target once, when it starts. The audit trail records
+    the impersonation either way.
+    """
+
+    dictation_compressed_audio: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    """Whether dictation accepts WebM, Ogg and MP4 as well as raw PCM (#1797).
+
+    Off, a dictation is 16 kHz mono 16-bit PCM WAV and nothing else, so its
+    length *is* its byte count and the longest dictation bounds what a
+    recording can cost exactly. On, the compressed formats `MediaRecorder`
+    makes are accepted too, with their length read from the file's own header -
+    which a file built by hand can understate, so the byte cap is then the only
+    bound, and low-bitrate audio fits about forty times the longest dictation
+    into it. A deployment's decision, because a hosted page or a widget lets a
+    stranger send the file, in every organization at once.
+    """
+
+    retention_defaults: Mapped[dict[str, int | None] | None] = mapped_column(JSONB, nullable=True)
+    """Days per class, for an organization that has set nothing itself (#1420).
+
+    Null, and a class absent from it, both mean "for ever". Deliberately: a
+    platform that started deleting an existing installation's history on upgrade
+    because a default said ninety days would be a platform nobody could trust
+    with the next upgrade either. An operator choosing a period is the event.
+    """
+
+    retention_max_days: Mapped[dict[str, int | None] | None] = mapped_column(JSONB, nullable=True)
+    """The ceiling: nothing of this class lives longer than this here.
+
+    An organization can ask for longer and will not get it. A class absent has no
+    ceiling. `audit` is the one class where the deployment's number is a floor
+    instead, and it lives below rather than here - a ceiling and a floor in one
+    mapping is how the two get read as each other.
+    """
+
+    audit_retention_floor_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """The shortest an audit entry may live, in days. Null takes the built-in six years.
+
+    A floor rather than a period, because a trail an administrator can shorten is
+    not a trail: an organization may keep its entries longer, never less. A
+    deployment under a longer obligation raises this; one under none may lower
+    it, which is then a deliberate act with a number attached.
+    """
+
+    def __repr__(self) -> str:
+        return (
+            f"<DeploymentSettings(app_name={self.app_name!r}, "
+            f"signup={self.signup_mode}, maintenance={self.maintenance_mode})>"
+        )

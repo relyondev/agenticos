@@ -1,0 +1,168 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { CreateContextDialog } from "./create-context-dialog";
+import { apiClient } from "@/lib/api-client";
+import { ApiError } from "@/lib/api-error";
+
+vi.mock("@/lib/api-client", () => ({
+  apiClient: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
+}));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+import { toast } from "sonner";
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+const TAKEN = "A context file named 'glossary' already exists.";
+const NAME_TAKEN = new ApiError(409, TAKEN, {
+  error: { code: "ALREADY_EXISTS", message: TAKEN, details: { name: "glossary" } },
+});
+
+const name = () => screen.getByLabelText("Name");
+const description = () => screen.getByLabelText("Description");
+// The body is the shared file pane, as the editor has it - editable only once
+// the pane is flipped to Source, and named from the file being created, so it is
+// asked for by role rather than by a name that moves as somebody types.
+const content = () => screen.getByRole("textbox", { name: /source$/ });
+const openSource = async () => {
+  const source = screen.queryByRole("button", { name: "Source" });
+  if (source) await userEvent.click(source);
+};
+const create = () => screen.getByRole("button", { name: "Create" });
+
+function mount(onOpenChange = vi.fn(), onCreated = vi.fn()) {
+  render(<CreateContextDialog open onOpenChange={onOpenChange} onCreated={onCreated} />, {
+    wrapper,
+  });
+  return { onOpenChange, onCreated };
+}
+
+describe("CreateContextDialog", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("creates an injected file by default and reports it", async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "c1", name: "glossary" });
+    const { onCreated } = mount();
+
+    await userEvent.type(name(), "glossary");
+    await userEvent.type(description(), "terms");
+    await openSource();
+    await userEvent.type(content(), "SLA: ...");
+    await userEvent.click(create());
+
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    expect(apiClient.post).toHaveBeenCalledWith("/context", {
+      name: "glossary",
+      description: "terms",
+      content: "SLA: ...",
+      format: "md",
+      mode: "inject",
+      visibility: "org",
+      group_ids: [],
+      user_ids: [],
+    });
+    // Reported rather than closed: whether one file created means "done" or
+    // "next of the four somebody dropped" is the page's queue to answer.
+    expect(onCreated).toHaveBeenCalledWith({ id: "c1", name: "glossary" });
+  });
+
+  it("sends an untouched description as null and Markdown as the default format", async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "c1", name: "glossary" });
+    mount();
+
+    await userEvent.type(name(), "glossary");
+    await openSource();
+    await userEvent.type(content(), "body");
+    await userEvent.click(create());
+
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    const [, payload] = vi.mocked(apiClient.post).mock.calls.at(-1)!;
+    expect(payload).toMatchObject({ description: null, format: "md" });
+  });
+
+  it("infers the renderer from the filename and leaves usage to the builder", async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "c1", name: "notes.json" });
+    mount();
+    await userEvent.type(name(), "notes.json");
+    expect(screen.queryByLabelText("Format")).toBeNull();
+    expect(screen.queryByLabelText("Mode")).toBeNull();
+    await userEvent.click(create());
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/context",
+      expect.objectContaining({ format: "json", mode: "inject" }),
+    );
+  });
+
+  it("cannot be submitted without a name", () => {
+    mount();
+    expect(create()).toBeDisabled();
+  });
+
+  it("shows a taken name against the field rather than losing the dialog", async () => {
+    vi.mocked(apiClient.post).mockRejectedValue(NAME_TAKEN);
+    const { onCreated } = mount();
+
+    await userEvent.type(name(), "glossary");
+    await openSource();
+    await userEvent.type(content(), "body");
+    await userEvent.click(create());
+
+    await waitFor(() => expect(screen.getByText(TAKEN)).toBeInTheDocument());
+    expect(onCreated).not.toHaveBeenCalled();
+    // Editing the field clears the refusal it was about.
+    await userEvent.type(name(), "2");
+    expect(screen.queryByText(TAKEN)).not.toBeInTheDocument();
+  });
+
+  it("marks every field the server named as wrong", async () => {
+    const problems = {
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "invalid",
+        details: {
+          fields: [
+            { field: "description", message: "too long" },
+            { field: "content", message: "must be text" },
+          ],
+        },
+      },
+    };
+    vi.mocked(apiClient.post).mockRejectedValue(new ApiError(422, "invalid", problems));
+    mount();
+
+    await userEvent.type(name(), "glossary");
+    await userEvent.click(create());
+
+    await waitFor(() => expect(screen.getByText("must be text")).toBeInTheDocument());
+    expect(screen.getByText("too long")).toBeInTheDocument();
+  });
+
+  it("toasts a failure that names no field", async () => {
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("bad gateway"));
+    mount();
+
+    await userEvent.type(name(), "glossary");
+    await openSource();
+    await userEvent.type(content(), "body");
+    await userEvent.click(create());
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+  });
+
+  it("closes without creating when cancelled", async () => {
+    const { onOpenChange } = mount();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(apiClient.post).not.toHaveBeenCalled();
+  });
+});

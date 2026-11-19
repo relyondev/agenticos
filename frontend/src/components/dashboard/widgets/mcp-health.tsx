@@ -1,0 +1,72 @@
+"use client";
+
+import { useLocale, useTranslations } from "next-intl";
+
+import { McpServerIcon } from "@/components/mcp/mcp-server-icon";
+import { useOrgMcpConnections } from "@/hooks";
+import { timeAgo } from "@/lib/utils";
+import { StatusList } from "../primitives/status-list";
+import { WidgetFrame } from "../widget-frame";
+import { Plug } from "lucide-react";
+
+import { WidgetEmptyBody, WidgetErrorBody, WidgetSkeleton } from "../widget-states";
+import type { DashboardWidgetProps } from "./types";
+
+/**
+ * The organization's MCP servers and their last probe. A server that stops
+ * answering quietly takes its tools from every agent using it - which is why
+ * this sits under "needs attention" rather than on a settings page alone.
+ */
+export function McpHealthWidget({ title, hint, seeAll, options }: DashboardWidgetProps) {
+  const t = useTranslations("dashboard.widgets.mcp-health");
+  const tTime = useTranslations("time");
+  const locale = useLocale();
+  const { connections, isLoading, error, refresh } = useOrgMcpConnections();
+
+  return (
+    <WidgetFrame title={title} hint={hint} seeAll={seeAll} options={options}>
+      {isLoading ? (
+        <WidgetSkeleton />
+      ) : error ? (
+        <WidgetErrorBody onRetry={() => void refresh()} />
+      ) : connections.length === 0 ? (
+        <WidgetEmptyBody
+          icon={Plug}
+          title={t("empty.title")}
+          description={t("empty.description")}
+        />
+      ) : (
+        <StatusList
+          rows={connections.map((connection) => ({
+            id: connection.id,
+            icon: (
+              <McpServerIcon
+                icon={null}
+                name={connection.name}
+                url={connection.url}
+                className="size-4"
+              />
+            ),
+            label: connection.name,
+            sub:
+              connection.last_status === "error" ? (connection.last_error ?? undefined) : undefined,
+            pill:
+              connection.last_status === "error"
+                ? connection.last_checked_at
+                  ? t("downSince", { ago: timeAgo(connection.last_checked_at, tTime, locale) })
+                  : t("down")
+                : connection.last_checked_at
+                  ? t("checked", { ago: timeAgo(connection.last_checked_at, tTime, locale) })
+                  : t("unchecked"),
+            tone:
+              connection.last_status === "error"
+                ? "err"
+                : connection.last_status === "ok"
+                  ? "ok"
+                  : "neutral",
+          }))}
+        />
+      )}
+    </WidgetFrame>
+  );
+}

@@ -1,0 +1,125 @@
+/**
+ * The Content Security Policy every page of the console is served with.
+ *
+ * Here rather than inline in `next.config.ts` so it can be asserted. A policy is
+ * a list of quiet refusals: when a directive is missing, nothing fails to build
+ * and nothing appears in a log the deployment reads - a pane renders empty and
+ * the reason is in one visitor's browser console. `frame-src` was missing, so
+ * every PDF and HTML preview in the product was blank while images worked
+ * (#1039), and the only thing that would have caught it is a test naming the
+ * directives.
+ *
+ * A function of the deployment's public origins rather than a constant: the API
+ * and the chat WebSocket are `PUBLIC_API_URL` and `PUBLIC_WS_URL`, read from the
+ * server's environment on every request since #1544, and `connect-src` has to
+ * name exactly those. A build-time constant could only name `localhost` and a
+ * scheme-wide `ws:`, which on a split-origin deployment blocks the hosted chat's
+ * upload to the API and lets the socket open anywhere (#1416 review).
+ */
+
+import type { PublicConfig } from "./public-config";
+
+/**
+ * Every directive the header carries. A closed union rather than `string`, so a
+ * lookup is a value and not a maybe - and so adding one is a decision made here
+ * rather than a key appearing in an object literal.
+ */
+export type CspDirective =
+  | "default-src"
+  | "script-src"
+  | "worker-src"
+  | "style-src"
+  | "img-src"
+  | "frame-src"
+  | "font-src"
+  | "connect-src"
+  | "frame-ancestors"
+  | "base-uri"
+  | "form-action"
+  | "object-src";
+
+/** The origin a public URL names, so `connect-src` lists a host and not a path. */
+function originOf(url: string): string {
+  return new URL(url).origin;
+}
+
+/**
+ * The one path a console frame loads an artifact from: the signed content route,
+ * `{ARTIFACT_ORIGIN or the API}/api/v1/artifact-content/<token>`, which the backend
+ * builds from the same variables. A source ending in `/` matches every path under
+ * it, so each token's address is allowed and nothing else on that origin is - when
+ * `ARTIFACT_ORIGIN` is unset that origin is the API itself. A browser stops
+ * matching the path after a redirect and checks only the origin, which can widen
+ * this but never refuse a frame; the content route answers without redirecting.
+ */
+function artifactContentSource(config: PublicConfig): string {
+  return `${config.artifactUrl}/api/v1/artifact-content/`;
+}
+
+/** What each directive allows for a deployment, in the order the header is written. */
+export function cspDirectives(
+  config: PublicConfig,
+  nonce: string,
+): Readonly<Record<CspDirective, readonly string[]>> {
+  return {
+    "default-src": ["'self'"],
+    // No `'unsafe-inline'`: the app router inlines its flight data, so each of
+    // those scripts carries this request's `nonce` instead, and `'strict-dynamic'`
+    // extends that trust to the chunks they load - which is what lets the host
+    // allowlist (`'self'`) be ignored rather than widened. `'unsafe-eval'` stays
+    // because Next's development runtime needs it. The nonce is per request
+    // (`src/middleware.ts`) - a constant one is `'unsafe-inline'` wearing a
+    // disguise (#1624).
+    "script-src": ["'self'", "'unsafe-eval'", `'nonce-${nonce}'`, "'strict-dynamic'"],
+    // The service worker Web Push arrives through (`public/sw.js`, #2097). Its
+    // registration is checked against this rather than `script-src`, whose
+    // `'strict-dynamic'` ignores `'self'` and would refuse a worker - which has
+    // no nonce to carry - outright. `'self'` only: no `blob:` worker.
+    "worker-src": ["'self'"],
+    "style-src": ["'self'", "'unsafe-inline'"],
+    // `blob:` for a canvas export and for bytes fetched then handed to an `img`;
+    // `https:` because a model provider's avatar and a connector's brand mark are
+    // remote.
+    "img-src": ["'self'", "blob:", "data:", "https:"],
+    // A document the viewer cannot render itself - a PDF, an HTML page - goes in
+    // an iframe whose `src` is a blob URL minted from bytes this origin already
+    // fetched. Deliberately not `data:`: a data URL in a frame is a document of
+    // somebody else's choosing running as this origin, which is the attack
+    // `frame-src` exists to refuse. A blob URL can only be minted by this
+    // origin's own script.
+    //
+    // And the route a published artifact is served from. That document is
+    // agent-authored script, which is why it is framed from another origin under
+    // a `sandbox` policy of its own rather than minted into a blob here. The route,
+    // not the origin: the origin is the API's unless `ARTIFACT_ORIGIN` moved it.
+    "frame-src": ["'self'", "blob:", artifactContentSource(config)],
+    "font-src": ["'self'", "data:"],
+    // This origin's own BFF routes, the API the browser calls directly - OAuth,
+    // the hosted chat's uploads - and the chat's WebSocket. Named from the
+    // deployment's configuration, not a scheme: `wss:` alone would let the socket
+    // open to any host.
+    "connect-src": [
+      ...new Set([
+        "'self'",
+        originOf(config.apiUrl),
+        originOf(config.wsUrl),
+        ...(config.diagnosticsUrl ? [originOf(config.diagnosticsUrl)] : []),
+      ]),
+    ],
+    // Nothing may frame the console, itself included. The embed widget is served
+    // from its own route, which sets its own header.
+    "frame-ancestors": ["'none'"],
+    "base-uri": ["'self'"],
+    "form-action": ["'self'"],
+    // No `<object>`, `<embed>` or `<applet>` at all - the console renders none, and
+    // they are a plugin-content vector `default-src` does not cover on its own.
+    "object-src": ["'none'"],
+  };
+}
+
+/** The header value for a deployment, as one line, carrying this request's nonce. */
+export function contentSecurityPolicy(config: PublicConfig, nonce: string): string {
+  return Object.entries(cspDirectives(config, nonce))
+    .map(([directive, sources]) => `${directive} ${sources.join(" ")}`)
+    .join("; ");
+}

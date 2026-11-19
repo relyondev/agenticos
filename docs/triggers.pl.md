@@ -1,0 +1,777 @@
+---
+source_sha: "517be3b7106d"
+---
+
+# Konfigurowanie triggera zdarzeniowego { #setting-up-an-event-trigger }
+
+**Trigger zdarzeniowy** uruchamia agenta, gdy coś wydarzy się gdzie indziej.
+
+Są dwie drogi, którymi to do nas dociera, a to, której używa dane źródło, jest
+sprawą tego źródła, a nie twoją:
+
+- **Wypychane.** Provider wysyła POST-em podpisany payload: **GitHub**,
+  **HubSpot**, **Zendesk** albo cokolwiek, co potrafi wysłać podpisany JSON
+  (źródło **API**).
+- **Odpytywane.** Platforma czyta podłączone konto według harmonogramu: skrzynki
+  (**Gmail**, **Outlook**), pliki (**Google Drive**, **OneDrive & SharePoint**) i
+  kalendarze (**Google Calendar**, **Outlook Calendar**). Nic nie jest do nas
+  wysyłane, więc nie ma URL-a do skonfigurowania ani sekretu do przechowania.
+  Podłączasz konto i to cała konfiguracja.
+
+[Koncepcje](concepts.md#trigger) opisują, czym trigger *jest* i jak zachowuje się
+uruchomiony run; [Nadzór](governance.md) opisuje, co on wydaje i jak obsługiwana
+jest odmowa.
+
+Ta strona jest o tym, co robisz dalej: jak skierować prawdziwego providera na
+webhook, co musi zawierać dostarczenie i jak przetestować całość z laptopa.
+
+!!! tip "Jeśli potrzebujesz tylko zegara, chodzi ci o harmonogram"
+
+    Żadnego webhooka, żadnego sekretu, żadnego providera do skonfigurowania.
+
+    Każdy z tych dwóch rodzajów może zacząć od zasianego **szablonu**
+    (`GET /trigger-templates`). Szablon harmonogramu — „podsumuj moje otwarte
+    pull requesty każdego ranka w dzień roboczy” — wypełnia z góry prompt i
+    sensowną kadencję. Szablon zdarzeniowy — „posegreguj nowe issue”, „napisz
+    szkic odpowiedzi na maila” — wypełnia z góry prompt na kroku wiadomości
+    swojego własnego źródła. Żaden nie zaczyna od pustego pola.
+
+## Strefa czasowa harmonogramu { #a-schedules-time-zone }
+
+Harmonogram ustawiony na porę dnia - codziennie o 09:00, w dni robocze o 08:30 -
+jest czytany w **strefie czasowej**, nazwie IANA takiej jak `Europe/Warsaw`. Nowy
+bierze twoją, ze strefy czasowej na twoim koncie, chyba że formularz albo API
+wskaże inną (`time_zone`). Trzyma swoją godzinę przez zmianę czasu: „codziennie o
+09:00” w Warszawie to 08:00 UTC zimą i 07:00 UTC latem, a run przesuwa się razem z
+nią. Harmonogram zapisany, zanim harmonogramy miały strefy, jest czytany w UTC,
+jak zawsze, dopóki ktoś nie wybierze mu strefy. Harmonogram interwałowy nie ma
+pory dnia ani strefy.
+
+## Harmonogram, którego ostatni run wciąż trwa { #a-schedule-whose-last-run-is-still-going }
+
+Termin harmonogramu może nadejść, gdy run odpalony poprzednim razem wciąż
+trwa - nocna synchronizacja, która trwa dłużej niż noc, albo run zaparkowany na
+zatwierdzeniu, którego nikt nie rozstrzygnął. O tym, co się wtedy dzieje,
+decyduje **If the previous run is still going** w formularzu harmonogramu,
+`overlap` w API:
+
+| Opcja | `overlap` | Co robi |
+|---|---|---|
+| Skip this run | `skip` (domyślnie) | Wystąpienie przepada, a harmonogram czeka na kolejny termin. Wolny agent działa tak często, jak zdąży skończyć |
+| Run when it finishes | `queue` | Odpala raz po zakończeniu poprzedniego runu, niezależnie od tego, ile wystąpień minęło |
+| Run anyway | `allow` | Odpala o czasie, do tego samego logu runów, więc dwa runy nachodzą na siebie i płaci się za oba |
+
+Trigger zdarzeniowy nie ma takiego ustawienia: każde dostarczenie to osobne
+odpalenie.
+
+Wszystko poniżej dotyczy przypadku zdarzeniowego.
+
+## Gdzie żyją w produkcie i jak je nazywać { #where-they-live-in-the-product-and-what-to-call-them }
+
+**Routines** to parasol - nawigacja, strona, własny panel agenta, boczny pasek
+czatu i kafelek na dashboardzie używają tego jednego słowa, więc człowiek spotyka
+ten sam rzeczownik, gdziekolwiek trafi. Dwie rodziny pod tym parasolem pozostają
+rozróżnione, bo zachowują się inaczej: **harmonogram** odpala się z zegara,
+**trigger** odpala się na przyjściu czegoś. Tym, czemu nie wolno było się różnić,
+był parasol — i tak właśnie nawigacja zaczęła mówić „Routines” nad panelem
+zatytułowanym „Schedules & triggers” (#594).
+
+Cztery powierzchnie, jedna lista:
+
+| Gdzie | Do czego służy |
+|---|---|
+| **Routines** (`/routines`) | Każda rutyna w organizacji i dwa sposoby, żeby zacząć nową |
+| Zakładka **Availability** agenta | Tylko rutyny tego agenta, obok miejsca, gdzie konfiguruje się jego ekspozycję |
+| Sekcja Routines w bocznym pasku **czatu** | To, co agent, z którym rozmawiasz, robi sam z siebie |
+| Kafelek **Routines** na dashboardzie | Najbliższe na górze, wraz z tym, jak poszło ostatnie odpalenie - rutyna psująca się co godzinę jest niewidoczna gdziekolwiek indziej na tej stronie |
+
+Kafelek dashboardu można dodać z `Customize` i jest na domyślnym układzie pod
+**Needs attention**. Czyta tę samą listę obejmującą całą organizację, więc ten,
+kto może widzieć agentów, widzi ich rutyny; wynik i koszt w każdym wierszu
+wymagają `runs:view` i po prostu ich nie ma bez tego uprawnienia.
+
+## Mechanizm, raz { #the-mechanism-once }
+
+Trigger zdarzeniowy daje ci dwie rzeczy: **URL webhooka** i **sekret
+podpisujący**. Provider wysyła POST-em swój payload na ten URL i podpisuje
+żądanie; platforma przelicza podpis i odpala agenta tylko wtedy, gdy oba się
+zgadzają.
+
+```mermaid
+flowchart TD
+    P[A provider, or your own script] -->|POST + signature header| W["/api/v1/webhooks/triggers/{source}/{id}"]
+    W --> V{signature verifies?}
+    V -->|no| R403["403 - refused before the runner"]
+    V -->|yes| J{a JSON object?}
+    J -->|no| R400["400"]
+    J -->|yes| F{trigger active,<br/>filter matches?}
+    F -->|no| R202["202 - nothing to do"]
+    F -->|yes| SUB["queue a fire-trigger job"]
+    SUB --> R202b["202 - accepted, not finished"]
+    SUB -.->|later, in the worker| RUN[the agent runs, spending the org's budget]
+```
+
+- **URL** budowany jest na jednym publicznym adresie deploymentu
+  (`PUBLIC_BASE_URL`), a nie na originie dashboardu - webhook serwowany jest przez
+  host API, który zwykle jest innym originem niż UI. Jego kształt to:
+
+  ```
+  {PUBLIC_BASE_URL}/api/v1/webhooks/triggers/{source}/{trigger_id}
+  ```
+
+  `source` to `github`, `hubspot`, `zendesk` albo `webhook` (nazwa źródła API na
+  drucie); `trigger_id` to nieodgadywalny UUID. Dialog wypełnia to za ciebie -
+  skopiuj, nie buduj tego ręcznie. **Odpytywane źródło nie ma URL-a**: nie ma
+  drzwi wejściowych, a POST nazywający je dostaje odpowiedź jak każde
+  dostarczenie, przy którym nie ma nic do zrobienia.
+
+- **Podpis** to `HMAC-SHA256` kluczowany sekretem podpisującym, w schemacie
+  każdego providera:
+
+  | Źródło | Nagłówek | Co jest podpisane |
+  |---|---|---|
+  | `github` | `X-Hub-Signature-256` | Surowe body, `sha256=<hex>` |
+  | `webhook` | `X-Signature-256` | Surowe body, `sha256=<hex>` - albo czas i body, zob. [niżej](#signing-a-delivery-yourself) |
+  | `hubspot` | `X-HubSpot-Signature-v3` | Metoda, URL, body i `X-HubSpot-Request-Timestamp`, base64 |
+  | `zendesk` | `X-Zendesk-Webhook-Signature` | `X-Zendesk-Webhook-Signature-Timestamp` i body, base64 |
+
+  GitHub, HubSpot i Zendesk podpisują swoje dostarczenia same, więc dajesz
+  providerowi sekret - albo, przy HubSpocie i Zendesku, bierzesz ten, który on
+  wydał - a on robi podpisywanie. Źródło API używa schematu GitHuba pod
+  `X-Signature-256`, który to, co skierujesz na ten URL, musi ustawić samo.
+  Źródło **odpytywane** nic nie podpisuje i nie trzyma sekretu: nie było
+  adresowane, tylko odczytane, a autoryzacją odczytu jest własna zgoda OAuth tego
+  konta.
+
+!!! danger "Podpis nie jest ozdobą"
+
+    Bez niego URL jest jedyną rzeczą między obcym a budżetem modelowym twojej
+    organizacji - a URL-e wyciekają: do logów, do historii dostarczeń providera,
+    na zrzut ekranu w zgłoszeniu do supportu. Ktokolwiek ma ten URL, mógłby
+    odpalać agenta do woli i wydawać z twoich limitów. Sekret jest tym, co czyni
+    dostarczenie *autentycznym*, a nie tylko *poprawnie zaadresowanym*.
+
+Żądanie, którego podpis się nie weryfikuje, jest odrzucane z `403`, zanim
+runner zostanie w ogóle osiągnięty; sekret jest zapieczętowany w
+[vault](secrets.md) i nigdy nie pojawia się w odczycie, w listingu ani w URL-u.
+
+!!! info "`202` znaczy przyjęte, a nie zakończone"
+
+    Dopasowane dostarczenie jest kolejkowane jako zadanie `fire-trigger` we
+    własnej transakcji żądania, a agent działa w workerze, więc provider dostaje
+    swoją odpowiedź po jednym insercie, zamiast czekać na model.
+    Nie czytaj `202` jako „agent odpowiedział” - od tego jest przeczytanie runa w
+    Activity.
+
+Zweryfikowane dostarczenie, przy którym nie ma nic do zrobienia - nieaktywny
+trigger albo payload, którego filtr nie dopasowuje - odpowiada `202` dokładnie
+tak samo jak odpalone, więc posiadanie sekretu nie mówi ci nic o tym, które
+triggery istnieją. Body, które nie jest obiektem JSON, to `400`.
+
+**Jeden trigger odpala się najwyżej 60 razy na minutę.** Zweryfikowane
+dostarczenie ponad to jest odrzucane z `429` i `Retry-After`, a ponowienie
+providera odpali je, gdy minuta minie. Liczone jest dopiero, gdy podpis się
+zgadza, więc nikt bez sekretu go nie wyczerpie - i to ono powstrzymuje wyciekły
+sekret albo przekaźnik w pętli przed wydaniem budżetu w jedno popołudnie.
+
+**To, co przyszło, to dane, nigdy polecenia.** Wiadomość runa to twój prompt, a
+potem zdarzenie w bloku `<event_content>`, który mówi modelowi, by czytał je jako
+dane. Issue, mail czy nazwę pliku pisze ten, kto je wysłał, a zdanie w nich, które
+brzmi jak rozkaz, nadal jest częścią zdarzenia.
+
+## Rotowanie sekretu i edytowanie filtra { #rotating-the-secret-and-editing-the-filter }
+
+URL jest **tożsamością** triggera i nigdy się nie zmienia. Sekret jest
+**poświadczeniem** i jak każdy inny klucz w tym produkcie może być rotowany —
+ponowne zapieczętowanie i świeży tekst jawny pokazany dokładnie raz.
+
+```
+POST /agents/{agent_id}/triggers/{trigger_id}/rotate-secret
+```
+
+Bije nowy sekret, pieczętuje go i zwraca trigger z `reveal_secret` ustawionym raz
+— tym samym polem, którego używa tworzenie. Rotuj w chwili, gdy sekret mógł
+wyciec; stary natychmiast przestaje się weryfikować.
+
+Dla hooka, który platforma zarejestrowała sama (`auto_webhook`), rotacja
+rejestruje go ponownie z nowym sekretem, więc jego dostarczenia dalej się
+weryfikują i nie ma czego ujawniać. Chyba że konto nie może go już zarejestrować
+— wtedy trigger spada do `manual`, a ujawniony sekret jest tym, co wklejasz
+ponownie.
+
+Harmonogram nie ma sekretu, więc rotowanie go jest odrzucane.
+
+**To, które akcje na issue odpalają trigger, jest filtrem, a nie innym
+triggerem**, więc daje się edytować w miejscu. Zrób `PATCH` na triggerze z nowym
+`event_config`, a zostanie on ponownie zwalidowany wobec reguł źródła dokładnie
+tak, jak waliduje tworzenie — nieznany klucz jest odrzucany, a nie zapisywany po
+to, żeby nic nie dopasowywać.
+
+Źródło i sekret nie są tą drogą edytowalne. Przekierowanie triggera zdarzeniowego
+na inne źródło to nowy trigger: usuń ten, utwórz tamten.
+
+## Gmail (~1 minuta i żadnego sekretu nigdzie) { #gmail-1-minute-and-no-secret-anywhere }
+
+Gmail jest odpytywany, więc konfiguracja to ekran zgody i nic poza tym.
+
+1. **Podłącz konto.** *Routines → New event trigger → Gmail → Connect account*.
+   To wymaga `mcp:manage`, tego samego uprawnienia, którego wymaga każde inne
+   podłączone konto.
+2. **Wybierz, co go odpala**: dowolna nowa wiadomość, tylko skrzynka odbiorcza
+   albo oznaczone jako ważne. Zawęź dalej fragmentem nadawcy lub tematu albo
+   etykietą Gmaila. Filtr nadawcy odpala się tylko na poczcie podpisanej przez
+   domenę nadawcy - zob.
+   [Kto to wysłał](#who-sent-it-a-sender-filter-is-a-trust-decision).
+3. **Napisz prompt** albo zacznij od szablonu „draft a reply”.
+
+Nie ma URL-a do wklejenia ani sekretu do zapisania, bo nic do nas nie wysyła. Co
+warto wiedzieć o tym, jak to czyta:
+
+- **Co minutę albo tak często, jak ustawisz.** Heartbeat pyta Gmaila, co przyszło od ostatniego zajrzenia, więc najgorsze opóźnienie to ten odstęp - minuta, dopóki go nie zmienisz. **Check for new mail every** (1, 5, 15, 30 lub 60 minut) to ustawienie skrzynki, na jej karcie portalu i w kroku triggera Gmail, i dotyczy każdego triggera na tej skrzynce; zmiana wymaga `mcp:manage`. Odpytywanie jest celowe: alternatywa - `users.watch` do
+  tematu Google Cloud Pub/Sub - jest w czasie rzeczywistym i kosztuje temat oraz
+  subskrypcję jako wymagania *deploymentu*, plus rejestrację, która wygasa co
+  siedem dni i potrzebuje czegoś, co ją odnowi.
+- **Podłączenie nic nie odpala - i nic nie gubi.** Pozycja skrzynki jest brana w
+  chwili zakończenia zgody, więc podłączenie nie odpala agenta raz na każdą
+  wiadomość, która już tam leży, a poczta przychodząca między zgodą a pierwszym
+  heartbeatem wciąż ląduje za tą pozycją i odpala.
+- **Nawał trafia do kolejki.** Jedno tyknięcie czyta najwyżej 25 wiadomości
+  w całości. Nieprzeczytane identyfikatory pozostają w kursorze i są przetwarzane
+  od najstarszych w kolejnych tyknięciach, także gdy historia nie zwraca nowych
+  wiadomości. Wysłane wiadomości i spam nie wypierają trwale poczty przychodzącej.
+- **Jedna wiadomość może odpalić kilka triggerów.** W odróżnieniu od webhooka,
+  którego URL nazywa dokładnie jeden - „dowolna wiadomość” i „oznaczone jako
+  ważne” na tej samej skrzynce odpalają oba.
+- **Tylko poczta, która przyszła.** Historia Gmaila zgłasza jako dodane również
+  wiadomości wysłane z konta, szkice, spam i kosz. Żadna z nich nie odpala
+  triggera - agent odpowiadający mailem odpalałby sam siebie, a spam dawałby run
+  każdemu z adresem e-mail - chyba że `label` triggera wskazuje jedną z nich
+  (`SENT`, `DRAFT`, `SPAM` albo `TRASH`).
+- **Przegapiony tydzień naprawia się sam.** Google trzyma około tygodnia
+  historii. Kursor starszy niż to resynchronizuje się do teraz, zamiast zaparkować
+  skrzynkę na zawsze.
+- **Prompt nazywa wiadomość i jej wątek.** Obok nadawcy, tematu i tekstu agent
+  dostaje wiersz `Message-ID:` i wiersz `Thread:`, każdy tylko wtedy, gdy poczta go
+  niosła. Wartość dłuższa niż 998 znaków jest pomijana, nigdy ucinana, a treści
+  HTML, referencji i załączników w prompcie nie ma.
+- **Wycofana zgoda zatrzymuje triggery.** Gdy Google odmawia grantu na dobre -
+  refresh token został unieważniony albo konto usunęło aplikację - triggery
+  skrzynki są wyłączane, kafelek prosi o ponowne podłączenie, a dziennik audytu
+  zapisuje powód (`mailbox_access_revoked`). Podłącz ponownie, potem włącz je z
+  powrotem. Awaria po stronie Google to nie to: odpytanie jest ponawiane przy następnym sprawdzeniu.
+
+Organizacja potrzebuje własnego klienta Google OAuth, zapisanego w Vault jako
+sekret **Google OAuth client** (`google_oauth_app`), z włączonym Gmail API w jej
+projekcie Google. Bez niego kafelek mówi to wprost, zamiast oferować przycisk
+Connect, który mógłby tylko zawieść. To nie jest `GOOGLE_CLIENT_ID` deploymentu,
+który służy do logowania.
+
+## Outlook (~1 minuta i żadnego sekretu nigdzie) { #outlook-1-minute-and-no-secret-anywhere }
+
+Skrzynka Outlooka - Microsoft 365 albo Exchange Online - jest odpytywana tak jak
+Gmail, więc konfiguracja to znowu ekran zgody.
+
+1. **Zarejestruj aplikację** w centrum administracyjnym Microsoft Entra: webowy
+   redirect URI `{FRONTEND_URL}/api/me/mcp-connections/oauth/callback`, sekret
+   klienta i delegowane uprawnienia Microsoft Graph `Mail.Read`,
+   `Mail.Read.Shared` oraz `offline_access`. Żadne z nich nie wymaga zgody
+   administratora.
+2. **Zapisz ją w Vault** jako sekret **Microsoft OAuth app**
+   (`microsoft_oauth_app`): identyfikator albo domena tenanta, client id i wartość
+   sekretu. `organizations` jako tenanta użyj tylko dla aplikacji zarejestrowanej
+   jako wielodostępna. Musi być widoczny dla organizacji i musi być dokładnie
+   jeden.
+3. **Podłącz konto.** *Routines → New event trigger → Outlook → Connect
+   account*, z `mcp:manage`. Microsoft pyta, którego konta użyć, więc
+   przeglądarka zalogowana na konto prywatne nie podłączy niewłaściwej skrzynki.
+4. **Wybierz, co go odpala**: dowolna nowa wiadomość, tylko z załącznikami albo
+   tylko oznaczona jako bardzo ważna. Zawęź nadawcą albo fragmentem tematu.
+
+Czym różni się od Gmaila:
+
+- **Ten sam odstęp sprawdzania.** **Check for new mail every** dotyczy skrzynki
+  Outlooka tak samo jak Gmaila: jedno ustawienie podłączonej skrzynki, wspólne dla
+  każdego triggera na niej.
+- **Czyta foldery, nie skrzynkę.** Microsoft Graph zgłasza nową pocztę po jednym
+  folderze naraz, więc trigger nazywa folder, który obserwuje - skrzynkę odbiorczą,
+  chyba że wskaże inny - a poller czyta dokładnie te foldery, które nazywają
+  triggery Outlooka organizacji. `folder` to nazwa dobrze znana (`inbox`,
+  `archive`, `junkemail`) albo ścieżka nazw folderów, na przykład `Inbox/Invoices`
+  dla folderu, do którego reguła poczty odkłada faktury. `mailbox` czyta zamiast
+  własnej skrzynki współdzieloną, którą podłączone konto może otworzyć; wskazanie
+  jej wymaga `mcp:manage`, uprawnienia, którym konto podłączono, bo korzysta z
+  zasięgu tego konta.
+- **Filtr ma własne pola Outlooka**: `has_attachments`, `importance` (`low`,
+  `normal`, `high`) i `category`, obok `subject_contains` i `sender_contains`,
+  które ma Gmail. Ustawia się je w `event_config` triggera; dialog oferuje presety
+  i dwa fragmenty tekstu.
+- **Nowy trigger widzi to, co przyszło od jego utworzenia.** Folder jest
+  pierwszy raz czytany od chwili utworzenia jego najstarszego triggera, nigdy
+  sprzed podłączenia skrzynki, więc ani podłączenie, ani dodanie triggera nie
+  odpala się na poczcie, która już tam była.
+- **Zmiana to nie nadejście.** Graph zgłasza wiadomość, którą ktoś oznaczył jako
+  przeczytaną, równie chętnie jak tę, która właśnie przyszła; odpala tylko poczta
+  otrzymana od ostatniego czytania folderu.
+- **Run czyta tekst.** Treść przychodzi jako zwykły tekst - Exchange sam konwertuje
+  wiadomość HTML - a prompt wymienia załączniki w wierszu `Attachments:`, same nazwy.
+  Wypisywane są tylko załączniki-pliki: dołączona wiadomość ani link do chmury nie.
+  Same pliki nie są pobierane. Tak jak w Gmailu, prompt ma też wiersz `Message-ID:` i
+  `Thread:`, każdy tylko wtedy, gdy wiadomość go niosła.
+- **Folder, którego nie da się przeczytać, zatrzymuje swoje triggery.** Folder
+  usunięty i utworzony ponownie pod tą samą ścieżką jest wyszukiwany jeszcze raz i
+  czytany dalej. Folder, którego już nie ma, albo skrzynka współdzielona, która
+  przestała być udostępniana, wyłącza obserwujące go triggery, z
+  `mailbox_folder_unreadable` w dzienniku audytu, a reszta skrzynki jest czytana jak
+  zwykle. Wycofana zgoda zatrzymuje je wszystkie, tak jak przy Gmailu.
+- **Utracony stan synchronizacji zaczyna od ostatniego odczytu.** Graph trzyma
+  śledzenie zmian folderu bez stałego terminu i na porzucone odpowiada
+  `syncStateNotFound`; folder jest wtedy czytany ponownie od chwili tuż przed
+  ostatnim odczytem, więc nic nie odpala się dwa razy i nic nie przepada.
+- **Seria wiadomości trafia do kolejki.** Jeden tick czyta w całości co najwyżej 25
+  wiadomości, od najstarszej. Reszta zostaje w kursorze i jest czytana w kolejnych
+  tickach, więc folder przeniesiony hurtem albo zaległości po awarii niczego nie gubią.
+
+Identyfikatory dostarczeń to niezmienne identyfikatory wiadomości Outlooka, więc
+wiadomość przeczytana dwa razy - ponowiony tick, wolne odpytanie nachodzące na
+następne - odpala każdy trigger raz.
+
+## Kto to wysłał: filtr nadawcy to decyzja o zaufaniu { #who-sent-it-a-sender-filter-is-a-trust-decision }
+
+`sender_contains` czyta nagłówek `From`, który pisze nadawca: wiadomość
+podająca się za `ceo@acme.com` nic nie kosztuje. Dlatego trigger Gmaila albo
+Outlooka, który filtruje po nadawcy, odpala się tylko na poczcie, za którą
+**poręczyła** domena nadawcy: DMARC przeszedł albo podpis DKIM przeszedł dla tej
+domeny lub domeny nadrzędnej.
+
+Werdykt to ten, który twój dostawca poczty zapisał,
+gdy wiadomość przyszła - najwyższy nagłówek `Authentication-Results` - więc kopia
+wklejona przez nadawcę do wiadomości nic nie znaczy. Sam SPF nie wystarcza:
+sprawdza nadawcę z koperty, którego nikt nie widzi. W Outlooku poczta między dwiema
+skrzynkami twojego własnego tenanta liczy się jako poręczona, bo Exchange
+oznacza ją jako wewnętrzną.
+
+| `authenticated_only` | Co odpala |
+|---|---|
+| nieustawione (domyślnie) | Tylko poręczona poczta, gdy trigger filtruje po nadawcy; cokolwiek, gdy nie |
+| `true` | Tylko poręczona poczta, z filtrem nadawcy albo bez |
+| `false` | Cokolwiek, co przepuszczą pozostałe filtry |
+
+Twój własny przekaźnik, który nic nie podpisuje - wewnętrzny skaner, stara bramka
+pocztowa - zostaje odrzucony przez filtr nadawcy. Odmowa jest logowana
+(`trigger_mail_unauthenticated`, z domeną nadawcy), a ustawienie
+`authenticated_only` na `false` w `event_config` triggera przepuszcza tego
+nadawcę.
+
+Filtr nadawcy porównuje sparsowany adres, nigdy nazwę wyświetlaną. Pełny adres
+lub filtr `@domena` wymaga dokładnego dopasowania; inny tekst jest fragmentem
+adresu. DMARC nie uwierzytelnia nazwy wyświetlanej osoby.
+
+## HubSpot { #hubspot }
+
+HubSpot wysyła webhooki z aplikacji - wystarczy private app na twoim koncie
+HubSpot - i podpisuje je **client secretem** tej aplikacji.
+
+1. **Utwórz trigger** ze źródłem **Webhook HubSpot** i wklej client secret
+   aplikacji (*Settings → Integrations → Private Apps → twoja aplikacja → Auth*).
+   Nie ma przycisku Generate: HubSpot podpisuje własnym sekretem, a nie takim,
+   który moglibyśmy wygenerować.
+2. **Zasubskrybuj webhooki aplikacji** na zdarzenia, które chcesz -
+   `contact.creation`, `deal.propertyChange`, `ticket.creation` - z URL-em
+   triggera jako celem.
+
+HubSpot wysyła do stu zdarzeń w jednym dostarczeniu, a trigger odpala się dla
+niego raz, gdy którekolwiek zdarzenie przejdzie przez filtr: `subscription_types`
+zostawia wskazane typy zdarzeń, `property_names` zmianę właściwości do wskazanych
+właściwości. Run dostaje każde zdarzenie z paczki, do dwudziestu.
+
+Dostarczenie jest weryfikowane podpisem v3 HubSpota, po metodzie, URL-u, który
+HubSpot wywołał, body i znaczniku czasu, który musi mieścić się w pięciu
+minutach. HubSpot wciąż podpisuje subskrypcje obiektów CRM starszym schematem v1,
+bez czasu, i te też są przyjmowane: paczka jest rozpoznawana po swoich
+zdarzeniach, więc dostarczenie v1 odtworzone później niczego nie odpala. URL w
+podpisie to ten, który dał ci dialog, więc deployment za proxy też się
+weryfikuje.
+
+## Zendesk { #zendesk }
+
+Zendesk wydaje każdemu webhookowi własny **sekret podpisujący**.
+
+1. **Utwórz webhook w Zendesku** (*Admin Center → Apps and integrations →
+   Webhooks*) wskazujący na URL triggera - najpierw utwórz trigger ze źródłem
+   **Webhook Zendesk**, wklej dowolny tymczasowy sekret i wróć.
+2. **Odsłoń sekret webhooka** na jego stronie i wklej go do triggera jako sekret
+   podpisujący.
+3. **Zdecyduj, kiedy jest wywoływany.** Webhook zasubskrybowany na zdarzenia
+   Zendeska - `zen:event-type:ticket.created` i podobne - niesie typ zdarzenia, a
+   `event_types` triggera zostawia wskazane. Webhook wywoływany przez trigger albo
+   automatyzację Zendeska niesie JSON, który napisał admin, i bez typu, więc
+   odpala trigger, który żadnego nie wskazuje: kiedy, zdecydowała już reguła
+   Zendeska.
+
+Dostarczenie jest weryfikowane po znaczniku czasu i body i musi mieścić się w
+pięciu minutach od naszego zegara; identyfikator wywołania Zendeska rozpoznaje
+ponowione.
+
+## Pliki: Google Drive, OneDrive i SharePoint { #files-google-drive-onedrive-and-sharepoint }
+
+Dwa odpytywane portale, każdy z osobną zgodą, więc żaden nie prosi o więcej niż
+pliki:
+
+| | Google Drive | OneDrive & SharePoint |
+|---|---|---|
+| Sekret w vault | Klient Google OAuth, którego używa Gmail, z włączonym Drive API | Aplikacja Microsoft OAuth, której używa Outlook |
+| Uprawnienie | `drive.metadata.readonly` | `Files.Read.All`, `Sites.Read.All`, `User.Read`, `offline_access` (bez zgody administratora) |
+| Gdzie patrzy | Każdy plik, który konto widzi, łącznie z dyskami współdzielonymi | Własny OneDrive konta albo biblioteka dokumentów jednej witryny SharePoint na `site_url` |
+| Zawęża po | `folder_id` (link folderu albo jego id), `name_contains` | `folder_path` (folder i wszystko pod nim), `name_contains` |
+
+Oba odpalają się na `change`: `created`, `modified` albo `any` (domyślnie);
+presety oferują **New files** i **New or changed files**.
+
+- **Edytowany plik to jeden run, a nie jeden na minutę.** Google Docs zapisuje w
+  trakcie pisania, a OneDrive zgłasza każdy zapis, więc zmiana pliku, który już
+  się odpalił, jest wstrzymywana na pół godziny.
+- **Własne edycje konta niczego nie odpalają**, chyba że ustawiono
+  `include_own_changes`: agent zapisujący przez tę samą zgodę odpalałby sam
+  siebie.
+- **Podłączenie nic nie odpala.** Oba zaczynają czytać od teraz - nowa biblioteka
+  SharePoint jest czytana od chwili jej pierwszego triggera - nigdy od historii
+  dysku. Seria - folder zsynchronizowany hurtem - jest ograniczona do 25 ostatnio
+  zmienionych plików na tick.
+- **Run dowiaduje się, który plik, a nie co w nim jest.** Czytane są tylko
+  metadane: nazwa, typ, link, kto zmienił i gdzie leży. Agent, który ma przeczytać
+  plik, robi to własnymi narzędziami.
+- **Witryna, której nie da się odczytać, zatrzymuje swoje triggery**, z powodem w
+  dzienniku audytu, a pozostałe miejsca konta są czytane dalej.
+
+Wybór lub zmiana `site_url` SharePointa wymaga `mcp:manage`, również przez API.
+Dostęp podłączonego konta nie uprawnia twórcy triggera do wyboru nowej witryny.
+Ta sama zasada dotyczy skrzynek współdzielonych. Odczyt tożsamości używa
+`User.Read`; SharePoint nie wymaga osobistego OneDrive. Podłącz ponownie
+istniejące konta Microsoft Files i Google Calendar, aby zatwierdzić nowe zakresy.
+
+Edytor triggera pozwala zmieniać filtry plików i kalendarzy, uwzględniać własne
+zmiany oraz ustawiać wyprzedzenie spotkania od 5 do 120 minut. Presety GitHub
+pozwalają zmienić frazę wzmianki i gałęzie oddzielone przecinkami. Odpytywane
+triggery nie mają rotacji sekretu. Ograniczenie powtórzeń plików dotyczy każdego
+pasującego triggera osobno: pominięta własna edycja nie blokuje późniejszej cudzej.
+Oba kalendarze odczytują kolejne strony do ustalonego limitu; jego przekroczenie
+zgłasza błąd dostawcy zamiast przyjmować niepełne wyniki.
+
+## Spotkania: Google Calendar i Outlook Calendar { #meetings-google-calendar-and-outlook-calendar }
+
+Trigger kalendarza odpala się **przed** spotkaniem, a nie wtedy, gdy coś się
+zmieniło: domyślnie 15 minut wcześniej, od 5 do 120 (`minutes_before`). Presety
+to **Before each meeting**, **Before meetings with outsiders** i **An hour
+before**; run dostaje temat, czas, organizatora, kto przychodzi, kto z nich jest
+spoza twojej domeny, link do dołączenia i opis - dość, by przygotować brief.
+
+| | Google Calendar | Outlook Calendar |
+|---|---|---|
+| Sekret w vault | Klient Google OAuth, z włączonym Calendar API | Aplikacja Microsoft OAuth |
+| Uprawnienie | `calendar.events.readonly`, `calendar.calendars.readonly` | `Calendars.Read`, `offline_access` |
+| Czytany kalendarz | Główny kalendarz konta | Domyślny kalendarz konta |
+
+- **Tylko spotkanie.** Takie bez nikogo innego, odrzucone przez ciebie, odwołane
+  i całodniowe wydarzenie nigdy nie odpalają. Sale nie liczą się jako ludzie.
+- **Raz na spotkanie.** Każde spotkanie jest ogłaszane raz dla każdego
+  wyprzedzenia, które obserwuje jakiś trigger, a ogłoszenie zapisywane jest razem
+  z pozycją konta, więc wolny tick albo restart nie odpali go dwa razy. Spotkanie
+  zarezerwowane w środku wyprzedzenia - o 10:50 na 11:00, przy triggerze na 15
+  minut - odpala się od razu; przeniesione na inną godzinę odpala się znowu dla
+  nowej godziny.
+- **`external_only`** zostawia spotkania z kimś spoza własnej domeny konta;
+  `subject_contains` i `attendee_contains` zawężają po temacie i po adresie
+  uczestnika (`@client.com`).
+
+## Dwa sposoby podłączenia GitHuba i jak poznać, który masz { #two-ways-to-connect-github-and-how-to-tell-which-you-are-running }
+
+Są dwa i wdrożenie może oferować jeden albo oba. Wybór pokazuje **GitHub** i
+**GitHub (App)** jako osobne źródła, a to, którego trigger używa, rozstrzyga się
+przy jego tworzeniu (#1072).
+
+| | GitHub (OAuth App) | GitHub (App) |
+|---|---|---|
+| Co trzyma | Token dostępu **osoby**, która wyraziła zgodę | Id instalacji plus prywatny klucz Appa w vaulcie |
+| Co może sięgnąć | Każde repozytorium, którym to konto może administrować — `repo` plus `admin:repo_hook`, odczyt i zapis | Repozytoria, na których zainstalowano Appa, z uprawnieniami, które App deklaruje |
+| Jak długo żyje | Na zawsze. Klasyczny token OAuth App nie ma refresh ani wygaśnięcia, więc wyciekły jest ważny, dopóki ktoś ręcznie go nie odwoła | Godzinę. Wybijany na żądanie z klucza, który nie opuszcza vaulta |
+| Hooki | Jeden na repozytorium, tworzony razem z triggerem i usuwany razem z nim | Żadnych. App już dostarcza |
+| Rate limit | 5000/godz. tej osoby, dzielone ze wszystkim, co to konto autoryzowało | Własny Appa |
+| Gdzie dostarcza | `/api/v1/webhooks/triggers/github/<id triggera>` — URL na trigger | `/api/v1/webhooks/github-app` — jeden URL dla wszystkich instalacji |
+
+**Jak poznać, na którym jest trigger:** po jego źródle. Trigger utworzony pod
+**GitHub (App)** nie ma webhooka do znalezienia w ustawieniach repozytorium, bo go
+nie ma; trigger pod **GitHub** ma dokładnie jeden, dodany przez platformę przy
+tworzeniu.
+
+### Konfiguracja Appa (raz na organizację) { #setting-up-the-app-once-per-organization }
+
+1. **Zarejestruj Appa** na [github.com/settings/apps](https://github.com/settings/apps)
+   (albo w odpowiedniku twojej organizacji).
+   - **Webhook URL**: `https://<twoje wdrożenie>/api/v1/webhooks/github-app`. Jeden
+     URL dla wszystkich instalacji — i dlatego publiczny adres wdrożenia jest tu
+     wymaganiem konfiguracji, a nie wartością czytaną w locie.
+   - **Webhook secret**: wygeneruj. Podpisuje każdą dostawę z każdej instalacji
+     tego Appa.
+   - **Uprawnienia**: `Metadata: Read-only` oraz dostęp tylko do odczytu do tego,
+     na czym odpalają się twoje triggery - `Issues` dla issue i ich komentarzy,
+     `Pull requests`, `Actions` dla runów workflow, `Contents` dla release'ów i
+     pushy. Nic więcej nie jest czytane.
+   - **Subskrybuj eventy**: te, których używają twoje triggery - `Issues`,
+     `Issue comment`, `Pull request`, `Workflow run`, `Release`, `Push`.
+2. **Wygeneruj klucz prywatny** na tej samej stronie i pobierz PEM.
+3. **Zapisz całą trójkę w vaulcie** jako sekret **GitHub App** — App ID, klucz
+   prywatny i webhook secret. Jeden na organizację, widoczny dla organizacji:
+   ścieżka dostawy czyta go po organizacji i odmawia zgadywania między dwoma.
+4. **Zainstaluj Appa** na repozytoriach, które chcesz, z zakładki *Install App*.
+   To — i tylko to — jest tym, do czego wdrożenie może sięgnąć.
+5. **Połącz go** — przyciskiem *Connect* na portalu, który pyta o **id
+   instalacji**. GitHub umieszcza je na końcu adresu strony ustawień samej
+   instalacji (`…/settings/installations/<id instalacji>`). To nie jest sekret:
+   jedzie w każdej dostawie i to ono mówi platformie, do którego grantu dostawa
+   należy.
+
+Krok 5 nie ma odpowiednika na ścieżce OAuth, bo App nie ma flow zgody do
+uruchomienia. Połączenie od razu mintuje jeden token instalacji — nie po to, żeby
+go trzymać, ale żeby udowodnić, że App ID, klucz prywatny i id instalacji zgadzają
+się ze sobą. Literówka w id albo PEM, który po drodze do formularza stracił
+podziały wierszy, zostaje odrzucony tam, a nie odkryty później jako dostawy, które
+po cichu do niczego nie pasują. To jest też jedyny moment, w którym klucz w ogóle
+da się sprawdzić: vault nigdy więcej nie pokazuje zapisanego sekretu.
+
+Tworzenie triggera wybiera wtedy repozytorium z instalacji i nie rejestruje nic.
+
+!!! tip "Wyłączanie"
+
+    Wyłączenie połączenia sprawia, że dostawy przestają być w ogóle dopasowywane —
+    wyłączone granty nie są kandydatami. To jest wyłącznik dla całej instalacji,
+    bez dotykania GitHuba.
+
+### Kiedy przychodzi dostawa { #when-a-delivery-arrives }
+
+Jeden URL, więc ścieżka niczego nie nazywa. Id instalacji z payloadu wybiera
+granty, do których dostawa mogłaby należeć, webhook secret Appa dla tej
+organizacji weryfikuje podpis, a repozytorium i event wybierają triggery —
+**wszystkie**, nie jeden. Dwa triggery na tym samym repozytorium odpalają oba, co
+jest tym, do czego zachęcają presety, i czego URL per trigger nie potrafi.
+
+Dostawa, która nie pasuje do niczego, odpowiada `202` dokładnie jak ta, która
+odpaliła wszystko. Podpis, który nie zweryfikował się przy żadnym kandydacie, to
+`403`, więc **Recent Deliveries** GitHuba pokazuje temu, kto źle skonfigurował
+Appa, co jest nie tak.
+
+### Który wybrać { #which-to-choose }
+
+Appa, chyba że nie możesz go zarejestrować. Ścieżka OAuth App to fallback dla
+wdrożenia, którego organizacja na GitHubie nie pozwala nikomu utworzyć Appa, i
+nigdzie się nie wybiera — ale token, który może pushować do każdego repozytorium
+dostępnego administratorowi i nigdy nie wygasa, to duże poświadczenie do trzymania
+po to, żeby czytać issues.
+
+## Przepis na GitHuba (~5 minut) { #a-github-recipe-5-minutes }
+
+GitHub podpisuje własne dostarczenia, więc to najszybsze źródło do podłączenia.
+Najpierw utwórz trigger ze źródłem **GitHub**, skopiuj jego URL webhooka i sekret
+podpisujący, a potem:
+
+1. W repozytorium, które chcesz obserwować, wejdź w **Settings → Webhooks → Add webhook**.
+2. **Payload URL** - wklej URL webhooka z dialogu triggera.
+3. **Content type** - wybierz `application/json`. Nie `application/x-www-form-urlencoded`:
+   podpis obejmuje dokładne bajty, które GitHub wysyła, a kodowanie formularzowe je
+   zmienia, więc dostarczenie zakodowane formularzowo weryfikuje się z niczym i wraca `403`.
+4. **Secret** - wklej sekret podpisujący.
+5. **Which events?** - wybierz *Let me select individual events* i zaznacz to,
+   które wskazuje `event` triggera; dostarczenie każdego innego zdarzenia
+   (czytanego z nagłówka `X-GitHub-Event`) jest odrzucane. Zawęź to, *które*
+   akcje odpalają, filtrem triggera.
+6. **Add webhook.** GitHub wysyła `ping`, który nie jest zdarzeniem żadnego
+   triggera, więc nie odpali agenta - i tak ma być.
+
+**Na czym trigger GitHuba może się odpalać**, jego `event`, z tym, co odpala domyślnie:
+
+| `event` | Odpala na, chyba że `actions` mówi inaczej | Zawęża też po |
+|---|---|---|
+| `issues` (domyślnie) | Nowe issue (`opened`) | |
+| `pull_request` | `opened`, `ready_for_review`, `review_requested` | `branches` (gałąź bazowa) |
+| `issue_comment` | Nowy komentarz (`created`) | `mention`, fraza, którą musi zawierać, np. `@agent` |
+| `workflow_run` | Zakończony run (`completed`), który się nie powiódł | `conclusions`, `branches` |
+| `release` | Opublikowany release | |
+| `push` | Push do gałęzi | `branches` |
+
+**Czyje issue go odpalają.** W publicznym repozytorium każdy może otworzyć issue, a
+każde byłoby runem i stroną cudzego tekstu w prompcie. Dlatego issue, pull
+request albo komentarz odpala się tylko wtedy, gdy GitHub nazywa autora
+`OWNER`, `MEMBER` albo `COLLABORATOR` repozytorium - ustaw `authors` na `anyone`,
+żeby przepuścić wszystkich. Bot nigdy go nie odpala, tak samo jak konto, przez
+które trigger podłączono, więc agent komentujący przez nie nie odpali sam siebie.
+
+Kiedy dostarczenie zostaje odrzucone, zdiagnozuj to w zakładce **Recent Deliveries**
+przy webhooku w GitHubie: pokazuje ona dokładne żądanie i odpowiedź. `403` tam to
+niezgodność podpisu - prawie zawsze sekret jest zły albo content type nie jest
+`application/json`.
+
+## Kontrakt payloadu dla źródeł dostarczanych przez przekaźnik { #the-payload-contract-for-relay-delivered-sources }
+
+GitHub jest właścicielem kształtu swojego payloadu, a payload źródła odpytywanego
+czyta adapter, który go czyta - filtry triggera Gmaila albo Outlooka dopasowywane
+są do samej wiadomości, więc nie ma kontraktu, który miałbyś spełnić.
+
+Tym, który należy do ciebie, jest uniwersalne źródło `webhook` - **API** w
+dialogach. **Nie ma filtra**: zweryfikowane dostarczenie odpala, a całe body JSON
+jest doklejane do promptu. Użyj go do wszystkiego, czego nie obejmuje żaden
+portal - obserwowania kanału, dla którego żaden provider nie wystawia API (strona
+na LinkedInie, ogłoszenie na marketplace) albo dowolnego narzędzia, które potrafi
+wysłać POST - przy czym obserwowanie robi przekaźnik, który napiszesz.
+
+Było tu kiedyś źródło `email` i było to właśnie to źródło pod inną nazwą:
+zmieniało nazwy dwóch pól filtra i prosiło cię o uruchomienie przekaźnika - kroku
+kodu w Zapierze albo Make, małego skryptu - który podpisywał i wysyłał do nas
+JSON, bo nic w tym produkcie nie potrafiło odbierać poczty. Zostało usunięte z
+tego samego powodu co `linkedin`: pozycja w liście rozwijanej, której nazwa
+obiecuje integrację, której nie ma. Gmail zastąpił je jako prawdziwe podłączone
+konto (powyżej), a skrzynka karmiona przekaźnikiem to źródło API z
+udokumentowanym przykładem.
+
+**E-mail karmiony przekaźnikiem, jako źródło API:**
+
+```json
+{ "from": "billing@acme.com", "subject": "Invoice #4021", "body": "…" }
+```
+
+Nic już nie filtruje po tych nazwach, więc całe body dociera do promptu i agent je
+czyta. Jeśli chcesz *filtrowania*, podłącz skrzynkę zamiast tego.
+
+## Samodzielne podpisanie dostarczenia { #signing-a-delivery-yourself }
+
+Dla uniwersalnego źródła `webhook` (i żeby przetestować ręcznie źródło GitHuba)
+podpisujesz żądanie sam. O tym, czy podpis się zweryfikuje, decydują dwie pułapki,
+bo obie zmieniają bajty:
+
+- **Podpisuj te bajty, które wysyłasz, i tylko te.** `echo` dokleja kończący znak
+  nowej linii, który zostaje podpisany, ale może nie zostać wysłany, albo wysłany, ale
+  nie podpisany; użyj `printf '%s'` i przekaż body przez `curl --data-raw`, żeby nic nie
+  zostało dodane ani zinterpretowane.
+- **Nie serializuj ponownie.** Podpisanie słownika, a potem pozwolenie klientowi HTTP
+  zakodować go na nowo, daje inne bajty (przestawione klucze, inne odstępy). Podpisz
+  string i wyślij *ten sam* string.
+
+=== "curl"
+
+    ```bash
+    SECRET='your-signing-secret'
+    URL='https://api.example.com/api/v1/webhooks/triggers/webhook/<trigger_id>'
+    BODY='{"hello":"world"}'
+
+    SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
+
+    curl -sS -X POST "$URL" \
+      -H 'Content-Type: application/json' \
+      -H "X-Signature-256: $SIG" \
+      --data-raw "$BODY"
+    ```
+
+=== "Python (httpx)"
+
+    ```python
+    import hashlib
+    import hmac
+
+    import httpx
+
+    secret = b"your-signing-secret"
+    url = "https://api.example.com/api/v1/webhooks/triggers/webhook/<trigger_id>"
+    body = b'{"hello":"world"}'
+
+    signature = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+
+    # content=body sends these exact bytes. json=... would re-serialize and sign nothing.
+    httpx.post(
+        url,
+        content=body,
+        headers={"Content-Type": "application/json", "X-Signature-256": signature},
+    )
+    ```
+
+Dla źródła `github` algorytm jest identyczny; zmienia się tylko nazwa nagłówka na
+`X-Hub-Signature-256`.
+
+**Podpisz też czas, przeciw odtworzeniom.** Podpis samego body nie niesie czasu,
+więc przechwycone dostarczenie można wysyłać ponownie w nieskończoność. Wyślij
+`X-Signature-Timestamp` (sekundy Uniksa) i podpisz zamiast tego
+`{timestamp}.{body}`: dostarczenie odległe o ponad pięć minut od naszego zegara
+jest odrzucane, a usunięcie nagłówka, żeby je odtworzyć, też zawodzi, bo podpis
+nie obejmuje już samego body. Nadawca, który nie wysyła znacznika czasu, jest
+weryfikowany jak dotąd.
+
+```bash
+TS="$(date +%s)"
+SIG="sha256=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
+curl -sS -X POST "$URL" -H 'Content-Type: application/json' \
+  -H "X-Signature-Timestamp: $TS" -H "X-Signature-256: $SIG" --data-raw "$BODY"
+```
+
+## Zapier i Make nie zrobią tego bez kroku kodu { #zapier-and-make-cannot-do-this-without-a-code-step }
+
+!!! warning "Żaden z nich nie ma akcji HMAC"
+
+    Ich standardowe kroki „POST na webhooka” wysyłają body, ale nie potrafią go
+    podpisać, więc każde dostarczenie przychodzi niepodpisane i jest odrzucane
+    `403`. Zaplanuj godzinę z krokiem kodu, a nie pięć minut klikania.
+
+Kusi, żeby sięgnąć po no-code'ową akcję webhooka w Zapierze albo Make. Musisz
+dodać ich **krok kodu** (*Code by Zapier* w Zapierze, moduł *Custom JS / functions* w Make), policzyć
+HMAC `sha256=<hex>` po dokładnym body, które zaraz wyślesz, i ustawić z niego
+nagłówek `X-Signature-256`.
+
+To działa, ale bądź szczery co do kosztu: to mniej więcej godzina z krokiem kodu, a
+nie pięć minut klikania. Jeśli tylko sprawdzasz trigger od początku do końca, podpisz
+najpierw żądanie ręcznie snippetem powyżej.
+
+## Testowanie lokalnie { #testing-locally }
+
+!!! tip "Spróbuj *Run now*, zanim skonfigurujesz providera"
+
+    Odpala jednorazowo trigger dowolnego rodzaju, na żądanie, bez podpisu i bez
+    udziału webhooka - to najszybszy sposób, żeby potwierdzić, że agent, jego
+    prompt i jego budżet zachowują się jak trzeba.
+
+Na laptopie `PUBLIC_BASE_URL` domyślnie ma wartość `http://localhost:8000`, więc URL,
+który daje ci dialog, jest nieosiągalny z GitHuba ani z żadnego hostowanego
+przekaźnika - nie widzą twojej maszyny. Dwa sposoby, żeby to obejść:
+
+- **Po prostu użyj Run now.** *Run now* odpala trigger dowolnego rodzaju raz, na
+  żądanie - harmonogram odpala się jeden dodatkowy raz przy nietkniętej kadencji, a
+  **trigger zdarzeniowy też się odpala**, jako ręczne odpalenie testowe: agent
+  uruchamia swój bazowy prompt **bez kontekstu dostarczenia, bez podpisu i bez udziału
+  webhooka**. To najszybszy sposób, żeby potwierdzić, że agent, jego prompt i jego
+  budżet zachowują się jak trzeba, bez konfigurowania jakiegokolwiek providera.
+  Nieaktywny (wstrzymany) trigger jest respektowany - *Run now* nic mu nie robi. Jego
+  jedyną luką jest to, że nie ćwiczy ścieżki podpisu ani prawdziwego payloadu, więc nie
+  wyłapie złego sekretu ani źle nazwanego pola.
+
+- **Wystaw port tunelem**, kiedy rzeczywiście chcesz przetestować prawdziwą ścieżkę
+  webhooka. Skieruj tunel na API, ustaw `PUBLIC_BASE_URL` na publiczny adres tunelu i
+  **utwórz trigger dopiero potem** - URL budowany jest z `PUBLIC_BASE_URL` w momencie
+  odczytu, więc trigger utworzony przed tą zmianą wciąż wydawałby URL z `localhost`.
+
+  ```bash
+  cloudflared tunnel --url http://localhost:8000
+  # then set PUBLIC_BASE_URL to the printed https URL, restart the API,
+  # and create the trigger
+  ```
+
+  Skieruj providera (albo swój skrypt podpisujący) na URL tunelu, a dostarczenie
+  dotrze do twojej maszyny jak każde hostowane.
+
+## Podsumowanie { #recap }
+
+- Trigger daje ci **URL** i **sekret podpisujący**. URL jest jego tożsamością i
+  nigdy się nie zmienia; sekret jest poświadczeniem i może być rotowany.
+- Podpis to `HMAC-SHA256` po **dokładnych surowych bajtach**, w schemacie
+  każdego providera, i to on czyni dostarczenie autentycznym, a nie tylko
+  poprawnie zaadresowanym. Sekrety HubSpota i Zendeska wydaje provider.
+- `202` znaczy **przyjęte**, a nie zakończone. Przeczytaj run w Activity.
+- **Skrzynki, pliki i kalendarze są odpytywane**, więc nie mają URL-a ani sekretu
+  w ogóle - podłącz konto i to cała konfiguracja.
+- Filtr nadawcy odpala się tylko na poczcie podpisanej przez domenę nadawcy.
+- Pora dnia harmonogramu jest czytana w jego strefie czasowej, domyślnie twojej.
+- Na laptopie sięgnij po **Run now**, zanim sięgniesz po tunel.

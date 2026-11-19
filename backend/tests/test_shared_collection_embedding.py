@@ -1,0 +1,391 @@
+"""One collection name is one vector table, so it is one embedding space.
+
+`knowledge_bases.collection_name` is not unique: several knowledge bases can
+index into the same physical table. Nothing used to make them agree on *how* to
+index, and the day per-collection resolution started answering per organization
+(#913) that stopped being harmless - two rows on one table with different widths
+make pgvector refuse the comparison, and two with the same width and different
+models rank one embedding space against another and answer with plausible
+nonsense. The credential has the same shape of problem: whichever sibling the
+resolver happened to read is the vault key that gets billed.
+
+So a row joining an occupied name adopts that name's configuration, and an
+explicit disagreement is refused rather than silently overridden.
+"""
+
+import uuid
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.core.exceptions import AuthorizationError, BadRequestError
+from app.core.permissions import AuthContext, OrgRoleName, Perm
+from app.db.models.knowledge_base import KBScope, KnowledgeBase
+from app.repositories import collection_teardown_repo, knowledge_base_repo
+from app.schemas.knowledge_base import KnowledgeBaseCreate, KnowledgeBaseUpdate
+from app.services.knowledge_base import KnowledgeBaseService
+from app.services.rag import embedding_providers
+
+pytestmark = pytest.mark.anyio
+
+ORG = uuid.uuid4()
+SECRET = uuid.uuid4()
+
+
+def _ctx() -> AuthContext:
+    return AuthContext(
+        user_id=uuid.uuid4(),
+        organization_id=ORG,
+        role=OrgRoleName.OWNER.value,
+        is_app_admin=False,
+    )
+
+
+def _held(**overrides) -> KnowledgeBase:
+    """The row already indexing into `shared`, as the database would hand it back."""
+    fields = {
+        "id": uuid.uuid4(),
+        "name": "Held",
+        "scope": KBScope.ORG.value,
+        "collection_name": "shared",
+        "embedding_model": "text-embedding-3-large",
+        "embedding_dim": 3072,
+        "embedding_provider": "openai",
+        "embedding_secret_id": SECRET,
+        "organization_id": ORG,
+    } | overrides
+    return KnowledgeBase(**fields)
+
+
+@pytest.fixture
+def service(monkeypatch: pytest.MonkeyPatch) -> KnowledgeBaseService:
+    """A service whose only live collaborator is `knowledge_base_repo.create`.
+
+    Everything the claim reads is mocked at the repository boundary; each test
+    sets `list_by_collection_name` to say who holds the name, which is the one
+    input the behaviour turns on.
+    """
+    monkeypatch.setattr(collection_teardown_repo, "is_reserved", AsyncMock(return_value=False))
+    monkeypatch.setattr(knowledge_base_repo, "create", AsyncMock(side_effect=_created))
+    monkeypatch.setattr("app.services.collection_access.hold_name", AsyncMock())
+    # No endpoint is asked what it serves here; the tests that care read this mock.
+    monkeypatch.setattr(embedding_providers, "require_served_at", AsyncMock())
+    return KnowledgeBaseService(MagicMock())
+
+
+async def _created(_db: object, **kwargs) -> dict[str, object]:
+    """Stand in for the insert, answering with what would have been written."""
+    return kwargs
+
+
+def _holders(monkeypatch: pytest.MonkeyPatch, rows: list[KnowledgeBase]) -> None:
+    monkeypatch.setattr(
+        knowledge_base_repo, "list_by_collection_name", AsyncMock(return_value=rows)
+    )
+
+
+class TestARowJoiningAnOccupiedName:
+    async def test_adopts_the_collections_model_width_and_provider(
+        self, service: KnowledgeBaseService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _holders(monkeypatch, [_held()])
+
+        written = await service.create(
+            KnowledgeBaseCreate(name="Second", collection_name="shared"), ctx=_ctx()
+        )
+
+        assert written["embedding_model"] == "text-embedding-3-large"
+        assert written["embedding_dim"] == 3072
+        assert written["embedding_provider"] == "openai"
+
+    async def test_adopts_the_credential_so_the_bill_does_not_depend_on_which_row_is_read(
+        self, service: KnowledgeBaseService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _holders(monkeypatch, [_held()])
+
+        written = await service.create(
+            KnowledgeBaseCreate(name="Second", collection_name="shared"), ctx=_ctx()
+        )
+
+        assert written["embedding_secret_id"] == SECRET
+
+    async def test_takes_the_oldest_holder_when_several_already_share_the_name(
+        self, service: KnowledgeBaseService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`list_by_collection_name` orders by `created_at`, and the table's width
+        was fixed by whichever row was created first."""
+        _holders(
+            monkeypatch,
+            [_held(), _held(embedding_model="text-embedding-3-small", embedding_dim=1536)],
+        )
+
+        written = await service.create(
+            KnowledgeBaseCreate(name="Third", collection_name="shared"), ctx=_ctx()
+        )
+
+        assert written["embedding_dim"] == 3072
+
+    @pytest.mark.parametrize(
+        ("field", "payload"),
+        [
+            ("embedding_model", {"embedding_model": "text-embedding-3-small"}),
+            ("embedding_provider", {"embedding_provider": "openrouter"}),
+            ("embedding_secret_id", {"embedding_secret_id": uuid.uuid4()}),
+        ],
+    )
+    async def test_refuses_a_choice_that_disagrees_with_the_collection(
+        self,
+        service: KnowledgeBaseService,
+        monkeypatch: pytest.MonkeyPatch,
+        field: str,
+        payload: dict[str, object],
+    ) -> None:
+        """Silently overriding is worse than refusing: the caller asked for one
+        embedding space and would have been given another with nothing on screen
+        to say so."""
+        _holders(monkeypatch, [_held()])
+
+        with pytest.raises(BadRequestError) as refused:
+            await service.create(
+                KnowledgeBaseCreate(name="Second", collection_name="shared", **payload),
+                ctx=_ctx(),
+            )
+
+        assert refused.value.details["fields"][0]["field"] == field
+
+    async def test_accepts_a_choice_that_restates_what_the_collection_already_uses(
+        self, service: KnowledgeBaseService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _holders(monkeypatch, [_held()])
+
+        written = await service.create(
+            KnowledgeBaseCreate(
+                name="Second",
+                collection_name="shared",
+                embedding_model="text-embedding-3-large",
+                embedding_provider="openai",
+                embedding_secret_id=SECRET,
+            ),
+            ctx=_ctx(),
+        )
+
+        assert written["embedding_model"] == "text-embedding-3-large"
+
+
+class TestAFirstRowOnAFreeName:
+    async def test_keeps_the_callers_own_choice(
+        self, service: KnowledgeBaseService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _holders(monkeypatch, [])
+        # A first row names its own provider and key - there is no deployment
+        # default to adopt. The key check is the vault's concern, not this test's.
+        monkeypatch.setattr(KnowledgeBaseService, "_check_embedding_secret", AsyncMock())
+
+        written = await service.create(
+            KnowledgeBaseCreate(
+                name="First",
+                collection_name="unheld",
+                embedding_model="text-embedding-3-small",
+                embedding_provider="openrouter",
+                embedding_secret_id=SECRET,
+            ),
+            ctx=_ctx(),
+        )
+
+        assert written["embedding_model"] == "text-embedding-3-small"
+        assert written["embedding_dim"] == 1536
+
+
+async def test_a_shared_collection_keeps_its_regional_endpoint(service, monkeypatch):
+    held = _held(
+        embedding_provider="openrouter", embedding_base_url="https://eu.openrouter.ai/api/v1"
+    )
+    _holders(monkeypatch, [held])
+    written = await service.create(
+        KnowledgeBaseCreate(name="Regional", collection_name="shared"), ctx=_ctx()
+    )
+    assert written["embedding_base_url"] == held.embedding_base_url
+
+
+@pytest.mark.parametrize("endpoint", ["https://eu.openrouter.ai/api/v1", None])
+async def test_an_embedding_endpoint_can_be_set_or_explicitly_cleared(
+    service, monkeypatch, endpoint
+):
+    held = _held(
+        embedding_provider="openrouter", embedding_base_url="https://regional.example/api/v1"
+    )
+    monkeypatch.setattr(service, "get_for_write", AsyncMock(return_value=held))
+    _holders(monkeypatch, [held])
+    update = AsyncMock(return_value=held)
+    monkeypatch.setattr(knowledge_base_repo, "update", update)
+    _embedding_key_access(monkeypatch, visible=True)
+    await service.update(held.id, KnowledgeBaseUpdate(embedding_base_url=endpoint), ctx=_ctx())
+    assert update.call_args.kwargs["embedding_base_url"] == endpoint
+    assert update.call_args.kwargs["set_embedding_base_url"] is True
+
+
+async def test_an_endpoint_change_cannot_split_a_shared_collection(service, monkeypatch):
+    held = _held(embedding_provider="openrouter")
+    monkeypatch.setattr(service, "get_for_write", AsyncMock(return_value=held))
+    _holders(monkeypatch, [held, _held(embedding_provider="openrouter")])
+    _embedding_key_access(monkeypatch, visible=True)
+    with pytest.raises(BadRequestError):
+        await service.update(
+            held.id,
+            KnowledgeBaseUpdate(embedding_base_url="https://eu.openrouter.ai/api/v1"),
+            ctx=_ctx(),
+        )
+
+
+async def test_a_resource_grant_does_not_authorize_rerouting_an_existing_embedding_key(
+    service, monkeypatch
+):
+    held = _held(
+        embedding_provider="openrouter", embedding_base_url="https://eu.openrouter.ai/api/v1"
+    )
+    monkeypatch.setattr(service, "get_for_write", AsyncMock(return_value=held))
+    caller = AuthContext(
+        user_id=uuid.uuid4(), organization_id=ORG, role="member", is_app_admin=False
+    )
+    with pytest.raises(AuthorizationError):
+        await service.update(held.id, KnowledgeBaseUpdate(embedding_base_url=None), ctx=caller)
+
+
+@pytest.mark.parametrize("endpoint", ["file:///etc/passwd", "https://user:password@example.com/v1"])
+async def test_invalid_embedding_urls_name_the_embedding_field(service, endpoint):
+    with pytest.raises(BadRequestError) as failure:
+        await service._embedding_url(_ctx(), "openrouter", endpoint)
+    assert failure.value.details["fields"][0]["field"] == "embedding_base_url"
+
+
+async def test_endpoint_update_distinguishes_omission_from_explicit_null():
+    db = MagicMock(flush=AsyncMock(), refresh=AsyncMock())
+    held = _held(
+        embedding_provider="openrouter", embedding_base_url="https://eu.openrouter.ai/api/v1"
+    )
+    await knowledge_base_repo.update(db, db_kb=held)
+    assert held.embedding_base_url == "https://eu.openrouter.ai/api/v1"
+    await knowledge_base_repo.update(
+        db, db_kb=held, embedding_base_url=None, set_embedding_base_url=True
+    )
+    assert held.embedding_base_url is None
+
+
+def _embedding_key_access(monkeypatch: pytest.MonkeyPatch, *, visible: bool) -> AsyncMock:
+    secret = MagicMock(id=SECRET, organization_id=ORG, purpose="openrouter")
+    monkeypatch.setattr(
+        "app.services.knowledge_base.organization_secret_repo.get", AsyncMock(return_value=secret)
+    )
+    access = AsyncMock(return_value=visible)
+    monkeypatch.setattr("app.services.knowledge_base.resolve_access", access)
+    return access
+
+
+@pytest.mark.parametrize("endpoint", ["https://eu.openrouter.ai/api/v1", None])
+async def test_changing_the_embedding_destination_requires_access_to_the_retained_key(
+    service, monkeypatch, endpoint
+):
+    held = _held(
+        embedding_provider="openrouter", embedding_base_url="https://regional.example/api/v1"
+    )
+    monkeypatch.setattr(service, "get_for_write", AsyncMock(return_value=held))
+    access = _embedding_key_access(monkeypatch, visible=False)
+    update = AsyncMock()
+    monkeypatch.setattr(knowledge_base_repo, "update", update)
+    with pytest.raises(BadRequestError, match="not in this organization's vault"):
+        await service.update(held.id, KnowledgeBaseUpdate(embedding_base_url=endpoint), ctx=_ctx())
+    assert access.await_args.args[3] == Perm.SECRETS_VIEW
+    update.assert_not_awaited()
+
+
+async def test_renaming_a_kb_does_not_require_reauthorizing_its_retained_embedding_key(
+    service, monkeypatch
+):
+    held = _held(embedding_provider="openrouter")
+    monkeypatch.setattr(service, "get_for_write", AsyncMock(return_value=held))
+    access = _embedding_key_access(monkeypatch, visible=False)
+    update = AsyncMock(return_value=held)
+    monkeypatch.setattr(knowledge_base_repo, "update", update)
+    await service.update(held.id, KnowledgeBaseUpdate(name="New name"), ctx=_ctx())
+    assert update.await_args.kwargs["name"] == "New name"
+    access.assert_not_awaited()
+
+
+async def test_a_new_collection_on_an_endpoint_is_checked_for_its_model(service, monkeypatch):
+    """The endpoint decides which models a collection on it can index with; one
+    it does not serve fails every upload, so the create is where it is refused."""
+    _holders(monkeypatch, [])
+    _embedding_key_access(monkeypatch, visible=True)
+    await service.create(
+        KnowledgeBaseCreate(
+            name="Regional",
+            embedding_model="mistralai/mistral-embed-2312",
+            embedding_provider="openrouter",
+            embedding_secret_id=SECRET,
+            embedding_base_url="https://eu.openrouter.ai/api/v1/",
+        ),
+        ctx=_ctx(),
+    )
+    checked = embedding_providers.require_served_at
+    assert isinstance(checked, AsyncMock)
+    entry, url = checked.await_args.args
+    assert entry.provider == "openrouter"
+    assert url == "https://eu.openrouter.ai/api/v1"
+    assert checked.await_args.kwargs == {
+        "model": "mistralai/mistral-embed-2312",
+        "field": "embedding_model",
+    }
+
+
+async def test_a_new_collection_on_the_providers_own_address_asks_no_endpoint(service, monkeypatch):
+    _holders(monkeypatch, [])
+    _embedding_key_access(monkeypatch, visible=True)
+    await service.create(
+        KnowledgeBaseCreate(
+            name="Global",
+            embedding_model="text-embedding-3-small",
+            embedding_provider="openrouter",
+            embedding_secret_id=SECRET,
+        ),
+        ctx=_ctx(),
+    )
+    checked = embedding_providers.require_served_at
+    assert isinstance(checked, AsyncMock)
+    checked.assert_not_awaited()
+
+
+async def test_moving_a_collection_checks_the_new_endpoint_serves_its_model(service, monkeypatch):
+    """The model is frozen with the vectors, so the endpoint is what is refused."""
+    held = _held(embedding_provider="openrouter")
+    monkeypatch.setattr(service, "get_for_write", AsyncMock(return_value=held))
+    _holders(monkeypatch, [held])
+    monkeypatch.setattr(knowledge_base_repo, "update", AsyncMock(return_value=held))
+    _embedding_key_access(monkeypatch, visible=True)
+    await service.update(
+        held.id,
+        KnowledgeBaseUpdate(embedding_base_url="https://eu.openrouter.ai/api/v1"),
+        ctx=_ctx(),
+    )
+    checked = embedding_providers.require_served_at
+    assert isinstance(checked, AsyncMock)
+    assert checked.await_args.args[1] == "https://eu.openrouter.ai/api/v1"
+    assert checked.await_args.kwargs == {
+        "model": "text-embedding-3-large",
+        "field": "embedding_base_url",
+    }
+
+
+async def test_moving_a_collection_back_to_the_providers_address_asks_no_endpoint(
+    service, monkeypatch
+):
+    held = _held(
+        embedding_provider="openrouter", embedding_base_url="https://eu.openrouter.ai/api/v1"
+    )
+    monkeypatch.setattr(service, "get_for_write", AsyncMock(return_value=held))
+    _holders(monkeypatch, [held])
+    monkeypatch.setattr(knowledge_base_repo, "update", AsyncMock(return_value=held))
+    _embedding_key_access(monkeypatch, visible=True)
+    await service.update(held.id, KnowledgeBaseUpdate(embedding_base_url=None), ctx=_ctx())
+    checked = embedding_providers.require_served_at
+    assert isinstance(checked, AsyncMock)
+    checked.assert_not_awaited()

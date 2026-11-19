@@ -1,0 +1,890 @@
+/**
+ * Every tool the backend registers, and what this side does with it.
+ *
+ * One table, keyed on the **stable tool id** a capability declares in
+ * `backend/app/agents/capabilities/<name>/__init__.py`. That key is the whole point: the
+ * knowledge about a tool used to sit in three files independently - the icon in
+ * `tool-steps.ts`, the caption in `agent-step-captions.ts`, the renderer in
+ * `tool-call-card.tsx` - so a rename landed in one of them and the other two went on
+ * matching a name nothing emits. `web_search` and `create_chart` spent five weeks
+ * rendering as pretty-printed JSON next to the renderers written for them, with green
+ * tests, because the tests asserted on the old names too (#144).
+ *
+ * So this table holds the registry's tool ids and nothing else, and
+ * `backend/tests/test_capability_registry.py::TestFrontendToolCatalog` fails in both
+ * directions until it does. A row is a decision, not paperwork - which icon the step
+ * carries, what it says while it runs, and what opens underneath it when it is done.
+ *
+ * A name arriving from anywhere *other* than the registry has no row and needs none:
+ * MCP tools come prefixed with their connection's name, and a binding may rename a
+ * tool it exposes. Those fall back to a humanized name and the generic renderer,
+ * which is the honest answer for a tool this side has never heard of.
+ *
+ * `load_capability` is the exception, and `FRAMEWORK_TOOLS` below is where it is
+ * written down: Pydantic AI contributes it to every agent that has a deferred
+ * capability, so no capability registers it and every skills agent emits it.
+ *
+ * Dependency-free on purpose - it is the vocabulary, not the presentation.
+ */
+
+/** What kind of thing a step is about, which is what picks its icon. */
+export type StepKind =
+  | "write"
+  | "edit"
+  | "read"
+  | "list"
+  | "search"
+  | "shell"
+  | "chart"
+  | "image"
+  | "audio"
+  | "video"
+  | "knowledge"
+  | "web"
+  | "skill"
+  | "code"
+  | "delegate"
+  | "mcp"
+  | "tool";
+
+/**
+ * Which renderer opens under a finished call.
+ *
+ * A name rather than the component itself, so this table stays importable from a
+ * test, a hook and a server component - the components live in
+ * `components/chat/tool-results/` and one of them pulls in Recharts.
+ *
+ * There is no "nothing to open" any more. `list_context` carried one on the grounds
+ * that what comes back is a prompt fragment, and the question it is the answer to -
+ * "does it actually see my glossary" - is answered by the list and by nothing else.
+ */
+export type ToolRenderer =
+  | "artifact"
+  | "chart"
+  | "generated-image"
+  | "generated-speech"
+  | "generated-video"
+  | "desktop-screenshot"
+  | "web-search"
+  | "rag"
+  | "run-python"
+  | "coding-agent"
+  | "loaded-skill"
+  | "load-skill"
+  | "skill-list"
+  | "context-list"
+  | "plan"
+  | "asked"
+  | "delegation"
+  | "workspace"
+  | "generic";
+
+/**
+ * The tense pair for a step that names its own subject: *Writing test1.md*.
+ *
+ * Two `chat.tools` keys rather than two words, because a verb the sentence around it
+ * has to agree with cannot be a parameter - `{verb} {subject}` reads as translated and is the
+ * defect `messages/catalog.test.ts` refuses under the name `{noun}` (#362). Each
+ * message writes its own whole sentence and selects on `named`, which says whether the
+ * call gave a subject at all: `{named, select, no {Writing…} other {Writing {subject}}}`.
+ */
+export interface ToolVerbs {
+  /** While it runs. */
+  now: string;
+  /** Once it has finished. */
+  done: string;
+}
+
+/**
+ * Which `chat.tools` sentence names a parked call, and the `context` names it needs.
+ *
+ * `needs` is checked before the sentence is drawn, so a context missing one of them -
+ * a describer that could name the table and not the view - falls back to the plain
+ * card rather than to a sentence with a hole in it. A table write names its table and
+ * never its record: a record's label is a cell's text, stored on the approval row.
+ */
+export interface ApprovalSummary {
+  key: string;
+  needs: readonly string[];
+}
+
+export interface ToolEntry {
+  kind: StepKind;
+  render: ToolRenderer;
+  /**
+   * Key under `chat.tools` for the present tense, while the call runs. Defaults to
+   * `runningNamed`.
+   *
+   * A key rather than a sentence: this table is a module constant and cannot reach a
+   * translator, so the copy is resolved where it is rendered (#446).
+   */
+  captionKey?: string;
+  /**
+   * Key under `chat.tools` for what the finished step is called. Defaults to the
+   * humanized id.
+   */
+  displayNameKey?: string;
+  /** Set instead of `captionKey` when the label is a verb plus the call's subject. */
+  verbs?: ToolVerbs;
+  /**
+   * The sentence an approval card leads with when the call was parked with a
+   * `context` - the ids in its arguments as names, resolved by the tool's describer
+   * on the backend (`ApprovalDescriber`). Absent for a tool nobody describes, and
+   * never shown instead of the arguments: those are what runs.
+   */
+  approvalSummary?: ApprovalSummary;
+  /**
+   * Open this step when it finishes in front of somebody.
+   *
+   * The calls whose whole value is the thing they produced - a chart, code that ran,
+   * a file that was written. Everything else stays a line somebody can open.
+   */
+  opensWhenDone?: boolean;
+  /**
+   * Open this step whenever it is on screen, not only as it finishes.
+   *
+   * `opensWhenDone` needs a status *transition* to fire, and a step whose result
+   * arrived with it never has one - it mounts already completed. Only the last
+   * step of a turn is opened on mount (`startOpen` in `message-item.tsx`), so a
+   * turn that drew three charts showed two collapsed headers and one picture.
+   *
+   * For a chart that is wrong: the picture *is* the answer, and three of them are
+   * three answers rather than one with two footnotes. This is deliberately not
+   * set on `write_file`, `edit_file` or `run_python` - those confirm that
+   * something happened, and opening every one of them on sight is what made a
+   * replayed conversation a wall of diffs.
+   */
+  opensOnSight?: boolean;
+  /**
+   * Never open this step on its own - not even as the last step of a turn.
+   *
+   * For the agent's bookkeeping: what it noted to itself for next time is not
+   * something the person asked to see, and as the last step of a turn it opened
+   * over the answer it came after. It is still a line somebody can open.
+   */
+  staysClosed?: boolean;
+  /**
+   * Never drawn as a step: what the call produced is drawn under the answer
+   * instead - next steps as buttons, a card to switch a capability on (#2301).
+   * As a step it would be a line saying the agent offered something the person
+   * is already looking at.
+   */
+  hidden?: boolean;
+}
+
+/**
+ * The table. Grouped by the capability that registers each tool.
+ *
+ * Ordered as `all_capabilities()` returns them, so a diff here reads against a diff
+ * there.
+ */
+export const TOOL_CATALOG: Record<string, ToolEntry> = {
+  // ask_user - multiple-choice questions to the person running the agent (#2064).
+  ask_user_question: {
+    kind: "read",
+    render: "asked",
+    captionKey: "askingYou",
+    displayNameKey: "askedYou",
+  },
+  // artifacts - the published page is the answer, so its card sits under the
+  // answer (`publishedApps` in `message-item.tsx`) and the step stays one line,
+  // which lets the work fold away like any other turn's.
+  publish_artifact: {
+    kind: "write",
+    render: "artifact",
+    captionKey: "publishingArtifact",
+    displayNameKey: "publishArtifact",
+    staysClosed: true,
+  },
+  read_artifact: {
+    kind: "read",
+    render: "generic",
+    captionKey: "readingArtifact",
+    displayNameKey: "readArtifact",
+  },
+  list_artifacts: {
+    kind: "list",
+    render: "generic",
+    captionKey: "listingArtifacts",
+    displayNameKey: "listArtifacts",
+  },
+  // The picture goes to the model; the step shows the written report beside it.
+  preview_artifact: {
+    kind: "read",
+    render: "generic",
+    captionKey: "previewingArtifact",
+    displayNameKey: "previewArtifact",
+  },
+  // Files a request the owner answers in the Share dialog; nothing is shared by the call.
+  share_artifact: {
+    kind: "write",
+    render: "generic",
+    captionKey: "sharingArtifact",
+    displayNameKey: "shareArtifact",
+  },
+
+  // visuals - the drawing is its own panel under the message, drawn while it is
+  // written; the step stays a line, since opening it would print the drawing's
+  // source as JSON.
+  draw: {
+    kind: "image",
+    render: "generic",
+    captionKey: "drawingVisual",
+    displayNameKey: "drawVisual",
+    staysClosed: true,
+  },
+  revise_visual: {
+    kind: "edit",
+    render: "generic",
+    captionKey: "revisingVisual",
+    displayNameKey: "reviseVisual",
+    staysClosed: true,
+  },
+  read_visual: {
+    kind: "read",
+    render: "generic",
+    captionKey: "readingVisual",
+    displayNameKey: "readVisual",
+  },
+
+  // browser_use - a whole browse. The step card stays generic because the live view
+  // is its own panel beside the transcript: a frame per step folded into the message
+  // list would rewrite the transcript thirty times over.
+  browse_web: {
+    kind: "web",
+    render: "generic",
+    captionKey: "browsingWeb",
+    displayNameKey: "browseWeb",
+  },
+  // The agent's own hands on the same tab - one action a call. Each is a line in
+  // the transcript; the page itself is drawn in the browse panel the first one
+  // opened, which every later one adds its step to.
+  browser_open: {
+    kind: "web",
+    render: "generic",
+    captionKey: "openingPage",
+    displayNameKey: "openPage",
+  },
+  browser_new_tab: {
+    kind: "web",
+    render: "generic",
+    captionKey: "openingPage",
+    displayNameKey: "openPage",
+  },
+  browser_tabs: {
+    kind: "web",
+    render: "generic",
+    captionKey: "readingPage",
+    displayNameKey: "readPage",
+  },
+  browser_switch_tab: {
+    kind: "web",
+    render: "generic",
+    captionKey: "readingPage",
+    displayNameKey: "readPage",
+  },
+  browser_close_tab: {
+    kind: "web",
+    render: "generic",
+    captionKey: "readingPage",
+    displayNameKey: "readPage",
+  },
+  browser_read: {
+    kind: "web",
+    render: "generic",
+    captionKey: "readingPage",
+    displayNameKey: "readPage",
+  },
+  browser_click: {
+    kind: "web",
+    render: "generic",
+    captionKey: "clickingOnPage",
+    displayNameKey: "clickOnPage",
+  },
+  browser_type: {
+    kind: "web",
+    render: "generic",
+    captionKey: "typingOnPage",
+    displayNameKey: "typeOnPage",
+  },
+  browser_select: {
+    kind: "web",
+    render: "generic",
+    captionKey: "choosingOnPage",
+    displayNameKey: "chooseOnPage",
+  },
+  browser_scroll: {
+    kind: "web",
+    render: "generic",
+    captionKey: "scrollingPage",
+    displayNameKey: "scrollPage",
+  },
+  browser_back: {
+    kind: "web",
+    render: "generic",
+    captionKey: "goingBack",
+    displayNameKey: "goBack",
+  },
+
+  // computer_use - a desktop worked through screenshots. Like `browse_web`, the live
+  // view is the browse panel, fed by frames rather than by these calls; what comes
+  // back to the model is a screenshot plus a line, so the generic renderer serves.
+  computer_screenshot: {
+    kind: "web",
+    render: "generic",
+    captionKey: "lookingAtScreen",
+    displayNameKey: "takeScreenshot",
+  },
+  computer_act: {
+    kind: "web",
+    render: "generic",
+    captionKey: "usingComputer",
+    displayNameKey: "useComputer",
+  },
+  computer_apps: {
+    kind: "list",
+    render: "generic",
+    captionKey: "listingApps",
+    displayNameKey: "listApps",
+  },
+  // The screenshot kept for the user rather than looked at: the picture is the answer.
+  computer_save_screenshot: {
+    kind: "image",
+    render: "desktop-screenshot",
+    captionKey: "savingScreenshot",
+    displayNameKey: "savedScreenshot",
+    opensWhenDone: true,
+    opensOnSight: true,
+  },
+
+  // channel_tools - only ever called on a Slack, Telegram or Mattermost run, so these
+  // steps are read back in the run timeline rather than watched live in the dashboard.
+  get_channel_info: {
+    kind: "read",
+    render: "generic",
+    captionKey: "lookingAtChannel",
+    displayNameKey: "channelInfo",
+  },
+  list_channel_members: {
+    kind: "list",
+    render: "generic",
+    captionKey: "lookingAtChannelMembers",
+    displayNameKey: "channelMembers",
+  },
+  search_channels: {
+    kind: "search",
+    render: "generic",
+    captionKey: "lookingForChannel",
+    displayNameKey: "channelSearch",
+  },
+  send_channel_file: {
+    kind: "write",
+    render: "generic",
+    captionKey: "sendingChannelFile",
+    displayNameKey: "sendChannelFile",
+  },
+  read_channel_history: {
+    kind: "read",
+    render: "generic",
+    captionKey: "readingChannel",
+    displayNameKey: "channelHistory",
+  },
+
+  // charts
+  create_chart: {
+    kind: "chart",
+    render: "chart",
+    captionKey: "creatingChart",
+    displayNameKey: "chart",
+    opensWhenDone: true,
+    opensOnSight: true,
+  },
+
+  // image_generation - the picture is the answer, so it opens wherever it lands.
+  generate_image: {
+    kind: "image",
+    render: "generated-image",
+    captionKey: "generatingImage",
+    displayNameKey: "generateImage",
+    opensWhenDone: true,
+    opensOnSight: true,
+  },
+
+  // text_to_speech - the clip is the answer, so it opens wherever it lands, as an image does.
+  generate_speech: {
+    kind: "audio",
+    render: "generated-speech",
+    captionKey: "generatingSpeech",
+    displayNameKey: "generateSpeech",
+    opensWhenDone: true,
+    opensOnSight: true,
+  },
+
+  // video_generation - the clip is the answer, so it opens wherever it lands, as an image does.
+  generate_video: {
+    kind: "video",
+    render: "generated-video",
+    captionKey: "generatingVideo",
+    displayNameKey: "generateVideo",
+    opensWhenDone: true,
+    opensOnSight: true,
+  },
+
+  // sandbox - the workspace toolset, whose steps name the file they are about
+  ls: { kind: "list", render: "workspace", verbs: { now: "listing", done: "listed" } },
+  read_file: { kind: "read", render: "workspace", verbs: { now: "reading", done: "read" } },
+  glob: { kind: "search", render: "workspace", verbs: { now: "lookingFor", done: "lookedFor" } },
+  grep: {
+    kind: "search",
+    render: "workspace",
+    verbs: { now: "searchingFor", done: "searchedFor" },
+  },
+  write_file: {
+    kind: "write",
+    render: "workspace",
+    verbs: { now: "writing", done: "wrote" },
+    opensWhenDone: true,
+  },
+  edit_file: {
+    kind: "edit",
+    render: "workspace",
+    verbs: { now: "editing", done: "edited" },
+    opensWhenDone: true,
+  },
+  execute: { kind: "shell", render: "workspace", verbs: { now: "executing", done: "executed" } },
+
+  // coding_agent - Claude Code or Codex in the sandbox. Its steps stream into a
+  // panel of their own while it works; what it read, ran and changed opens under
+  // the step afterwards, because that is what a person checks before trusting it.
+  run_coding_agent: {
+    kind: "code",
+    render: "coding-agent",
+    captionKey: "runningCodingAgent",
+    displayNameKey: "runCodingAgent",
+    opensWhenDone: true,
+  },
+
+  // monitor - a long-running command watched while the agent works. Starting one is a
+  // shell step; what it matched so far and its state read as plain text.
+  start_monitor: {
+    kind: "shell",
+    render: "generic",
+    captionKey: "startingMonitor",
+    displayNameKey: "startMonitor",
+  },
+  list_monitors: {
+    kind: "list",
+    render: "generic",
+    captionKey: "listingMonitors",
+    displayNameKey: "listMonitors",
+  },
+  stop_monitor: {
+    kind: "shell",
+    render: "generic",
+    captionKey: "stoppingMonitor",
+    displayNameKey: "stopMonitor",
+  },
+
+  // code_execution
+  run_python: {
+    kind: "code",
+    render: "run-python",
+    captionKey: "runningCalculations",
+    displayNameKey: "runPython",
+    opensWhenDone: true,
+  },
+
+  // context - the link-mode half of the context capability; injected files never
+  // reach the model as a tool call, so there is nothing to render for them here.
+  list_context: {
+    kind: "list",
+    render: "context-list",
+    captionKey: "lookingThroughContext",
+    displayNameKey: "availableContext",
+  },
+  read_context: {
+    kind: "read",
+    render: "generic",
+    captionKey: "readingContext",
+    displayNameKey: "contextFile",
+  },
+
+  // knowledge
+  search_documents: {
+    kind: "knowledge",
+    render: "rag",
+    captionKey: "searchingDocuments",
+    displayNameKey: "knowledgeBaseSearch",
+  },
+
+  // virtual_tables - reads are lookups, writes are edits; `delete_record` is `edit`
+  // because `StepKind` has no delete, the same choice `delete_memory` makes.
+  list_tables: { kind: "list", render: "generic", captionKey: "tablesListing" },
+  table_exists: { kind: "read", render: "generic", captionKey: "tablesChecking" },
+  describe_table: { kind: "read", render: "generic", captionKey: "tablesDescribing" },
+  list_views: { kind: "list", render: "generic", captionKey: "viewsListing" },
+  create_table: { kind: "write", render: "generic", captionKey: "tablesCreating" },
+  record_exists: { kind: "read", render: "generic", captionKey: "recordsChecking" },
+  list_records: { kind: "list", render: "generic", captionKey: "recordsListing" },
+  get_record: { kind: "read", render: "generic", captionKey: "recordsReading" },
+  create_record: {
+    kind: "write",
+    render: "generic",
+    captionKey: "recordsCreating",
+    approvalSummary: { key: "approveCreateRecord", needs: ["table"] },
+  },
+  upsert_record: {
+    kind: "write",
+    render: "generic",
+    captionKey: "recordsUpserting",
+    approvalSummary: { key: "approveUpsertRecord", needs: ["table"] },
+  },
+  update_record: {
+    kind: "edit",
+    render: "generic",
+    captionKey: "recordsUpdating",
+    approvalSummary: { key: "approveUpdateRecord", needs: ["table"] },
+  },
+  delete_record: {
+    kind: "edit",
+    render: "generic",
+    captionKey: "recordsDeleting",
+    approvalSummary: { key: "approveDeleteRecord", needs: ["table"] },
+  },
+
+  // workflows - starting one is a write: it sets a process going.
+  list_workflows: { kind: "list", render: "generic", captionKey: "workflowsListing" },
+  run_workflow: { kind: "write", render: "generic", captionKey: "workflowRunning" },
+  get_workflow_run: { kind: "read", render: "generic", captionKey: "workflowRunReading" },
+
+  // follow_ups - next steps, drawn as buttons under the answer (#2301).
+  suggest_next_steps: {
+    kind: "tool",
+    render: "generic",
+    captionKey: "suggestingNextSteps",
+    displayNameKey: "nextSteps",
+    hidden: true,
+  },
+  // ...and things to set up, drawn as cards under the answer (#2301).
+  propose_setup: {
+    kind: "tool",
+    render: "generic",
+    captionKey: "proposingSetup",
+    displayNameKey: "setupProposals",
+    hidden: true,
+  },
+  // memory - the agent's own file store. An index and a note read back as text, so the
+  // generic renderer serves; `delete_memory` is `edit` because `StepKind` has no delete.
+  // All of it `staysClosed`: bookkeeping, not an answer.
+  list_memory: {
+    kind: "list",
+    render: "generic",
+    captionKey: "memoryChecking",
+    displayNameKey: "listMemory",
+    staysClosed: true,
+  },
+  read_memory: {
+    kind: "read",
+    render: "generic",
+    captionKey: "memoryReading",
+    displayNameKey: "readMemory",
+    staysClosed: true,
+  },
+  write_memory: {
+    kind: "write",
+    render: "generic",
+    captionKey: "memorySaving",
+    displayNameKey: "writeMemory",
+    staysClosed: true,
+  },
+  edit_memory: {
+    kind: "edit",
+    render: "generic",
+    captionKey: "memoryUpdating",
+    displayNameKey: "editMemory",
+    staysClosed: true,
+  },
+  delete_memory: {
+    kind: "edit",
+    render: "generic",
+    captionKey: "memoryForgetting",
+    displayNameKey: "deleteMemory",
+    staysClosed: true,
+  },
+  remember: {
+    kind: "write",
+    render: "generic",
+    captionKey: "memoryRemembering",
+    staysClosed: true,
+  },
+  recall: { kind: "search", render: "generic", captionKey: "memoryRecalling", staysClosed: true },
+
+  // conversation search - past threads, found and opened. Both answer in Markdown,
+  // which the generic renderer already shows as prose.
+  search_conversations: {
+    kind: "search",
+    render: "generic",
+    captionKey: "searchingConversations",
+    displayNameKey: "conversationSearch",
+  },
+  read_conversation: {
+    kind: "read",
+    render: "generic",
+    captionKey: "readingConversation",
+    displayNameKey: "pastConversation",
+  },
+
+  // skills - opening one is `load_capability`, in FRAMEWORK_TOOLS below
+  read_skill_resource: {
+    kind: "skill",
+    render: "generic",
+    captionKey: "readingSkillFiles",
+    displayNameKey: "skillResource",
+  },
+
+  // subagents - the parent's half of a delegation. The delegate's own run is a panel
+  // of its own, built from `subagent_*` frames rather than from these calls.
+  // `task` is one agent asking another, and is drawn as that: the delegate's face
+  // and name on the step, the brief and the answer under it.
+  task: { kind: "delegate", render: "delegation", captionKey: "handingWork" },
+  check_task: { kind: "delegate", render: "generic", captionKey: "checkingDelegate" },
+  wait_tasks: { kind: "delegate", render: "generic", captionKey: "waitingDelegates" },
+  list_active_tasks: {
+    kind: "delegate",
+    render: "generic",
+    captionKey: "lookingAtRunning",
+    displayNameKey: "activeTasks",
+  },
+  answer_subagent: {
+    kind: "delegate",
+    render: "generic",
+    captionKey: "answeringDelegate",
+    displayNameKey: "answerDelegate",
+  },
+  send_message_to_subagent: {
+    kind: "delegate",
+    render: "generic",
+    captionKey: "steeringDelegate",
+    displayNameKey: "messageDelegate",
+  },
+  soft_cancel_task: {
+    kind: "delegate",
+    render: "generic",
+    captionKey: "askingDelegateStop",
+    displayNameKey: "stopTask",
+  },
+  hard_cancel_task: {
+    kind: "delegate",
+    render: "generic",
+    captionKey: "cancellingDelegate",
+    displayNameKey: "cancelTask",
+  },
+  create_agent: {
+    kind: "delegate",
+    render: "generic",
+    captionKey: "creatingSpecialist",
+    displayNameKey: "createSpecialist",
+  },
+  delegate: { kind: "delegate", render: "generic", captionKey: "delegating" },
+
+  // planning - the model's own checklist. Every one of these answers with the plan
+  // as it now stands or with one line about one step, so they share a renderer that
+  // draws a checklist and falls back to the line. Never the generic one: `write_plan`
+  // is called with the whole ordered list every time, so it opened as forty lines of
+  // pretty-printed arguments above a rendered copy of the same steps.
+  write_plan: {
+    kind: "write",
+    render: "plan",
+    captionKey: "writingPlan",
+    displayNameKey: "plan",
+  },
+  read_plan: { kind: "read", render: "plan", captionKey: "readingPlan", displayNameKey: "plan" },
+  add_task: {
+    kind: "write",
+    render: "plan",
+    captionKey: "addingStep",
+    displayNameKey: "addStep",
+  },
+  update_task_status: {
+    kind: "edit",
+    render: "plan",
+    captionKey: "updatingStep",
+    displayNameKey: "updateStep",
+  },
+  update_task_statuses: {
+    kind: "edit",
+    render: "plan",
+    captionKey: "updatingSteps",
+    displayNameKey: "updateSteps",
+  },
+  remove_task: {
+    kind: "edit",
+    render: "plan",
+    captionKey: "removingStep",
+    displayNameKey: "removeStep",
+  },
+  add_subtask: {
+    kind: "write",
+    render: "plan",
+    captionKey: "addingSubtask",
+    displayNameKey: "addSubtask",
+  },
+  set_dependency: {
+    kind: "edit",
+    render: "plan",
+    captionKey: "settingDependency",
+    displayNameKey: "setDependency",
+  },
+  get_available_tasks: {
+    kind: "list",
+    render: "plan",
+    captionKey: "checkingAvailableSteps",
+    displayNameKey: "availableSteps",
+  },
+
+  // web_research
+  web_search: {
+    kind: "web",
+    render: "web-search",
+    captionKey: "searchingWeb",
+    displayNameKey: "webSearch",
+  },
+
+  // web_fetch - one page as Markdown, which is text the model reads rather than a
+  // payload with a shape of its own, so the generic renderer shows it the way
+  // `read_tool_result` is shown.
+  web_fetch: {
+    kind: "web",
+    render: "generic",
+    captionKey: "fetchingPage",
+    displayNameKey: "webFetch",
+  },
+
+  // tool_output_limits - reads a slice of a tool result that was spilled to the
+  // backend because it was too large to keep in the window. The slice is text the
+  // model pages through, so the generic renderer shows it.
+  read_tool_result: {
+    kind: "read",
+    render: "generic",
+    captionKey: "readingToolResult",
+    displayNameKey: "toolResult",
+  },
+};
+
+/**
+ * Tools the agent framework contributes, which no capability registers.
+ *
+ * Kept out of `TOOL_CATALOG` so the drift check against the backend registry stays an
+ * exact match in both directions - a surplus row there is a renderer nothing reaches,
+ * and that is the half that hid #144.
+ *
+ * `load_capability` is Pydantic AI's own, and it is how a model opens a skill: every
+ * skill an agent is given is a deferred capability, so this is the call a person sees
+ * where `load_skill` used to be. Without a row it would render as *Load Capability*
+ * over a JSON blob, which says nothing about which skill was opened.
+ */
+export const FRAMEWORK_TOOLS: Record<string, ToolEntry> = {
+  load_capability: {
+    kind: "skill",
+    render: "loaded-skill",
+    captionKey: "loadingSkill",
+    displayNameKey: "loadSkill",
+  },
+};
+
+/**
+ * Tools every agent's own setup adds, which no capability registers (#2301).
+ *
+ * `request_capability` is the card an agent shows for a capability it lacks,
+ * offered by the setup section every run carries rather than by a capability a
+ * spec binds - so, like `load_capability`, it stays out of the drift check.
+ */
+export const PLATFORM_TOOLS: Record<string, ToolEntry> = {
+  request_capability: {
+    kind: "tool",
+    render: "generic",
+    captionKey: "requestingCapability",
+    displayNameKey: "capabilityRequest",
+    hidden: true,
+  },
+};
+
+/**
+ * Tools a voice call adds that no capability registers (#54).
+ *
+ * `hand_off` is how a call's realtime model hands a task to the agent's own text
+ * model, which has the sandbox, the browser and the delegates a call cannot
+ * carry. Out of `TOOL_CATALOG` for the reason `FRAMEWORK_TOOLS` is: the drift
+ * check there is against the capability registry, and the backend checks this
+ * table against the tool's own name instead.
+ */
+export const CALL_TOOLS: Record<string, ToolEntry> = {
+  hand_off: {
+    kind: "delegate",
+    render: "generic",
+    captionKey: "workingInText",
+    displayNameKey: "workedInText",
+  },
+};
+
+/**
+ * Tools no agent emits any more, kept for the conversations that recorded them.
+ *
+ * A stored turn holds the tool name it actually called and the result it actually
+ * got, so removing an entry here does not remove the call - it removes the only
+ * thing that knew how to draw it, and an old thread reopens showing raw XML where
+ * it used to show a skill's description (#1704 review).
+ *
+ * Out of `TOOL_CATALOG` on purpose, like `FRAMEWORK_TOOLS`: the drift check
+ * against the backend registry is a statement about what this deployment offers
+ * *now*, and a legacy renderer must not make it pass by naming a tool nobody
+ * registers.
+ */
+export const LEGACY_TOOLS: Record<string, ToolEntry> = {
+  list_skills: {
+    kind: "skill",
+    render: "skill-list",
+    captionKey: "lookingThroughSkills",
+    displayNameKey: "availableSkills",
+  },
+  load_skill: {
+    kind: "skill",
+    render: "load-skill",
+    captionKey: "loadingSkill",
+    displayNameKey: "loadSkill",
+  },
+};
+
+/** What this side knows about `name`, or null for a tool it has never heard of. */
+export function toolEntry(name: string): ToolEntry | null {
+  return (
+    TOOL_CATALOG[name] ??
+    FRAMEWORK_TOOLS[name] ??
+    PLATFORM_TOOLS[name] ??
+    CALL_TOOLS[name] ??
+    LEGACY_TOOLS[name] ??
+    null
+  );
+}
+
+/**
+ * The tools that come from `pydantic-ai-backends`, which read and write real files.
+ *
+ * Derived rather than listed: `render: "workspace"` is the same decision, and a second
+ * list is a second thing to forget.
+ */
+export function isWorkspaceTool(name: string): boolean {
+  return TOOL_CATALOG[name]?.render === "workspace";
+}
+
+/**
+ * A tool's name as a person reads it, in `chat.tools`: the catalog's own name
+ * where it has one - "Save to memory" - and the identifier spelled as words
+ * otherwise, so `create_issue` reads "Create issue" rather than as code.
+ */
+export function toolLabel(name: string, t: (key: string) => string): string {
+  const key = toolEntry(name)?.displayNameKey;
+  if (key !== undefined) return t(key);
+  const words = name.split(/[_-]+/).filter(Boolean).join(" ");
+  return words === "" ? name : words.charAt(0).toUpperCase() + words.slice(1);
+}

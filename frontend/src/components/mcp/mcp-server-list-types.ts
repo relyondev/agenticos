@@ -1,0 +1,108 @@
+import type { McpConnectionRecord, McpToolInfo } from "@/lib/mcp-connections-api";
+import type { AudiencePayload } from "@/types/sharing";
+import type { McpServerRow } from "@/lib/mcp-servers";
+
+/**
+ * The shapes shared between `McpServerList` and its two dialogs.
+ *
+ * A leaf module, so the dialogs read them without importing the component that
+ * renders them - a value cycle (`SCOPE_LABEL`) the other way around would
+ * otherwise run the dialog module while the list module was still initializing.
+ */
+
+/** Who a connection belongs to. The whole of what the two columns mean. */
+export type Scope = "organization" | "personal";
+
+/**
+ * How a server checks who is calling.
+ *
+ * The three the platform can do, in either scope. An organization connection
+ * may hold an OAuth grant: the common case is a shared service account that one
+ * admin consents with and everybody's agents then use. The grant is still that
+ * account's at the provider, which is a real operational cost - the dialog says
+ * so where the choice is made rather than withholding the choice.
+ */
+export type DraftAuth = "none" | "token" | "oauth";
+
+/** Keys, not translations: a module constant has no translator to reach. */
+export const SCOPE_LABEL: Record<Scope, string> = {
+  organization: "scopeOrganization",
+  personal: "scopeYou",
+};
+
+export interface DraftState {
+  scope: Scope;
+  row: McpServerRow;
+  /** The connection being edited, or null when connecting for the first time. */
+  existing: McpConnectionRecord | null;
+  /**
+   * What to seed the name with, where the entry's own key is taken.
+   *
+   * Connecting a *second* account for one server would otherwise open on the
+   * name the first one already holds, and names are unique per organization -
+   * so the form's first submit was a guaranteed conflict.
+   */
+  suggestedName?: string;
+  /**
+   * The scope already holds an account on this server, so this one must be
+   * named: two accounts of one service otherwise read as the same name in every
+   * picker and approval, and the backend refuses the second without a label.
+   */
+  needsLabel?: boolean;
+}
+
+/**
+ * The fields the connection dialog collects, handed to the list on submit.
+ *
+ * The dialog owns this while it is open and seeds it from the `DraftState`; the
+ * list reads it back in one object rather than holding a `useState` per field
+ * and drilling a setter each into the dialog.
+ */
+export interface ConnectionFormValues {
+  /** What a person reads. Empty means the connection shows its slug instead. */
+  label: string;
+  name: string;
+  url: string;
+  token: string;
+  auth: DraftAuth;
+  clearToken: boolean;
+  /** Whether the server's own instructions join the agent's. Read only when editing. */
+  includeInstructions: boolean;
+  scope: Scope;
+  /**
+   * A client registered at the provider by hand, read only when `auth` is
+   * `"oauth"`. Empty is the common case: the server registers this app itself.
+   * A provider that will not (HubSpot) hands out these two in its own portal.
+   */
+  clientId: string;
+  clientSecret: string;
+  /**
+   * Who a new organization connection reaches (#2072). Read only for a new one
+   * on the organization; a personal connection is its owner's alone.
+   */
+  audience: AudiencePayload;
+}
+
+/** A probed connection and which of its tools are currently checked. */
+export interface ToolPickerState {
+  scope: Scope;
+  /**
+   * Whose tool list this is - the servers page names the connection, the
+   * Builder the server. A binding to each person's own account has no
+   * connection of its own to name, so the title is not read off one.
+   */
+  name: string;
+  connection: McpConnectionRecord;
+  tools: McpToolInfo[];
+  checked: Set<string>;
+  /**
+   * Whose narrowing this is, which is the whole of what the dialog says about
+   * itself.
+   *
+   * `"connection"` is the servers page: one administrator's decision for
+   * everybody bound to it. `"agent"` is the Builder: this agent only, within
+   * that ceiling. Saying the wrong one is worse than saying nothing, because
+   * both screens look identical (#1341).
+   */
+  appliesTo: "connection" | "agent";
+}

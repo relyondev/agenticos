@@ -1,0 +1,144 @@
+# Use message ratings
+
+People can rate an agent's answers, and the ratings are readable two ways: on the
+turn itself, and in aggregate for whoever administers the deployment.
+
+## Rating messages
+
+### Like/dislike
+
+Each AI assistant message displays two buttons:
+
+- **Like (👍)** — Click to indicate the response was helpful
+- **Dislike (👎)** — Click to indicate the response had issues
+
+### Toggle behavior
+
+- Clicking the same button again **removes** your rating
+- Clicking the opposite button **changes** your rating (like → dislike or vice versa)
+- Only assistant messages can be rated (not your own messages)
+
+### Adding feedback
+
+When you dislike a response, a dialog appears asking **"What went wrong?"**
+
+You can optionally provide a comment (up to 2000 characters) explaining the issue.
+This feedback is valuable for understanding why responses weren't helpful.
+
+Common reasons to dislike:
+
+- Incorrect or hallucinated information
+- Response didn't address the question
+- Too verbose or too brief
+- Poor formatting or structure
+
+## Rating counts
+
+Each message shows the total number of likes and dislikes from all users.
+Your own rating is highlighted (green for like, red for dislike).
+
+## For administrators
+
+### Ratings dashboard
+
+Navigate to **Admin → Response Ratings** (or `/admin/ratings`) to access the analytics dashboard.
+
+#### Summary statistics
+
+- **Total ratings** — All ratings across the system
+- **Likes** — Count of positive ratings
+- **Dislikes** — Count of negative ratings
+- **Average** — Overall satisfaction score (-1.0 to 1.0)
+
+#### Ratings chart
+
+A bar chart shows ratings over the last 30 days. Green bars represent likes,
+red bars represent dislikes.
+
+!!! note "This page's window is fixed at 30 days"
+
+    To read the same numbers over a period you choose, use the dashboard's
+    **Answer quality, deployment-wide** card, which follows the period filter at
+    the top of the page.
+
+### Filtering ratings
+
+Use the filter dropdowns to narrow down results:
+
+| Filter | Options |
+|--------|---------|
+| Rating type | All / Likes Only / Dislikes Only |
+| Comments | All / With comments only |
+
+### Ratings table
+
+The table shows individual ratings with:
+
+- **Date** — When the rating was submitted
+- **Rating** — 👍 Like or 👎 Dislike
+- **Comment** — Feedback text (if provided)
+- **Message** — Preview of the rated response
+- **User** — Who submitted the rating
+- **Actions** — Link to view the full conversation
+
+### Exporting data
+
+Export ratings for external analysis:
+
+- **JSON** — Full structured data, suitable for scripts and analysis tools
+- **CSV** — Spreadsheet-compatible format for Excel or Google Sheets
+
+!!! tip "Exports respect the current filters"
+
+    Narrow to dislikes with comments, then export, and that is what you get -
+    the filters are part of the query, not of the view.
+
+### Viewing conversations
+
+Click **"View conversation"** on any rating to open the chat interface with that conversation loaded.
+This is useful for understanding the context of a rating.
+
+## Admin conversations page
+
+Navigate to **Admin → All Conversations** (or `/admin/conversations`) to view all user conversations.
+
+This page provides:
+
+- Searchable list of all conversations
+- Filter by user email or username
+- Filter by date range (preset or custom)
+- Quick links to view conversation details
+
+## Direct conversation links
+
+You can share a direct link to a specific conversation by adding the `id` parameter to the chat URL:
+
+```
+http://localhost:3000/chat?id=550e8400-e29b-41d4-a716-446655440000
+```
+
+This is useful for:
+
+- Sharing conversation context with team members
+- Bookmarking important conversations
+- Linking from external tools or documentation
+
+Click **"View conversation"** from any rating or the admin conversations list to open a direct link.
+
+## API access
+
+For programmatic access to ratings data, use the admin API endpoints:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/admin/ratings` | GET | List ratings with pagination and filters |
+| `/admin/ratings/summary` | GET | Aggregate statistics over `from`/`to` (inclusive UTC dates, defaulting to the last 30 days) |
+| `/admin/ratings/export` | GET | Export ratings (JSON/CSV) |
+| `/admin/conversations` | GET | List all conversations |
+
+!!! warning "Every `/admin` endpoint is the deployment superadmin, not an org role"
+
+    The gate is `CurrentAppAdmin` — a signed-in user whose `users.is_app_admin` is
+    true. There is no `users.role` column, and no organization role reaches these
+    routes. See
+    [permissions](../permissions.md#layer-1-usersis_app_admin-the-deployment-superadmin).

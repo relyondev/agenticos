@@ -1,0 +1,115 @@
+/**
+ * Widget id to component. The registry (src/lib/dashboard/registry.ts) holds
+ * the decision data - gates, spans, destinations - and stays JSX-free so the
+ * coverage gate can hold it to 100%; this map holds the React halves. The
+ * page zips the two, and a registry id without a component here is a build
+ * error at the page's lookup, not a silently blank cell.
+ */
+
+import type { ComponentType } from "react";
+
+import type { WidgetId } from "@/lib/dashboard/registry";
+import { ActiveUsersWidget } from "./active-users";
+import { TopPeopleWidget } from "./top-people";
+import { AgentsAdoptionWidget } from "./agents-adoption";
+import { ApprovalsWidget } from "./approvals";
+import { BudgetHeadroomWidget } from "./budget-headroom";
+import { DepartmentQualityWidget } from "./department-quality";
+import { DepartmentSpendWidget } from "./department-spend";
+import { ConversationsWidget } from "./conversations";
+import { BackgroundJobsWidget } from "./background-jobs";
+import { HealthWidget } from "./health";
+import { KnowledgeFreshnessWidget } from "./knowledge-freshness";
+import { LatencyWidget } from "./latency";
+import { McpHealthWidget } from "./mcp-health";
+import { MembersWidget } from "./members";
+import { ModelMixWidget } from "./model-mix";
+import { MyActivityWidget } from "./my-activity";
+import { MySummaryWidget } from "./my-summary";
+import { MyAgentsWidget } from "./my-agents";
+import { MyQualityWidget } from "./my-quality";
+import { MyTopAgentsWidget } from "./my-top-agents";
+import { NotificationsWidget } from "./notifications";
+import { OrgRatingsWidget } from "./org-ratings";
+import { OutcomesWidget } from "./outcomes";
+import { PlatformWidget } from "./platform";
+import { PlatformRatingsWidget } from "./platform-ratings";
+import { RecentFailuresWidget } from "./recent-failures";
+import { RunsWidget } from "./runs";
+import { SandboxCapacityWidget } from "./sandbox-capacity";
+import { SandboxPolicyWidget } from "./sandbox-policy";
+import { SandboxSessionsWidget } from "./sandbox-sessions";
+import { SharedWithYouWidget } from "./shared-with-you";
+import { ArtifactsWidget } from "./artifacts";
+import { VoiceMinutesWidget } from "./voice-minutes";
+import { ProjectsWidget } from "./projects";
+import { RecentVisualsWidget } from "./recent-visuals";
+import { SpendWidget } from "./spend";
+import { ActivityRhythmWidget } from "./activity-rhythm";
+import { ChannelsWidget } from "./channels";
+import { RoutinesWidget } from "./routines";
+import { SuggestionsWidget } from "./suggestions";
+import { KnowledgeWidget } from "./knowledge";
+import { TablesWidget } from "./tables-widget";
+import { WorkflowsWidget } from "./workflows-widget";
+import { ApprovalOutcomesWidget } from "./approval-outcomes";
+import { WorkflowLogsWidget } from "./workflow-logs";
+import { SummaryWidget } from "./summary";
+import { SurfacesWidget } from "./surfaces";
+import { TopOrgsWidget } from "./top-orgs";
+import { VersionCompareWidget } from "./version-compare";
+import type { DashboardWidgetProps } from "./types";
+
+export const WIDGET_COMPONENTS: Record<WidgetId, ComponentType<DashboardWidgetProps>> = {
+  summary: SummaryWidget,
+  "activity-rhythm": ActivityRhythmWidget,
+  channels: ChannelsWidget,
+  routines: RoutinesWidget,
+  suggestions: SuggestionsWidget,
+  knowledge: KnowledgeWidget,
+  tables: TablesWidget,
+  workflows: WorkflowsWidget,
+  "approval-outcomes": ApprovalOutcomesWidget,
+  "workflow-logs": WorkflowLogsWidget,
+  platform: PlatformWidget,
+  health: HealthWidget,
+  "background-jobs": BackgroundJobsWidget,
+  "top-orgs": TopOrgsWidget,
+  "platform-ratings": PlatformRatingsWidget,
+  runs: RunsWidget,
+  outcomes: OutcomesWidget,
+  surfaces: SurfacesWidget,
+  agents: AgentsAdoptionWidget,
+  latency: LatencyWidget,
+  "active-users": ActiveUsersWidget,
+  "top-people": TopPeopleWidget,
+  spend: SpendWidget,
+  "model-mix": ModelMixWidget,
+  "version-compare": VersionCompareWidget,
+  approvals: ApprovalsWidget,
+  "recent-failures": RecentFailuresWidget,
+  "budget-headroom": BudgetHeadroomWidget,
+  "department-spend": DepartmentSpendWidget,
+  "department-quality": DepartmentQualityWidget,
+  "mcp-health": McpHealthWidget,
+  "knowledge-freshness": KnowledgeFreshnessWidget,
+  members: MembersWidget,
+  "org-ratings": OrgRatingsWidget,
+  "my-agents": MyAgentsWidget,
+  conversations: ConversationsWidget,
+  "my-activity": MyActivityWidget,
+  "my-summary": MySummaryWidget,
+  "my-top-agents": MyTopAgentsWidget,
+  "my-quality": MyQualityWidget,
+  "shared-with-you": SharedWithYouWidget,
+  artifacts: ArtifactsWidget,
+  "voice-minutes": VoiceMinutesWidget,
+  projects: ProjectsWidget,
+  "recent-visuals": RecentVisualsWidget,
+  "sandbox-capacity": SandboxCapacityWidget,
+  "sandbox-sessions": SandboxSessionsWidget,
+  "sandbox-policy": SandboxPolicyWidget,
+  notifications: NotificationsWidget,
+};
+
+export type { DashboardWidgetProps } from "./types";

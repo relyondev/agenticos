@@ -1,0 +1,147 @@
+"""KnowledgeBase model - scoped RAG collections (personal / org / app)."""
+
+import enum
+import uuid
+
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base, TimestampMixin
+from app.db.models.resource_grant import Visibility
+from app.db.vector_tables import VectorScope
+
+
+class KBScope(enum.StrEnum):
+    PERSONAL = "personal"
+    ORG = "org"
+    APP = "app"
+
+
+class KnowledgeBase(TimestampMixin, Base):
+    """Named, scoped wrapper around a vector-store collection."""
+
+    __tablename__ = "knowledge_bases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    scope: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=KBScope.PERSONAL.value, index=True
+    )
+    collection_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # How documents put into this collection are parsed, chunked and described.
+    # Validated as `app.services.ingestion_config.IngestionConfig`; stored as
+    # JSON so a new option does not cost a migration. Changing it affects only
+    # documents ingested afterwards.
+    ingestion_config: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    # The embedding model this collection's vectors were produced by, and the
+    # width of the column they live in. Recorded rather than configured, and
+    # immutable: `PgVectorStore` writes `embedding vector(N)` once, at creation,
+    # so a second model's vectors either cannot be written or are compared
+    # against the first model's as though they meant the same thing. Without
+    # these two columns the only record was a deployment environment variable,
+    # and changing it broke every existing collection silently.
+    embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Whose endpoint answers for that model. Unlike the two above this one is
+    # editable: the same model at the same width produces vectors in the same
+    # space wherever it is served from, so re-pointing the address and the
+    # credential leaves everything already stored valid. It used to be neither
+    # recorded nor chosen - every request went to OpenRouter, hardcoded in
+    # `EmbeddingService` - which is why an organization holding an OpenAI key
+    # could not use it and a rotated key meant re-ingesting the collection.
+    # Values are ids from `app/core/catalog/embedding_providers.json`.
+    embedding_base_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+
+    embedding_provider: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="openrouter"
+    )
+
+    # The organization vault key this collection embeds on. NULL is a collection
+    # that cannot index or search - there is no deployment-wide key - and SET
+    # NULL on delete is what a deleted secret becomes, so the resolver sees it as
+    # a key never chosen rather than as one that went missing.
+    embedding_secret_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("organization_secrets.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Where a keyless provider is reached: a `local_services` row of kind
+    # `embedding`, the organization's own or the deployment's. NULL for a keyed
+    # provider, whose address is the catalog's. SET NULL on delete for the same
+    # reason as the key above - the resolver then says the service is gone.
+    embedding_endpoint_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("local_services.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # How widely the collection is exposed inside its org; combines with the
+    # member's role scope and any explicit grant (app.services.access).
+    visibility: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=Visibility.PRIVATE.value
+    )
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    @property
+    def vector_tenant(self) -> uuid.UUID | None:
+        """The tenant this collection's runtime vector rows are stamped and scoped by.
+
+        A collection name is not unique across organizations, so two that pick the
+        same name share one physical `rag_<name>` table; this keeps each
+        organization's rows its own (#1684). An app-scoped base is deployment-wide,
+        readable by every organization, so its rows carry no tenant; every other
+        scope carries its organization (which is `None` for a personal base, whose
+        isolation is its owner check, not the row tag).
+        """
+        if self.scope == KBScope.APP.value:
+            return None
+        return self.organization_id
+
+    @property
+    def vector_scope(self) -> VectorScope:
+        """The chunks of the shared runtime table this base holds (#2537).
+
+        Its own chunks, and the unfiled chunks its tenant holds - except for a
+        personal base outside any organization, whose tenant `None` is the app
+        scope's: its own chunks are always filed under it, and the unfiled ones
+        with no tenant belong to the app-scoped base that shares the name.
+        """
+        tenant = self.vector_tenant
+        return VectorScope(
+            tenant=tenant,
+            knowledge_base_id=self.id,
+            takes_unfiled=self.scope == KBScope.APP.value or tenant is not None,
+        )
+
+    def __repr__(self) -> str:
+        return f"<KnowledgeBase(id={self.id}, name={self.name!r}, scope={self.scope})>"
+
+    __table_args__ = (
+        CheckConstraint(
+            "visibility IN ('private', 'team', 'org')", name="ck_knowledge_bases_visibility"
+        ),
+        CheckConstraint(
+            "scope <> 'org' OR organization_id IS NOT NULL",
+            name="ck_knowledge_bases_org_scope_has_org",
+        ),
+    )

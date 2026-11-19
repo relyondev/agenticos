@@ -1,0 +1,230 @@
+"""Tests for the permission catalog and the require() dependency.
+
+The catalog is the single source of truth for authorization, so these tests
+guard its invariants rather than restating the role table: a role that drifts
+into holding a permission the platform does not define, or a scope attached to
+a permission that has no rows to scope, is a bug the tests should catch before
+an endpoint does.
+"""
+
+import operator
+import uuid
+
+import pytest
+
+from app.api.deps import require
+from app.core.exceptions import AuthorizationError
+from app.core.permissions import (
+    RESOURCE_PERMS,
+    ROLE_PERMS,
+    AuthContext,
+    OrgRoleName,
+    Perm,
+    Scope,
+    assignable_roles,
+)
+
+pytestmark = pytest.mark.security
+
+
+def _ctx(role: str, *, is_app_admin: bool = False) -> AuthContext:
+    return AuthContext(
+        user_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        role=role,
+        is_app_admin=is_app_admin,
+    )
+
+
+class TestCatalogInvariants:
+    def test_every_role_is_defined(self):
+        assert set(ROLE_PERMS) == {role.value for role in OrgRoleName}
+
+    def test_roles_only_use_catalog_permissions(self):
+        for role, perms in ROLE_PERMS.items():
+            unknown = set(perms) - set(Perm)
+            assert not unknown, f"{role} holds permissions outside the catalog: {unknown}"
+
+    def test_no_role_holds_a_permission_at_scope_none(self):
+        """Absence means "not held" - an explicit NONE would be a second way to say it."""
+        for role, perms in ROLE_PERMS.items():
+            empty = [perm for perm, scope in perms.items() if scope is Scope.NONE]
+            assert not empty, f"{role} lists {empty} at scope none; drop the entry instead"
+
+    def test_global_permissions_are_never_partially_scoped(self):
+        """A global permission is binary - org-wide or not held at all."""
+        for role, perms in ROLE_PERMS.items():
+            for perm, scope in perms.items():
+                if perm not in RESOURCE_PERMS:
+                    assert scope is Scope.ALL, f"{role}.{perm} is global but scoped {scope}"
+
+    def test_owner_holds_everything(self):
+        assert set(ROLE_PERMS[OrgRoleName.OWNER]) == set(Perm)
+
+    def test_admin_cannot_delete_the_organization(self):
+        assert Perm.ORG_DELETE not in ROLE_PERMS[OrgRoleName.ADMIN]
+
+    def test_viewer_cannot_edit_anything(self):
+        viewer = ROLE_PERMS[OrgRoleName.VIEWER]
+        assert Perm.AGENTS_EDIT not in viewer
+        assert Perm.COLLECTIONS_EDIT not in viewer
+        assert Perm.SKILLS_EDIT not in viewer
+
+
+class TestScopeOrdering:
+    def test_scopes_are_ordered(self):
+        assert Scope.NONE < Scope.OWN < Scope.SHARED < Scope.TEAM < Scope.ALL
+
+    def test_every_comparison_orders_by_reach_rather_than_alphabetically(self):
+        """`Scope` is a `str`, and each of the four operators has to override it.
+
+        Left to string comparison these all invert - `"all" < "none" < "own"` -
+        so an operator that was forgotten reads as "narrower" for the widest
+        scope there is. Each one is checked in the direction where the two
+        orderings disagree.
+        """
+        assert Scope.ALL > Scope.NONE
+        assert Scope.ALL >= Scope.TEAM
+        assert Scope.NONE < Scope.ALL
+        assert Scope.NONE <= Scope.ALL
+        assert not Scope.OWN >= Scope.SHARED
+
+    def test_no_comparison_falls_back_to_string_ordering(self):
+        """A mixed comparison must raise rather than answer, in every direction.
+
+        `Scope.OWN < "shared"` is `True` as strings and `TypeError` here;
+        a silent wrong answer inside an authorization check is the failure this
+        exists to prevent.
+        """
+        for compare in (operator.lt, operator.le, operator.gt, operator.ge):
+            with pytest.raises(TypeError, match="only be compared to Scope"):
+                compare(Scope.OWN, "shared")
+
+
+class TestAuthContext:
+    def test_member_edits_only_their_own(self):
+        ctx = _ctx(OrgRoleName.MEMBER)
+        assert ctx.scope_for(Perm.AGENTS_EDIT) is Scope.OWN
+        assert ctx.scope_for(Perm.AGENTS_VIEW) is Scope.SHARED
+
+    def test_builder_sees_all_but_edits_shared(self):
+        ctx = _ctx(OrgRoleName.BUILDER)
+        assert ctx.scope_for(Perm.AGENTS_VIEW) is Scope.ALL
+        assert ctx.scope_for(Perm.AGENTS_EDIT) is Scope.SHARED
+
+    def test_operator_runs_but_does_not_build(self):
+        ctx = _ctx(OrgRoleName.OPERATOR)
+        assert ctx.has(Perm.AGENTS_RUN)
+        assert ctx.has(Perm.APPROVALS_DECIDE)
+        assert not ctx.has(Perm.AGENTS_EDIT)
+
+    def test_operator_watches_connections_but_does_not_manage_them(self):
+        """The whole point of splitting the permission: an operator can read a
+        host's sessions and ceilings without being handed create, edit and delete
+        - which is what pointing a connection at an address and attaching its
+        vault secret would have been."""
+        ctx = _ctx(OrgRoleName.OPERATOR)
+        assert ctx.has(Perm.CONNECTIONS_VIEW)
+        assert not ctx.has(Perm.CONNECTIONS_MANAGE)
+
+    @pytest.mark.parametrize("role", [OrgRoleName.OWNER, OrgRoleName.ADMIN, OrgRoleName.BUILDER])
+    def test_managing_connections_carries_watching_them(self, role: OrgRoleName):
+        """Nothing in the catalog implies one permission from another, so a role
+        that manages connections is given the read explicitly or loses the
+        listing it had before the split."""
+        ctx = _ctx(role)
+        assert ctx.has(Perm.CONNECTIONS_MANAGE)
+        assert ctx.has(Perm.CONNECTIONS_VIEW)
+
+    def test_unknown_role_holds_nothing(self):
+        ctx = _ctx("not-a-role")
+        assert ctx.permissions == {}
+        assert not ctx.has(Perm.AGENTS_VIEW)
+
+    def test_app_admin_holds_everything_regardless_of_role(self):
+        ctx = _ctx(OrgRoleName.VIEWER, is_app_admin=True)
+        assert all(ctx.has(perm) for perm in Perm)
+
+
+class TestAssignableRoles:
+    """Which roles a role may hand out, derived from the catalog (#672).
+
+    The rule is "strictly weaker than mine", so the interesting cases are the
+    two it refuses: a role cannot clone itself, and no role at all can assign
+    `owner` - ownership moves through transfer-ownership, which demotes the
+    outgoing owner in the same breath.
+    """
+
+    def test_no_role_can_assign_owner(self):
+        assert not any(
+            OrgRoleName.OWNER.value in assignable_roles(role.value) for role in OrgRoleName
+        )
+
+    @pytest.mark.parametrize("role", list(OrgRoleName))
+    def test_no_role_can_assign_its_own(self, role: OrgRoleName):
+        assert role.value not in assignable_roles(role.value)
+
+    def test_an_owner_may_assign_every_role_below_them(self):
+        assert assignable_roles(OrgRoleName.OWNER.value) == {
+            OrgRoleName.ADMIN.value,
+            OrgRoleName.BUILDER.value,
+            OrgRoleName.OPERATOR.value,
+            OrgRoleName.MEMBER.value,
+            OrgRoleName.VIEWER.value,
+        }
+
+    def test_an_admin_may_not_assign_admin(self):
+        assert assignable_roles(OrgRoleName.ADMIN.value) == {
+            OrgRoleName.BUILDER.value,
+            OrgRoleName.OPERATOR.value,
+            OrgRoleName.MEMBER.value,
+            OrgRoleName.VIEWER.value,
+        }
+
+    def test_a_role_cannot_hand_out_a_permission_it_lacks(self):
+        """An operator holds `approvals:decide` at ALL; a builder does not."""
+        assert OrgRoleName.OPERATOR.value not in assignable_roles(OrgRoleName.BUILDER.value)
+
+    def test_a_wider_scope_is_not_assignable_from_a_narrower_one(self):
+        """A member edits their own agents; a builder edits every shared one."""
+        assert OrgRoleName.BUILDER.value not in assignable_roles(OrgRoleName.MEMBER.value)
+
+    def test_a_custom_role_is_bounded_by_what_it_actually_holds(self, monkeypatch):
+        """The reason this is not keyed on a role name.
+
+        A custom role (Phase 2) holding `roles:manage` is exactly what a check
+        written against the literal `admin` cannot see, and it is the path by
+        which `owner` would have been mintable.
+        """
+        monkeypatch.setitem(ROLE_PERMS, "test:role-admin", {Perm.ROLES_MANAGE: Scope.ALL})
+        assert assignable_roles("test:role-admin") == frozenset()
+
+    def test_an_unknown_role_may_assign_nothing(self):
+        assert assignable_roles("nonexistent") == frozenset()
+
+
+class TestRequireDependency:
+    @pytest.mark.anyio
+    async def test_passes_when_permission_held(self):
+        ctx = _ctx(OrgRoleName.ADMIN)
+        dependency = require(Perm.MEMBERS_MANAGE)
+        assert await dependency(ctx) is ctx
+
+    @pytest.mark.anyio
+    async def test_raises_when_permission_missing(self):
+        ctx = _ctx(OrgRoleName.MEMBER)
+        dependency = require(Perm.MEMBERS_MANAGE)
+        with pytest.raises(AuthorizationError) as exc:
+            await dependency(ctx)
+        assert exc.value.details is not None
+        assert "members:manage" in exc.value.details["required"]
+
+    @pytest.mark.anyio
+    async def test_reports_every_missing_permission(self):
+        """The error names all of them so a caller fixes the role once, not twice."""
+        ctx = _ctx(OrgRoleName.VIEWER)
+        dependency = require(Perm.MEMBERS_MANAGE, Perm.BUDGETS_MANAGE)
+        with pytest.raises(AuthorizationError) as exc:
+            await dependency(ctx)
+        assert exc.value.details is not None
+        assert set(exc.value.details["required"]) == {"members:manage", "budgets:manage"}

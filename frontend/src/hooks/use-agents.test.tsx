@@ -1,0 +1,1213 @@
+import { QueryClient, QueryClientProvider, useIsMutating } from "@tanstack/react-query";
+import { renderHook, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { useOnboardingStore } from "@/stores/onboarding-store";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+
+import {
+  useAgent,
+  useAgentCeiling,
+  useAgentVersion,
+  useAgentVersions,
+  useAllAgentVersions,
+  useAgents,
+  useAddToAgent,
+  useCapabilityCatalog,
+  useDelegationTree,
+  usePromptVariables,
+} from "./use-agents";
+import { useAgentEnvironments } from "./use-agent-environments";
+import { apiClient } from "@/lib/api-client";
+import { ApiError } from "@/lib/api-error";
+import { qk } from "@/lib/query-keys";
+import type { AgentSpec, SpecialistSpec } from "@/types/agents";
+
+const SPEC: AgentSpec = {
+  spec_version: 3,
+  name: "Support",
+  description: null,
+  instructions: "",
+  model_profile_id: null,
+  model_settings: {},
+  capabilities: [],
+  collection_ids: [],
+  skill_ids: [],
+  context_ids: [],
+  mcp_servers: [],
+  budget: null,
+};
+
+vi.mock("@/lib/api-client", () => ({
+  apiClient: {
+    get: vi.fn(),
+    post: vi.fn(),
+    put: vi.fn(),
+    patch: vi.fn(),
+    delete: vi.fn(),
+    upload: vi.fn(),
+  },
+}));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+beforeEach(() => {
+  useOnboardingStore.setState({ isOpen: false, flowId: null, flowAgentId: null, index: 0 });
+});
+
+describe("useAgents", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("lists the agents the caller can see", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({
+      items: [{ id: "a1", slug: "support", name: "Support", status: "published" }],
+      total: 1,
+    });
+    const { result } = renderHook(() => useAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.agents).toHaveLength(1);
+  });
+
+  it("threads the discovery facet into the request as sorted tuple pairs", async () => {
+    // Repeated keys survive only as tuple pairs, and the facet is sorted so the
+    // order the chips were typed in does not split the cache.
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    const categories = ["sales", "billing"];
+
+    const { result } = renderHook(() => useAgents({ categories, tags: ["urgent"] }), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(apiClient.get).toHaveBeenCalledWith("/agents", {
+      params: [
+        ["category", "billing"],
+        ["category", "sales"],
+        ["tag", "urgent"],
+      ],
+    });
+    // The source array the caller holds is never sorted in place.
+    expect(categories).toEqual(["sales", "billing"]);
+  });
+
+  it("keeps the plain listing request unfiltered so it shares one cache entry", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+
+    const { result } = renderHook(() => useAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(apiClient.get).toHaveBeenCalledWith("/agents", undefined);
+  });
+
+  it("reads every page, so a picker is not cut off after the first", async () => {
+    const agent = (id: string) => ({ id, name: id });
+    vi.mocked(apiClient.get)
+      .mockResolvedValueOnce({ items: [agent("a1"), agent("a2")], total: 4 })
+      .mockResolvedValueOnce({ items: [agent("a3"), agent("a4")], total: 4 });
+    const { result } = renderHook(() => useAgents({ includeArchived: true }), {
+      wrapper,
+    });
+
+    await waitFor(() => expect(result.current.agents).toHaveLength(4));
+    expect(apiClient.get).toHaveBeenLastCalledWith("/agents", {
+      params: [
+        ["include_archived", "true"],
+        ["skip", "2"],
+        ["limit", "100"],
+      ],
+    });
+  });
+
+  it("stops at a page that comes back empty, whatever the total said", async () => {
+    vi.mocked(apiClient.get)
+      .mockResolvedValueOnce({ items: [{ id: "a1", name: "a1" }], total: 9 })
+      .mockResolvedValueOnce({ items: [], total: 9 });
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await waitFor(() => expect(result.current.agents).toHaveLength(1));
+    expect(apiClient.get).toHaveBeenCalledTimes(2);
+  });
+
+  it("posts a whole spec when creating", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support" });
+
+    const { result } = renderHook(() => useAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await result.current.create.mutateAsync({ spec: SPEC });
+
+    expect(apiClient.post).toHaveBeenCalledWith("/agents", {
+      // Whatever version was read round-trips; the client never authors one.
+      spec: expect.objectContaining({ name: "Support", spec_version: 3 }),
+    });
+  });
+
+  it("passes on a request for the starter agent's defaults", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support" });
+
+    const { result } = renderHook(() => useAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await result.current.create.mutateAsync({ spec: SPEC, from_starter: true });
+
+    expect(apiClient.post).toHaveBeenCalledWith(
+      "/agents",
+      expect.objectContaining({ from_starter: true }),
+    );
+  });
+});
+
+describe("useAgent draft", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("sends every per-tool decision to the server exactly as the Builder set it", async () => {
+    // The spec is PUT whole, so nothing here picks fields - which is precisely
+    // why a field added to the spec can go missing without anything failing.
+    // A tool held for approval that arrives at the server unheld is the whole
+    // feature quietly not existing.
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: SPEC });
+    vi.mocked(apiClient.put).mockResolvedValue({ id: "a1", name: "Support" });
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await result.current.saveDraft.mutateAsync({
+      ...SPEC,
+      capabilities: [
+        {
+          id: "email",
+          config: {},
+          approval: "never",
+          tool_approval: { send_email: "required" },
+          tool_overrides: { send_email: { name: "send_invoice_email" } },
+          secret_id: "sec-1",
+          enabled: true,
+        },
+      ],
+    });
+
+    expect(apiClient.put).toHaveBeenCalledWith("/agents/a1/draft", {
+      spec: expect.objectContaining({
+        capabilities: [
+          expect.objectContaining({
+            approval: "never",
+            tool_approval: { send_email: "required" },
+            tool_overrides: { send_email: { name: "send_invoice_email" } },
+            // A dropped secret reference is a capability that fails at run time
+            // holding a credential the organization did select.
+            secret_id: "sec-1",
+          }),
+        ],
+      }),
+    });
+  });
+});
+
+describe("useAgent validation", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("returns an empty list when the draft is publishable", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.post).mockResolvedValue(undefined);
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(await result.current.validate()).toEqual({ problems: [], fields: [] });
+  });
+
+  it("returns every problem rather than throwing", async () => {
+    // A rejected draft is a normal state while editing. Fixing a form one
+    // error per round trip is the difference between a Builder people use and
+    // one they avoid.
+    //
+    // Rejecting with a real `ApiError` carrying the real envelope is what makes
+    // this test worth having. It used to reject with `{details: {problems}}` -
+    // a shape nothing produces - and so it passed for months against a hook
+    // that read a property `ApiError` does not have and threw the list away.
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.post).mockRejectedValue(
+      new ApiError(400, "This agent cannot be published yet", {
+        error: {
+          code: "BAD_REQUEST",
+          message: "This agent cannot be published yet",
+          details: { problems: ["Unknown capability: typo", "No model selected"] },
+        },
+      }),
+    );
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(await result.current.validate()).toEqual({
+      problems: ["Unknown capability: typo", "No model selected"],
+      fields: [],
+    });
+  });
+
+  it("carries the inputs a refused capability configuration named", async () => {
+    // The half that says *which box to fix*. Publish validation aggregates
+    // every problem in a spec into sentences, and it used to keep only the
+    // sentence for a refused config - so `default_top_k: 999` reached the
+    // Builder as one line about the capability and marked nothing (#882).
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.post).mockRejectedValue(
+      new ApiError(400, "This agent cannot be published yet", {
+        error: {
+          code: "BAD_REQUEST",
+          message: "This agent cannot be published yet",
+          details: {
+            problems: ["Capability 'knowledge': Invalid configuration for capability 'knowledge'"],
+            fields: [
+              {
+                field: "capabilities.knowledge.config.default_top_k",
+                message: "Input should be less than or equal to 50",
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    const refusal = await result.current.validate();
+    expect(refusal.fields).toEqual([
+      {
+        field: "capabilities.knowledge.config.default_top_k",
+        message: "Input should be less than or equal to 50",
+      },
+    ]);
+    // And still as a line, because most of a spec is not a generated form.
+    expect(refusal.problems).toHaveLength(1);
+  });
+
+  it("falls back to the error message when the server sends no problem list", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("Service unavailable"));
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(await result.current.validate()).toEqual({
+      problems: ["Service unavailable"],
+      fields: [],
+    });
+  });
+
+  it("does not turn a refused permission into a list of spec problems", async () => {
+    // A 403 says the caller may not validate, not that the draft is wrong.
+    // Rendering it in the "cannot be published yet" banner would blame the
+    // agent for something the reader cannot fix by editing it.
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.post).mockRejectedValue(
+      new ApiError(403, "You cannot edit this agent", {
+        error: {
+          code: "AUTHORIZATION_ERROR",
+          message: "You cannot edit this agent",
+          details: null,
+        },
+      }),
+    );
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(await result.current.validate()).toEqual({
+      problems: ["You cannot edit this agent"],
+      fields: [],
+    });
+  });
+
+  it("does not fetch until an agent is selected", () => {
+    renderHook(() => useAgent(null), { wrapper });
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+});
+
+describe("useAgent rollback", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("publishes a new version rather than moving a pointer backwards", async () => {
+    // History stays linear: the timeline shows that a rollback happened rather
+    // than pretending the bad version never existed.
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "v3", version: 3 });
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await result.current.rollback.mutateAsync("v1");
+
+    expect(apiClient.post).toHaveBeenCalledWith("/agents/a1/rollback", { version_id: "v1" });
+  });
+});
+
+describe("useAgent avatar colour", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("sends the chosen slot to the agent's colour endpoint", async () => {
+    // A column, not the spec: it patches the row directly, like the picture.
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.patch).mockResolvedValue({ id: "a1", avatar_color: 3 });
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await result.current.setColor.mutateAsync(3);
+
+    expect(apiClient.patch).toHaveBeenCalledWith("/agents/a1/avatar-color", { color: 3 });
+  });
+
+  it("reports a failed colour change rather than swallowing it", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.patch).mockRejectedValue(new Error("nope"));
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await expect(result.current.setColor.mutateAsync(null)).rejects.toThrow();
+  });
+});
+
+describe("useAgent metadata", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("patches the row directly with the raw typed values", async () => {
+    // A command, not a spec edit - both facets are always meant and an empty
+    // list clears one, so it hits its own endpoint like the avatar colour.
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.patch).mockResolvedValue({ id: "a1", categories: ["sales"], tags: [] });
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await result.current.setMetadata.mutateAsync({ categories: ["Sales"], tags: [] });
+
+    expect(apiClient.patch).toHaveBeenCalledWith("/agents/a1/metadata", {
+      categories: ["Sales"],
+      tags: [],
+    });
+  });
+
+  it("reports a refused metadata save rather than swallowing it", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.patch).mockRejectedValue(new Error("too many tags"));
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await expect(
+      result.current.setMetadata.mutateAsync({ categories: [], tags: Array(21).fill("x") }),
+    ).rejects.toThrow();
+    expect(toast.error).toHaveBeenCalledWith("too many tags");
+  });
+
+  it("serves the agent over A2A through its own endpoint", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.put).mockResolvedValue({ id: "a1", a2a_enabled: true });
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await result.current.setA2a.mutateAsync(true);
+
+    expect(apiClient.put).toHaveBeenCalledWith("/agents/a1/a2a", { enabled: true });
+  });
+
+  it("reports a refused A2A switch", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: {} });
+    vi.mocked(apiClient.put).mockRejectedValue(new Error("Publish the agent first"));
+
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await expect(result.current.setA2a.mutateAsync(true)).rejects.toThrow();
+    expect(toast.error).toHaveBeenCalledWith("Publish the agent first");
+  });
+});
+
+describe("useCapabilityCatalog", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("reads the catalog the Builder renders", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({
+      items: [{ id: "knowledge", name: "Knowledge search", category: "knowledge" }],
+      total: 1,
+    });
+    const { result } = renderHook(() => useCapabilityCatalog(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.capabilities[0]?.id).toBe("knowledge");
+  });
+
+  it("names and describes each capability in the console's words", async () => {
+    // "Sandbox", not the registry's sentence, everywhere the Builder lists it;
+    // one the console has no words for keeps the registry's (#2070).
+    vi.mocked(apiClient.get).mockResolvedValue({
+      items: [
+        { id: "sandbox", name: "Sandbox", category: "analysis", description: "Registry words." },
+        { id: "from_a_plugin", name: "Plugin", category: "x", description: "Its own words." },
+      ],
+      total: 2,
+    });
+    const { result } = renderHook(() => useCapabilityCatalog(), { wrapper });
+    await waitFor(() => expect(result.current.capabilities).toHaveLength(2));
+
+    const [sandbox, plugin] = result.current.capabilities;
+    expect(sandbox?.description).toMatch(/^Gives the agent its own small computer/);
+    expect(plugin?.description).toBe("Its own words.");
+  });
+});
+
+/**
+ * The mutation callbacks.
+ *
+ * Each one invalidates the agent cache and then says something. They look like
+ * boilerplate and are not: `create` is the only mutation here that deliberately
+ * does **not** toast its failure, because the things that stop an agent being
+ * created are things the dialog can fix in place - and a toast would put the
+ * message somewhere it cannot be acted on and then take it away.
+ */
+describe("useAgents mutations", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("says what was created, by name", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1", name: "Support" });
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await result.current.create.mutateAsync({ spec: SPEC });
+
+    expect(toast.success).toHaveBeenCalledWith("Created Support");
+  });
+
+  it("records its own created agent before refreshing a guided create's ceiling", async () => {
+    let created = false;
+    let seenDuringRefresh: string | null = null;
+    vi.mocked(apiClient.get).mockImplementation(async () => {
+      if (created) seenDuringRefresh = useOnboardingStore.getState().flowAgentId;
+      return { items: [], total: 0 };
+    });
+    vi.mocked(apiClient.post).mockImplementation(async () => {
+      created = true;
+      return { id: "new-agent", name: "New" };
+    });
+    useOnboardingStore.getState().openFlow("create-agent");
+    const { result } = renderHook(() => useAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await result.current.create.mutateAsync({ spec: SPEC });
+    expect(seenDuringRefresh).toBe("new-agent");
+    expect(useOnboardingStore.getState().flowAgentId).toBe("new-agent");
+  });
+
+  it("exposes a pending create to the coach until its response settles", async () => {
+    const response = Promise.withResolvers<{ id: string; name: string }>();
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockReturnValue(response.promise);
+    const { result } = renderHook(
+      () => ({
+        agents: useAgents(),
+        creating: useIsMutating({ mutationKey: qk.agents.create() }),
+      }),
+      { wrapper },
+    );
+    const pending = result.current.agents.create.mutateAsync({ spec: SPEC });
+    await waitFor(() => expect(result.current.creating).toBe(1));
+    response.resolve({ id: "new-agent", name: "New" });
+    await pending;
+    await waitFor(() => expect(result.current.creating).toBe(0));
+  });
+
+  it.each(["closed", "other-flow", "later-step", "already-bound"])(
+    "does not replace a guided agent for an unrelated create: %s",
+    async (state) => {
+      const flow = useOnboardingStore.getState();
+      flow.openFlow(state === "other-flow" ? "create-skill" : "create-agent");
+      if (state === "closed") flow.close();
+      if (state === "later-step") flow.setIndex(1);
+      if (state === "already-bound") flow.setFlowAgentId("original-agent");
+      vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+      vi.mocked(apiClient.post).mockResolvedValue({ id: "unrelated-agent", name: "Other" });
+      const { result } = renderHook(() => useAgents(), { wrapper });
+      await result.current.create.mutateAsync({ spec: SPEC });
+      expect(useOnboardingStore.getState().flowAgentId).toBe(
+        state === "already-bound" ? "original-agent" : null,
+      );
+    },
+  );
+
+  it.each(["closed", "reopened", "other-flow", "page-tour", "later-step", "already-bound"])(
+    "ignores a late create after its original walk changes: %s",
+    async (transition) => {
+      const response = Promise.withResolvers<{ id: string; name: string }>();
+      vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+      vi.mocked(apiClient.post).mockReturnValue(response.promise);
+      const flow = useOnboardingStore.getState();
+      flow.openFlow("create-agent");
+      const { result } = renderHook(() => useAgents(), { wrapper });
+      const pending = result.current.create.mutateAsync({ spec: SPEC });
+      await waitFor(() => expect(apiClient.post).toHaveBeenCalledOnce());
+      if (transition === "closed") flow.close();
+      if (transition === "reopened") flow.openFlow("create-agent");
+      if (transition === "other-flow") flow.openFlow("create-skill");
+      if (transition === "page-tour") flow.openPage();
+      if (transition === "later-step") flow.setIndex(1);
+      if (transition === "already-bound") flow.setFlowAgentId("original-agent");
+      response.resolve({ id: "late-agent", name: "Late" });
+      await pending;
+      expect(useOnboardingStore.getState().flowAgentId).toBe(
+        transition === "already-bound" ? "original-agent" : null,
+      );
+    },
+  );
+
+  it("leaves a failed creation to the dialog rather than toasting it", async () => {
+    // The regression this guards: a toast here duplicates the field-level
+    // message the dialog already shows, in a place nobody can act on.
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("handle taken"));
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await expect(result.current.create.mutateAsync({ spec: SPEC })).rejects.toThrow("handle taken");
+
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("says a clone is a draft, because nothing was published", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a2", name: "Support copy" });
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await result.current.clone.mutateAsync("a1");
+
+    expect(apiClient.post).toHaveBeenCalledWith("/agents/a1/clone", {});
+    expect(toast.success).toHaveBeenCalledWith(
+      "Created Support copy - a draft, nothing published yet",
+    );
+  });
+
+  it("reports a failed clone", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("nope"));
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await expect(result.current.clone.mutateAsync("a1")).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("nope");
+  });
+
+  it("sends the specialist and its model fallback when promoting", async () => {
+    // The specialist whole, and the model a null profile falls back to - the
+    // surface handles the toast, so the hook only carries the request.
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a2", name: "invoice-parser" });
+    const specialist = {
+      name: "invoice-parser",
+      description: "Pulls line items out of an invoice",
+      instructions: "Read the invoice.",
+      model_profile_id: null,
+      model_settings: {},
+      capabilities: [],
+      collection_ids: [],
+      skill_ids: [],
+      context_ids: [],
+      max_steps: null,
+      preferred_mode: null,
+    };
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await result.current.promote.mutateAsync({ specialist, fallbackModelProfileId: "m1" });
+
+    expect(apiClient.post).toHaveBeenCalledWith("/agents/promote", {
+      specialist,
+      fallback_model_profile_id: "m1",
+    });
+  });
+
+  it("says archiving keeps the history", async () => {
+    // The one thing somebody hesitating over the button wants to know.
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "a1" });
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await result.current.archive.mutateAsync("a1");
+
+    expect(toast.success).toHaveBeenCalledWith("Agent archived. Its history and runs are kept.");
+  });
+
+  it("reports a failed archive", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("busy"));
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await expect(result.current.archive.mutateAsync("a1")).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("busy");
+  });
+
+  it("says a restored agent is live when it went back to published", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ name: "Support", status: "published" });
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await result.current.unarchive.mutateAsync("a1");
+
+    expect(toast.success).toHaveBeenCalledWith("Support is live again");
+  });
+
+  it("says a restored agent needs publishing when it came back a draft", async () => {
+    // Unarchiving does not publish, and telling somebody it is "live again" when
+    // it answers nothing would be the wrong half of the truth.
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ name: "Support", status: "draft" });
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await result.current.unarchive.mutateAsync("a1");
+
+    expect(toast.success).toHaveBeenCalledWith("Support is back as a draft - publish it to run it");
+  });
+
+  it("reports a failed restore", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("gone"));
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await expect(result.current.unarchive.mutateAsync("a1")).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("gone");
+  });
+
+  it("deletes an agent", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.delete).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await result.current.remove.mutateAsync("a1");
+
+    expect(apiClient.delete).toHaveBeenCalledWith("/agents/a1");
+    expect(toast.success).toHaveBeenCalledWith("Agent deleted");
+  });
+
+  it("reports a failed delete", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.delete).mockRejectedValue(new Error("in use"));
+    const { result } = renderHook(() => useAgents(), { wrapper });
+
+    await expect(result.current.remove.mutateAsync("a1")).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("in use");
+  });
+});
+
+const SPECIALIST: SpecialistSpec = {
+  name: "invoice-parser",
+  description: "Pulls line items out of an invoice",
+  instructions: "Read the invoice.",
+  model_profile_id: null,
+  model_settings: {},
+  capabilities: [],
+  collection_ids: [],
+  skill_ids: [],
+  context_ids: [],
+  max_steps: null,
+  preferred_mode: null,
+};
+
+describe("the agent ceiling", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function shared() {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const Wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    return { client, wrapper: Wrapper };
+  }
+
+  it("reads the ceiling from its own route, and is unknown until it lands", async () => {
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.get).mockReturnValue(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useAgentCeiling(), { wrapper });
+    expect(result.current).toEqual({ ceiling: null, known: false });
+
+    answer({ limit: 3, held: 3, at_limit: true });
+    await waitFor(() => expect(result.current.known).toBe(true));
+    expect(result.current.ceiling).toEqual({ limit: 3, held: 3, at_limit: true });
+    expect(apiClient.get).toHaveBeenCalledWith("/agents/ceiling");
+  });
+
+  it("is known without asking when disabled, for a caller with no create to gate", () => {
+    const { result } = renderHook(() => useAgentCeiling({ enabled: false }), { wrapper });
+    expect(result.current).toEqual({ ceiling: null, known: true });
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("counts a failed read as known, leaving the refusal to the server", async () => {
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("down"));
+    const { result } = renderHook(() => useAgentCeiling(), { wrapper });
+    await waitFor(() => expect(result.current.known).toBe(true));
+    expect(result.current.ceiling).toBeNull();
+  });
+
+  it("discards a cached refusal when the ceiling refresh fails", async () => {
+    vi.mocked(apiClient.get).mockResolvedValueOnce({ limit: 1, held: 1, at_limit: true });
+    const { client, wrapper: Wrapper } = shared();
+    const { result } = renderHook(() => useAgentCeiling(), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.ceiling?.at_limit).toBe(true));
+    vi.mocked(apiClient.get).mockRejectedValueOnce(new Error("unavailable"));
+    await client.invalidateQueries({ queryKey: qk.agents.ceiling() });
+    await waitFor(() => expect(result.current.ceiling).toBeNull());
+    expect(result.current.known).toBe(true);
+  });
+
+  it("is kept fresher than the list and refetched on focus", async () => {
+    // Another member's archive or a raised limit reaches this caller through no
+    // event of theirs.
+    vi.mocked(apiClient.get).mockResolvedValue({ limit: null, held: null, at_limit: false });
+    const { client, wrapper: Wrapper } = shared();
+    renderHook(() => useAgentCeiling(), { wrapper: Wrapper });
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalled());
+    const options = client.getQueryCache().find({ queryKey: qk.agents.ceiling() })?.options;
+    expect(options).toMatchObject({ staleTime: 30_000, refetchOnWindowFocus: true });
+  });
+
+  it.each([
+    ["create", (r: ReturnType<typeof useAgents>) => r.create.mutateAsync({ spec: SPEC })],
+    ["clone", (r: ReturnType<typeof useAgents>) => r.clone.mutateAsync("a1")],
+    ["unarchive", (r: ReturnType<typeof useAgents>) => r.unarchive.mutateAsync("a1")],
+    [
+      "promote",
+      (r: ReturnType<typeof useAgents>) =>
+        r.promote.mutateAsync({ specialist: SPECIALIST, fallbackModelProfileId: null }),
+    ],
+  ])("recounts after a refused %s", async (_name, run) => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("at the limit"));
+    const { client, wrapper: Wrapper } = shared();
+    client.setQueryData(qk.agents.ceiling(), { limit: 5, held: 4, at_limit: false });
+    const { result } = renderHook(() => useAgents(), { wrapper: Wrapper });
+
+    await expect(run(result.current)).rejects.toThrow("at the limit");
+
+    expect(client.getQueryState(qk.agents.ceiling())?.isInvalidated).toBe(true);
+  });
+
+  it("hands a refused create to the dialog without waiting for the recount", async () => {
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("handle taken"));
+    let reads = 0;
+    vi.mocked(apiClient.get).mockImplementation(() => {
+      reads += 1;
+      // The first ceiling read answers; the recount after the refusal never does.
+      return reads === 1
+        ? Promise.resolve({ limit: 5, held: 1, at_limit: false })
+        : new Promise(() => {});
+    });
+    const { wrapper: Wrapper } = shared();
+    const { result } = renderHook(
+      () => ({ agents: useAgents({ enabled: false }), ceiling: useAgentCeiling() }),
+      {
+        wrapper: Wrapper,
+      },
+    );
+    await waitFor(() => expect(result.current.ceiling.known).toBe(true));
+
+    await expect(result.current.agents.create.mutateAsync({ spec: SPEC })).rejects.toThrow(
+      "handle taken",
+    );
+  });
+});
+
+describe("useAgent mutations", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("saves a draft without announcing it", async () => {
+    // Autosave: a toast on every keystroke-debounce would be unusable.
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1" });
+    vi.mocked(apiClient.put).mockResolvedValue({ id: "a1" });
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+
+    await result.current.saveDraft.mutateAsync(SPEC);
+
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed autosave, because the work is at risk", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1" });
+    vi.mocked(apiClient.put).mockRejectedValue(new Error("conflict"));
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+
+    await expect(result.current.saveDraft.mutateAsync(SPEC)).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("conflict");
+  });
+
+  it("names the version it published", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1" });
+    vi.mocked(apiClient.post).mockResolvedValue({ version: 4 });
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+
+    await result.current.publish.mutateAsync("A note");
+
+    expect(apiClient.post).toHaveBeenCalledWith("/agents/a1/publish", { note: "A note" });
+    expect(toast.success).toHaveBeenCalledWith("Published v4");
+  });
+
+  it("refetches the environments after a publish, because the default one moved", async () => {
+    // The environments cache is not under `qk.agents`, so the shared
+    // invalidation never reaches it - and a panel still naming the old pin
+    // right after publishing is the publish dialog's sentence contradicted.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const shared = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.post).mockResolvedValue({ version: 4 });
+    const { result } = renderHook(
+      () => ({ agent: useAgent("a1"), environments: useAgentEnvironments("a1") }),
+      { wrapper: shared },
+    );
+    await waitFor(() => expect(result.current.environments.isLoading).toBe(false));
+    const fetches = () =>
+      vi.mocked(apiClient.get).mock.calls.filter(([path]) => path === "/agents/a1/environments")
+        .length;
+    const before = fetches();
+
+    await result.current.agent.publish.mutateAsync(null);
+
+    await waitFor(() => expect(fetches()).toBeGreaterThan(before));
+  });
+
+  it("switches an environment between waiting and following publishes", async () => {
+    // The mode is what decides whether a publish moves this pointer at all, so
+    // it is a PATCH of that one field - never bundled with a promotion, which
+    // is a different decision with a different audit entry.
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.patch).mockResolvedValue({ id: "e1" });
+    const { result } = renderHook(() => useAgentEnvironments("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await result.current.setReleaseMode.mutateAsync({
+      environmentId: "e1",
+      tracksLatest: true,
+    });
+
+    expect(apiClient.patch).toHaveBeenCalledWith("/agents/a1/environments/e1", {
+      tracks_latest: true,
+    });
+    expect(toast.success).toHaveBeenCalledWith("Release mode saved");
+  });
+
+  it("reports a refused release-mode change", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(apiClient.patch).mockRejectedValue(new Error("nope"));
+    const { result } = renderHook(() => useAgentEnvironments("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    await expect(
+      result.current.setReleaseMode.mutateAsync({ environmentId: "e1", tracksLatest: false }),
+    ).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("nope");
+  });
+
+  it("reports a refused publish", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1" });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("spec invalid"));
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+
+    await expect(result.current.publish.mutateAsync(null)).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("spec invalid");
+  });
+
+  it("reports a failed rollback", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1" });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("no such version"));
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+
+    await expect(result.current.rollback.mutateAsync("v9")).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("no such version");
+  });
+
+  it("uploads an avatar and says so", async () => {
+    // Not part of the spec, so it takes effect at once rather than at publish.
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1" });
+    vi.mocked(apiClient.upload).mockResolvedValue({ id: "a1" });
+    const file = new File(["x"], "face.png", { type: "image/png" });
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+
+    await result.current.setAvatar.mutateAsync(file);
+
+    expect(apiClient.upload).toHaveBeenCalledWith("/agents/a1/avatar", file);
+    expect(toast.success).toHaveBeenCalledWith("Avatar updated");
+  });
+
+  it("reports a rejected avatar", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1" });
+    vi.mocked(apiClient.upload).mockRejectedValue(new Error("too large"));
+    const { result } = renderHook(() => useAgent("a1"), { wrapper });
+
+    await expect(
+      result.current.setAvatar.mutateAsync(new File(["x"], "face.png")),
+    ).rejects.toThrow();
+
+    expect(toast.error).toHaveBeenCalledWith("too large");
+  });
+});
+
+/**
+ * The version timeline, and one version's frozen spec.
+ *
+ * Two queries rather than one: the timeline is read every time the history opens
+ * and a spec is the whole configuration of an agent, so specs are fetched per
+ * version - and cached for the session, because a published version never
+ * changes.
+ */
+describe("an agent's versions", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("reads the timeline for one agent", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [{ id: "v1", version: 1 }], total: 1 });
+
+    const { result } = renderHook(() => useAgentVersions("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    // One page, the size the history card reads. A caller needing every version
+    // uses `useAllAgentVersions`, which walks the pages.
+    expect(apiClient.get).toHaveBeenCalledWith("/agents/a1/versions", {
+      params: { skip: "0", limit: "10" },
+    });
+    expect(result.current.versions).toHaveLength(1);
+    expect(result.current.total).toBe(1);
+  });
+
+  it("asks for the page the history card is showing", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 60 });
+
+    const { result } = renderHook(() => useAgentVersions("a1", { skip: 10, limit: 10 }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(apiClient.get).toHaveBeenCalledWith("/agents/a1/versions", {
+      params: { skip: "10", limit: "10" },
+    });
+    // Every version, not the length of this page: the listing used to report
+    // its own cap, so ten versions were unreachable and nothing said so.
+    expect(result.current.total).toBe(60);
+  });
+
+  it("does not fetch a timeline before an agent is chosen", () => {
+    renderHook(() => useAgentVersions(null), { wrapper });
+
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("walks every page for a picker, because one request is capped", async () => {
+    // The defect: the pickers read one request of fifty and the route reports a
+    // larger `total`, so an agent published more than fifty times offered its
+    // newest fifty - and the version an environment is pinned to could be missing
+    // from the picker that repins it. A `<Select>` with no matching option renders
+    // a blank trigger, so it reads as "no version" rather than as a hidden one.
+    vi.mocked(apiClient.get)
+      .mockResolvedValueOnce({
+        items: Array.from({ length: 100 }, (_, i) => ({ id: `v${230 - i}`, version: 230 - i })),
+        total: 230,
+      })
+      .mockResolvedValueOnce({
+        items: Array.from({ length: 100 }, (_, i) => ({ id: `v${130 - i}`, version: 130 - i })),
+        total: 230,
+      })
+      .mockResolvedValueOnce({
+        items: Array.from({ length: 30 }, (_, i) => ({ id: `v${30 - i}`, version: 30 - i })),
+        total: 230,
+      });
+
+    const { result } = renderHook(() => useAllAgentVersions("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.versions).toHaveLength(230);
+    expect(result.current.total).toBe(230);
+    expect(vi.mocked(apiClient.get).mock.calls.map(([, options]) => options)).toEqual([
+      { params: { skip: "0", limit: "100" } },
+      { params: { skip: "100", limit: "100" } },
+      { params: { skip: "200", limit: "100" } },
+    ]);
+  });
+
+  it("stops walking when a page answers nothing, rather than looping", async () => {
+    // A publication deleted between two requests leaves `total` larger than what
+    // is there to read, and a `while` trusting the count alone would spin.
+    vi.mocked(apiClient.get)
+      .mockResolvedValueOnce({ items: [{ id: "v2", version: 2 }], total: 9 })
+      .mockResolvedValueOnce({ items: [], total: 9 });
+
+    const { result } = renderHook(() => useAllAgentVersions("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.versions).toHaveLength(1);
+    expect(apiClient.get).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops walking when the first page is empty", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 4 });
+
+    const { result } = renderHook(() => useAllAgentVersions("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.versions).toEqual([]);
+    expect(apiClient.get).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks for nothing before an agent is chosen", () => {
+    renderHook(() => useAllAgentVersions(null), { wrapper });
+
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("fetches one version's spec on its own endpoint", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "v1", version: 1, spec: SPEC });
+
+    const { result } = renderHook(() => useAgentVersion("a1", "v1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(apiClient.get).toHaveBeenCalledWith("/agents/a1/versions/v1");
+    expect(result.current.version?.spec.name).toBe("Support");
+  });
+
+  it("does not fetch a spec until both the agent and the version are known", () => {
+    // The diff mounts with one side unchosen; a request for
+    // `/agents/a1/versions/null` would answer 404 and read as a deleted version.
+    renderHook(() => useAgentVersion("a1", null), { wrapper });
+
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("hands back the failure rather than an empty spec", async () => {
+    // The history renders "pick two versions" for an unresolved side, which is
+    // only truthful if the caller can tell a refusal from a pending fetch.
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("Version not found"));
+
+    const { result } = renderHook(() => useAgentVersion("a1", "v9"), { wrapper });
+
+    await waitFor(() => expect(result.current.error).toBeTruthy());
+    expect(result.current.version).toBeUndefined();
+  });
+});
+
+describe("the delegation tree", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("reads the tree from its own endpoint", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ truncated: true, nodes: [] });
+
+    const { result } = renderHook(() => useDelegationTree("a1"), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(apiClient.get).toHaveBeenCalledWith("/agents/a1/delegation-tree");
+    expect(result.current.tree?.truncated).toBe(true);
+  });
+
+  it("does not walk the tree while nothing shows it", () => {
+    // The server resolves and access-checks every pinned version to answer
+    // this; the map dialog is the one caller, so a closed dialog costs nothing.
+    renderHook(() => useDelegationTree("a1", { enabled: false }), { wrapper });
+
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch before an agent is chosen", () => {
+    renderHook(() => useDelegationTree(null), { wrapper });
+
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("hands back the failure so the map can say the tree is partial", async () => {
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("boom"));
+
+    const { result } = renderHook(() => useDelegationTree("a1"), { wrapper });
+
+    await waitFor(() => expect(result.current.error).toBeTruthy());
+    expect(result.current.tree).toBeNull();
+  });
+});
+
+describe("usePromptVariables", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("reads the system variables an agent's instructions may use", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({
+      items: [{ name: "today", description: "Today's date", example: "2026-10-10" }],
+    });
+
+    const { result } = renderHook(() => usePromptVariables(), { wrapper });
+
+    await waitFor(() => expect(result.current.variables).toHaveLength(1));
+    expect(apiClient.get).toHaveBeenCalledWith("/agents/prompt-variables");
+    expect(result.current.variables[0]?.name).toBe("today");
+  });
+
+  it("offers none while the catalog is still being read", () => {
+    vi.mocked(apiClient.get).mockReturnValue(new Promise(() => {}));
+
+    const { result } = renderHook(() => usePromptVariables(), { wrapper });
+
+    expect(result.current.variables).toEqual([]);
+  });
+});
+
+describe("useAddToAgent", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("writes the draft with the resource bound", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ id: "a1", draft_spec: SPEC });
+    vi.mocked(apiClient.put).mockResolvedValue({ id: "a1" });
+    const { result } = renderHook(() => useAddToAgent(), { wrapper });
+
+    const answer = await result.current.mutateAsync({
+      agentId: "a1",
+      resource: { kind: "skill", id: "s1" },
+    });
+
+    expect(answer).toEqual({ already: false });
+    const [path, body] = vi.mocked(apiClient.put).mock.calls[0]!;
+    expect(path).toBe("/agents/a1/draft");
+    expect((body as { spec: AgentSpec }).spec.skill_ids).toEqual(["s1"]);
+  });
+
+  it("writes nothing when the agent already has it", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({
+      id: "a1",
+      draft_spec: { ...SPEC, skill_ids: ["s1"] },
+    });
+    const { result } = renderHook(() => useAddToAgent(), { wrapper });
+
+    const answer = await result.current.mutateAsync({
+      agentId: "a1",
+      resource: { kind: "skill", id: "s1" },
+    });
+
+    expect(answer).toEqual({ already: true });
+    expect(apiClient.put).not.toHaveBeenCalled();
+  });
+
+  it("says what was refused", async () => {
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("nope"));
+    const { result } = renderHook(() => useAddToAgent(), { wrapper });
+
+    await expect(
+      result.current.mutateAsync({ agentId: "a1", resource: { kind: "skill", id: "s1" } }),
+    ).rejects.toThrow();
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+  });
+});

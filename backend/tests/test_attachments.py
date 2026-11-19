@@ -1,0 +1,1487 @@
+"""Where an attached file goes, and what the model is told about it.
+
+The change these cover is easy to state and easy to get wrong: an agent with a
+workspace should be handed a *reference* to a file, and an agent without one
+should keep getting the paste it always got. Both halves matter. Pasting when
+there is a workspace throws away the point of having one; referencing when there
+is not leaves the model told about a file it has no tool to open.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+from pydantic_ai import Agent
+from pydantic_ai.messages import BinaryContent
+from pydantic_ai.models.test import TestModel
+from pydantic_ai_harness import GuardrailResult
+
+from app.agents.capabilities.guardrails import (
+    GuardrailBlocked,
+    GuardrailsConfig,
+    build_guardrails,
+    input_screen,
+)
+from app.agents.capabilities.sandbox._capped import CappedStateBackend
+from app.repositories import chat_file as chat_file_repo
+from app.services import attachments as attachments_module
+from app.services.attachments import AttachmentRouter, safe_name, workspace_path
+from tests.workspaces import ShellFailing, document_workspace
+
+pytestmark = pytest.mark.anyio
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def _file(**overrides: object):
+    defaults: dict[str, object] = {
+        "id": uuid4(),
+        "filename": "raport.csv",
+        "mime_type": "text/csv",
+        "size": 2048,
+        "storage_path": "u/1/raport.csv",
+        "file_type": "text",
+        "parsed_content": "month,total\njan,10\nfeb,12",
+    }
+    return SimpleNamespace(**{**defaults, **overrides})
+
+
+@pytest.fixture
+def storage(monkeypatch):
+    """Whatever the router asks the file store for, it gets these bytes."""
+    loaded = AsyncMock(return_value=PNG)
+    monkeypatch.setattr(
+        attachments_module, "get_file_storage", lambda: SimpleNamespace(load=loaded)
+    )
+    return loaded
+
+
+def _document(max_bytes: int = 1024 * 1024) -> CappedStateBackend:
+    """A stored workspace's document, which the tests read back to see what landed."""
+    return CappedStateBackend(max_bytes=max_bytes)
+
+
+class TestWithoutAWorkspace:
+    """The behaviour that already existed, kept exactly."""
+
+    async def test_a_parsed_file_is_pasted_whole(self, storage):
+        prompt = await AttachmentRouter().build_prompt("what changed?", [_file()])
+
+        assert "month,total" in prompt
+        assert "```" in prompt
+
+    async def test_a_large_paste_is_capped_per_file(self, storage, monkeypatch):
+        # The no-workspace paste path is the only one that inlines a file's whole
+        # parse, so it honours the documented per-file prompt cap rather than
+        # putting an unbounded parse in front of the model (#1591, §7 finding 9).
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "CHAT_PROMPT_TEXT_MAX_CHARS", 100)
+        prompt = await AttachmentRouter().build_prompt(
+            "summarise", [_file(parsed_content="a" * 5000)]
+        )
+
+        assert isinstance(prompt, str)
+        assert "truncated 100 of 5000 chars" in prompt
+        assert "a" * 5000 not in prompt
+
+    async def test_an_image_is_sent_for_the_model_to_look_at(self, storage):
+        prompt = await AttachmentRouter().build_prompt(
+            "what is this?", [_file(file_type="image", mime_type="image/png")]
+        )
+
+        assert isinstance(prompt, list)
+        assert isinstance(prompt[1], BinaryContent)
+
+    async def test_a_file_nothing_could_parse_is_named_not_dropped(self, storage):
+        # Silence reads as the model denying a file the transcript says arrived,
+        # so the reference names it and why it cannot be read.
+        prompt = await AttachmentRouter().build_prompt(
+            "look", [_file(filename="dump.zip", file_type="binary", parsed_content=None)]
+        )
+
+        assert isinstance(prompt, str)
+        assert "dump.zip" in prompt
+        assert "could not be extracted" in prompt
+
+    async def test_no_attachments_is_the_message_unchanged(self):
+        assert await AttachmentRouter().build_prompt("hello", []) == "hello"
+
+
+class TestWhatTheNextTurnIsTold:
+    """`context` is what a later turn's history replays after the person's words.
+
+    The defect: the paste reached the first request and nothing else, so a
+    follow-up about the file went to a model that had never been told of it.
+    """
+
+    async def test_a_pasted_file_is_kept_for_the_next_turn(self, storage):
+        router = AttachmentRouter()
+
+        prompt = await router.build_prompt("what changed?", [_file()])
+
+        assert prompt == "what changed?" + router.context
+        assert "month,total" in router.context
+
+    async def test_a_picture_is_named_not_repeated(self, storage):
+        router = AttachmentRouter()
+
+        await router.build_prompt(
+            "what is this?", [_file(filename="shot.png", file_type="image", mime_type="image/png")]
+        )
+
+        assert "Attached image: shot.png" in router.context
+        assert "not repeated" in router.context
+
+    async def test_a_turn_without_files_leaves_nothing_to_keep(self):
+        router = AttachmentRouter()
+
+        await router.build_prompt("hello", [])
+
+        assert router.context == ""
+
+
+class TestWithAWorkspace:
+    async def test_the_file_is_written_and_referenced_rather_than_pasted(self, storage):
+        """The whole point: a large file stops costing its weight every turn."""
+        document = _document()
+        chat_file = _file(parsed_content="month,total\n" + "row\n" * 500)
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "summarise", [chat_file]
+        )
+
+        assert workspace_path(chat_file) in prompt
+        assert document.exists(workspace_path(chat_file))
+        assert prompt.count("row") < 100
+
+    async def test_the_reference_carries_a_head_the_model_can_judge_from(self, storage):
+        document = _document()
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "summarise", [_file()]
+        )
+
+        assert "month,total" in prompt
+        assert "First 20 lines" in prompt
+
+    async def test_an_image_is_both_seen_and_written(self, storage):
+        """A path is not a substitute for looking, and looking is not a
+        substitute for being able to resize it."""
+        document = _document()
+        chat_file = _file(file_type="image", mime_type="image/png", parsed_content=None)
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "crop this", [chat_file]
+        )
+
+        assert isinstance(prompt, list)
+        assert isinstance(prompt[1], BinaryContent)
+        assert document.exists(workspace_path(chat_file))
+
+    async def test_a_large_image_is_written_and_not_also_inlined(self, storage, monkeypatch):
+        from app.core import config as config_module
+
+        monkeypatch.setattr(config_module.settings, "SANDBOX_INLINE_IMAGE_MAX_BYTES", 100)
+        document = _document()
+        chat_file = _file(file_type="image", mime_type="image/png", parsed_content=None, size=5000)
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "shrink it", [chat_file]
+        )
+
+        assert isinstance(prompt, str)
+        assert workspace_path(chat_file) in prompt
+
+    @pytest.mark.security
+    async def test_a_turn_stops_inlining_images_once_its_budget_is_spent(
+        self, storage, monkeypatch
+    ):
+        """A per-file cap bounds one attachment; nothing bounded a turn carrying
+        several, and one TIFF alone reaches fifty megabytes at the defaults. The
+        second image is named rather than dropped silently (#1591 review)."""
+        from app.core import config as config_module
+
+        # The budget is spent on the bytes actually held, so the store answers
+        # with as many as the row claims.
+        storage.return_value = b"\x89PNG" + b"\x00" * 4996
+        monkeypatch.setattr(config_module.settings, "CHAT_TURN_INLINE_MAX_BYTES", 6000)
+        monkeypatch.setattr(config_module.settings, "SANDBOX_INLINE_IMAGE_MAX_BYTES", 10_000)
+        document = _document()
+        first = _file(file_type="image", mime_type="image/png", parsed_content=None, size=5000)
+        second = _file(file_type="image", mime_type="image/png", parsed_content=None, size=5000)
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "compare", [first, second]
+        )
+
+        assert isinstance(prompt, list)
+        assert sum(isinstance(part, BinaryContent) for part in prompt) == 1
+        assert "already reached the limit" in prompt[0]
+
+    async def test_an_image_larger_than_what_the_turn_has_left_is_named_not_shown(
+        self, storage, monkeypatch
+    ):
+        from app.core import config as config_module
+
+        monkeypatch.setattr(config_module.settings, "SANDBOX_INLINE_IMAGE_MAX_BYTES", 10_000)
+        document = _document()
+        chat_file = _file(file_type="image", mime_type="image/png", parsed_content=None, size=5000)
+
+        router = AttachmentRouter(document_workspace(document))
+        plan = await router.route(chat_file, inline_budget=100)
+
+        assert plan.inline == []
+        assert plan.reference is not None
+        assert "already reached the limit" in plan.reference
+
+        # And an allowance already spent to the byte, which is the TIFF case too:
+        # a TIFF is not gated on its stored size, so nothing else would stop it.
+        spent = await router.route(chat_file, inline_budget=0)
+
+        assert spent.inline == []
+        assert spent.reference is not None
+        assert "already reached the limit" in spent.reference
+
+    async def test_a_pdf_keeps_its_bytes_and_gains_its_text(self, storage):
+        """A shell has no tool for a PDF; the extracted text is the usable half."""
+        document = _document()
+        chat_file = _file(
+            filename="contract.pdf",
+            file_type="pdf",
+            mime_type="application/pdf",
+            parsed_content="Clause 1. The parties agree.",
+        )
+
+        await AttachmentRouter(document_workspace(document)).build_prompt("summarise", [chat_file])
+
+        assert document.exists(workspace_path(chat_file))
+
+    async def test_the_same_file_on_a_later_turn_is_not_written_again(self, storage):
+        """Otherwise an upload costs one write per turn for the whole chat."""
+        document = _document()
+        chat_file = _file()
+        router = AttachmentRouter(document_workspace(document))
+
+        await router.build_prompt("first", [chat_file])
+        await router.build_prompt("second", [chat_file])
+
+        assert storage.await_count == 1
+
+    async def test_two_files_of_the_same_name_do_not_overwrite_each_other(self, storage):
+        document = _document()
+        first, second = _file(), _file()
+
+        await AttachmentRouter(document_workspace(document)).build_prompt(
+            "compare", [first, second]
+        )
+
+        assert workspace_path(first) != workspace_path(second)
+        assert document.exists(workspace_path(first))
+        assert document.exists(workspace_path(second))
+
+    async def test_a_full_workspace_still_names_and_samples_the_file(self, storage):
+        """The file is still worth mentioning; it just cannot be stored."""
+        document = _document(max_bytes=1)
+        chat_file = _file()
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "summarise", [chat_file]
+        )
+
+        assert "month,total" in prompt
+        assert chat_file.filename in prompt
+        assert not document.exists(workspace_path(chat_file))
+
+    async def test_a_container_that_cannot_take_the_file_still_names_it(self, storage):
+        """A container moves the bytes through its shell, which fails with
+        `WorkspaceError` - a full disk, an image missing `base64` - rather than the
+        `OSError` of a full document. Either way the turn goes on without the file
+        in the workspace, rather than failing before the model is asked."""
+        chat_file = _file()
+
+        prompt = await AttachmentRouter(ShellFailing(document_workspace())).build_prompt(
+            "summarise", [chat_file]
+        )
+
+        assert isinstance(prompt, str)
+        assert chat_file.filename in prompt
+        assert "could not be written" in prompt
+
+    async def test_a_parse_a_container_cannot_take_is_not_named(self, storage):
+        """The sibling write fails the same way, on its own."""
+
+        class _OnlyTheOriginal(ShellFailing):
+            async def write_bytes(self, path: str, data: bytes) -> None:
+                if path.endswith(".txt"):
+                    await super().write_bytes(path, data)
+                await self.wrapped.write_bytes(path, data)
+
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one")
+        document = _document()
+
+        prompt = await AttachmentRouter(
+            _OnlyTheOriginal(document_workspace(document))
+        ).build_prompt("read it", [chat_file])
+
+        assert document.exists(workspace_path(chat_file))
+        assert "beside it at" not in prompt
+
+    async def test_a_file_too_large_to_store_is_not_pasted_whole(self, storage):
+        """The degradation used to run backwards.
+
+        A file the workspace would not take is not a file to put in a prompt:
+        with a 50 MB upload limit against a 4 MB document, falling back to the
+        paste put up to fifty megabytes of text into one message. A file small
+        enough to paste safely would have fitted in the workspace in the first
+        place.
+        """
+        body = "\n".join(f"row-{n},{n}" for n in range(500))
+        chat_file = _file(parsed_content=body)
+
+        prompt = await AttachmentRouter(document_workspace(_document(max_bytes=1))).build_prompt(
+            "go", [chat_file]
+        )
+
+        assert isinstance(prompt, str)
+        assert "row-0" in prompt
+        # The head, not the file: twenty lines of it and no more.
+        assert "row-499" not in prompt
+        assert "could not be written" in prompt
+
+    async def test_an_unparsed_file_too_large_to_store_is_still_named(self, storage):
+        """A zip has no text to sample, so all there is to say is that it arrived
+        and could not be kept - which still beats the model never hearing of it."""
+        chat_file = _file(filename="dump.zip", file_type="other", parsed_content=None)
+
+        prompt = await AttachmentRouter(document_workspace(_document(max_bytes=1))).build_prompt(
+            "go", [chat_file]
+        )
+
+        assert isinstance(prompt, str)
+        assert "dump.zip" in prompt
+        assert "could not be written" in prompt
+
+    async def test_a_file_that_was_not_stored_is_given_no_path_to_open(self, storage):
+        """Naming a path the write did not create costs the agent a tool call to
+        find out the file is not there."""
+        chat_file = _file()
+
+        prompt = await AttachmentRouter(document_workspace(_document(max_bytes=1))).build_prompt(
+            "go", [chat_file]
+        )
+
+        assert isinstance(prompt, str)
+        assert workspace_path(chat_file) not in prompt
+
+    async def test_an_oversized_image_is_not_inlined_without_a_workspace_either(
+        self, storage, monkeypatch
+    ):
+        """The ceiling used to apply only to the workspace path.
+
+        So the same screenshot was refused by an agent *with* a workspace and loaded
+        whole by one without - the wrong way round, since the first has a path to
+        offer instead and the second has nothing to fall back to.
+        """
+        from app.core import config as config_module
+
+        monkeypatch.setattr(config_module.settings, "SANDBOX_INLINE_IMAGE_MAX_BYTES", 10)
+        chat_file = _file(file_type="image", mime_type="image/png", filename="big.png", size=5000)
+
+        prompt = await AttachmentRouter().build_prompt("what is this", [chat_file])
+
+        assert isinstance(prompt, str)
+        assert "big.png" in prompt
+        assert "too large to show" in prompt
+
+    async def test_an_image_inside_the_ceiling_is_still_inlined_without_a_workspace(self, storage):
+        """The case that has to keep working: no workspace, and a picture the model
+        can simply be shown."""
+        chat_file = _file(file_type="image", mime_type="image/png", filename="small.png", size=64)
+
+        prompt = await AttachmentRouter().build_prompt("what is this", [chat_file])
+
+        assert isinstance(prompt, list)
+        assert any(isinstance(part, BinaryContent) for part in prompt)
+
+    async def test_an_image_too_large_to_store_is_still_shown_to_the_model(self, storage):
+        """The exception, for the reason images go both ways at all: a path is no
+        substitute for looking at the picture, and the inline ceiling is its own."""
+        chat_file = _file(file_type="image", mime_type="image/png", filename="chart.png")
+
+        prompt = await AttachmentRouter(document_workspace(_document(max_bytes=1))).build_prompt(
+            "look", [chat_file]
+        )
+
+        assert isinstance(prompt, list)
+        assert any(isinstance(part, BinaryContent) for part in prompt)
+
+    async def test_a_file_the_store_cannot_load_is_named_rather_than_fatal(self, monkeypatch):
+        """A routing failure must not fail the turn - the person asked a question
+        and answering without the file beats not answering. But the model is told
+        the file arrived and could not be processed, not left denying it."""
+        monkeypatch.setattr(
+            attachments_module,
+            "get_file_storage",
+            lambda: SimpleNamespace(load=AsyncMock(side_effect=OSError("gone"))),
+        )
+
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "summarise", [_file(filename="raport.csv")]
+        )
+
+        assert isinstance(prompt, str)
+        assert prompt.startswith("summarise")
+        assert "raport.csv" in prompt
+        assert "could not be processed" in prompt
+
+
+class TestWhereAnAttachmentLands:
+    """Inside the working directory, which is the whole of #1039.
+
+    A sandbox resolves an absolute path as absolute. `/uploads/x` therefore
+    landed at the *container's* filesystem root rather than in the bind-mounted
+    work directory, and three things followed, all of them silent: the agent's
+    own `ls` did not see the file, the workspace browser reads the host
+    directory and so could not list it, and it died with the container. Probed
+    against a live service, `write uploads/a.txt` answers
+    `/workspace/uploads/a.txt` and `write /uploads/a.txt` answers
+    `/uploads/a.txt`, which exists nowhere on the host.
+    """
+
+    def test_the_path_is_relative_so_the_sandbox_resolves_it_in_the_work_dir(self):
+        path = workspace_path(_file(filename="report.pdf"))
+
+        assert not path.startswith("/")
+        assert path.startswith("uploads/")
+
+    def test_a_generated_image_lands_there_too(self):
+        # The same defect in the other direction: an image the agent made was
+        # written outside the workspace, so it was also absent from the snapshot
+        # a channel diffs to decide what to post back.
+        from app.agents.capabilities._generated import WORKSPACE_OUTPUT_DIR
+
+        assert not WORKSPACE_OUTPUT_DIR.startswith("/")
+
+    async def test_the_model_is_told_the_path_the_file_is_actually_at(self, storage):
+        # The reference is the only thing that tells a model where to look, so a
+        # path in it that a shell cannot reach is worse than no path at all.
+        document = _document()
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="a b c")
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "read it", [chat_file]
+        )
+
+        assert workspace_path(chat_file) in prompt
+        assert "/uploads/" not in prompt
+
+
+class TestWhatTheModelIsToldAboutAPath:
+    """Where the file is, said so a model does not have to guess.
+
+    The reference read `report.pdf (uploads/8b1e-report.pdf, 280 KB, pdf)` - the
+    path one of three facts in a bracket - and the failure that started #1039 was
+    a model answering "the directory is empty" after a single `ls`, about a file it
+    had summarised a turn earlier.
+    """
+
+    async def test_the_path_gets_its_own_clause(self, storage):
+        chat_file = _file(filename="report.csv", file_type="spreadsheet", parsed_content="a,b\n1,2")
+
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "read it", [chat_file]
+        )
+
+        assert f"in your workspace at {workspace_path(chat_file)}" in prompt
+
+    async def test_a_runtime_that_can_read_the_file_gets_no_copy_beside_it(self, storage):
+        """The workspace used to get a `.txt` of the parse next to every PDF,
+        `.docx` and spreadsheet. On a runtime carrying `lit` - one command to
+        markdown, OCR included - that is a second copy of the file's contents on
+        disk to save the agent a tool call it should be making."""
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one")
+        document = _document()
+
+        prompt = await AttachmentRouter(document_workspace(document), can_parse=True).build_prompt(
+            "read it", [chat_file]
+        )
+
+        assert f"in your workspace at {workspace_path(chat_file)}" in prompt
+        assert not document.exists(f"{workspace_path(chat_file)}.txt")
+        assert "beside it at" not in prompt
+
+    async def test_a_workspace_that_cannot_read_it_keeps_the_extracted_text(self, storage):
+        """A `state` workspace is files with no shell, so there is no `lit` and no
+        anything: without the sibling an agent has the first twenty lines in its
+        prompt and an unreadable binary on disk. A Daytona sandbox and somebody's
+        own runtime are the same case - their image is not ours."""
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one")
+        document = _document()
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "read it", [chat_file]
+        )
+
+        assert document.exists(f"{workspace_path(chat_file)}.txt")
+        assert f"beside it at {workspace_path(chat_file)}.txt" in prompt
+
+    async def test_a_sibling_the_workspace_refused_is_not_named(self, storage):
+        """The second write can be refused on its own.
+
+        A document with room for the original and not for its parse used to be told
+        about a file that is not there - so the agent spent a tool call finding out,
+        and was left with the head sample either way. What is named is what the
+        workspace answers `exists` for.
+        """
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one" * 400)
+        # Room for the 72-byte original and nothing like the 3,200-byte parse.
+        document = _document(max_bytes=900)
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "read it", [chat_file]
+        )
+
+        assert f"in your workspace at {workspace_path(chat_file)}" in prompt
+        assert not document.exists(f"{workspace_path(chat_file)}.txt")
+        assert "beside it at" not in prompt
+
+    async def test_a_sibling_from_an_earlier_turn_is_still_named(self, storage):
+        """Re-attaching writes nothing, because the file is already there - so the
+        reference has to come from what the workspace holds rather than from what
+        this turn did."""
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one")
+        document = _document()
+
+        await AttachmentRouter(document_workspace(document)).build_prompt("read it", [chat_file])
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "again", [chat_file]
+        )
+
+        assert f"beside it at {workspace_path(chat_file)}.txt" in prompt
+
+    async def test_a_spreadsheet_is_the_case_that_makes_it_matter(self, storage):
+        """`.xlsx` in a workspace with no shell is a zip of XML that `read_file`
+        returns as mojibake."""
+        chat_file = _file(filename="q3.xlsx", file_type="spreadsheet", parsed_content="a,b")
+        document = _document()
+
+        await AttachmentRouter(document_workspace(document)).build_prompt("read it", [chat_file])
+
+        assert document.exists(f"{workspace_path(chat_file)}.txt")
+
+    async def test_an_image_is_told_where_it_is_as_well_as_shown(self, storage):
+        # Both, and the path is the half that lets it be resized, converted or read
+        # by something the model writes.
+        chat_file = _file(filename="chart.png", file_type="image")
+
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "look", [chat_file]
+        )
+
+        assert isinstance(prompt, list)
+        assert f"in your workspace at {workspace_path(chat_file)}" in prompt[0]
+        assert any(isinstance(part, BinaryContent) for part in prompt)
+
+
+class TestFilenamesAreNotTrusted:
+    @pytest.mark.parametrize(
+        "hostile",
+        ["../../etc/passwd", "..\\..\\secrets.env", "-rf", "  ", "." * 5],
+    )
+    def test_a_name_cannot_escape_the_uploads_directory(self, hostile: str):
+        assert workspace_path(_file(filename=hostile)).startswith("uploads/")
+        assert ".." not in safe_name(hostile)
+
+    def test_a_very_long_name_is_bounded(self):
+        assert len(safe_name("a" * 500)) <= 96
+
+    def test_a_name_of_nothing_usable_still_produces_one(self):
+        assert safe_name("   ") == "attachment"
+        assert safe_name("///")
+
+
+class TestTheReferenceReadsWell:
+    async def test_megabytes_are_shown_as_megabytes(self, storage):
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "x", [_file(size=3 * 1024 * 1024)]
+        )
+
+        assert "3.0 MB" in prompt
+
+    async def test_a_small_file_is_shown_in_kilobytes(self, storage):
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "x", [_file(size=10)]
+        )
+
+        assert "1 KB" in prompt
+
+    async def test_a_file_with_no_text_is_referenced_without_a_head(self, storage):
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "x", [_file(file_type="binary", parsed_content=None)]
+        )
+
+        assert "First 20 lines" not in prompt
+        assert "raport.csv" in prompt
+
+    async def test_one_enormous_line_is_still_bounded(self, storage):
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "x", [_file(parsed_content="a" * 50_000)]
+        )
+
+        assert len(prompt) < 5_000
+
+
+class TestASecondTurn:
+    async def test_an_image_already_in_the_workspace_is_still_shown(self, storage):
+        """The write is skipped on the second turn; the model still has to see
+        the picture, so the bytes are fetched for the inline half alone."""
+        document = _document()
+        chat_file = _file(file_type="image", mime_type="image/png", parsed_content=None)
+        router = AttachmentRouter(document_workspace(document))
+
+        await router.build_prompt("what is this?", [chat_file])
+        prompt = await router.build_prompt("and now?", [chat_file])
+
+        assert isinstance(prompt, list)
+        assert isinstance(prompt[1], BinaryContent)
+        assert storage.await_count == 2
+
+
+class TestTiffPagesForTheModel:
+    """A TIFF the vision APIs cannot take is converted to PNG at the point it is
+    shown, multi-page scans contributing more than page one. The conversion is
+    driven by a stubbed `tiff_pages_to_png` so every routing branch is exercised
+    without a real bomb or a real multi-page decode (those are covered in
+    `test_tiff_attachment.py`)."""
+
+    @staticmethod
+    def _tiff(**overrides):
+        return _file(
+            filename="scan.tiff",
+            mime_type="image/tiff",
+            file_type="image",
+            parsed_content=None,
+            **overrides,
+        )
+
+    @staticmethod
+    def _stub(monkeypatch, conversion):
+        from app.services.file_upload import TiffConversion
+
+        monkeypatch.setattr(
+            attachments_module,
+            "tiff_pages_to_png",
+            lambda data, **_kwargs: (
+                conversion
+                if isinstance(conversion, TiffConversion)
+                else TiffConversion(**conversion)
+            ),
+        )
+
+    async def test_a_single_page_tiff_is_shown_as_one_png(self, storage, monkeypatch):
+        self._stub(monkeypatch, {"images": [b"PNG-A"], "total": 1, "omitted": False})
+
+        prompt = await AttachmentRouter().build_prompt("what is this", [self._tiff()])
+
+        assert isinstance(prompt, list)
+        assert isinstance(prompt[1], BinaryContent)
+        assert prompt[1].media_type == "image/png"
+        assert prompt[1].data == b"PNG-A"
+
+    async def test_a_multi_page_tiff_names_shown_and_total_when_known(self, storage, monkeypatch):
+        self._stub(monkeypatch, {"images": [b"P1", b"P2"], "total": 5, "omitted": True})
+
+        prompt = await AttachmentRouter().build_prompt("read it", [self._tiff()])
+
+        assert isinstance(prompt, list)
+        assert sum(isinstance(part, BinaryContent) for part in prompt) == 2
+        assert "Showing 2 of 5 pages" in prompt[0]
+
+    async def test_an_unknown_total_says_pages_were_omitted(self, storage, monkeypatch):
+        self._stub(monkeypatch, {"images": [b"P1"], "total": None, "omitted": True})
+
+        prompt = await AttachmentRouter().build_prompt("read it", [self._tiff()])
+
+        assert "additional pages" in prompt[0]
+
+    async def test_a_tiff_with_no_usable_page_is_named_not_dropped(self, storage, monkeypatch):
+        self._stub(monkeypatch, {"images": [], "total": None, "omitted": True})
+
+        prompt = await AttachmentRouter().build_prompt("what is this", [self._tiff()])
+
+        assert isinstance(prompt, str)
+        assert "scan.tiff" in prompt
+        assert "could not be converted" in prompt
+
+    async def test_a_workspace_tiff_is_referenced_and_its_pages_shown(self, storage, monkeypatch):
+        self._stub(monkeypatch, {"images": [b"P1", b"P2"], "total": 4, "omitted": True})
+        document = _document()
+        chat_file = self._tiff()
+
+        prompt = await AttachmentRouter(document_workspace(document)).build_prompt(
+            "read it", [chat_file]
+        )
+
+        assert isinstance(prompt, list)
+        assert f"in your workspace at {workspace_path(chat_file)}" in prompt[0]
+        assert "Showing 2 of 4 pages" in prompt[0]
+        assert document.exists(workspace_path(chat_file))
+
+    async def test_a_workspace_tiff_that_fits_needs_no_note(self, storage, monkeypatch):
+        self._stub(monkeypatch, {"images": [b"P1"], "total": 1, "omitted": False})
+
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "look", [self._tiff()]
+        )
+
+        assert isinstance(prompt, list)
+        assert "Showing" not in prompt[0]
+
+
+class TestThePerTurnTextBudget:
+    """Several large attachments in one turn compound past any per-file cap on the
+    no-workspace paste path, so the running total is bounded once (#1591)."""
+
+    async def test_text_past_the_turn_budget_is_truncated_and_said_once(self, storage, monkeypatch):
+        from app.core import config as config_module
+
+        monkeypatch.setattr(config_module.settings, "CHAT_TURN_TEXT_MAX_CHARS", 60)
+        files = [
+            _file(filename="a.csv", parsed_content="x" * 400),
+            _file(filename="b.csv", parsed_content="y" * 400),
+            _file(filename="c.csv", parsed_content="z" * 400),
+        ]
+
+        prompt = await AttachmentRouter().build_prompt("go", files)
+
+        assert isinstance(prompt, str)
+        assert "size budget" in prompt
+        assert prompt.count("size budget") == 1
+        # The third file's text never makes it in once the budget is spent.
+        assert "z" * 400 not in prompt
+
+    async def test_a_truncated_reference_is_dropped_whole_not_sliced(self, storage, monkeypatch):
+        """A reference is a formatted block (a fenced extract); slicing it mid-way
+        drops the closing code fence, so the truncation notice lands *inside* the
+        file's code block and the model reads it as file contents. The over-budget
+        reference is dropped whole, leaving the fences balanced (#1591)."""
+        from app.core import config as config_module
+
+        monkeypatch.setattr(config_module.settings, "CHAT_TURN_TEXT_MAX_CHARS", 30)
+        files = [_file(filename="big.csv", parsed_content="x" * 400)]
+
+        prompt = await AttachmentRouter().build_prompt("go", files)
+
+        assert isinstance(prompt, str)
+        assert "size budget" in prompt
+        # No dangling code fence: the partial file body (and its unclosed ```) is not
+        # emitted, so the truncation notice is not swallowed into a code block.
+        assert prompt.count("```") % 2 == 0
+        assert "x" * 400 not in prompt
+
+
+class TestTheSiblingForTheNewFormats:
+    async def test_a_presentation_gets_its_text_beside_it(self, storage):
+        chat_file = _file(filename="deck.pptx", file_type="presentation", parsed_content="Slide 1")
+        document = _document()
+
+        await AttachmentRouter(document_workspace(document)).build_prompt("read it", [chat_file])
+
+        assert document.exists(f"{workspace_path(chat_file)}.txt")
+
+    async def test_an_email_gets_a_sibling_even_on_a_lit_runtime(self, storage):
+        """`lit` reads office documents but not `.msg`, so the extracted text is the
+        only readable form and must be written even where the sibling is otherwise
+        skipped (#1591, §5 #7)."""
+        chat_file = _file(filename="thread.msg", file_type="email", parsed_content="From: a@b")
+        document = _document()
+
+        prompt = await AttachmentRouter(document_workspace(document), can_parse=True).build_prompt(
+            "read it", [chat_file]
+        )
+
+        assert document.exists(f"{workspace_path(chat_file)}.txt")
+        assert "beside it at" in prompt
+
+    async def test_a_document_is_skipped_beside_it_on_a_lit_runtime(self, storage):
+        chat_file = _file(filename="memo.doc", file_type="document", parsed_content="Dear all")
+        document = _document()
+
+        await AttachmentRouter(document_workspace(document), can_parse=True).build_prompt(
+            "read it", [chat_file]
+        )
+
+        assert not document.exists(f"{workspace_path(chat_file)}.txt")
+
+
+class TestLoadingTheRows:
+    async def test_the_ids_a_client_sent_are_resolved_as_the_caller(self, monkeypatch):
+        """The sender's id rides along, because the read is scoped to it (#706)."""
+        from app.services import attachments as module
+
+        caller = uuid4()
+        service = SimpleNamespace(list_attached_files=AsyncMock(return_value=["row"]))
+        monkeypatch.setattr(
+            "app.services.conversation.ConversationService", lambda db: service, raising=True
+        )
+
+        assert await module.load_attached_files(object(), [uuid4()], user_id=caller) == ["row"]
+        assert service.list_attached_files.await_args.kwargs["user_id"] == caller
+
+    async def test_a_run_reads_its_turn_by_message_and_caller(self, monkeypatch):
+        """The run loads what it just linked, by id and scoped to the caller (#1756)."""
+        from app.services import attachments as module
+
+        message_id = uuid4()
+        caller = uuid4()
+        service = SimpleNamespace(list_turn_attachments=AsyncMock(return_value=["row"]))
+        monkeypatch.setattr(
+            "app.services.conversation.ConversationService", lambda db: service, raising=True
+        )
+
+        assert await module.load_turn_attachments(object(), message_id, ["f1"], user_id=caller) == [
+            "row"
+        ]
+        assert service.list_turn_attachments.await_args.args == (message_id, ["f1"])
+        assert service.list_turn_attachments.await_args.kwargs["user_id"] == caller
+
+
+class TestWhatTheModelIsToldAboutAFailedWrite:
+    """It says what happened. It used to say why, and be wrong.
+
+    The sentence read "too large for the workspace", reasoned from the `state`
+    backend's four-megabyte document - and a container write fails for reasons
+    that have nothing to do with size. A 782 KB PDF attached while `sandboxd` was
+    down was reported to the model as too large; the model told the person who
+    attached it exactly that, and offered to work around a limit that was never
+    the problem.
+    """
+
+    async def test_it_does_not_blame_the_size(self, storage):
+        chat_file = _file()
+
+        prompt = await AttachmentRouter(document_workspace(_document(max_bytes=1))).build_prompt(
+            "go", [chat_file]
+        )
+
+        assert isinstance(prompt, str)
+        assert "too large" not in prompt
+        assert "could not be written" in prompt
+
+    async def test_it_tells_the_model_not_to_invent_one(self, storage):
+        """The model fills a gap where a cause is missing - it offered "because of
+        its size" unprompted once the sentence stopped saying so."""
+        prompt = await AttachmentRouter(document_workspace(_document(max_bytes=1))).build_prompt(
+            "go", [_file()]
+        )
+
+        assert isinstance(prompt, str)
+        assert "Do not guess at why" in prompt
+
+
+class TestWhenTheWorkspaceWillNotTakeAWrite:
+    """Said once, about the machine, where every other line is about a file.
+
+    A run whose workspace refuses a write is a run whose shell and file tools will
+    fail too, and nothing told the model that: it read each failure as a problem
+    with the command it had just written and kept trying - `ls`, then a `curl` of a
+    `data:` URI, then three workarounds offered to the person, across two turns
+    and 57k tokens (#1046).
+    """
+
+    async def test_the_turn_is_told_the_workspace_is_unavailable(self, storage):
+        chat_file = _file()
+
+        prompt = await AttachmentRouter(document_workspace(_document(max_bytes=1))).build_prompt(
+            "go", [chat_file]
+        )
+
+        assert isinstance(prompt, str)
+        assert "would not accept a write this turn" in prompt
+        assert "another attempt will fail the same way" in prompt
+
+    async def test_it_is_said_once_however_many_files_were_refused(self, storage):
+        """Once about the workspace, not once per file: three attachments is one
+        broken machine, not three."""
+        files = [_file(), _file(filename="second.pdf"), _file(filename="third.pdf")]
+
+        prompt = await AttachmentRouter(document_workspace(_document(max_bytes=1))).build_prompt(
+            "go", files
+        )
+
+        assert isinstance(prompt, str)
+        assert prompt.count("would not accept a write this turn") == 1
+
+    async def test_nothing_is_said_when_every_write_landed(self, storage):
+        prompt = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "go", [_file()]
+        )
+
+        assert isinstance(prompt, str)
+        assert "would not accept a write" not in prompt
+
+    async def test_an_agent_with_no_workspace_is_told_nothing_about_one(self, storage):
+        """It has no workspace to be unavailable, and the reference already says the
+        file is inline rather than on disk."""
+        prompt = await AttachmentRouter(None).build_prompt("go", [_file()])
+
+        assert isinstance(prompt, str)
+        assert "would not accept a write" not in prompt
+
+
+class TestALaterTurnPutsBackWhatAFailedTurnLost:
+    """A file whose turn failed before it reached the workspace (#2481).
+
+    It is linked to the message it came with, so it cannot be attached again, and
+    nothing else ever wrote an attachment: the next turn's model looked in
+    `uploads/`, found nothing, and the only way on was a new conversation.
+    """
+
+    @staticmethod
+    def _earlier(*files) -> attachments_module.EarlierAttachments:
+        return attachments_module.EarlierAttachments(
+            conversation_id=uuid4(),
+            organization_id=uuid4(),
+            user_id=uuid4(),
+            agent_id=uuid4(),
+            paths={f.id: workspace_path(f) for f in files},
+            text_bearing=frozenset(
+                f.id
+                for f in files
+                if f.parsed_content and f.file_type in attachments_module._TEXT_BEARING
+            ),
+            lit_readable=frozenset(
+                f.id for f in files if f.file_type in attachments_module._LIT_READABLE
+            ),
+        )
+
+    @staticmethod
+    def _rows(monkeypatch, *files) -> AsyncMock:
+        """The scoped read of the missing rows, on a session of its own."""
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def session():
+            yield object()
+
+        read = AsyncMock(side_effect=lambda db, ids, **_: [f for f in files if f.id in ids])
+        monkeypatch.setattr(attachments_module, "get_db_context", session)
+        monkeypatch.setattr(
+            attachments_module.chat_file_repo, "get_many_left_by_interrupted_turns", read
+        )
+        return read
+
+    async def test_a_file_the_workspace_lacks_is_written_with_its_text(self, storage, monkeypatch):
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one")
+        document = _document()
+        earlier = self._earlier(chat_file)
+        read = self._rows(monkeypatch, chat_file)
+
+        await attachments_module.restore_earlier_attachments(
+            document_workspace(document), earlier, can_parse=False
+        )
+
+        assert document.exists(workspace_path(chat_file))
+        assert document.exists(f"{workspace_path(chat_file)}.txt")
+        # Read under the thread's scope, not by id alone.
+        assert read.await_args.kwargs == {
+            "conversation_id": earlier.conversation_id,
+            "organization_id": earlier.organization_id,
+            "user_id": earlier.user_id,
+            "agent_id": earlier.agent_id,
+        }
+
+    async def test_a_file_already_there_is_not_read_or_written_again(self, storage, monkeypatch):
+        """The question asked on almost every turn: nothing is missing, so the rows -
+        and their parsed text - are never loaded."""
+        chat_file = _file()
+        workspace = document_workspace(_document())
+        await workspace.write_bytes(workspace_path(chat_file), b"already here")
+        read = self._rows(monkeypatch, chat_file)
+
+        await attachments_module.restore_earlier_attachments(
+            workspace, self._earlier(chat_file), can_parse=False
+        )
+
+        read.assert_not_awaited()
+        storage.assert_not_awaited()
+        assert await workspace.read_bytes(workspace_path(chat_file)) == b"already here"
+
+    async def test_text_the_turn_stopped_before_writing_is_put_back_alone(
+        self, storage, monkeypatch
+    ):
+        """The turn can stop between the original's write and its text's: the
+        original is there, so only the sibling is missing - and only it is written."""
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one")
+        workspace = document_workspace(_document())
+        await workspace.write_bytes(workspace_path(chat_file), b"%PDF already here")
+        self._rows(monkeypatch, chat_file)
+
+        await attachments_module.restore_earlier_attachments(
+            workspace, self._earlier(chat_file), can_parse=False
+        )
+
+        storage.assert_not_awaited()
+        assert await workspace.read_bytes(workspace_path(chat_file)) == b"%PDF already here"
+        assert await workspace.read_text(f"{workspace_path(chat_file)}.txt") == "page one"
+
+    async def test_no_sibling_is_missed_where_lit_reads_the_original(self, storage, monkeypatch):
+        """A runtime carrying `lit` never gets one, so its absence is not a loss."""
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one")
+        workspace = document_workspace(_document())
+        await workspace.write_bytes(workspace_path(chat_file), b"%PDF")
+        read = self._rows(monkeypatch, chat_file)
+
+        await attachments_module.restore_earlier_attachments(
+            workspace, self._earlier(chat_file), can_parse=True
+        )
+
+        read.assert_not_awaited()
+
+    async def test_a_row_the_scope_does_not_return_is_not_written(self, storage, monkeypatch):
+        """Whatever the paths said, only a row the scoped read hands back is written."""
+        chat_file = _file()
+        document = _document()
+        self._rows(monkeypatch)
+
+        await attachments_module.restore_earlier_attachments(
+            document_workspace(document), self._earlier(chat_file), can_parse=False
+        )
+
+        assert not document.exists(workspace_path(chat_file))
+
+    async def test_a_file_the_store_cannot_load_does_not_stop_the_rest(self, monkeypatch):
+        gone, kept = _file(storage_path="gone"), _file(filename="kept.csv")
+        document = _document()
+        self._rows(monkeypatch, gone, kept)
+
+        async def load(path: str) -> bytes:
+            if path == "gone":
+                raise FileNotFoundError(path)
+            return b"month,total"
+
+        monkeypatch.setattr(
+            attachments_module, "get_file_storage", lambda: SimpleNamespace(load=load)
+        )
+
+        await attachments_module.restore_earlier_attachments(
+            document_workspace(document), self._earlier(gone, kept), can_parse=False
+        )
+
+        assert not document.exists(workspace_path(gone))
+        assert document.exists(workspace_path(kept))
+
+    async def test_a_file_the_workspace_refuses_does_not_stop_the_rest(self, storage, monkeypatch):
+        """A document with no room for a large file may still have room for a small one."""
+        large, small = _file(filename="large.csv"), _file(filename="small.csv")
+        self._rows(monkeypatch, large, small)
+        document = _document()
+        workspace = document_workspace(document)
+        write = workspace.write_bytes
+
+        async def refusing_the_large_one(path: str, data: bytes) -> None:
+            if path == workspace_path(large):
+                raise OSError("no room")
+            await write(path, data)
+
+        monkeypatch.setattr(workspace, "write_bytes", refusing_the_large_one)
+
+        await attachments_module.restore_earlier_attachments(
+            workspace, self._earlier(large, small), can_parse=False
+        )
+
+        assert not document.exists(workspace_path(large))
+        assert document.exists(workspace_path(small))
+
+    async def test_a_sibling_the_sandbox_cannot_take_does_not_escape(self, storage, monkeypatch):
+        """The extracted text's write fails the way an unreachable sandbox fails, which
+        is not one of the errors that write expects - and set-up must never fail the
+        operation waiting behind it."""
+        from app.core.exceptions import ExternalServiceError
+
+        chat_file = _file(filename="report.pdf", file_type="pdf", parsed_content="page one")
+        self._rows(monkeypatch, chat_file)
+        document = _document()
+        workspace = document_workspace(document)
+        write = workspace.write_bytes
+
+        async def unreachable_for_text(path: str, data: bytes) -> None:
+            if path.endswith(".txt"):
+                raise ExternalServiceError(message="The sandbox service is unreachable.")
+            await write(path, data)
+
+        monkeypatch.setattr(workspace, "write_bytes", unreachable_for_text)
+
+        await attachments_module.restore_earlier_attachments(
+            workspace, self._earlier(chat_file), can_parse=False
+        )
+
+        assert document.exists(workspace_path(chat_file))
+
+    async def test_a_workspace_that_cannot_be_asked_puts_nothing_back(self, storage, monkeypatch):
+        """The run goes on: this is set-up, and it never fails the operation behind it."""
+        read = self._rows(monkeypatch, _file())
+
+        class _Unreachable(ShellFailing):
+            async def exists(self, path: str) -> bool:
+                raise ConnectionError("sandbox down")
+
+        await attachments_module.restore_earlier_attachments(
+            _Unreachable(document_workspace()), self._earlier(_file()), can_parse=False
+        )
+
+        read.assert_not_awaited()
+
+    async def test_a_read_that_fails_puts_nothing_back(self, storage, monkeypatch):
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def session():
+            raise ConnectionError("database down")
+            yield  # pragma: no cover - never reached
+
+        monkeypatch.setattr(attachments_module, "get_db_context", session)
+        chat_file = _file()
+        document = _document()
+
+        await attachments_module.restore_earlier_attachments(
+            document_workspace(document), self._earlier(chat_file), can_parse=False
+        )
+
+        assert not document.exists(workspace_path(chat_file))
+
+    async def test_an_agent_without_a_workspace_has_nothing_put_back(self, storage):
+        await AttachmentRouter(None).restore([_file()])
+
+        storage.assert_not_awaited()
+
+    async def test_the_thread_is_asked_as_the_caller_in_their_organization(self, monkeypatch):
+        conversation, organization, caller = uuid4(), uuid4(), uuid4()
+        file_id, pdf_id, scan_id = uuid4(), uuid4(), uuid4()
+        found = AsyncMock(
+            return_value=[
+                chat_file_repo.InterruptedFile(file_id, "raport.csv", "text", 10, "a,b"),
+                chat_file_repo.InterruptedFile(pdf_id, "umowa.pdf", "pdf", 10, "Umowa"),
+                chat_file_repo.InterruptedFile(scan_id, "skan.pdf", "pdf", 10, ""),
+            ]
+        )
+        monkeypatch.setattr(attachments_module.chat_file_repo, "left_by_interrupted_turns", found)
+
+        agent = uuid4()
+        earlier = await attachments_module.find_earlier_attachments(
+            object(),
+            conversation_id=conversation,
+            organization_id=organization,
+            user_id=caller,
+            agent_id=agent,
+            can_parse=False,
+            screen=None,
+        )
+
+        assert earlier is not None
+        assert earlier.paths[file_id] == f"uploads/{file_id.hex[:8]}-raport.csv"
+        # Only a document with text gets a sibling; `lit` reads both PDFs itself.
+        assert earlier.text_bearing == {pdf_id}
+        assert earlier.lit_readable == {pdf_id, scan_id}
+        assert found.await_args.kwargs == {
+            "conversation_id": conversation,
+            "organization_id": organization,
+            "user_id": caller,
+            "agent_id": agent,
+            "limit": attachments_module.EARLIER_ATTACHMENTS_RESTORED,
+            "opening_chars": attachments_module._OPENING_CHARS,
+        }
+
+    async def test_a_thread_with_no_attachments_has_nothing_to_put_back(self, monkeypatch):
+        monkeypatch.setattr(
+            attachments_module.chat_file_repo,
+            "left_by_interrupted_turns",
+            AsyncMock(return_value=[]),
+        )
+
+        assert (
+            await attachments_module.find_earlier_attachments(
+                object(),
+                conversation_id=uuid4(),
+                organization_id=uuid4(),
+                user_id=uuid4(),
+                agent_id=uuid4(),
+                can_parse=False,
+                screen=None,
+            )
+            is None
+        )
+
+
+class TestAFileTheInputEdgeRefusesIsNotPutBack:
+    """A turn whose input the guardrail would refuse can still end interrupted -
+    a budget is checked before the edge reads anything - and putting its file back
+    would hand a later turn what the policy turns away (#2481)."""
+
+    @staticmethod
+    async def _find(monkeypatch, *found, screen, can_parse: bool = False):
+        monkeypatch.setattr(
+            attachments_module.chat_file_repo,
+            "left_by_interrupted_turns",
+            AsyncMock(return_value=list(found)),
+        )
+        return await attachments_module.find_earlier_attachments(
+            object(),
+            conversation_id=uuid4(),
+            organization_id=uuid4(),
+            user_id=uuid4(),
+            agent_id=uuid4(),
+            can_parse=can_parse,
+            screen=screen,
+        )
+
+    @staticmethod
+    def _keyword(word: str, seen: list[str] | None = None):
+        from app.agents.capabilities.guardrails import GuardrailsConfig, input_screen
+
+        screen = input_screen(GuardrailsConfig(blocked_keywords_in=word))
+        assert screen is not None
+
+        def recording(text: str):
+            if seen is not None:
+                seen.append(text)
+            return screen(text)
+
+        return recording
+
+    @pytest.mark.security
+    async def test_a_refused_file_is_left_out_and_the_rest_put_back(self, monkeypatch, caplog):
+        refused, allowed = uuid4(), uuid4()
+
+        earlier = await self._find(
+            monkeypatch,
+            chat_file_repo.InterruptedFile(refused, "plan.csv", "text", 10, "salary,2026"),
+            chat_file_repo.InterruptedFile(allowed, "sales.csv", "text", 10, "month,total"),
+            screen=self._keyword("salary"),
+        )
+
+        assert earlier is not None
+        assert set(earlier.paths) == {allowed}
+        assert [
+            record.file_id
+            for record in caplog.records
+            if record.name == attachments_module.__name__
+        ] == [str(refused)]
+        # The log names the file, never what is in it.
+        assert "salary" not in caplog.text
+
+    @pytest.mark.security
+    async def test_a_thread_whose_every_file_is_refused_has_nothing_to_put_back(self, monkeypatch):
+        """And so no briefing telling the model a file may be back."""
+        earlier = await self._find(
+            monkeypatch,
+            chat_file_repo.InterruptedFile(uuid4(), "salary.pdf", "pdf", 10, ""),
+            screen=self._keyword("salary"),
+        )
+
+        assert earlier is None
+
+    @pytest.mark.security
+    async def test_a_screen_that_raises_its_refusal_refuses(self, monkeypatch):
+        from app.agents.capabilities.guardrails import GuardrailBlocked
+
+        def raising(text: str):
+            raise GuardrailBlocked(edge="input", message="Refused.")
+
+        earlier = await self._find(
+            monkeypatch,
+            chat_file_repo.InterruptedFile(uuid4(), "a.csv", "text", 10, "x"),
+            screen=raising,
+        )
+
+        assert earlier is None
+
+    @pytest.mark.security
+    @pytest.mark.parametrize(("can_parse", "sibling"), [(False, True), (True, False)])
+    async def test_the_edge_reads_what_it_would_read_of_the_file(
+        self, monkeypatch, can_parse: bool, sibling: bool
+    ):
+        """Its name, path and opening lines, and its extracted text named where a
+        runtime without `lit` gets it - `_referenced`, as on the turn it came with."""
+        file_id = uuid4()
+        seen: list[str] = []
+
+        await self._find(
+            monkeypatch,
+            chat_file_repo.InterruptedFile(file_id, "umowa.pdf", "pdf", 4096, "Umowa\nStrona 1"),
+            screen=self._keyword("unused", seen),
+            can_parse=can_parse,
+        )
+
+        path = f"uploads/{file_id.hex[:8]}-umowa.pdf"
+        (text,) = seen
+        assert f"Attached file: umowa.pdf (4 KB, pdf), in your workspace at {path}" in text
+        assert "Umowa\nStrona 1" in text
+        assert (f"{path}.txt" in text) is sibling
+
+    def test_the_opening_read_has_the_head_of_the_whole_text(self):
+        """Only a prefix of the parsed text is read for the screen, and it must
+        show the edge the same first lines - `\r\n` lines halve what a prefix holds."""
+        head_chars = attachments_module.HEAD_CHARS
+        crlf = "\r\n" * (head_chars + 5)
+        long_lines = "\r\n".join(["x" * 300] * 30)
+
+        for text in (crlf, long_lines, "a\rb\nc" * 2000):
+            prefix = text[: attachments_module._OPENING_CHARS]
+            assert attachments_module._head(prefix) == attachments_module._head(text)
+
+
+def _blocking(word: str = "XYZZY"):
+    """The input edge's own detector, blocking `word` - the one the harness runs."""
+    screen = input_screen(GuardrailsConfig(blocked_keywords_in=word))
+    assert screen is not None
+    return screen
+
+
+@pytest.mark.security
+class TestTheInputEdgeScreensBeforeAnythingIsWritten:
+    """A file the input guardrail refuses never reaches the workspace (#2559).
+
+    The edge screens the prompt on the first model request, and routing used to
+    write the file while the prompt was built - before that. On a conversation-,
+    user- or agent-scoped workspace the refused file stayed, and a later turn
+    could open it.
+    """
+
+    async def test_a_refused_file_is_not_written(self, storage):
+        document = _document()
+        chat_file = _file(parsed_content="month,total\nXYZZY,10")
+
+        await AttachmentRouter(document_workspace(document), screen=_blocking()).build_prompt(
+            "summarise", [chat_file]
+        )
+
+        assert document.files == {}
+        storage.assert_not_awaited()
+
+    async def test_a_refused_turn_is_handed_on_for_the_edge_to_refuse(self, storage):
+        """Built from the same text the edge reads, so the edge refuses it and the
+        turn ends as `guardrail_blocked` the way it always did."""
+        screen = _blocking()
+
+        prompt = await AttachmentRouter(
+            document_workspace(_document()), screen=screen
+        ).build_prompt("summarise", [_file(parsed_content="month,total\nXYZZY,10")])
+
+        assert isinstance(prompt, str)
+        assert "XYZZY" in prompt
+        with pytest.raises(GuardrailBlocked):
+            screen(prompt)
+
+    async def test_a_refused_turn_leaves_the_next_turn_nothing_to_look_for(self, storage):
+        """`context` is replayed to later turns; a path to a file that was never
+        written would send the model looking for it."""
+        router = AttachmentRouter(document_workspace(_document()), screen=_blocking())
+
+        await router.build_prompt("summarise", [_file(parsed_content="XYZZY")])
+
+        assert router.context == ""
+
+    async def test_the_message_alone_is_enough_to_stop_the_write(self, storage):
+        document = _document()
+
+        await AttachmentRouter(document_workspace(document), screen=_blocking()).build_prompt(
+            "XYZZY - summarise", [_file()]
+        )
+
+        assert document.files == {}
+
+    async def test_the_extracted_text_of_a_document_is_screened_too(self, storage):
+        """A PDF's opening lines reach the prompt through its parse, like any other."""
+        document = _document()
+        chat_file = _file(
+            filename="memo.pdf",
+            mime_type="application/pdf",
+            file_type="pdf",
+            parsed_content="XYZZY confidential",
+        )
+
+        await AttachmentRouter(document_workspace(document), screen=_blocking()).build_prompt(
+            "summarise", [chat_file]
+        )
+
+        assert document.files == {}
+
+    async def test_a_screen_that_answers_block_rather_than_raising_stops_it_too(self, storage):
+        document = _document()
+
+        await AttachmentRouter(
+            document_workspace(document), screen=lambda _text: GuardrailResult.block("no")
+        ).build_prompt("summarise", [_file()])
+
+        assert document.files == {}
+
+    async def test_a_clean_turn_is_routed_as_before(self, storage):
+        document = _document()
+        chat_file = _file()
+
+        prompt = await AttachmentRouter(
+            document_workspace(document), screen=_blocking()
+        ).build_prompt("summarise", [chat_file])
+
+        assert document.exists(workspace_path(chat_file))
+        assert workspace_path(chat_file) in prompt
+
+    async def test_a_pictures_bytes_decide_neither_here_nor_at_the_edge(self, storage):
+        """The edge reads a picture's prompt by its text parts (#2566), so this
+        screen's prediction holds for it: written here, and run there."""
+        storage.return_value = PNG + b"XYZZY"
+        document = _document()
+        chat_file = _file(
+            filename="shot.png", file_type="image", mime_type="image/png", parsed_content=None
+        )
+
+        prompt = await AttachmentRouter(
+            document_workspace(document), screen=_blocking()
+        ).build_prompt("what is this?", [chat_file])
+
+        assert document.exists(workspace_path(chat_file))
+        assert isinstance(prompt, list)
+        assert [type(part) for part in prompt] == [str, BinaryContent]
+        capability = build_guardrails(GuardrailsConfig(blocked_keywords_in="XYZZY"))
+        assert capability is not None
+        agent: Agent = Agent(
+            model=TestModel(custom_output_text="a picture"), capabilities=[capability]
+        )
+        assert (await agent.run(prompt)).output == "a picture"
+
+    async def test_a_redacting_screen_does_not_stop_the_write(self, storage):
+        """Only a refusal stops the turn; a redaction is the edge's to apply."""
+        document = _document()
+        chat_file = _file()
+
+        await AttachmentRouter(
+            document_workspace(document), screen=lambda text: GuardrailResult.replace(text)
+        ).build_prompt("summarise", [chat_file])
+
+        assert document.exists(workspace_path(chat_file))
+
+    async def test_an_agent_with_no_workspace_is_not_screened_here(self, storage):
+        """Nothing is written without a workspace, so the edge alone decides."""
+        prompt = await AttachmentRouter(None, screen=_blocking()).build_prompt(
+            "summarise", [_file(parsed_content="XYZZY")]
+        )
+
+        assert isinstance(prompt, str)
+        assert "XYZZY" in prompt
+
+    async def test_what_is_screened_is_what_a_clean_turn_sends(self, storage):
+        """The screen predicts the edge only while both read the same text: a
+        reference worded differently in one place would let a refused head through."""
+        chat_file = _file()
+        clean = await AttachmentRouter(document_workspace(_document())).build_prompt(
+            "summarise", [chat_file]
+        )
+
+        refused = await AttachmentRouter(
+            document_workspace(_document()), screen=lambda _text: GuardrailResult.block("no")
+        ).build_prompt("summarise", [chat_file])
+
+        assert refused == clean

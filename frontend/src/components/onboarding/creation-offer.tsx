@@ -1,0 +1,116 @@
+"use client";
+
+import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslations } from "next-intl";
+
+import { isAtAgentLimit } from "@/components/agents/agent-limit-notice";
+import { ConfirmDialog } from "@/components/ui";
+import { useAgentCeiling } from "@/hooks/use-agents";
+import { usePermissions } from "@/hooks/use-permissions";
+import { Perm } from "@/types/permissions";
+import { canOfferFlow, FLOWS } from "@/lib/onboarding/flows";
+import { qk } from "@/lib/query-keys";
+import type { AgentList } from "@/types/agents";
+import type { McpCatalog } from "@/types/mcp";
+// The specific module, not the `@/stores` barrel — this mounts on every
+// dashboard page through `OnboardingFlows`, and the barrel would drag this store
+// into every test that partially mocks `@/stores`.
+import { useOnboardingStore } from "@/stores/onboarding-store";
+
+/**
+ * The "Create X? [Yes, guide me] [Not now]" prompt that ends a section's "?"
+ * walk (and follows the first-run tour, for the agent).
+ *
+ * It renders whatever flow the store is offering; accepting starts that flow,
+ * declining records nothing — asking for help is not the same as finishing
+ * onboarding, and a decline the reader can change their mind about is a decline
+ * worth nothing to persist. The permission is checked here as well as at the
+ * point the offer is made, so a stale offer can never point the reader at a
+ * create the server would refuse them.
+ *
+ * A `ConfirmDialog` rather than bespoke chrome: it is the platform's yes/no, so
+ * the offer reads like every other confirmation rather than a second dialect of
+ * one.
+ */
+export function CreationOffer() {
+  const t = useTranslations("onboarding");
+  const offer = useOnboardingStore((state) => state.offer);
+  const offerFromTour = useOnboardingStore((state) => state.offerFromTour);
+  const openFlow = useOnboardingStore((state) => state.openFlow);
+  const dismissOffer = useOnboardingStore((state) => state.dismissOffer);
+  const { can } = usePermissions();
+  const queryClient = useQueryClient();
+  // Subscribed, never fetching (`skipToken`): the answer is produced by the
+  // Routines page's own gate (`useCanCreateTrigger`), and a subscription - where
+  // a one-time `getQueryData` snapshot missed it - re-renders this component
+  // when it lands, so a walk that finishes before the query settles shows the
+  // offer the moment the answer says it may, and never on a refusal.
+  const { data: anyRunnable } = useQuery({
+    queryKey: qk.agents.anyRunnable(),
+    queryFn: skipToken,
+  });
+  const { ceiling, known: ceilingKnown } = useAgentCeiling({
+    enabled: offer === "create-agent" && can(Perm.agentsEdit),
+  });
+
+  if (offer === null || !canOfferFlow(FLOWS[offer], can)) return null;
+  // The MCP catalog is compiled into the deployment; empty, there is nothing to
+  // connect, and the walk that ends on this offer had no servers to spotlight
+  // either. Read the cache the MCP page already filled — no fetch of this always-
+  // mounted component's own — so the offer falls away rather than opening a flow
+  // with an empty catalog to pick from.
+  if (
+    offer === "create-mcp" &&
+    queryClient.getQueryData<McpCatalog>(qk.mcpServers.catalog())?.items.length === 0
+  ) {
+    return null;
+  }
+  // "Shall we build your first agent?" to an organization that has six of them is
+  // the offer answering a question nobody asked — and it is what the first-run
+  // tour ends with, having just walked the reader through an existing agent's
+  // builder in detail. So the *tour's* agent offer is for an organization with no
+  // agent yet. The Agents "?" walk ends on the same offer, but there asking to
+  // build one is the whole point of the walk, so it is not gated on the count —
+  // only the tour's is (#910). Read the origin the offer was made with rather than
+  // live `mode`, which a later walk mutates: a suppressed tour offer must stay
+  // suppressed, not resurface when the next "?" walk flips the mode. Read the
+  // count from the cache the walk itself filled, not a fetch of our own.
+  if (
+    offer === "create-agent" &&
+    offerFromTour &&
+    (queryClient.getQueryData<AgentList>(qk.agents.list())?.total ?? 0) > 0
+  ) {
+    return null;
+  }
+  // The agent flow's first target is New agent, which the Agents page disables at
+  // the organization's agent limit, and a coach waiting on a disabled control
+  // has no way forward. So no offer at the limit, and none until it is known.
+  // Fetched rather than read from the cache like the gates above: nothing else
+  // need have filled it, and an unfilled cache would never answer.
+  if (offer === "create-agent" && (!ceilingKnown || isAtAgentLimit(ceiling))) {
+    return null;
+  }
+  // The routine flow's first target is the Routines page's create buttons, which
+  // mount on the per-agent `can_run` answer, not on the scope-blind `can` above -
+  // and the coach waits on a flow target with no timeout. So the offer needs the
+  // same answer to say yes: a caller it refused gets no offer, and one it has
+  // not answered yet gets it only once it does - the store holds the offer, so
+  // waiting loses nothing.
+  if (offer === "create-routine" && anyRunnable !== true) {
+    return null;
+  }
+
+  return (
+    <ConfirmDialog
+      open
+      onOpenChange={(next) => {
+        if (!next) dismissOffer();
+      }}
+      title={t(`offer.${offer}.title`)}
+      description={t(`offer.${offer}.body`)}
+      confirmLabel={t("offer.accept")}
+      cancelLabel={t("offer.decline")}
+      onConfirm={() => openFlow(offer)}
+    />
+  );
+}

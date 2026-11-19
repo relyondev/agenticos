@@ -1,0 +1,96 @@
+"use client";
+
+import { Pencil, RotateCw, Trash2 } from "lucide-react";
+import { useLocale, useTranslations } from "next-intl";
+
+import { Button } from "@/components/ui";
+import { ConnectorIcon } from "@/components/rag/connector-icon";
+import { SyncSourceLogs } from "@/components/rag/sync-source-logs";
+import { RagStatusBadge } from "@/components/rag/rag-status-badge";
+import type { SyncSourceRead } from "@/lib/rag-api";
+import { formatDateTime } from "@/lib/utils";
+
+export function SyncSourceRow({
+  source,
+  kbId,
+  onEdit,
+  onTrigger,
+  onDelete,
+}: {
+  source: SyncSourceRead;
+  kbId: string;
+  /** Absent when the caller may not write - the buttons are then not drawn. */
+  onEdit?: () => void;
+  onTrigger?: () => void;
+  /** Asks for the disconnection; the page owns the confirmation and the call. */
+  onDelete?: () => void;
+}) {
+  const t = useTranslations("pages.kb");
+  const locale = useLocale();
+  const lastSync = source.last_sync_at ? formatDateTime(source.last_sync_at, locale) : t("never");
+  return (
+    <li className="overflow-hidden">
+      <div className="hover:bg-accent flex items-center gap-3 px-4 py-3 transition-colors">
+        <ConnectorIcon type={source.connector_type} size="sm" />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <p className="text-foreground truncate text-sm font-medium">{source.name}</p>
+          </div>
+          <div className="text-muted-foreground mt-0.5 flex flex-wrap items-center gap-x-2 text-xs">
+            <span>{t("lastSyncAt", { when: lastSync })}</span>
+            {source.schedule_minutes && source.schedule_minutes > 0 && (
+              <>
+                <span>·</span>
+                <span>{t("everyMinutes", { minutes: source.schedule_minutes })}</span>
+              </>
+            )}
+          </div>
+        </div>
+        {source.last_sync_status && (
+          <RagStatusBadge
+            status={source.last_sync_status}
+            message={source.last_error}
+            className="shrink-0"
+          />
+        )}
+        {onEdit && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground hover:text-foreground h-8 w-8 p-0"
+            onClick={onEdit}
+            title={t("editSource")}
+            aria-label={t("editSource")}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </Button>
+        )}
+        {onTrigger && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground hover:text-foreground h-8 w-8 p-0"
+            onClick={onTrigger}
+            title={t("triggerSyncNow")}
+            aria-label={t("triggerSyncNow2")}
+          >
+            <RotateCw className="h-3.5 w-3.5" />
+          </Button>
+        )}
+        {onDelete && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground hover:text-destructive h-8 w-8 p-0"
+            onClick={onDelete}
+            title={t("removeSource")}
+            aria-label={t("removeSource2")}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        )}
+      </div>
+      <SyncSourceLogs logsPath={`/kb/${kbId}/sync-sources/${source.id}/logs`} />
+    </li>
+  );
+}

@@ -1,0 +1,306 @@
+"""RAG tool for agent knowledge base search."""
+
+import contextvars
+import logging
+from collections.abc import Mapping
+from typing import Any
+from uuid import UUID
+
+from app.core.config import settings
+from app.core.exceptions import AppException, ExternalServiceError
+from app.db.session import on_the_pooled_loop
+from app.db.vector_tables import VectorScope
+from app.services.rag.citation import citation_locator
+from app.services.rag.embeddings import EmbeddingService
+from app.services.rag.filters import RetrievalFilters, RetrievalScope, scope_for
+from app.services.rag.models import ParentContextMode, SearchResult
+from app.services.rag.query_analysis import GenerateText, QueryAnalysisMode, plan_queries
+from app.services.rag.retrieval import RetrievalService, fuse_over_queries
+from app.services.rag.vectorstore import process_vector_store, unpooled_vector_store
+
+logger = logging.getLogger(__name__)
+
+_pooled_service: RetrievalService | None = None
+_unpooled_service: RetrievalService | None = None
+
+
+def get_retrieval_service() -> RetrievalService:
+    """The retrieval service for the loop this search is running on.
+
+    An agent is the one vector caller that does not know which loop it is on: it
+    runs on the API's loop in one process and on a worker's loop in
+    another. That decides which engine its store may ride, because a pooled
+    asyncpg connection belongs to the loop that opened it - a store cached for
+    the life of the process and shared by two loops in one worker handed the
+    second a connection the first had opened, and the search failed with
+    `InterfaceError: attached to a different loop`, intermittently and invisibly
+    to any test with one loop in it (#1079).
+
+    So: on the loop that owns the process's pools, the store the API means -
+    `vector_engine`, bounded by `DB_POOL_SIZE + DB_MAX_OVERFLOW`, the same store
+    the lifespan and every request use. Anywhere else, a store on the pool-less
+    engine, which caches no connection and so has none to hand to the wrong
+    loop. Both are held for the life of the process rather than rebuilt per
+    search, which would rebuild the embedding client per turn; neither builds a
+    pool of its own, which is the second pool #948 removed.
+
+    Keeping the pooled store for the API is what bounds this. `NullPool` opens a
+    connection per checkout and caps nothing, so serving the API from it would
+    let a burst of concurrent runs reach `max_connections` where the pool used to
+    queue. Off that loop the bound is the worker's own flow concurrency.
+    """
+    global _pooled_service, _unpooled_service
+    rag_settings = settings.rag
+
+    if on_the_pooled_loop():
+        if _pooled_service is None:
+            _pooled_service = RetrievalService(
+                process_vector_store(rag_settings, EmbeddingService(rag_settings)), rag_settings
+            )
+        return _pooled_service
+
+    if _unpooled_service is None:
+        _unpooled_service = RetrievalService(
+            unpooled_vector_store(rag_settings, EmbeddingService(rag_settings)), rag_settings
+        )
+    return _unpooled_service
+
+
+def reset_retrieval_service() -> None:
+    """Forget both cached stores, at shutdown.
+
+    A store is built on the first knowledge search and then held for the life of
+    the process; what a shutdown owes is only that the next search builds
+    afresh, so a shutdown followed by more work - a test, a reload - does not
+    search through a store whose engine `close_db` has disposed. Neither store
+    owns a pool of its own, so there is nothing here to close.
+    """
+    global _pooled_service, _unpooled_service
+    _pooled_service = None
+    _unpooled_service = None
+
+
+def _format_results(results: list[Any]) -> str:
+    if not results:
+        return "No relevant documents found in the knowledge base."
+    formatted = []
+    for i, result in enumerate(results, start=1):
+        source = result.metadata.get("filename", "unknown")
+        chunk = result.metadata.get("chunk_num", "")
+        col = result.metadata.get("collection", "")
+        # Only a real page is a location: Markdown's stored "page 1" is
+        # structural, and a chunk's opening hash line may be code (#2489).
+        locator = citation_locator(result.metadata)
+        chunk_info = f", chunk {chunk}" if chunk else ""
+        col_info = f" [{col}]" if col else ""
+        # The expanded passage when small-to-big retrieval added surrounding
+        # context, else the matched chunk itself (#1651). The score and citation
+        # stay the matched chunk's; only the text the model reads grows.
+        body = result.expanded_content or result.content
+        # The locator and chunk name the match; said so when the passage below
+        # reaches past it, so a citation is not read as covering the whole text.
+        context_info = ", with surrounding text" if result.expanded_content else ""
+        formatted.append(
+            f"[{i}] Source: {source}{locator}{chunk_info}{col_info}{context_info} "
+            f"(score: {result.score:.3f})\n"
+            f"{body}"
+        )
+    return (
+        "Search results (cite inline using [1], [2], etc. - do NOT list sources at the end):\n\n"
+        + "\n\n".join(formatted)
+    )
+
+
+# ContextVar set by non-PydanticAI frameworks before each agent invocation so that
+# the tool can read the active KB collections without needing explicit Deps injection.
+# Default is None (not []) - mutable defaults on ContextVar are a foot-gun
+# because every reader gets the same shared list. Callers should treat None
+# as "no collections active".
+_active_kb_collections: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "_active_kb_collections", default=None
+)
+
+
+async def _scope_of(
+    service: RetrievalService,
+    name: str,
+    organization_id: UUID,
+    bound: Mapping[str, VectorScope] | None,
+) -> RetrievalScope:
+    """The scope one collection is searched under: its bound base's, when known.
+
+    An agent is bound to knowledge bases, not names, and a name is not unique: an
+    organization's base and a member's personal base can share one. Resolving the
+    name again would search whichever of them resolves first - a personal base's
+    agent reading the organization's chunks and none of its own (#2537). A name
+    with no bound scope - a caller holding names alone - is resolved for the
+    organization as before.
+    """
+    if bound is not None and name in bound:
+        return scope_for(bound[name])
+    return await service.resolve_scope(name, organization_id)
+
+
+async def organizational_units_in_scope(
+    kb_collection_names: list[str],
+    organization_id: UUID | None,
+    *,
+    kb_vector_scopes: Mapping[str, VectorScope] | None = None,
+) -> list[str]:
+    """The organizational units the collections carry, read as a search reads them.
+
+    Each collection's scope is resolved exactly as :func:`search_knowledge_base`
+    resolves it, so the facet read is confined to the rows the search itself could
+    return and never names another organization's units. Self-query states these
+    in its prompt and keeps no inferred unit outside them.
+
+    Returns:
+        The distinct units across the collections, sorted; empty with no
+        organization, since there is then no scope to read under.
+    """
+    if organization_id is None:
+        return []
+    service = get_retrieval_service()
+    units: set[str] = set()
+    for name in kb_collection_names:
+        scope = await _scope_of(service, name, organization_id, kb_vector_scopes)
+        values = await service.store.distinct_metadata_values(name, ["organizational_unit"], scope)
+        units.update(values.get("organizational_unit", []))
+    return sorted(units)
+
+
+async def search_knowledge_base(
+    query: str,
+    kb_collection_names: list[str] | None = None,
+    kb_vector_scopes: Mapping[str, VectorScope] | None = None,
+    top_k: int = 5,
+    organization_id: UUID | None = None,
+    filters: RetrievalFilters | None = None,
+    analysis_mode: QueryAnalysisMode = "off",
+    analysis_max_variants: int = 3,
+    generate: GenerateText | None = None,
+    parent_context: ParentContextMode = ParentContextMode.OFF,
+) -> str:
+    """Search the knowledge base and return formatted results.
+
+    Args:
+        query: The search query string.
+        kb_collection_names: Vector-store collection names resolved server-side from the
+            agent's spec. Never supplied by the LLM directly - injected via
+            PydanticAI Deps or the _active_kb_collections ContextVar.
+        kb_vector_scopes: The bound knowledge base behind each of those names. A
+            name found here is searched under its own base's scope rather than
+            resolved again, since a name is not unique (#2537).
+        top_k: Number of top results to retrieve (default: 5).
+        organization_id: The organization this agent runs for. The security-bearing
+            tenant scope is built from it, so a collection name shared across
+            organizations returns and embeds only this tenant's chunks (#913). A
+            search without one is refused rather than run unscoped.
+        filters: Optional narrowing-only business filters (source, document type,
+            organizational unit, date range). Never a tenant or authorization
+            field - those are structurally inexpressible here.
+        analysis_mode: Optional query analysis run before retrieval (#1649). Off by
+            default. Each produced query is retrieved under the *same* scope and
+            filters and their results are fused, so expansion can widen recall but
+            never access.
+        analysis_max_variants: How many rephrasings `multi_query` may add.
+        generate: Runs one prompt through the run's model, for the analysis
+            modes. `None` when the run's model cannot make a request-response call,
+            which degrades them to the plain query.
+        parent_context: The agent's small-to-big return mode (#1651). Return-path
+            only - matching and ranking still run on the small chunks - so `OFF`
+            (the default) returns the matched chunks unchanged. With several
+            queries it runs once, after fusion, so the passage budget is spent
+            on the fused list rather than on each variant's.
+    """
+    resolved = kb_collection_names if kb_collection_names else (_active_kb_collections.get() or [])
+    if not resolved:
+        return "No active knowledge bases selected for this conversation."
+
+    if organization_id is None:
+        # Fail-closed: with no trusted tenant there is no scope to build, and an
+        # unscoped search over a shared physical table could read another
+        # tenant's chunks. Refuse rather than widen (FA-039 C1).
+        return "No organization context is available, so the knowledge base cannot be searched."
+
+    # The analysis step runs before retrieval and produces only alternative query
+    # *strings*; the scope and filters below are resolved once and bound into the
+    # `retrieve_one` closure, identical for every produced query, so no expanded
+    # query can reach past this tenant's and collection's rows (#1649, FA-039).
+    queries = await plan_queries(
+        query, mode=analysis_mode, max_variants=analysis_max_variants, generate=generate
+    )
+
+    service: Any = get_retrieval_service()
+    one_collection = len(resolved) == 1
+    try:
+        single_scope = scopes_by_name = None
+        if one_collection:
+            # Built from the bound base's own scope, or resolved per name when a
+            # caller holds the name alone - never from `organization_id` alone:
+            # `AppScope` for a base with no tenant, `TenantScope` for an org one,
+            # or an app-scoped base's untagged rows never matched (#1684,
+            # FA-039, #2537).
+            single_scope = await _scope_of(service, resolved[0], organization_id, kb_vector_scopes)
+        else:
+            scopes_by_name = {
+                name: await _scope_of(service, name, organization_id, kb_vector_scopes)
+                for name in resolved
+            }
+
+        # Several variants are retrieved bare and expanded once after fusion; a
+        # single query expands inside its own retrieval, exactly as before #1649.
+        fused = len(queries) > 1
+        per_query_context = ParentContextMode.OFF if fused else parent_context
+
+        async def retrieve_one(one_query: str) -> list[SearchResult]:
+            if one_collection:
+                return await service.retrieve(
+                    query=one_query,
+                    collection_name=resolved[0],
+                    scope=single_scope,
+                    filters=filters,
+                    limit=top_k,
+                    parent_context=per_query_context,
+                )
+            return await service.retrieve_multi(
+                query=one_query,
+                collection_names=resolved,
+                scopes=scopes_by_name,
+                filters=filters,
+                limit=top_k,
+                parent_context=per_query_context,
+            )
+
+        results = await fuse_over_queries(queries, retrieve_one, limit=top_k)
+        if fused:
+            await service.expand(
+                results,
+                parent_context=parent_context,
+                scopes={resolved[0]: single_scope} if one_collection else scopes_by_name,
+            )
+    except AppException:
+        # Already an account of what is wrong and what to do about it - an
+        # unconfigured embedding credential names the setting to set. Rewrapping
+        # it as "search failed" would replace that with a symptom.
+        raise
+    except Exception as e:
+        # The upstream text stays here and goes no further. `details` is
+        # serialized into the response body, and `str(e)` on an embedding or
+        # vector-store client is not a controlled string: provider SDKs put the
+        # failing request URL in the message, and a URL carries a key in its
+        # query string. What the caller can act on is which collections were
+        # searched and how, so that is what the refusal carries (agenticos#342).
+        logger.exception("Knowledge base search failed")
+        raise ExternalServiceError(
+            message="Knowledge base search failed",
+            details={
+                "collections": resolved,
+                "operation": "retrieve" if one_collection else "retrieve_multi",
+            },
+        ) from e
+
+    return _format_results(results)
+
+
+__all__ = ["organizational_units_in_scope", "search_knowledge_base"]

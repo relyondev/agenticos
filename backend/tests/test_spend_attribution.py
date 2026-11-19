@@ -1,0 +1,118 @@
+"""Where the money went: which provider, and through which key.
+
+A run recorded `model_label` - a display name somebody chose, like "GPT-4.1
+(prod)". Two questions an invoice raises could not be answered from it at all:
+what did we spend at OpenAI versus Anthropic, and which key is costing the most.
+
+The property worth pinning is not the sum, it is the *attribution*: it is taken
+from what the run actually used and frozen there, so repointing a model profile
+or rotating a key never rewrites what last month appears to have cost.
+"""
+
+import uuid
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.agents.model_resolver import ModelRequestSpec, ResolvedCredential
+from app.core.permissions import AuthContext, OrgRoleName
+from app.core.secret_kinds import ApiKeySecret
+from app.services.agent_runner import AgentRunnerService
+
+RUNNER = "app.services.agent_runner"
+
+
+def _ctx() -> AuthContext:
+    return AuthContext(user_id=uuid.uuid4(), organization_id=uuid.uuid4(), role=OrgRoleName.OWNER)
+
+
+def _model_spec(secret_id: uuid.UUID | None) -> ModelRequestSpec:
+    return ModelRequestSpec(
+        profile_id=uuid.uuid4(),
+        label="GPT-4.1 (prod)",
+        provider="openai",
+        model="gpt-4.1",
+        params={},
+        credential=ResolvedCredential(provider="openai", secret=ApiKeySecret(api_key="sk-x-12345")),
+        secret_id=secret_id,
+        fallbacks=[],
+    )
+
+
+class TestWhatARunRecords:
+    def test_the_resolver_carries_which_key_it_resolved(self):
+        """Without it the run has a provider and no way to say whose key paid."""
+        secret_id = uuid.uuid4()
+        assert _model_spec(secret_id).secret_id == secret_id
+
+    def test_a_keyless_provider_records_no_key(self):
+        """A self-hosted server has no key to attribute spend to, and inventing
+        one would put a row under a credential that does not exist."""
+        assert _model_spec(None).secret_id is None
+
+
+class TestAggregation:
+    @pytest.mark.anyio
+    async def test_spend_is_grouped_by_the_provider_the_run_used(self):
+        rows = [("openai", Decimal("12.50"), 40), ("anthropic", Decimal("3.00"), 5)]
+        with patch(
+            f"{RUNNER}.agent_run_repo.spend_by_provider", new=AsyncMock(return_value=rows)
+        ) as query:
+            result = await AgentRunnerService(MagicMock()).spend_by_provider(
+                _ctx(), since=datetime.now(UTC) - timedelta(days=7)
+            )
+
+        assert result == rows
+        # The window is a window, not "everything": a monthly bill is not
+        # answered by a total since the beginning of time.
+        assert isinstance(query.call_args.kwargs["since"], datetime)
+        assert query.call_args.kwargs["since"].tzinfo is UTC
+
+    @pytest.mark.anyio
+    async def test_cache_collapses_are_read_per_agent_and_model_in_the_callers_org(self):
+        rows = [(uuid.uuid4(), "Clerk", "clerk", "gpt-4.1", 2, 0, 900, 1)]
+        ctx = _ctx()
+        with patch(
+            f"{RUNNER}.agent_run_repo.cache_collapses", new=AsyncMock(return_value=rows)
+        ) as query:
+            result = await AgentRunnerService(MagicMock()).cache_collapses(
+                ctx, since=datetime.now(UTC)
+            )
+        assert result == rows
+        assert query.await_args.kwargs["organization_id"] == ctx.organization_id
+
+    @pytest.mark.anyio
+    async def test_spend_is_grouped_by_the_day_it_was_spent(self):
+        rows = [(date(2026, 10, 12), Decimal("1.25"), 4)]
+        with patch(f"{RUNNER}.agent_run_repo.spend_by_day", new=AsyncMock(return_value=rows)):
+            result = await AgentRunnerService(MagicMock()).spend_by_day(
+                _ctx(), since=datetime.now(UTC) - timedelta(days=7)
+            )
+
+        assert result == rows
+
+    @pytest.mark.anyio
+    async def test_spend_is_grouped_by_the_key_that_paid(self):
+        secret_id = uuid.uuid4()
+        rows = [(secret_id, "OpenAI production", Decimal("9.00"), 12)]
+        with patch(f"{RUNNER}.agent_run_repo.spend_by_key", new=AsyncMock(return_value=rows)):
+            result = await AgentRunnerService(MagicMock()).spend_by_key(
+                _ctx(), since=datetime.now(UTC) - timedelta(days=30)
+            )
+
+        assert result[0][0] == secret_id
+        assert result[0][1] == "OpenAI production"
+
+    @pytest.mark.anyio
+    async def test_a_deleted_key_keeps_its_spend_under_a_null_label(self):
+        """The money was spent whether or not the key still exists. Dropping the
+        row would make a month's total quietly stop adding up."""
+        rows = [(None, None, Decimal("4.20"), 3)]
+        with patch(f"{RUNNER}.agent_run_repo.spend_by_key", new=AsyncMock(return_value=rows)):
+            result = await AgentRunnerService(MagicMock()).spend_by_key(
+                _ctx(), since=datetime.now(UTC) - timedelta(days=30)
+            )
+
+        assert result[0][2] == Decimal("4.20")

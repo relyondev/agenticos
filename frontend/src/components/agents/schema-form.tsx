@@ -1,0 +1,882 @@
+"use client";
+
+import { useState } from "react";
+import Image from "next/image";
+import { ChevronRight, Cloud, Container, Eye, EyeOff, Globe, Laptop, Network } from "lucide-react";
+
+import {
+  Checkbox,
+  Input,
+  Label,
+  MarkdownEditor,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Switch,
+  Textarea,
+} from "@/components/ui";
+import { ModelProfilePicker } from "@/components/agents/model-profile-picker";
+import { BrandIcon, type BrandName } from "@/components/icons/brand-icon";
+import { useModelProviders } from "@/hooks";
+import { ProviderIcon } from "@/components/vault/provider-icon";
+import { BRAND_GLYPHS } from "@/lib/brand-glyphs.generated";
+import type { FieldCopy, FieldCopyFor } from "@/components/agents/capability-field-copy";
+import { cn } from "@/lib/utils";
+import type { JsonSchema, JsonSchemaProperty } from "@/types/agents";
+import { useTranslations } from "next-intl";
+
+/**
+ * The option standing for "this field was left alone".
+ *
+ * A select needs a value for every option and the empty string is not one Radix
+ * accepts, so absence needs a name. It never reaches the spec: choosing it
+ * stores `undefined`, which is what an untouched field already is.
+ */
+const UNSET = "__unset__";
+
+interface SchemaFormProps {
+  hiddenFields?: readonly string[];
+  schema: JsonSchema;
+  value: Record<string, unknown>;
+  onChange: (value: Record<string, unknown>) => void;
+  disabled?: boolean;
+  /** Prefixed onto field ids so two forms on one page keep distinct labels. */
+  idPrefix: string;
+  /**
+   * What the server said about individual fields, keyed by field name.
+   *
+   * A generated form has to be able to show a generated refusal. "This is not a
+   * service account key - its 'type' is not service_account" is a sentence
+   * about one input, and announcing it in a toast puts it somewhere it cannot
+   * be acted on and then takes it away.
+   */
+  errors?: Readonly<Record<string, string>>;
+  /**
+   * Each field's title and description in the reader's language, where a
+   * catalog holds them - a capability's settings do (#2098). Without it, or for
+   * a field it has no copy for, the schema's own English is shown.
+   */
+  copyFor?: FieldCopyFor;
+}
+
+/**
+ * A form generated from a capability's JSON Schema.
+ *
+ * The backend publishes `config_schema` precisely so this exists: a developer
+ * adds a field to a Pydantic model and it appears here, with its constraints and
+ * its help text, without anyone touching the frontend. Hand-maintaining a form
+ * per capability is how the two drift - the form keeps accepting a field the
+ * backend removed, and the new field nobody added stays unreachable.
+ *
+ * The supported subset is deliberately small: strings, numbers, booleans, enums
+ * and a list of strings, which is what capability configuration actually is. A
+ * capability that needs a richer editor should ship its own component rather
+ * than push this towards being a general schema renderer.
+ *
+ * The same generator builds the vault's secret forms, from the schemas
+ * `/secrets/kinds` serves - which is why it knows about `const` and about
+ * `format: "password"`. Both are Pydantic's own output: the discriminator on a
+ * secret payload, and every `SecretStr` in it.
+ */
+export function SchemaForm({
+  hiddenFields = [],
+  schema,
+  value,
+  onChange,
+  disabled,
+  idPrefix,
+  errors,
+  copyFor,
+}: SchemaFormProps) {
+  const properties = Object.entries(schema.properties ?? {}).filter(
+    // A field with exactly one legal value is not a question. Rendering it
+    // would offer a control whose every other answer the server refuses, and
+    // for a secret payload that control is the `kind` the caller already chose.
+    ([key, property]) =>
+      !hiddenFields.includes(key) &&
+      property.const === undefined &&
+      visible(property, schema, value),
+  );
+  if (properties.length === 0) return null;
+
+  const set = (key: string, fieldValue: unknown) => {
+    const next: Record<string, unknown> = { ...value, [key]: fieldValue };
+    // A choice that depended on this field and is no longer offered goes,
+    // rather than staying selected where the form cannot show it.
+    for (const [other, property] of Object.entries(schema.properties ?? {})) {
+      if (property["x-visible-when"]?.field === key && !visible(property, schema, next)) {
+        next[other] = undefined;
+        continue;
+      }
+      const when = property["x-enum-when"];
+      if (
+        when === undefined ||
+        (when.field !== key && when.unless?.field !== key) ||
+        next[other] === undefined
+      )
+        continue;
+      const allowed = conditionalChoices(property, schema, next);
+      if (allowed !== undefined && !allowed.includes(String(next[other]))) {
+        next[other] = undefined;
+      }
+    }
+    onChange(next);
+  };
+  const field = ([key, property]: [string, JsonSchemaProperty]) => (
+    <SchemaField
+      key={key}
+      id={`${idPrefix}-${key}`}
+      name={key}
+      property={narrowed(property, schema, value)}
+      value={value[key]}
+      required={schema.required?.includes(key) ?? false}
+      disabled={disabled}
+      error={errors?.[key]}
+      copy={copyFor?.(key) ?? null}
+      onChange={(fieldValue) => set(key, fieldValue)}
+    />
+  );
+  const basic = properties.filter(([, property]) => property["x-advanced"] !== true);
+  const advanced = properties.filter(([, property]) => property["x-advanced"] === true);
+
+  return (
+    <div className="space-y-4">
+      {basic.map(field)}
+      {advanced.length > 0 && (
+        <AdvancedFields
+          // Open where something in it was set or refused: a value hidden behind
+          // a fold is a value nobody remembers choosing.
+          open={advanced.some(([key]) => value[key] !== undefined || errors?.[key] !== undefined)}
+        >
+          {advanced.map(field)}
+        </AdvancedFields>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The property with only the choices `x-enum-when` allows for what the form holds now.
+ *
+ * Read with the deciding field's schema default, as `visible` does, because the
+ * form shows a default without storing it.
+ */
+function narrowed(
+  property: JsonSchemaProperty,
+  schema: JsonSchema,
+  value: Record<string, unknown>,
+): JsonSchemaProperty {
+  const choices = conditionalChoices(property, schema, value);
+  if (choices === undefined) return property;
+  const allowed = new Set(choices);
+  const keep = (values: unknown[] | undefined) =>
+    values?.filter((choice) => allowed.has(String(choice)));
+  return {
+    ...property,
+    enum: keep(property.enum),
+    anyOf: property.anyOf?.map((branch) =>
+      branch.enum ? { ...branch, enum: keep(branch.enum) } : branch,
+    ),
+  };
+}
+
+function conditionalChoices(
+  property: JsonSchemaProperty,
+  schema: JsonSchema,
+  value: Record<string, unknown>,
+): string[] | undefined {
+  const when = property["x-enum-when"];
+  if (when === undefined) return undefined;
+  const read = (field: string) => value[field] ?? schema.properties?.[field]?.default;
+  if (when.unless?.equals.includes(String(read(when.unless.field)))) return undefined;
+  return when.choices[String(read(when.field))] ?? [];
+}
+
+/**
+ * Whether a field marked `x-visible-when` applies to what the form holds now.
+ *
+ * The deciding field is read with its schema default, because the form shows a
+ * default without storing it until somebody changes it.
+ */
+function visible(
+  property: JsonSchemaProperty,
+  schema: JsonSchema,
+  value: Record<string, unknown>,
+): boolean {
+  const when = property["x-visible-when"];
+  if (when === undefined) return true;
+  const current = value[when.field] ?? schema.properties?.[when.field]?.default;
+  return when.equals.includes(String(current));
+}
+
+/**
+ * The settings a capability works without touching, folded away (#2070).
+ *
+ * A field is here because its capability marks it `x-advanced`: limits, cache
+ * lifetimes, prompts and tuning that change how well something runs rather than
+ * what it does. Fewer decisions up front for whoever is building their first
+ * agent, and nothing taken away from whoever needs one.
+ */
+function AdvancedFields({ open, children }: { open: boolean; children: React.ReactNode }) {
+  const t = useTranslations("agents");
+  return (
+    <details className="group" open={open}>
+      <summary className="text-muted-foreground hover:text-foreground flex cursor-pointer items-center gap-1.5 text-xs">
+        <ChevronRight className="h-3 w-3 transition-transform group-open:rotate-90" />
+        {t("advancedSettings")}
+      </summary>
+      <div className="mt-3 space-y-4">{children}</div>
+    </details>
+  );
+}
+
+interface SchemaFieldProps {
+  id: string;
+  name: string;
+  property: JsonSchemaProperty;
+  value: unknown;
+  required: boolean;
+  disabled?: boolean;
+  error?: string;
+  copy: FieldCopy | null;
+  onChange: (value: unknown) => void;
+}
+
+function SchemaField({
+  id,
+  name,
+  property,
+  value,
+  required,
+  disabled,
+  error,
+  copy,
+  onChange,
+}: SchemaFieldProps) {
+  const t = useTranslations("agents");
+  const label = copy?.title ?? property.title ?? humanise(name);
+
+  const computerEnvironment = property["x-widget"] === "computer-environment";
+  const codingEnvironment = property["x-widget"] === "coding-environment";
+  const tiled =
+    computerEnvironment || codingEnvironment || property["x-widget"] === "browser-connection";
+  const choices =
+    enumChoices(property)?.filter((choice) => !computerEnvironment || choice !== "auto") ?? null;
+  const kind = resolveKind(property);
+  const masked = isSecret(property);
+  // What the field shows while nobody has touched it. Shown as the *value*
+  // rather than as placeholder grey: a field reading "Not set" over a
+  // capability that will happily run says nothing about what it will do, and
+  // three empty boxes under a strategy picker read as three decisions still to
+  // make. Nothing is stored until it is edited — an untouched field and one set
+  // to its default mean the same thing to the server, and writing the default
+  // in would freeze it against a later change in code.
+  const fallback = defaultOf(property);
+  const selected =
+    typeof value === "string" ? value : typeof fallback === "string" ? fallback : UNSET;
+  const optionDescriptions =
+    property["x-enum-descriptions"] ??
+    property.anyOf?.find((entry) => entry["x-enum-descriptions"])?.["x-enum-descriptions"];
+  const description =
+    computerEnvironment && selected === "auto"
+      ? (copy?.description ?? property.description)
+      : ((kind === "enum"
+          ? (copy?.options?.[selected]?.description ?? optionDescriptions?.[selected])
+          : undefined) ??
+        copy?.description ??
+        property.description);
+
+  const multiline = property["x-multiline"] === true;
+  // A connector's plain-text config box (`textarea`), distinct from the prompt
+  // editor `multiline` gets: the two never coincide on one field.
+  const textarea = property["x-textarea"] === true && !multiline;
+  // A hint shown in grey while the field is empty, never stored. A connector's
+  // config default lands here rather than on `default`, because its effective
+  // value is resolved server-side (an S3 region falls back to the credential's,
+  // not to the schema's) - so showing it as the value would claim a setting the
+  // sync will not use.
+  const placeholder =
+    typeof property["x-placeholder"] === "string" ? property["x-placeholder"] : undefined;
+  // Off on every mount, including a re-open of the same dialog: revealing is a
+  // decision about the room you are in, and the room changes.
+  const [revealed, setRevealed] = useState(false);
+  // A list is edited as text and stored as an array, so the text is state of its
+  // own. Deriving it from the array instead would re-render the separator away
+  // the moment it is typed, leaving a field nobody can put a second entry in.
+  const [listText, setListText] = useState(() => (Array.isArray(value) ? value.join(", ") : ""));
+  const errorId = `${id}-error`;
+  const invalid =
+    error === undefined ? undefined : { "aria-invalid": true, "aria-describedby": errorId };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <Label htmlFor={id} title={property["x-hint"]}>
+          {label}
+          {required && <span className="text-muted-foreground"> *</span>}
+          {property["x-hint"] !== undefined && (
+            <span className="sr-only">{`. ${property["x-hint"]}`}</span>
+          )}
+        </Label>
+        {kind === "boolean" && (
+          <Switch
+            id={id}
+            checked={value === undefined ? fallback === true : value === true}
+            onCheckedChange={onChange}
+            disabled={disabled}
+            {...invalid}
+          />
+        )}
+      </div>
+
+      {kind === "suggested" && (
+        <>
+          <Input
+            id={id}
+            list={`${id}-suggestions`}
+            placeholder={placeholder}
+            value={typeof value === "string" ? value : typeof fallback === "string" ? fallback : ""}
+            disabled={disabled}
+            onChange={(event) =>
+              onChange(event.target.value === "" ? undefined : event.target.value)
+            }
+            {...invalid}
+          />
+          {/* A native datalist rather than a combobox component: this is an
+              ordinary text field that offers the usual answers, and anything
+              richer would be a widget standing between somebody and a string
+              they already know how to type. i18n-exempt: option values are
+              identifiers the backend validates, not copy. */}
+          <datalist id={`${id}-suggestions`}>
+            {(suggestions(property) ?? []).map((choice) => (
+              <option key={choice} value={choice}>
+                {enumLabel(property, choice, copy)}
+              </option>
+            ))}
+          </datalist>
+        </>
+      )}
+
+      {kind === "number" && (
+        <Input
+          id={id}
+          type="number"
+          min={property.minimum}
+          max={property.maximum}
+          placeholder={placeholder}
+          value={numberText(value, fallback)}
+          disabled={disabled}
+          // Empty means "unset", which is not the same as zero: an unset field
+          // falls back to the capability's own default, and coercing it to 0
+          // would silently pick a different behaviour.
+          onChange={(event) =>
+            onChange(event.target.value === "" ? undefined : Number(event.target.value))
+          }
+          {...invalid}
+        />
+      )}
+
+      {kind === "enum" && choices !== null && tiled && (
+        <div
+          id={id}
+          role="radiogroup"
+          aria-label={label}
+          aria-describedby={description ? `${id}-description` : undefined}
+          className="grid grid-cols-1 gap-2 sm:grid-cols-2"
+          {...invalid}
+        >
+          {choices.map((choice) => {
+            return (
+              <button
+                key={choice}
+                type="button"
+                role="radio"
+                aria-checked={selected === choice}
+                aria-label={enumLabel(property, choice, copy)}
+                disabled={disabled}
+                onClick={() => onChange(choice)}
+                className={cn(
+                  "flex min-h-14 flex-col items-start gap-1.5 rounded-xl border px-3 py-3 text-left text-sm transition-colors disabled:opacity-50",
+                  selected === choice
+                    ? "border-foreground/40 bg-foreground/5"
+                    : "border-border hover:bg-muted",
+                )}
+              >
+                <span className="flex items-center gap-2 font-medium">
+                  {choiceMark(
+                    choice,
+                    computerEnvironment || codingEnvironment ? "desktop" : "browser-connection",
+                  )}
+                  {enumLabel(property, choice, copy)}
+                </span>
+                {copy?.options?.[choice]?.summary && (
+                  <span className="text-muted-foreground text-xs leading-relaxed">
+                    {copy?.options?.[choice]?.summary}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {kind === "enum" && choices !== null && !tiled && (
+        <Select
+          value={
+            typeof value === "string" ? value : typeof fallback === "string" ? fallback : UNSET
+          }
+          disabled={disabled}
+          onValueChange={(choice) => onChange(choice === UNSET ? undefined : choice)}
+        >
+          <SelectTrigger id={id} aria-describedby={description ? `${id}-description` : undefined}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {/*
+              A field with a fixed set of values still has the state of nobody
+              having picked one, and for an optional field that state is a real
+              answer - it is what defers to whatever is configured further down.
+              Offered only where the schema allows it: a required field has no
+              such state, and neither has one with a default, where "not set"
+              and the default are the same behaviour under two names.
+            */}
+            {!required && fallback === undefined && (
+              <SelectItem value={UNSET}>{t("notSet")}</SelectItem>
+            )}
+            {choices.map((choice) => (
+              <SelectItem key={choice} value={choice}>
+                <span className="flex items-center gap-2">
+                  {/* Environment symbols and provider marks also appear in the selected value. */}
+                  {choiceMark(choice, name)}
+                  {enumLabel(property, choice, copy)}
+                </span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
+
+      {kind === "choiceList" && (
+        <div id={id} role="group" aria-label={label} className="flex flex-wrap gap-x-4 gap-y-2">
+          {(listChoices(property) ?? []).map((choice) => {
+            const picked = Array.isArray(value) ? value : Array.isArray(fallback) ? fallback : [];
+            const on = picked.includes(choice);
+            return (
+              <label key={choice} className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={on}
+                  disabled={disabled}
+                  onCheckedChange={(checked) => {
+                    const next =
+                      checked === true
+                        ? [...picked, choice]
+                        : picked.filter((item) => item !== choice);
+                    onChange(next.length === 0 ? undefined : next);
+                  }}
+                />
+                {enumLabel(property, choice, copy)}
+              </label>
+            );
+          })}
+        </div>
+      )}
+
+      {kind === "stringList" && (
+        <Input
+          id={id}
+          value={listText}
+          placeholder={t("separateWithCommas")}
+          disabled={disabled}
+          // Blank stores nothing rather than an empty array, which is the same
+          // distinction the other inputs make and the one the server reads: an
+          // absent list is "no restriction", where `[]` is a list of nothing.
+          onChange={(event) => {
+            setListText(event.target.value);
+            onChange(parseList(event.target.value));
+          }}
+          {...invalid}
+        />
+      )}
+
+      {kind === "modelProfile" && (
+        <SchemaModelProfile
+          value={typeof value === "string" ? value : null}
+          disabled={disabled}
+          onChange={(profileId) => onChange(profileId ?? undefined)}
+        />
+      )}
+
+      {kind === "string" && multiline && (
+        /* The same control the agent's own instructions get. A prompt is
+           paragraphs - a one-line box for one is a field nobody can read what
+           they are editing in, and a plain textarea shows Markdown as asterisks.
+           The schema says which fields are prose: Pydantic has no notion of
+           multiline, so a capability marks it the way it marks enum labels. */
+        <MarkdownEditor
+          id={id}
+          label={label}
+          rows={10}
+          value={typeof value === "string" ? value : typeof fallback === "string" ? fallback : ""}
+          disabled={disabled}
+          onChange={(next) => onChange(next === "" ? undefined : next)}
+          invalid={error !== undefined}
+          describedBy={error === undefined ? undefined : errorId}
+        />
+      )}
+
+      {kind === "string" && textarea && (
+        /* A connector's plain-text config box (`textarea`) - not the
+           MarkdownEditor above, which is for prose.
+
+           Masked when the schema says so, which used to be impossible: every
+           secret was single-line, so this branch assumed one and the masked
+           control below was an `<input type="password">`. A GitHub App's private
+           key is a PEM - a header, a base64 body over many lines, a footer - and
+           a browser strips line breaks out of an input value, so pasting one
+           into that control silently produced an unusable key and the failure
+           surfaced later as a JWT that would not sign (#1072). A masked textarea
+           is shown as its own line count so nothing is inferred from the dots. */
+        <div className="relative">
+          <Textarea
+            id={id}
+            rows={masked ? 4 : 6}
+            placeholder={placeholder}
+            value={typeof value === "string" ? value : typeof fallback === "string" ? fallback : ""}
+            disabled={disabled}
+            spellCheck={false}
+            className={cn(
+              "font-mono text-base md:text-xs",
+              masked && "pr-10",
+              // No `type="password"` on a textarea, so the masking is the font.
+              // It hides the value from a shoulder and from a screenshot, which
+              // is what this masking is for, and the reveal beside it is how the
+              // paste gets checked.
+              masked && !revealed && "[-webkit-text-security:disc] [text-security:disc]",
+            )}
+            onChange={(event) =>
+              onChange(event.target.value === "" ? undefined : event.target.value)
+            }
+            {...invalid}
+          />
+          {masked && (
+            <button
+              type="button"
+              onClick={() => setRevealed((shown) => !shown)}
+              disabled={disabled}
+              aria-label={
+                revealed ? t("hideNamed", { name: label }) : t("showNamed", { name: label })
+              }
+              aria-pressed={revealed}
+              className="text-muted-foreground hover:text-foreground absolute top-1 right-1 rounded-md p-2 disabled:pointer-events-none disabled:opacity-50"
+            >
+              {revealed ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          )}
+        </div>
+      )}
+
+      {kind === "string" && !multiline && !textarea && (
+        <div className="relative">
+          <Input
+            id={id}
+            // Masked wherever the schema says so, which for a Pydantic model is
+            // every `SecretStr`. Not because typing a key is dangerous, but
+            // because these fields are filled in meetings and on shared screens.
+            type={masked && !revealed ? "password" : undefined}
+            autoComplete={masked ? "off" : undefined}
+            maxLength={property.maxLength}
+            placeholder={placeholder}
+            value={typeof value === "string" ? value : typeof fallback === "string" ? fallback : ""}
+            disabled={disabled}
+            onChange={(event) =>
+              onChange(event.target.value === "" ? undefined : event.target.value)
+            }
+            className={cn(masked && "pr-10 font-mono")}
+            {...invalid}
+          />
+          {/* A key is pasted, and a paste that went wrong is invisible behind
+              dots - a trailing newline, half a value, the wrong clipboard entry.
+              The vault never shows a stored secret again, so this is the only
+              moment its value can be checked at all. */}
+          {masked && (
+            <button
+              type="button"
+              onClick={() => setRevealed((shown) => !shown)}
+              disabled={disabled}
+              aria-label={
+                revealed ? t("hideNamed", { name: label }) : t("showNamed", { name: label })
+              }
+              aria-pressed={revealed}
+              className="text-muted-foreground hover:text-foreground absolute top-1/2 right-1 -translate-y-1/2 rounded-md p-2 disabled:pointer-events-none disabled:opacity-50"
+            >
+              {revealed ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          )}
+        </div>
+      )}
+
+      {description && (
+        <p id={`${id}-description`} className="text-muted-foreground text-xs">
+          {description}
+        </p>
+      )}
+
+      {error !== undefined && (
+        <p id={errorId} className="text-destructive text-xs">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A model profile for a capability's own use - `browse_web`'s step model - from
+ * the same picker as the agent's model. Its own component, so the query it
+ * reads is made only by a form that has such a field.
+ */
+function SchemaModelProfile({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: string | null;
+  disabled?: boolean;
+  onChange: (profileId: string | null) => void;
+}) {
+  const { profiles, profilesStatus } = useModelProviders();
+  return (
+    <ModelProfilePicker
+      profiles={profiles}
+      profilesStatus={profilesStatus}
+      value={value}
+      disabled={disabled}
+      onChange={onChange}
+    />
+  );
+}
+
+type FieldKind =
+  | "string"
+  | "number"
+  | "boolean"
+  | "enum"
+  | "suggested"
+  | "stringList"
+  | "choiceList"
+  | "modelProfile";
+
+/**
+ * The values a field suggests without restricting itself to them.
+ *
+ * `x-suggestions` is the open counterpart of `enum`: the backend validates a
+ * plain string and the catalog is what most people want, so the form offers the
+ * catalog and still accepts anything. A decision step's `model` is the case it
+ * serves - the catalog holds the moving aliases, and a step whose confidence
+ * floor was tuned against a pinned build has to be able to name that build.
+ */
+function suggestions(property: JsonSchemaProperty): string[] | null {
+  const values = property["x-suggestions"];
+  return Array.isArray(values) && values.every((v) => typeof v === "string") ? values : null;
+}
+
+/**
+ * What kind of input a property needs.
+ *
+ * Pydantic renders an optional field as `anyOf: [{type: "x"}, {type: "null"}]`
+ * rather than a plain type, so the null branch has to be looked past - without
+ * that, every optional field would fall through to a text box.
+ */
+function resolveKind(property: JsonSchemaProperty): FieldKind {
+  if (property["x-widget"] === "model-profile") return "modelProfile";
+  // Before the enum check: a field carrying suggestions is an *open* string
+  // that happens to know the usual answers, and rendering it as a closed
+  // select would forbid the unusual one it exists to allow.
+  if (suggestions(property) !== null) return "suggested";
+  // Before the type check, not after: a `Literal` is a string, and a text box
+  // for a closed set of values is a way to type one the backend will refuse.
+  if (enumChoices(property) !== null) return "enum";
+  if (listChoices(property) !== null) return "choiceList";
+  if (isStringList(property)) return "stringList";
+
+  const candidates = property.anyOf
+    ? property.anyOf.map((entry) => entry.type)
+    : [property.type].flat();
+
+  const type = candidates.find((entry) => entry !== undefined && entry !== "null");
+  if (type === "integer" || type === "number") return "number";
+  if (type === "boolean") return "boolean";
+  return "string";
+}
+
+/**
+ * The values a property is restricted to, or null when it is not restricted.
+ *
+ * An optional `Literal` arrives as `anyOf: [{enum: [...]}, {type: "null"}]`, so
+ * the branches are searched as well as the property itself. Non-string members
+ * are dropped rather than rendered: this form's controls put their value back
+ * as a string, and a select that turned `3` into `"3"` would fail validation
+ * somewhere far from here.
+ */
+function enumChoices(property: JsonSchemaProperty): string[] | null {
+  const values = property.enum ?? property.anyOf?.find((entry) => entry.enum)?.enum;
+  if (values === undefined) return null;
+  return values.filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * The values a list of choices may hold - a `tuple[Literal[...], ...]` - or null.
+ *
+ * Its labels are on the list itself (`x-enum-labels`), since the list is the
+ * field a person reads; each value is ticked on or off.
+ */
+function listChoices(property: JsonSchemaProperty): string[] | null {
+  const branch = property.anyOf?.find((entry) => entry.type === "array") ?? property;
+  const values = branch.type === "array" ? branch.items?.enum : undefined;
+  if (values === undefined) return null;
+  return values.filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * Whether this field is a list of strings, which is the one array it renders.
+ *
+ * `list[str] | None` arrives as `anyOf: [{type: "array", items: …}, {type:
+ * "null"}]`, so the branch carries the `items` rather than the property. An
+ * array of anything else falls through to a text box, as it did before this
+ * existed: a list of objects is the richer editor a capability should ship
+ * itself. Without this every list was a text box, so typing a hostname into one
+ * stored the string and the server refused the spec - which left `web_fetch`'s
+ * domain filters publishable only by leaving them empty.
+ */
+function isStringList(property: JsonSchemaProperty): boolean {
+  const branch = property.anyOf?.find((entry) => entry.type === "array") ?? property;
+  return branch.type === "array" && branch.items?.type === "string";
+}
+
+/** The entries typed into a list field, or `undefined` when it is blank. */
+function parseList(text: string): string[] | undefined {
+  const entries = text.split(/[\s,]+/).filter((entry) => entry !== "");
+  return entries.length === 0 ? undefined : entries;
+}
+
+/**
+ * What this field falls back to when nobody has set it, or `undefined`.
+ *
+ * Pydantic writes `"default": null` for every optional field, which is not a
+ * default at all - it is the absence of one, spelt in JSON. Rendering it would
+ * put the word `null` in a text box.
+ */
+function defaultOf(property: JsonSchemaProperty): unknown {
+  return property.default === null ? undefined : property.default;
+}
+
+/** A number input's text, showing the schema's default until somebody types. */
+function numberText(value: unknown, fallback: unknown): string {
+  const shown = value === undefined || value === null ? fallback : value;
+  return typeof shown === "number" || typeof shown === "string" ? String(shown) : "";
+}
+
+/**
+ * Environment symbols are scoped to the desktop field; other enums keep provider marks.
+ *
+ * Two shapes reach here. A value that *is* a service - `brave`, `tavily` - wears
+ * that service's mark. A value that names a provider and a model - the image
+ * capability's `openai-responses:gpt-5.4` - wears the provider's, read off the
+ * segment before the colon, with the SDK's own transport suffixes trimmed:
+ * `openai-responses` and `google-vertex` are OpenAI and Google to a reader, and
+ * the provider table is keyed the way the model catalog is.
+ */
+function choiceMark(choice: string, field: string) {
+  if (field === "desktop") {
+    const className = "h-3.5 w-3.5 shrink-0";
+    switch (choice) {
+      case "e2b":
+        // Official E2B app mark, from https://e2b.dev/icon2.png.
+        return (
+          <Image
+            src="/icons/e2b.png"
+            width={20}
+            height={20}
+            alt=""
+            className="size-5 shrink-0"
+            unoptimized
+          />
+        );
+      case "sandbox":
+        return <Container className={className} aria-hidden />;
+      case "this_computer":
+      case "local":
+        return <Laptop className={className} aria-hidden />;
+      case "daemon":
+        return <Network className={className} aria-hidden />;
+    }
+  }
+  if (field === "browser-connection") {
+    const className = "h-4 w-4 shrink-0";
+    switch (choice) {
+      case "local":
+        return <Laptop className={className} aria-hidden />;
+      case "hosted":
+        return <Cloud className={className} aria-hidden />;
+      case "proxy":
+        return <Network className={className} aria-hidden />;
+      default:
+        return <Globe className={className} aria-hidden />;
+    }
+  }
+  if (choice in BRAND_GLYPHS) {
+    return <BrandIcon name={choice as BrandName} className="h-3.5 w-3.5 shrink-0" />;
+  }
+  const [head] = choice.split(":");
+  const provider = (head ?? "").replace(/-(responses|chat|vertex|gla)$/, "");
+  // Unequal only when there was a colon to split on: a value with none is a
+  // plain choice and wears nothing.
+  if (provider === choice) return null;
+  return <ProviderIcon provider={provider} className="h-3.5 w-3.5" />;
+}
+
+/**
+ * What one choice of an enum is called in the picker.
+ *
+ * The values are spec format - `clear_tool_results`, `sliding_window` - and a
+ * dropdown of them is a decision somebody makes by guessing. A schema may carry
+ * `x-enum-labels` to say what each one does.
+ *
+ * It is an extension keyword because JSON Schema has none for this, and it
+ * belongs in the schema for the same reason `description` does: the copy that
+ * explains a field lives beside its definition, not in a table here that a
+ * renamed value silently outlives.
+ *
+ * Without labels the value is shown verbatim rather than prettified. Some of
+ * these are identifiers a person recognises - a tool id, an effort level - and
+ * turning `get_channel_info` into `Get channel info` in a picker whose choice is
+ * stored as the former is a rename this form is not entitled to make.
+ */
+function enumLabel(property: JsonSchemaProperty, choice: string, copy: FieldCopy | null): string {
+  const labels =
+    property["x-enum-labels"] ??
+    property.anyOf?.find((entry) => entry["x-enum-labels"])?.["x-enum-labels"];
+  return copy?.options?.[choice]?.label ?? labels?.[choice] ?? choice;
+}
+
+/**
+ * Whether this field holds something that must not be shown while it is typed.
+ *
+ * The null branch is searched as well as the property itself: an optional
+ * `SecretStr` arrives as `anyOf: [{format: "password"}, {type: "null"}]`, and
+ * `aws_session_token` is exactly that - the one field of the five kinds where
+ * missing the branch would render a real credential in the clear.
+ */
+function isSecret(property: JsonSchemaProperty): boolean {
+  return (
+    property.format === "password" ||
+    (property.anyOf?.some((entry) => entry.format === "password") ?? false)
+  );
+}
+
+/** `default_top_k` -> `Default top k`, for schemas that omit a title. */
+function humanise(name: string): string {
+  const words = name.replace(/_/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}

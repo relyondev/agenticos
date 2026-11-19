@@ -1,0 +1,188 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
+import { useSidebarStore } from "@/stores/sidebar-store";
+import { act, render, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ADMIN_TABS } from "@/app/[locale]/(dashboard)/admin/admin-tabs";
+import { SETTINGS_TABS } from "@/app/[locale]/(dashboard)/settings/settings-tabs";
+import { nav } from "@/../messages/en.json";
+import { NAV_GROUPS } from "./app-sidebar";
+import { CommandPalette } from "./command-palette";
+import { apiClient } from "@/lib/api-client";
+
+const can = vi.fn<(permission: string) => boolean>();
+const currentUser = vi.fn<() => { is_app_admin?: boolean } | null>(() => ({
+  is_app_admin: false,
+}));
+const push = vi.fn();
+
+vi.mock("next-intl", async () => ({
+  useTranslations: (await import("@/test-utils/intl")).keyTranslations(),
+}));
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push }),
+  // next-intl's createNavigation wraps these at module scope; see `vitest.setup.ts`.
+  redirect: vi.fn(),
+  permanentRedirect: vi.fn(),
+}));
+vi.mock("@/hooks/use-permissions", () => ({ usePermissions: () => ({ can }) }));
+vi.mock("@/hooks", () => ({ useAuth: () => ({ user: currentUser(), logout: vi.fn() }) }));
+vi.mock("@/lib/api-client", () => ({ apiClient: { get: vi.fn() } }));
+
+const ANSWERS: Record<string, unknown> = {
+  "/agents": { items: [{ id: "a1", name: "Getting Started" }], total: 1 },
+  "/kb": { items: [{ id: "k1", name: "E2E Handbook" }], total: 1 },
+  "/conversations": { items: [{ id: "c1", title: "Refund policy" }] },
+};
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+/** Mounted closed, then opened the way the sidebar button opens it. */
+async function openPalette() {
+  render(<CommandPalette />, { wrapper });
+  act(() => window.dispatchEvent(new CustomEvent("command-palette:open")));
+  await screen.findByRole("dialog", { name: "commandPalette" });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  can.mockReturnValue(true);
+  currentUser.mockReturnValue({ is_app_admin: false });
+  vi.mocked(apiClient.get).mockImplementation((endpoint: string) =>
+    endpoint in ANSWERS
+      ? Promise.resolve(ANSWERS[endpoint])
+      : Promise.reject(new Error(`no such endpoint in this platform: ${endpoint}`)),
+  );
+});
+
+describe("the palette's destinations", () => {
+  /**
+   * The bug this suite exists for.
+   *
+   * The palette used to restate the navigation, and the restatement fell
+   * behind: Agents, Skills, Activity, Vault and MCP servers were reachable from
+   * the sidebar and not from ⌘K. Deriving the list is the fix; this is what
+   * keeps it derived, because the next person to add a destination will add it
+   * to `NAV_GROUPS` and nowhere else.
+   */
+  it("offers every destination the sidebar offers", async () => {
+    // An admin holding everything, so the assertion covers the whole table
+    // rather than the part today's default caller happens to be shown.
+    currentUser.mockReturnValue({ is_app_admin: true });
+
+    await openPalette();
+
+    for (const item of NAV_GROUPS.flatMap((group) => group.items)) {
+      expect(await screen.findByRole("option", { name: item.labelKey })).toBeInTheDocument();
+    }
+  });
+
+  it("hides a destination the caller's role does not allow", async () => {
+    // The sidebar filters these out; a palette that did not would hand a Viewer
+    // the page the sidebar just declined to offer them.
+    can.mockImplementation((permission) => permission !== "skills:view");
+
+    await openPalette();
+
+    expect(screen.queryByRole("option", { name: "skills" })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "agents" })).toBeInTheDocument();
+  });
+
+  it("keeps the admin section for platform admins only", async () => {
+    await openPalette();
+    expect(screen.queryByRole("option", { name: "adminOverview" })).not.toBeInTheDocument();
+
+    currentUser.mockReturnValue({ is_app_admin: true });
+    await openPalette();
+    expect(await screen.findByRole("option", { name: "adminOverview" })).toBeInTheDocument();
+  });
+
+  it("offers each section page exactly once", async () => {
+    // `/admin` is both a primary destination and the admin section's own index.
+    // Listed from both tables it appears twice, and the second one is dead
+    // weight the reader has to tell apart from the first.
+    currentUser.mockReturnValue({ is_app_admin: true });
+
+    await openPalette();
+
+    expect(await screen.findAllByRole("option", { name: "adminOverview" })).toHaveLength(1);
+    expect(screen.getAllByRole("option", { name: "profile" })).toHaveLength(1);
+  });
+
+  it("sends the API docs to the backend that serves them", async () => {
+    // The frontend has no /docs route. The old entry opened its 404 page.
+    const openWindow = vi.spyOn(window, "open").mockReturnValue(null);
+    await openPalette();
+
+    act(() => screen.getByRole("option", { name: "apiDocs" }).click());
+
+    expect(openWindow).toHaveBeenCalledWith(
+      expect.stringMatching(/^https?:\/\/.+\/docs$/),
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+});
+
+describe("the palette's named entities", () => {
+  it("finds an agent by name and opens that agent", async () => {
+    await openPalette();
+
+    const agent = await screen.findByRole("option", { name: "Getting Started" });
+    act(() => agent.click());
+
+    expect(push).toHaveBeenCalledWith("/agents/a1");
+  });
+
+  it("finds a knowledge base and a conversation", async () => {
+    await openPalette();
+
+    expect(await screen.findByRole("option", { name: "E2E Handbook" })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "Refund policy" })).toBeInTheDocument();
+  });
+
+  it("asks for nothing at all until it is opened", () => {
+    // It is mounted on every page. Three requests per navigation to fill a
+    // dialog nobody opened is the cost of getting this wrong.
+    render(<CommandPalette />, { wrapper });
+
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("does not ask for entities the caller may not see", async () => {
+    can.mockImplementation((permission) => permission !== "collections:view");
+
+    await openPalette();
+
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith("/agents"));
+    expect(vi.mocked(apiClient.get).mock.calls.map(([endpoint]) => endpoint)).not.toContain("/kb");
+  });
+});
+
+describe("the tab tables", () => {
+  it("names a message the catalog holds for every settings and admin page", () => {
+    // Both tables used to hold the English word, and the palette carried a
+    // second table mapping each route back to a `nav` key so that *it* could be
+    // translated - the tab row itself never was (#425). The type now says these
+    // are keys; only the catalog can say they are keys that resolve, and a key
+    // that does not renders as its own name on screen.
+    const missing = [...SETTINGS_TABS, ...ADMIN_TABS]
+      .map((tab) => tab.labelKey)
+      .filter((key) => !(key in nav));
+
+    expect(missing).toEqual([]);
+  });
+});
+
+it("closes mobile navigation when a search result opens a page", async () => {
+  useSidebarStore.getState().open();
+  await openPalette();
+  await userEvent.click(await screen.findByRole("option", { name: "Getting Started" }));
+  expect(push).toHaveBeenCalledWith("/agents/a1");
+  expect(useSidebarStore.getState().isOpen).toBe(false);
+});

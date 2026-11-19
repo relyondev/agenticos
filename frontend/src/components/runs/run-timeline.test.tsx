@@ -1,0 +1,479 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { NextIntlClientProvider } from "next-intl";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import messages from "../../../messages/en.json";
+import { RunTimeline } from "./run-timeline";
+import type { RunTranscript, RunTranscriptMessage } from "@/types/runs";
+
+/**
+ * The trace view's claims: the whole thread is asked for and the focused run's
+ * turns are the marked ones; a tool call reads raw - name, status, input JSON,
+ * recorded output - not through the chat's renderers; and a run with no
+ * conversation says so rather than drawing an empty page. And what the model was
+ * actually handed: the files attached to a turn, and what that turn cost.
+ */
+
+const useRunTranscriptMock = vi.fn();
+// Partial, because opening an attachment mounts the shared file viewer and that
+// reaches for several hooks of its own. Only the transcript is stood in for.
+// The renderer is tested on its own (`markdown-content.impl.test.tsx`) and the
+// real one arrives through `next/dynamic`, which never resolves in jsdom - so
+// what this file asserts on is the text handed to it. The timeline renders an
+// agent's answer as markdown rather than printing its source, which is the one
+// thing this stub has to preserve.
+vi.mock("@/components/chat/markdown-content", () => ({
+  MarkdownContent: ({ content }: { content: string }) => <div>{content}</div>,
+}));
+
+vi.mock("@/hooks", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks")>()),
+  useRunManifest: () => ({ manifest: undefined, error: null, isLoading: false }),
+  useRunTranscript: (runId: string, scope?: string) => useRunTranscriptMock(runId, scope),
+}));
+
+function turn(overrides: Partial<RunTranscriptMessage> = {}): RunTranscriptMessage {
+  return {
+    id: `m-${Math.random().toString(36).slice(2, 8)}`,
+    role: "assistant",
+    content: "Done.",
+    created_at: "2026-08-14T09:00:00Z",
+    run_id: "run-1",
+    ...overrides,
+  };
+}
+
+function serve(transcript: Partial<RunTranscript>) {
+  useRunTranscriptMock.mockReturnValue({
+    transcript: { run_id: "run-1", conversation_id: "conv-1", items: [], total: 0, ...transcript },
+    isLoading: false,
+    error: null,
+  });
+}
+
+function renderTimeline(runId = "run-1", scroll = vi.fn()) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <NextIntlClientProvider locale="en" messages={messages}>
+        <div
+          data-run-scrollport
+          ref={(node) => {
+            if (node) node.scrollTo = scroll;
+          }}
+        >
+          <RunTimeline runId={runId} />
+        </div>
+      </NextIntlClientProvider>
+    </QueryClientProvider>,
+  );
+}
+
+beforeEach(() => useRunTranscriptMock.mockReset());
+
+describe("the thread and the run inside it", () => {
+  it("asks for the whole thread and opens only the run being read", async () => {
+    // Read flat, the thread is worse than no context: every turn looks equally
+    // relevant and the answer somebody opened the page for is somewhere in the
+    // middle of fifteen others. So each run is a section and one of them opens.
+    serve({
+      items: [
+        turn({ id: "m-ctx", role: "user", content: "earlier question", run_id: "run-0" }),
+        turn({ id: "m-own", role: "user", content: "the question", run_id: "run-1" }),
+      ],
+    });
+
+    renderTimeline();
+
+    expect(useRunTranscriptMock).toHaveBeenCalledWith("run-1", "conversation");
+    expect(screen.getByText("the question")).toBeVisible();
+    expect(screen.queryByText("earlier question")).toBeNull();
+    // The folded one still says what it is before it is opened.
+    expect(screen.getByRole("button", { name: /Run 1 in this thread/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("opens a folded run when the reader asks for it", async () => {
+    serve({
+      items: [
+        turn({ id: "m-ctx", role: "user", content: "earlier question", run_id: "run-0" }),
+        turn({ id: "m-own", role: "user", content: "the question", run_id: "run-1" }),
+      ],
+    });
+
+    renderTimeline();
+    await userEvent.click(screen.getByRole("button", { name: /Run 1 in this thread/ }));
+
+    // Both open at once: a reader comparing this run with the one before it
+    // should not have to close one to read the other.
+    expect(screen.getByText("earlier question")).toBeVisible();
+    expect(screen.getByText("the question")).toBeVisible();
+  });
+
+  it("opens the section a step lands on, without remounting the thread", async () => {
+    // Stepping with the arrows keeps this component mounted - two runs of one
+    // conversation are the same turns - so the section that opens has to follow
+    // the anchor rather than being decided once when it mounted.
+    const items = [
+      turn({ id: "m-a", run_id: "run-0", content: "the earlier answer" }),
+      turn({ id: "m-b", run_id: "run-1", content: "the next answer" }),
+    ];
+    serve({ run_id: "run-0", items });
+    const { rerender } = renderTimeline("run-0");
+    expect(screen.getByText("the earlier answer")).toBeVisible();
+    expect(screen.queryByText("the next answer")).toBeNull();
+
+    serve({ run_id: "run-1", items });
+    rerender(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <NextIntlClientProvider locale="en" messages={messages}>
+          <div data-run-scrollport>
+            <RunTimeline runId="run-1" />
+          </div>
+        </NextIntlClientProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByText("the next answer")).toBeVisible();
+    // And the one stepped away from stays where the reader left it - open,
+    // because they were reading it a moment ago.
+    expect(screen.getByText("the earlier answer")).toBeVisible();
+  });
+
+  it("cuts the thread where the run changes, not where the ids repeat", () => {
+    // The thread's order is the fact being shown: two runs interleave only if
+    // that is what happened, and regrouping would invent a conversation.
+    serve({
+      items: [
+        turn({ id: "m-1", run_id: "run-0", content: "first" }),
+        turn({ id: "m-2", run_id: "run-1", content: "second" }),
+        turn({ id: "m-3", run_id: "run-0", content: "third" }),
+      ],
+    });
+
+    renderTimeline();
+
+    expect(screen.getAllByRole("button", { name: /in this thread/ })).toHaveLength(2);
+  });
+
+  it("scrolls the reader to the run's own section, not the top of the thread", () => {
+    const scrolled = vi.fn();
+    const scrollAncestors = vi.fn();
+    Element.prototype.scrollIntoView = scrollAncestors;
+    serve({
+      items: [
+        turn({ id: "m-ctx", run_id: "run-0" }),
+        turn({ id: "m-own", run_id: "run-1" }),
+        turn({ id: "m-own-2", run_id: "run-1" }),
+      ],
+    });
+
+    renderTimeline("run-1", scrolled);
+
+    // Only this transcript's viewport moves, never the page or its toolbar.
+    expect(scrolled).toHaveBeenCalledTimes(1);
+    expect(scrolled.mock.contexts[0]).toBe(document.querySelector("[data-run-scrollport]"));
+    expect(scrollAncestors).not.toHaveBeenCalled();
+  });
+});
+
+describe("a tool call, raw", () => {
+  it.each([
+    ["error", "Failed"],
+    ["unfinished", "Did not finish"],
+  ] as const)("says a step that ended %s in words", async (status, words) => {
+    serve({
+      items: [
+        turn({
+          id: "m-1",
+          parts: [{ type: "tool", tool_call_id: "call-1" }],
+          tool_calls: [
+            { tool_call_id: "call-1", tool_name: "web_search", args: {}, result: null, status },
+          ],
+        }),
+      ],
+    });
+
+    renderTimeline();
+
+    expect(await screen.findByText(words)).toBeVisible();
+  });
+
+  it("shows the wire: name, stored status, input JSON and recorded output", async () => {
+    serve({
+      items: [
+        turn({
+          id: "m-1",
+          parts: [{ type: "tool", tool_call_id: "call-1" }],
+          tool_calls: [
+            {
+              tool_call_id: "call-1",
+              tool_name: "web_search",
+              args: { query: "pgvector" },
+              result: "3 results",
+              status: "completed",
+            },
+          ],
+        }),
+      ],
+    });
+
+    renderTimeline();
+
+    const step = screen.getByText("web_search").closest("details") as HTMLElement;
+    // Said in words beside the tool's own id: how it ended, and what it was.
+    expect(within(step).getByText("Done")).toBeVisible();
+
+    await userEvent.click(within(step).getByText("web_search"));
+
+    expect(within(step).getByText(/"query": "pgvector"/)).toBeVisible();
+    expect(within(step).getByText("3 results")).toBeVisible();
+  });
+
+  it("keeps the stored order: reasoning, tools and text interleaved as written", () => {
+    serve({
+      items: [
+        turn({
+          id: "m-1",
+          content: "unused when parts are stored",
+          thinking: "unused too",
+          parts: [
+            { type: "text", text: "Let me check." },
+            { type: "tool", tool_call_id: "call-1" },
+            { type: "text", text: "All done." },
+          ],
+          tool_calls: [
+            {
+              tool_call_id: "call-1",
+              tool_name: "list_files",
+              args: {},
+              result: null,
+              status: "completed",
+            },
+          ],
+        }),
+      ],
+    });
+
+    renderTimeline();
+
+    const row = screen.getByText("Let me check.").closest("li") as HTMLElement;
+    const order = row.textContent ?? "";
+    expect(order.indexOf("Let me check.")).toBeLessThan(order.indexOf("list_files"));
+    expect(order.indexOf("list_files")).toBeLessThan(order.indexOf("All done."));
+  });
+
+  it("folds reasoning behind a disclosure rather than printing the trace whole", () => {
+    serve({
+      items: [turn({ id: "m-1", thinking: "chain of thought", content: "Answer." })],
+    });
+
+    renderTimeline();
+
+    expect(screen.getByText("Reasoning")).toBeVisible();
+    expect(screen.getByText("chain of thought").closest("details")).not.toBeNull();
+  });
+});
+
+describe("what people said about it", () => {
+  it("puts the verdict and the words on the turn they judged", () => {
+    serve({
+      items: [
+        turn({
+          id: "m-1",
+          rating_count: { likes: 0, dislikes: 2 },
+          rating_comment: "wrong currency",
+        }),
+      ],
+    });
+
+    renderTimeline();
+
+    expect(screen.getByText("Rated down 2 times")).toBeVisible();
+    expect(screen.getByText("wrong currency")).toBeVisible();
+  });
+});
+
+describe("a run outside any conversation", () => {
+  it("says no transcript was recorded rather than drawing an empty page", () => {
+    serve({ conversation_id: null });
+
+    renderTimeline();
+
+    expect(screen.getByText("No transcript recorded")).toBeVisible();
+  });
+
+  it("says the read failed rather than that nothing happened", () => {
+    useRunTranscriptMock.mockReturnValue({
+      transcript: undefined,
+      isLoading: false,
+      error: new Error("502"),
+    });
+
+    renderTimeline();
+
+    expect(screen.getByText("The transcript could not be read")).toBeVisible();
+  });
+});
+
+describe("what the model was actually handed", () => {
+  it("shows the files attached to a turn, and opens one", async () => {
+    serve({
+      items: [
+        turn({
+          id: "m-1",
+          role: "user",
+          content: "summarise this",
+          files: [
+            {
+              id: "file-1",
+              filename: "q3-report.pdf",
+              mime_type: "application/pdf",
+              file_type: "pdf",
+            },
+          ],
+        }),
+      ],
+    });
+
+    renderTimeline();
+
+    expect(screen.getByText("1 file attached")).toBeVisible();
+    await userEvent.click(screen.getByText("q3-report.pdf"));
+    // The shared viewer, not a byte count: the question "was the agent handed a
+    // scan with no text in it" is only answerable by looking at the file.
+    expect(within(screen.getByRole("dialog")).getByText("q3-report.pdf")).toBeVisible();
+
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("draws a thumbnail for a render-safe image but not for a TIFF", () => {
+    // A TIFF is an `image` kind no browser draws inline; on the run detail it must
+    // get its glyph rather than a broken thumbnail, while a PNG is drawn (#1591).
+    serve({
+      items: [
+        turn({
+          id: "m-1",
+          role: "user",
+          content: "look",
+          files: [
+            { id: "p", filename: "shot.png", mime_type: "image/png", file_type: "image" },
+            { id: "t", filename: "scan.tiff", mime_type: "image/tiff", file_type: "image" },
+          ],
+        }),
+      ],
+    });
+
+    renderTimeline();
+
+    // `hidden`: the tile's peek is decorative and out of the accessibility tree.
+    expect(screen.getByRole("img", { name: "shot.png", hidden: true })).toBeVisible();
+    expect(screen.queryByRole("img", { name: "scan.tiff", hidden: true })).toBeNull();
+  });
+
+  it("puts the model, the cost and the context carried on the turn", () => {
+    serve({
+      items: [
+        turn({
+          id: "m-1",
+          model_name: "claude-sonnet-4-5",
+          input_tokens: 1200,
+          output_tokens: 340,
+          cost_usd: "0.0182",
+          context_used_tokens: 8600,
+        }),
+      ],
+    });
+
+    renderTimeline();
+
+    expect(screen.getByText("claude-sonnet-4-5")).toBeVisible();
+    expect(screen.getByText(/1,200/)).toBeVisible();
+    expect(screen.getByText(/\$0\.0182/)).toBeVisible();
+    expect(screen.getByText("8600 ctx")).toBeVisible();
+  });
+
+  it("draws no cost at all for a turn nobody measured", () => {
+    serve({ items: [turn({ id: "m-1", model_name: null })] });
+
+    renderTimeline();
+
+    // Absent means not recorded, and "$0.0000" under an answer that cost money
+    // is the number that lies.
+    expect(screen.queryByText(/\$/)).toBeNull();
+  });
+
+  it("opens the run the answer is anchored on, not the one asked for", () => {
+    // What a step through a thread renders while the next answer is in flight:
+    // the transcript being held is the neighbour's, and anchoring on the
+    // requested id would fold every section until the request came back.
+    serve({
+      run_id: "run-0",
+      items: [
+        turn({ id: "m-a", run_id: "run-0", content: "the held answer" }),
+        turn({ id: "m-b", run_id: "run-1", content: "the answer asked for" }),
+      ],
+    });
+
+    renderTimeline("run-1");
+
+    expect(screen.getByText("This run")).toBeVisible();
+    expect(screen.getByText("the held answer")).toBeVisible();
+    expect(screen.queryByText("the answer asked for")).toBeNull();
+  });
+});
+
+describe("taking something out of a run", () => {
+  it("actually shows the copy button rather than leaving it transparent", async () => {
+    // `CopyButton` hides itself with `opacity-0 group-hover:opacity-100`, which
+    // watches an *unnamed* `.group`. The wrapper here is `group/copy`, so that
+    // rule never fires and the control shipped invisible at every state -
+    // `getByRole` finds an `opacity-0` element perfectly well, which is why the
+    // first version of these tests passed against a broken feature.
+    serve({ items: [turn({ role: "user", content: "explore the wikipedia page" })] });
+    renderTimeline();
+
+    const copy = (await screen.findAllByRole("button", { name: /copy/i }))[0];
+    expect(copy).toHaveClass("opacity-100");
+    expect(copy).not.toHaveClass("opacity-0");
+  });
+
+  it("offers to copy what the person asked", async () => {
+    // Half of reading a run back is *taking* something from it - the prompt to
+    // try again, the answer to paste into a ticket. None of it was reachable
+    // without selecting text by hand across a scrolling panel.
+    serve({ items: [turn({ role: "user", content: "explore the wikipedia page" })] });
+    renderTimeline();
+
+    expect(await screen.findByText("explore the wikipedia page")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /copy/i }).length).toBeGreaterThan(0);
+  });
+
+  it("offers to copy what the agent answered", async () => {
+    serve({ items: [turn({ role: "assistant", content: "## Poland\n\n**Capital:** Warsaw" })] });
+    renderTimeline();
+
+    expect(await screen.findByText(/Capital/)).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /copy/i }).length).toBeGreaterThan(0);
+  });
+
+  it("offers nothing to copy where there is nothing", async () => {
+    // A turn recorded with no text at all - a run refused before the model
+    // answered. A copy button for an empty string is a control that does
+    // nothing, and it would sit on every one of those rows.
+    // A *user* turn, because an assistant turn with no text produces no parts
+    // at all and so never reaches the panel. A prompt recorded empty does.
+    serve({ items: [turn({ role: "user", content: "" })] });
+    const { container } = renderTimeline();
+
+    await waitFor(() => expect(container.querySelector("li")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: /copy/i })).toBeNull();
+  });
+});

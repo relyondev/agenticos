@@ -1,0 +1,1833 @@
+"""RAG ingestion & sync tasks - processes documents asynchronously."""
+
+import asyncio
+import hashlib
+import json
+import logging
+import tempfile
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+from app.agents.capabilities.budget import BudgetExceeded, SpendLedger, metered_by
+from app.core.config import settings
+from app.core.exceptions import NotFoundError
+from app.core.secret_kinds import SecretKind, StorableSecret, unseal_secret
+from app.core.vault import VaultScope
+from app.db.locks import LockScope, hold_name, try_hold_subject_on_connection
+from app.db.models.knowledge_base import KnowledgeBase
+from app.db.models.rag_document import DocumentStatus
+from app.db.models.sync_source import SyncSource
+from app.db.session import get_worker_connection, get_worker_db_context
+from app.db.vector_tables import VectorScope
+from app.repositories import (
+    collection_teardown_repo,
+    ingestion_spend_repo,
+    knowledge_base_repo,
+    organization_secret_repo,
+    rag_document_repo,
+)
+from app.repositories import sync_log as sync_log_repo
+from app.repositories import sync_source as sync_source_repo
+from app.services.embedding_resolution import (
+    ResolvedEmbeddings,
+    embeddings_for_collection,
+)
+from app.services.ingestion_config import (
+    IngestionConfig,
+    IngestionConfigService,
+    deployment_defaults,
+)
+from app.services.notifications import NotificationService
+from app.services.rag.config import DocumentExtensions
+from app.services.rag.connectors import CONNECTOR_REGISTRY, RemoteListing, WithdrawnFile
+from app.services.rag.documents import DocumentProcessor
+from app.services.rag.embeddings import EmbeddingService
+from app.services.rag.failures import IngestionStage, failure_summary
+from app.services.rag.filters import Source
+from app.services.rag.ingestion import IngestionService
+from app.services.rag.models import IngestionResult, IngestionStatus
+from app.services.rag.provenance import iso_doc_date
+from app.services.rag.vectorstore import EmbeddingResolver
+from app.services.rag.vectorstore import PgVectorStore as VectorStore
+from app.services.spend import assert_organization_within_budget
+from app.services.sync_source import SyncSourceService, SyncState, sync_fingerprint
+from app.worker.attempt import is_final_attempt
+from app.worker.jobs import IngestDocument, SyncCollection, SyncConnectorSource, sync_source_key
+
+logger = logging.getLogger(__name__)
+
+
+def _hash_file(path: Path) -> str:
+    """SHA-256 of a file's bytes. Blocking - reach it through `asyncio.to_thread`
+    so a large file does not stall the worker's event loop (#1100)."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _walk_files(root: Path) -> list[Path]:
+    """Every non-hidden file under a tree. Blocking - `rglob` plus a `stat` per
+    entry - so it runs through `asyncio.to_thread`, not on the loop (#1100)."""
+    return [f for f in root.rglob("*") if f.is_file() and not f.name.startswith(".")]
+
+
+def _announcing_resolver(organization_id: UUID | None) -> EmbeddingResolver:
+    """`embeddings_for_collection`, saying a degraded credential out loud once.
+
+    The organization is the ingesting flow's own, threaded into resolution so a
+    collection name shared across tenants embeds on this document's organization's
+    key rather than whichever knowledge base the database ordered first (#913). The
+    store passes no organization on the ingest path, so the flow's stands in.
+
+    The resolver degrades to no key on every path but one - no key chosen, no
+    vault to choose from, the chosen secret deleted, unsealable or not an API
+    key, the recorded provider gone from the catalog - each a `logger.warning`
+    in `app.services.embedding_resolution` that reaches nothing an operator
+    reads. So a collection that *had* been given a vault key failed with advice
+    about a deployment variable, and nothing said which of the reasons had
+    happened. There is no deployment-wide key any more, so every degraded
+    resolution is a collection that cannot index, and every one is said here.
+
+    One thing it does not say twice: the same collection - the store resolves
+    per operation rather than per cache miss, so indexing one document asks
+    twice (once to create the table, once to embed), and a sync of two hundred
+    files would otherwise print four hundred copies of the line it exists to
+    make noticeable. The set is per ingestion service, so it is per job
+    rather than per process; a credential fixed between runs is reported again
+    on the next one.
+    """
+    announced: set[str] = set()
+
+    async def resolve(
+        collection_name: str, store_organization_id: UUID | None = None
+    ) -> ResolvedEmbeddings | None:
+        resolved = await embeddings_for_collection(
+            collection_name, store_organization_id or organization_id
+        )
+        if (
+            resolved is not None
+            and resolved.key_source.is_degraded
+            and collection_name not in announced
+        ):
+            announced.add(collection_name)
+            logger.warning("Embedding %s.", resolved.describe(collection_name))
+        return resolved
+
+    return resolve
+
+
+@asynccontextmanager
+async def _ingestion_service(
+    *, processor: DocumentProcessor, organization_id: UUID | None, scope: VectorScope
+) -> AsyncGenerator[IngestionService]:
+    """An ingester that reads documents the way the collection asked to be read.
+
+    `organization_id` is the flow's own, and scopes embedding resolution to the
+    right tenant's key (#913). `scope` is the collection's knowledge base -
+    resolved by the caller, its `vector_scope`, or the deployment-wide tenant with
+    no base for a collection no base claims - and is what the rows are stamped and
+    scoped by (#1684, #2537). They differ for an app-scoped base: the
+    organization pays for the embeddings, but the rows are deployment-wide and
+    carry no tenant.
+
+    Both halves come off the collection. The parser, the chunker and the image
+    model come through the `processor` the caller built from its
+    `IngestionConfig` - built by the caller, on the session it already holds,
+    because it is the part that can fail for reasons of configuration and a
+    failed build must leave nothing open. The embedding model, its recorded
+    vector width and the vault key that pays for it come from the resolver,
+    which the store consults per collection.
+
+    That resolver used to be omitted here, and only here - the deployment's
+    model and `OPENROUTER_API_KEY` were used for every collection, whatever it
+    had chosen. On a deployment with no key set that was a crash advising the
+    operator to set one; with both set it was worse, because the embeddings
+    were billed to the deployment while the product said the organization's
+    key paid (#306).
+
+    A context manager because the store rides an engine built for this one
+    piece of work, and the exit is what disposes it on every path out - the
+    parse that fails, the sync cancelled from inside its file loop. A flow that
+    built a store and disposed none left its pool open for the life of the
+    worker, and two hundred uploads reached Postgres `max_connections` (#948).
+    The engine is per job rather than the process's own so that its pool is
+    bounded by the job that opened it and closed when the job ends, whatever
+    the job's way out.
+    """
+    rag_settings = settings.rag
+    engine = create_async_engine(settings.DATABASE_URL)
+    try:
+        yield IngestionService(
+            processor=processor,
+            vector_store=VectorStore(
+                settings=rag_settings,
+                embedding_service=EmbeddingService(settings=rag_settings),
+                resolver=_announcing_resolver(organization_id),
+                engine=engine,
+            ),
+            scope=scope,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _record_embedding_spend(
+    ledger: SpendLedger, *, organization_id: UUID | None, rag_document_id: UUID | None
+) -> None:
+    """Persist what a metering window spent, if it spent anything.
+
+    One row per model per window - a document upload, a whole sync - rather
+    than per API call: the unit anyone reconciles against a bill is "what did
+    indexing this cost with which model", and a window can spend in two models
+    at once - the embedder and the image describer. Written even when the
+    window failed, because a document that died half-embedded still spent the
+    tokens it got through, and a budget that ignores failures is not a budget.
+    """
+    if not ledger.entries:
+        return
+    async with get_worker_db_context() as db:
+        for model_name in dict.fromkeys(entry.model_name for entry in ledger.entries):
+            entries = [entry for entry in ledger.entries if entry.model_name == model_name]
+            await ingestion_spend_repo.record(
+                db,
+                organization_id=organization_id,
+                rag_document_id=rag_document_id,
+                model=model_name,
+                input_tokens=sum(entry.input_tokens for entry in entries),
+                output_tokens=sum(entry.output_tokens for entry in entries),
+                cost_usd=sum((entry.cost_usd for entry in entries), Decimal(0)),
+                cost_is_partial=any(not entry.priced for entry in entries),
+            )
+
+
+async def _knowledge_base_for(
+    db: AsyncSession, collection_name: str | None, organization_id: UUID | None
+) -> KnowledgeBase | None:
+    """The knowledge base behind a collection name, or `None` if none claims it.
+
+    The org-scoped resolution itself is `knowledge_base_repo.get_for_collection`,
+    shared with per-collection embedding resolution so the tenant-narrowing rule
+    the non-unique `collection_name` needs lives in one place (#913, #992). Two
+    callers still reach `None` before it: a local-directory sync, which names a
+    path on the server rather than a collection somebody configured, and a sync
+    source with no collection at all - an org-level integration template that
+    exists to be cloned and should never have been run.
+    """
+    if collection_name is None:
+        return None
+    return await knowledge_base_repo.get_for_collection(db, collection_name, organization_id)
+
+
+async def _still_ingestable(document_id: str, collection_name: str) -> bool:
+    """Whether a parsed file may still be indexed: its tracking row exists and its
+    collection is not mid-teardown.
+
+    The row, not the collection's knowledge base: a collection drop deletes every
+    `rag_documents` row for the name, even for a default KB whose row it keeps, so
+    checking the row is what tells a sync into a default collection to stop rather
+    than recreate the table the drop just emptied (#1275). The reservation covers the
+    window the row check misses: a default cleared with an active sync keeps its row,
+    so the row still exists while the table is reserved for the deferred drop - and a
+    reserved name is being torn down, so indexing now would recreate the very table
+    the drop is about to destroy (#1382). Fail-safe: any error answers yes, so the
+    guard only ever skips a write it is certain is unwanted, never blocks a legitimate
+    ingestion.
+    """
+    try:
+        async with get_worker_db_context() as db:
+            if await collection_teardown_repo.is_reserved(db, collection_name):
+                return False
+            return await rag_document_repo.get_by_id(db, UUID(document_id)) is not None
+    except Exception:
+        logger.warning("Could not confirm document %s still exists; indexing anyway", document_id)
+        return True
+
+
+async def ingest_document(job: IngestDocument) -> dict[str, Any]:
+    """Process a document: parse, chunk, embed, store in vector DB.
+
+    The row this puts an error on is read on the documents page, so what lands
+    there is a summary rather than the exception's own text (#423). The text
+    itself is in the worker's log, with the traceback, because the failure is
+    re-raised - which is also what lets the queue retry it.
+
+    A refused ingest is the exception: its collection or knowledge base was
+    removed while the file parsed, so `_run_ingestion` fails the row with the
+    written reason and returns, logged at INFO, and the queue does not retry it
+    (#2561).
+
+    `job.attempt` is which dispatch of the document this is (#1598) - `1` for an
+    upload, whatever `retry_ingestion` bumped it to for a retry - carried through
+    to every settlement so a stale one (superseded by a later retry) is ignored
+    rather than notifying under the wrong attempt's dedup key. It is not the
+    job's own attempt, which the queue counts.
+    """
+    logger.info("Starting ingestion: %s -> %s", job.source_path, job.collection_name)
+    try:
+        return await _run_ingestion(
+            str(job.rag_document_id),
+            job.collection_name,
+            job.filepath,
+            job.source_path,
+            job.replace,
+            job.attempt,
+        )
+    except Exception as exc:
+        logger.exception("Ingestion failed for %s", job.source_path)
+        await _fail_document(
+            str(job.rag_document_id),
+            error_message=failure_summary(exc, stage=IngestionStage.INGEST),
+            attempt=job.attempt,
+        )
+        raise
+
+
+async def sync_collection(job: SyncCollection) -> dict[str, Any]:
+    """Sync a collection from a local directory.
+
+    `knowledge_base_id` is the base the route authorized this sync to write, or
+    `None` for a deployment-wide local sync.
+    """
+    logger.info("Starting sync: %s -> %s (mode=%s)", job.source, job.collection_name, job.mode)
+    try:
+        return await _run_sync(
+            str(job.sync_log_id),
+            job.source,
+            job.collection_name,
+            job.mode,
+            job.path,
+            None if job.knowledge_base_id is None else str(job.knowledge_base_id),
+        )
+    except Exception as exc:
+        logger.exception("Sync failed for %s -> %s", job.source, job.collection_name)
+        if is_final_attempt():
+            await _update_sync_log(
+                str(job.sync_log_id),
+                "error",
+                error_message=failure_summary(exc, stage=IngestionStage.SYNC),
+            )
+        raise
+
+
+async def sync_source(job: SyncConnectorSource) -> dict[str, Any]:
+    """Sync a single connector source, onto the given log when the caller made one."""
+    logger.info("Starting source sync: %s", job.source_id)
+    return await _run_source_sync(
+        str(job.source_id), sync_log_id=None if job.sync_log_id is None else str(job.sync_log_id)
+    )
+
+
+async def dispatch_due_syncs() -> int:
+    """Queue a sync for each source that has come due. Answers how many were queued.
+
+    The `dispatch-due-syncs` schedule, every minute. A source whose sync is
+    already queued or running is left alone - it stays "due" until that sync
+    finishes and stamps it, and a second copy behind the first would sync the
+    same files again for nothing.
+    """
+    from app.services.background_jobs import enqueue
+    from app.worker.jobs import SYNC_SOURCE
+
+    queued = 0
+    async with get_worker_db_context() as db:
+        if not await sync_source_repo.any_due_for_sync(db):
+            return 0
+        sources = SyncSourceService(db)
+        for source in await sync_source_repo.get_due_for_sync(db):
+            key = sync_source_key(source.id)
+            # The log and its job in one savepoint, as a manual trigger queues them:
+            # the job then names its own log, and a job that dies leaves that log
+            # to close rather than whichever of the source's logs is newest - a
+            # manual sync queued behind it, which was then failed in its place
+            # (Codex, #2248). A sync already queued or running keeps the source,
+            # and the log opened for nothing goes with the savepoint.
+            savepoint = await db.begin_nested()
+            log_id = None
+            if source.collection_name:
+                log = await sources.open_sync_log(source, collection_name=source.collection_name)
+                log_id = log.id
+            job_id = await enqueue(
+                db,
+                SYNC_SOURCE,
+                SyncConnectorSource(source_id=source.id, sync_log_id=log_id),
+                organization_id=source.organization_id,
+                dedupe_key=key,
+                dedupe_active=True,
+                concurrency_key=key,
+            )
+            if job_id is None:
+                await savepoint.rollback()
+            else:
+                await savepoint.commit()
+                queued += 1
+    if queued:
+        logger.info("Scheduled sync check: queued %d source(s)", queued)
+    return queued
+
+
+async def _run_ingestion(
+    rag_document_id: str,
+    collection_name: str,
+    filepath: str,
+    source_path: str,
+    replace: bool,
+    attempt: int,
+) -> dict[str, Any]:
+    """Parse and index one uploaded document, exactly as its record says to.
+
+    The configuration comes off the `rag_documents` row rather than out of the
+    environment, and it is the *resolved* one - the collection's, with whatever
+    that upload overrode already folded in. Reading the collection again here
+    would quietly re-parse with settings that changed while the file waited in
+    the queue, and would lose the override entirely.
+    """
+    from app.services.rag_document import RAGDocumentService
+
+    async with get_worker_db_context() as db:
+        record = await RAGDocumentService(db).get_document(rag_document_id)
+        organization_id = record.organization_id
+        # Checked again here, not only at upload: the budget can be reached by
+        # runs that finished while this file waited in the queue. Raising lets
+        # the flow's handler put the refusal on the document row, where the
+        # uploader will look for it.
+        if organization_id is not None:
+            await assert_organization_within_budget(db, organization_id)
+        config = IngestionConfig.model_validate(record.ingestion_config)
+        # Read here, with the session still open, for the same reason the
+        # resolved configuration is: what this upload decided, off its own row,
+        # rather than a flow parameter a queued run would not carry (#1777).
+        organizational_unit = record.organizational_unit
+        processor = await IngestionConfigService(db).build_processor(organization_id, config)
+        # The collection's own scope, off the knowledge base this document is
+        # tracked under: the base itself (#2537) and its tenant - its organization
+        # for an org base, None for an app-scoped one every organization reads.
+        # Distinct from `organization_id`, which pays for the embeddings even when
+        # the rows are deployment-wide (#1684).
+        kb = (
+            await knowledge_base_repo.get_by_id(db, record.knowledge_base_id)
+            if record.knowledge_base_id is not None
+            else None
+        )
+        scope = kb.vector_scope if kb is not None else VectorScope(tenant=None)
+
+    ledger = SpendLedger(organization_id=organization_id)
+    file_path = Path(filepath)
+    # An uploaded document's date: the file's own mtime, else ingestion time.
+    # The trusted tenant comes off the tracked row, never from the uploader.
+    upload_mtime = file_path.stat().st_mtime if file_path.exists() else None
+    async with _ingestion_service(
+        processor=processor, organization_id=organization_id, scope=scope
+    ) as ingester:
+        try:
+            with metered_by(ledger):
+                result = await ingester.ingest_file(
+                    filepath=file_path,
+                    rag_document_id=UUID(rag_document_id),
+                    collection_name=collection_name,
+                    replace=replace,
+                    source_path=source_path,
+                    still_wanted=lambda: _still_ingestable(rag_document_id, collection_name),
+                    source=Source.UPLOAD,
+                    doc_date=iso_doc_date(upload_mtime),
+                    organizational_unit=organizational_unit,
+                )
+        except Exception as exc:
+            # `ingest_file` reports a failed parse or a failed index by returning
+            # one, so what reaches here escaped the metering window instead - the
+            # budget, or the pipeline itself. Which stage it was is not knowable
+            # from here, and the stage below says so.
+            logger.exception("Ingestion failed for %s", source_path)
+            await _fail_document(
+                rag_document_id,
+                error_message=failure_summary(exc, stage=IngestionStage.INGEST),
+                attempt=attempt,
+            )
+            raise
+        finally:
+            await _record_embedding_spend(
+                ledger, organization_id=organization_id, rag_document_id=UUID(rag_document_id)
+            )
+
+    # Checked outside the `try` because `ingest_file` *returns* a failure rather
+    # than raising one - which is why this used to fall straight through to
+    # `complete_ingestion` below. A document whose embeddings were never written
+    # was marked `done`, and that is worse than an error: the collection looks
+    # ingested, answers nothing, and says nowhere why. Reproduced with no
+    # embedding credential configured - the service logged an accurate refusal,
+    # the flow finished `Completed()`, the row said `done`, and the vector table
+    # held zero rows.
+    if result.status is not IngestionStatus.DONE:
+        reason = result.error_message or result.message
+        if result.refused:
+            # Skipped on purpose: the collection or its base went while the file
+            # parsed. A retry cannot index it, so this ends the job instead of
+            # raising into one, and it is not an error worth a traceback (#2561).
+            logger.info("Ingestion of %s refused: %s", source_path, reason)
+            await _fail_document(rag_document_id, error_message=reason, attempt=attempt, final=True)
+            return {"status": "refused", "filename": source_path, "message": reason}
+        await _fail_document(rag_document_id, error_message=reason, attempt=attempt)
+        raise RuntimeError(f"Ingestion failed for {source_path}: {reason}")
+
+    # `ingest_file` only sets `document_id` on the branch that returns `DONE` -
+    # the two travel together in `IngestionResult`.
+    assert result.document_id is not None
+
+    try:
+        async with get_worker_db_context() as db:
+            documents = RAGDocumentService(db)
+            recorded = await documents.complete_ingestion(
+                rag_document_id,
+                vector_document_id=result.document_id,
+                chunk_count=result.chunk_count,
+                replaced_document_id=result.replaced_document_id,
+                attempt=attempt,
+            )
+            if not recorded:
+                await documents.discard_untracked(collection_name, result.document_id, scope=scope)
+    except Exception as exc:
+        logger.exception("Indexed %s but could not record it", source_path)
+        await _fail_document(
+            rag_document_id,
+            error_message=failure_summary(exc, stage=IngestionStage.RECORD),
+            attempt=attempt,
+        )
+        raise
+
+    if not recorded:
+        logger.info("Document %s was deleted while indexing", rag_document_id)
+        return {"status": "deleted", "filename": source_path}
+
+    logger.info("Ingestion complete: %s", source_path)
+    return {"status": "done", "document_id": result.document_id, "filename": source_path}
+
+
+async def _run_sync(
+    sync_log_id: str,
+    source: str,
+    collection_name: str,
+    mode: str,
+    path: str,
+    knowledge_base_id: str | None = None,
+) -> dict[str, Any]:
+    from app.services.rag_sync import RAGSyncService
+
+    target_path = Path(path).resolve()
+    if not target_path.exists():
+        await _update_sync_log(sync_log_id, "error", error_message=f"Path not found: {path}")
+        return {"status": "error", "message": f"Path not found: {path}"}
+
+    if target_path.is_file():
+        files = [target_path]
+    else:
+        files = await asyncio.to_thread(_walk_files, target_path)
+
+    allowed = {ext.value for ext in DocumentExtensions}
+    files = [f for f in files if f.suffix.lower() in allowed]
+    ingested = updated = skipped = failed = 0
+
+    async with get_worker_db_context() as db:
+        # The knowledge base the caller was authorized to write, loaded by the id
+        # the route resolved rather than re-resolved from the name here: `path`
+        # names a server directory, but the *destination* is a real collection, and
+        # re-resolving by name could pick a same-named base in a different scope than
+        # the one authorized (#1684). Its scope - the base itself (#2537) and its
+        # tenant - is what every row this sync writes is stamped and scoped by. The
+        # tenant is `None` for an app-scoped base (deployment-wide,
+        # as a local sync always was) or its organization for an org or personal one,
+        # which normal reads for that collection filter on; writing untagged there
+        # would strand the content from search, listing, count and replace, and could
+        # surface it under an app-scoped base sharing the name (#1684). The
+        # organization also scopes embedding resolution to the right key, answers the
+        # budget, and bills the spend; the base id and both models are recorded on
+        # every document row, the provenance the documents page reads (#992, #997).
+        kb = (
+            None
+            if knowledge_base_id is None
+            else await knowledge_base_repo.get_by_id(db, UUID(knowledge_base_id))
+        )
+        if knowledge_base_id is not None and kb is None:
+            # Deleted while the job waited. Falling through would write its files
+            # under the deployment-wide scope below, unfiled where any same-named
+            # app-scoped base reads them and no base's purge removes them (#2561).
+            # Settled in this session, as the budget refusal below is: a write
+            # that fails raises into a retry rather than leaving the log running.
+            reason = "The knowledge base was deleted before this sync ran"
+            await RAGSyncService(db).complete_sync(
+                sync_log_id, status="error", error_message=reason
+            )
+            return {"status": "error", "message": reason}
+        organization_id = None if kb is None else kb.organization_id
+        scope = VectorScope(tenant=None) if kb is None else kb.vector_scope
+        resolved_kb_id = None if kb is None else kb.id
+        ingestion_config = (
+            deployment_defaults()
+            if kb is None
+            else IngestionConfig.model_validate(kb.ingestion_config)
+        )
+        embedding_model = None if kb is None else kb.embedding_model
+        # Only an org-backed collection has an organization whose model profiles an
+        # image-description model could resolve against; a deployment-wide one has
+        # none and records no image model, as a local sync always did.
+        image_description_model = (
+            None
+            if organization_id is None
+            else await IngestionConfigService(db).resolved_image_model(
+                organization_id, ingestion_config
+            )
+        )
+        processor = await IngestionConfigService(db).build_processor(
+            organization_id, ingestion_config
+        )
+        # An org-backed local sync answers to the organization's budget the same way
+        # a connector sync does, and the refusal lands on the sync log rather than
+        # leaving it running (#1684). An app-scoped or unclaimed destination has no
+        # organization and no ceiling to check, as before.
+        if organization_id is not None:
+            try:
+                await assert_organization_within_budget(db, organization_id)
+            except BudgetExceeded as exc:
+                reason = failure_summary(exc, stage=IngestionStage.SYNC)
+                await RAGSyncService(db).complete_sync(
+                    sync_log_id, status="error", error_message=reason
+                )
+                return {"status": "error", "message": reason}
+
+    # The spend is billed to the destination's organization, or to none for an
+    # app-scoped or unclaimed collection - recorded either way, because a total that
+    # quietly under-reports is worse than one holding rows nobody claims.
+    ledger = SpendLedger(organization_id=organization_id)
+
+    # Entered after the validations above, so an early "path not found" return
+    # builds no engine, and every return inside the loop still disposes one (#948).
+    async with _ingestion_service(
+        processor=processor, organization_id=organization_id, scope=scope
+    ) as ingester:
+        for filepath in files:
+            async with get_worker_db_context() as db:
+                sync_log_check = await RAGSyncService(db).get_sync_log(sync_log_id)
+                if sync_log_check.status == "cancelled":
+                    logger.info("Sync %s cancelled by user", sync_log_id)
+                    await _record_embedding_spend(
+                        ledger, organization_id=organization_id, rag_document_id=None
+                    )
+                    return {
+                        "status": "cancelled",
+                        "ingested": ingested,
+                        "updated": updated,
+                        "skipped": skipped,
+                        "failed": failed,
+                    }
+
+            source_path = str(await asyncio.to_thread(filepath.resolve))
+            if mode in ("new_only", "update_only"):
+                # One scan for both answers. They are facts about the same
+                # document, and asking for them separately is what let a live
+                # file's hash be compared against a different document's (#548).
+                existing = await ingester.existing_document(collection_name, source_path)
+
+                if mode == "new_only":
+                    if existing.document_id:
+                        file_hash = await asyncio.to_thread(_hash_file, filepath)
+                        if existing.content_hash and file_hash == existing.content_hash:
+                            skipped += 1
+                            continue
+
+                elif mode == "update_only":
+                    if not existing.document_id:
+                        skipped += 1
+                        continue
+                    file_hash = await asyncio.to_thread(_hash_file, filepath)
+                    if existing.content_hash and file_hash == existing.content_hash:
+                        skipped += 1
+                        continue
+            try:
+                stat_result = await asyncio.to_thread(filepath.stat)
+                # Opened before the ingest, as the upload and the connector sync
+                # do (#992). Written afterwards it could fail afterwards - a
+                # database blip, a name longer than the column - leaving the
+                # vector document stored and untracked, and the next `new_only`
+                # run then matched its unchanged hash and skipped the file before
+                # reaching the write, for good (#997).
+                row_id = await _open_document_row(
+                    filename=filepath.name,
+                    filesize=stat_result.st_size,
+                    collection_name=collection_name,
+                    # The same address it hands `existing_document` above, so the
+                    # row and the lookup name one file (#996).
+                    source_path=source_path,
+                    # The destination collection's own, off the knowledge base the
+                    # route authorized: an org or personal base carries its
+                    # organization and its id so the row is tracked, scoped and
+                    # re-stampable; an app-scoped or unclaimed one carries neither
+                    # and its rows stay deployment-wide, as before (#1684, #992).
+                    organization_id=organization_id,
+                    knowledge_base_id=resolved_kb_id,
+                    ingestion_config=ingestion_config,
+                    image_description_model=image_description_model,
+                    embedding_model=embedding_model,
+                )
+
+                with metered_by(ledger):
+                    result = await ingester.ingest_file(
+                        filepath=filepath,
+                        rag_document_id=UUID(row_id),
+                        collection_name=collection_name,
+                        replace=True,
+                        still_wanted=lambda rid=row_id: _still_ingestable(rid, collection_name),
+                        # The address this flow already looks documents up by. It
+                        # was omitted, so the stored document identified itself by
+                        # filename while the lookup asked for a path - the
+                        # `existing_document` call above only ever matched through
+                        # the filename fallback, and the row and the vector would
+                        # now disagree about which file this is (#996).
+                        source_path=source_path,
+                        # The origin only. Which tenant and base these chunks carry
+                        # is not decided here and never from the path: it is the
+                        # destination base's own `vector_scope`, bound on the
+                        # ingester above - an organization's id for an org or
+                        # personal base, `None` for an app-scoped one, which
+                        # `AppScope` is what reads back (FA-039 R5, #1684, #2537).
+                        source=Source.LOCAL,
+                        doc_date=iso_doc_date(stat_result.st_mtime),
+                    )
+
+                # Either way, which is the other half of #997: a file that failed
+                # to parse used to leave no row and no reason, so a sync log
+                # saying four of forty failed named none of the four.
+                settled = await _settle_document_row(
+                    row_id, result, ingester=ingester, collection_name=collection_name
+                )
+
+                if not settled:
+                    # Deleted while it indexed: not a file this sync ingested (#2565).
+                    pass
+                elif result.status is IngestionStatus.DONE:
+                    if result.replaced_document_id:
+                        updated += 1
+                    else:
+                        ingested += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                logger.warning("Sync file error %s: %s", filepath.name, e)
+                failed += 1
+
+        await _record_embedding_spend(ledger, organization_id=organization_id, rag_document_id=None)
+
+        async with get_worker_db_context() as db:
+            await RAGSyncService(db).complete_sync(
+                sync_log_id,
+                status="done" if failed == 0 else "error",
+                total_files=len(files),
+                ingested=ingested,
+                updated=updated,
+                skipped=skipped,
+                failed=failed,
+            )
+
+        return {
+            "status": "done",
+            "ingested": ingested,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
+
+async def _fail_document(
+    rag_document_id: str, *, error_message: str | None, attempt: int, final: bool = False
+) -> None:
+    """Put a failure on the document row, and let the first one keep it.
+
+    One collapse is reported by up to three handlers here: the stage that
+    raised, the check that a *returned* failure is not `done`, and the flow's
+    own backstop - and they run innermost first. The innermost is the specific
+    one ("could not be indexed, check the collection's embedding credential");
+    the outermost only knows the ingest failed. Overwriting therefore replaces
+    the useful sentence with the vague one, which mattered from the moment the
+    column stopped holding the same `str(exc)` at every level (#423). This
+    holds within one attempt - the `status == ERROR` check below is what makes
+    it true - and is unaffected by `attempt` (#1598): a retry resets the row to
+    `PROCESSING` before dispatching again, so the guard cannot mistake a
+    previous attempt's already-recorded failure for this one's.
+
+    Only a document still `processing` is failed: a settler that runs after the
+    queue gave up on the job finds a `done` or already-failed row and leaves it.
+    And only on the job's last attempt (`is_final_attempt`): an earlier one is
+    retried, and failing the row then reported a failure the retry undid.
+    `final` says the job ends here whatever its attempt - a refused ingest,
+    which returns rather than raising into a retry. A row already gone is what
+    such a refusal usually finds, so it is noted at INFO rather than warned of.
+
+    Failure is the only status this records. Reaching `DONE` needs the vector
+    document's id, which only `_run_ingestion` holds, so it calls
+    `complete_ingestion` itself.
+    """
+    from app.services.rag_document import RAGDocumentService
+
+    if not final and not is_final_attempt():
+        # The queue tries again: the document stays `processing`, and its owner is
+        # told nothing yet - the retry may well index it (Codex, #2248).
+        logger.info("Ingestion of %s failed; the queue retries it", rag_document_id)
+        return
+    try:
+        async with get_worker_db_context() as db:
+            doc_svc = RAGDocumentService(db)
+            if (await doc_svc.get_document(rag_document_id)).status != DocumentStatus.PROCESSING:
+                return
+            await doc_svc.fail_ingestion(
+                rag_document_id, error_message=error_message or "Unknown error", attempt=attempt
+            )
+    except NotFoundError:
+        logger.info("Document %s is gone; no failure to record", rag_document_id)
+    except Exception as e:
+        logger.warning("Failed to record the ingestion failure: %s", e)
+
+
+async def _update_sync_log(sync_log_id: str, status: str, error_message: str | None = None) -> None:
+    from app.services.rag_sync import RAGSyncService
+
+    try:
+        async with get_worker_db_context() as db:
+            await RAGSyncService(db).complete_sync(
+                sync_log_id, status=status, error_message=error_message
+            )
+    except Exception as e:
+        logger.warning("Failed to update SyncLog: %s", e)
+
+
+async def _connector_credential(
+    db: AsyncSession, secret_id: UUID | None, organization_id: UUID
+) -> StorableSecret | None:
+    """The unsealed credential a sync source names, or `None`.
+
+    Both ids arrive as `uuid.UUID` - `get_source` answers with the model, whose
+    columns are `PG_UUID(as_uuid=True)` - so nothing here re-parses them. Passing
+    one to `UUID()` raises `AttributeError: 'UUID' object has no attribute
+    'replace'`, which is what this did before review and what a fixture holding a
+    string instead of a UUID hid.
+
+    `None` for three reasons, and the connector treats them alike because a
+    caller cannot act on the difference: the source names no credential, the
+    secret was deleted from the vault (the column is `ON DELETE SET NULL`), or
+    the envelope will not open. What must *not* happen is a fallback - a Drive or
+    S3 source that ran on the deployment's own credentials would read under the
+    operator's identity rather than the tenant's, which is the reach both
+    connectors had their environment fallbacks removed for.
+
+    The unsealing happens here rather than in the connector because only this
+    layer has a database session, and because a connector that could reach the
+    vault could reach another organization's row in it.
+    """
+    if secret_id is None:
+        return None
+    row = await organization_secret_repo.get(db, secret_id, organization_id=organization_id)
+    if row is None:
+        logger.warning("sync_source_secret_missing", extra={"organization": str(organization_id)})
+        return None
+    try:
+        return unseal_secret(
+            row.sealed_secret,
+            kind=SecretKind(row.kind),
+            scope=VaultScope.organization(organization_id),
+            key_version=row.key_version,
+        )
+    except Exception:
+        logger.warning("sync_source_secret_unusable", extra={"secret": str(row.id)})
+        return None
+
+
+async def _open_document_row(
+    *,
+    filename: str,
+    filesize: int,
+    collection_name: str,
+    source_path: str,
+    organization_id: UUID | None,
+    knowledge_base_id: UUID | None,
+    ingestion_config: IngestionConfig,
+    image_description_model: str | None,
+    embedding_model: str | None,
+    organizational_unit: str | None = None,
+    sync_source_id: UUID | None = None,
+) -> str:
+    """Record a document a sync is about to ingest, and answer its row id.
+
+    A connector sync used to create no `rag_documents` row at all, so its
+    documents were searchable and invisible: absent from the knowledge base's
+    Documents tab, from a collection's own `document_count`, and from delete -
+    a file ingested from a Drive folder could be removed only by dropping the
+    whole collection (#992). A failure was counted in the sync log and recorded
+    nowhere per-file, so "which four of the forty failed, and why" had no answer.
+
+    No original is stored, unlike an upload, and that holds for both callers:
+    a connector's file lives in the system it was synced from and a local one is
+    already on this host's disk at the path the sync named, so keeping a second
+    copy to make a retry button work is a cost per corpus rather than per
+    failure. `has_file` is false for these, and **re-running the sync is the
+    retry** - which since #990 skips everything unchanged and re-fetches exactly
+    what has no document.
+    """
+    from app.services.rag_document import RAGDocumentService
+
+    async with get_worker_db_context() as db:
+        row = await RAGDocumentService(db).create_document(
+            collection_name=collection_name,
+            filename=filename,
+            filesize=filesize,
+            filetype=Path(filename).suffix.lstrip(".").lower(),
+            source_path=source_path,
+            sync_source_id=sync_source_id,
+            organization_id=organization_id,
+            knowledge_base_id=knowledge_base_id,
+            ingestion_config=ingestion_config,
+            image_description_model=image_description_model,
+            embedding_model=embedding_model,
+            organizational_unit=organizational_unit,
+        )
+        return str(row.id)
+
+
+async def _settle_document_row(
+    row_id: str,
+    result: IngestionResult,
+    *,
+    ingester: IngestionService,
+    collection_name: str,
+    inherited: frozenset[UUID] = frozenset(),
+) -> bool:
+    """Move an open row to what the ingest actually did; `False` if the row is gone.
+
+    The failure branch is not an afterthought: a document that failed to parse
+    is the one a reader most needs to see, and its reason is a `failure_summary`
+    already, built by `ingest_file` rather than by a caller stringifying a
+    vendor's exception (#423).
+
+    `inherited` are the other sources that claimed a dead row this run dropped
+    at the same address (`_reconcile_stale_rows`). They claim the row once it
+    settles, never while it is `PROCESSING`: a stale row is found by its
+    claim, and another source's run must not take this one's for its own.
+
+    `ingester` and `collection_name` are what wrote the chunks: a row deleted
+    while they were written is settled by queueing their removal (#2565), and
+    the sync counts it as nothing - neither ingested nor failed.
+    """
+    from app.services.rag_document import RAGDocumentService
+
+    try:
+        async with get_worker_db_context() as db:
+            documents = RAGDocumentService(db)
+            # A sync's row is opened fresh per file, every run (#992) - there is
+            # no `retry_ingestion` on this path, so `attempt` is always `1`, the
+            # column's own default; re-syncing the same source another night
+            # opens another row rather than resubmitting this one.
+            if result.status is IngestionStatus.DONE and result.document_id:
+                if not await documents.complete_ingestion(
+                    row_id,
+                    vector_document_id=result.document_id,
+                    chunk_count=result.chunk_count,
+                    replaced_document_id=result.replaced_document_id,
+                    attempt=1,
+                ):
+                    await documents.discard_untracked(
+                        collection_name, result.document_id, scope=ingester.scope
+                    )
+                    logger.info("Document %s was deleted while indexing", row_id)
+                    return False
+            else:
+                await documents.fail_ingestion(
+                    row_id, result.error_message or "Ingestion failed", attempt=1
+                )
+            if inherited:
+                await documents.add_claims(row_id, sync_source_ids=set(inherited))
+    except NotFoundError:
+        # The base was deleted mid-sync and took the row with it (#2561). Raising
+        # here escaped the per-file loop's own handler and failed the whole run.
+        logger.info("Document %s is gone; nothing to settle", row_id)
+        return False
+    return True
+
+
+async def _notify_sync_start_failure(
+    db: AsyncSession,
+    *,
+    source: SyncSource,
+    sync_log_id: str | None,
+    started_at: datetime,
+    message: str,
+) -> None:
+    """The whole-attempt notification for a sync that failed before a single
+    file could be opened - an unknown connector, or a source with no
+    collection assigned (#1598).
+
+    Neither of these two call sites is in the design doc's own enumeration of
+    "exactly three points" (`docs/design/notification-center-plan.md`,
+    Decision 1) - it names only the unknown-connector branch, but the
+    no-collection branch immediately below it in `_run_source_sync` is
+    structurally identical: the same conditional `complete_sync` before an
+    unconditional `update_after_sync`, and the same "no per-document event
+    will ever exist for this sync" reasoning the doc gives for hooking the
+    first one. Both get the same treatment here.
+
+    Keyed on `(log.id, log.started_at)` when a log is available, the same
+    stable pair the budget-exceeded branch below keys on - `complete_sync`
+    fetches the row this call already has an id for, so there is no reason to
+    prefer the fresh `started_at` this call was handed instead. Falls back to
+    `(source_id, started_at)` only when there is no log to read one off: the
+    scheduler's own dispatch reaches here with no `sync_log_id` at all
+    (Decision 1's "whichever the firing call site actually has"), and that
+    fallback pair is what a manual-trigger retry with a lost log id would
+    otherwise fall back to as well.
+    """
+    from app.services.rag_sync import RAGSyncService
+
+    initiator_user_id = None
+    occurrence_id = f"{source.id}:{started_at.isoformat()}"
+    if sync_log_id:
+        log = await RAGSyncService(db).complete_sync(
+            sync_log_id, status="error", error_message=message
+        )
+        if log is not None:
+            initiator_user_id = log.triggered_by_user_id
+            occurrence_id = f"{log.id}:{log.started_at.isoformat()}"
+    kb = await _knowledge_base_for(db, source.collection_name, source.organization_id)
+    await NotificationService(db).sync_failed(
+        organization_id=source.organization_id,
+        initiator_user_id=initiator_user_id,
+        occurrence_id=occurrence_id,
+        # The gate's own marker, not a readable stand-in: an empty
+        # `collection_name` beside an empty `collection_id` is what tells
+        # `_collections_visible` a source was never assigned a collection
+        # from one whose collection was deleted mid-sync, and the two are
+        # shown to different people. `source.name` here made every
+        # unassigned source look like the second, hiding the failure from
+        # the very person who triggered it.
+        collection_name=source.collection_name or "",
+        collection_id=kb.id if kb else None,
+        error=message,
+    )
+
+
+# How many of a listing's problems a sync log names before it counts the rest.
+_NAMED_PROBLEMS = 3
+
+
+async def _remove_unlisted(
+    ingester: IngestionService,
+    *,
+    listing: RemoteListing,
+    withdrawn: set[str],
+    source_id: UUID,
+    collection_name: str,
+    notes: list[str],
+) -> tuple[int, int]:
+    """Remove what this source brought in earlier and no longer lists.
+
+    Answers how many documents went and how many could not. `withdrawn` are
+    the listed files whose fetch found the source no longer holds them (see
+    `WithdrawnFile`): named by the listing, but not vouched for by it.
+
+    Only against a complete listing. A partial one - a crawl stopped at its page
+    ceiling, a page that timed out - did not see what it does not name, and
+    removing on its word would empty a collection because of one bad night; it
+    says so in `notes` instead, and the next complete run catches up.
+
+    A document another source feeding the collection still claims stays: this
+    source drops its own claim, and the document goes with the last one (#1879).
+    Each document is decided and removed in one transaction holding its row
+    locked (`release_claim`), so two sources dropping it at once cannot both
+    leave it to the other, and one claiming it meanwhile waits for the outcome.
+
+    Vectors first, then the row, one document at a time: a vector delete that
+    fails keeps its row, so the document is still visible, deletable, and tried
+    again by the next run - the other order leaves searchable chunks nothing
+    tracks (#992). A document whose vectors would not delete is a failure of
+    this run rather than a detail: the caller counts it, so the run does not
+    report success while a document its source no longer holds stays searchable.
+    """
+    if not listing.complete:
+        # First, so it is never among the notes the summary counts rather than names.
+        notes.insert(
+            0,
+            "The source could not be listed completely, so documents it may no longer "
+            "hold were kept. They are removed by the next complete sync.",
+        )
+        return 0, 0
+    from app.services.rag_document import RAGDocumentService
+
+    async with get_worker_db_context() as db:
+        unlisted = await RAGDocumentService(db).unlisted_by_source(
+            sync_source_id=source_id,
+            collection_name=collection_name,
+            listed={file.source_path for file in listing.files} - withdrawn,
+        )
+        row_ids = [str(row.id) for row in unlisted]
+    removed = unremoved = 0
+    for row_id in row_ids:
+        async with get_worker_db_context() as db:
+            documents = RAGDocumentService(db)
+            doc = await documents.release_claim(row_id, sync_source_id=source_id)
+            if doc is None:
+                continue
+            # Under the base the row is filed under, not the ingester's: the base a
+            # sync resolves to can change - an app-scoped base created, a base
+            # deleted - and a delete under another base's scope matches none of
+            # this document's chunks while the row below is forgotten, leaving
+            # them searchable with nothing tracking them (#992, #2537).
+            if doc.vector_document_id and not await ingester.remove_document(
+                collection_name, doc.vector_document_id, await documents.vector_scope(doc)
+            ):
+                unremoved += 1
+                continue
+            await documents.forget_document(row_id)
+            removed += 1
+    if unremoved:
+        notes.append(
+            f"{unremoved} documents the source no longer lists could not be "
+            "removed and will be tried again by the next sync."
+        )
+    return removed, unremoved
+
+
+async def _stale_rows(*, source_id: UUID, collection_name: str) -> dict[str, list[str]]:
+    """Row ids a dead run of this source left `PROCESSING`, by the address each was for."""
+    from app.services.rag_document import RAGDocumentService
+
+    async with get_worker_db_context() as db:
+        rows = await RAGDocumentService(db).stale_for_source(
+            sync_source_id=source_id, collection_name=collection_name
+        )
+        by_path: dict[str, list[str]] = {}
+        for row in rows:
+            if row.source_path is not None:
+                by_path.setdefault(row.source_path, []).append(str(row.id))
+        return by_path
+
+
+async def _reconcile_stale_rows(
+    ingester: IngestionService,
+    *,
+    stale: dict[str, list[str]],
+    source_id: UUID,
+    collection_name: str,
+    notes: list[str],
+) -> tuple[int, dict[str, frozenset[UUID]]]:
+    """Settle what a worker that died mid-file left.
+
+    Answers how many rows could not be settled, and, by address, the other
+    sources that claimed a dead row it dropped: they list that address too, so
+    the row this run ingests there takes their claims when it settles, or this
+    source dropping it later would remove it from under them (#1879).
+
+    A worker killed after `ingest_file` stored the vectors and before
+    `_settle_document_row` recorded their id leaves a `PROCESSING` row and
+    searchable vectors that no row names. Left alone, the next run matches
+    those vectors by address and hash, skips the file as unchanged, and a
+    removal later has no id to delete them by - so they stay searchable after
+    the file is gone upstream.
+
+    Per address, then: the stored documents nothing in the collection tracks
+    are deleted, vectors first; this source's rows whose vectors are gone
+    (a death after the old document was replaced) are dropped with the stale
+    ones; and the file, now absent from the store, is ingested again by the run
+    that called this. A lookup or delete that fails keeps every row at that
+    address and counts it, so the run records no state and the next one tries
+    again - a row is never dropped without its address having been read.
+    """
+    from app.services.rag_document import RAGDocumentService
+
+    unsettled = 0
+    inherited: dict[str, frozenset[UUID]] = {}
+    for source_path, row_ids in stale.items():
+        try:
+            stored = set(await ingester.document_ids_at(collection_name, source_path))
+            async with get_worker_db_context() as db:
+                documents = RAGDocumentService(db)
+                tracked = await documents.tracked_vector_ids(
+                    collection_name=collection_name, vector_document_ids=stored
+                )
+                # Only rows filed under the base this run writes for: `stored` was
+                # read in its scope, so a row filed under another base - the
+                # base the sync resolved to before one was created or deleted -
+                # is absent from it whether or not its vectors are there, and
+                # forgetting it would strand them (#2537).
+                gone = [
+                    str(row.id)
+                    for row in await documents.settled_at(
+                        sync_source_id=source_id,
+                        collection_name=collection_name,
+                        source_path=source_path,
+                    )
+                    if row.vector_document_id
+                    and row.vector_document_id not in stored
+                    and row.knowledge_base_id == ingester.scope.knowledge_base_id
+                ]
+            cleared = True
+            for vector_document_id in sorted(stored - tracked):
+                if not await ingester.remove_document(collection_name, vector_document_id):
+                    cleared = False
+                    break
+            if not cleared:
+                unsettled += len(row_ids)
+                continue
+            async with get_worker_db_context() as db:
+                documents = RAGDocumentService(db)
+                others = await documents.claimants(gone) - {source_id}
+                for row_id in [*row_ids, *gone]:
+                    await documents.forget_document(row_id)
+            if others:
+                inherited[source_path] = frozenset(others)
+        except Exception:
+            logger.exception("Could not settle the rows a stopped sync left at %s", source_path)
+            unsettled += len(row_ids)
+    if unsettled:
+        notes.append(
+            f"{unsettled} documents a stopped sync left half-ingested could not be "
+            "cleaned up and will be tried again by the next sync."
+        )
+    return unsettled, inherited
+
+
+def _sync_summary(failed: int, notes: list[str]) -> str | None:
+    """The sentence a finished sync stores beside its counts, or `None` when there is nothing to say."""
+    named = notes[:_NAMED_PROBLEMS]
+    rest = len(notes) - len(named)
+    parts = ([f"{failed} files failed."] if failed else []) + named
+    if rest:
+        parts.append(f"And {rest} more.")
+    return " ".join(parts) or None
+
+
+OVERLAPPING_RUN = "Another sync of this source is still running, so this one did not start."
+
+
+@asynccontextmanager
+async def _exclusive_source_run(source_id: str) -> AsyncGenerator[bool]:
+    """Whether this run is the only one of its source, held for as long as it runs.
+
+    A connection of its own, kept open for the whole sync, because the lock
+    lives on it and is released when it closes - including when the worker dies
+    mid-run.
+    """
+    async with get_worker_connection() as connection:
+        yield await try_hold_subject_on_connection(
+            connection, LockScope.SYNC_SOURCE_RUN, UUID(source_id)
+        )
+
+
+async def _run_source_sync(source_id: str, sync_log_id: str | None = None) -> dict[str, Any]:
+    """Core sync logic for connector-based sources (shared between all task frameworks).
+
+    Fetches files from a remote connector (e.g. Google Drive, S3), downloads them
+    to a temporary directory, and ingests each into the vector store.
+
+    **One run of a source at a time.** A manual trigger is not refused while a
+    run is going, and the scheduler can dispatch a due source twice, because
+    `last_sync_at` moves only when a run finishes. Two overlapping runs are
+    harmless until one of them deletes: the older listing does not name a file
+    the newer run just ingested, and would remove it (#987). So the second run
+    does not start, and says so on its log.
+    """
+    async with _exclusive_source_run(source_id) as held:
+        if held:
+            return await _sync_source(source_id, sync_log_id)
+    from app.services.rag_sync import RAGSyncService
+
+    if sync_log_id is not None:
+        async with get_worker_db_context() as db:
+            await RAGSyncService(db).complete_sync(
+                sync_log_id, status="error", error_message=OVERLAPPING_RUN
+            )
+    logger.info("Sync of source %s not started: another run holds it", source_id)
+    return {"status": "skipped", "message": OVERLAPPING_RUN}
+
+
+async def _sync_source(source_id: str, sync_log_id: str | None) -> dict[str, Any]:
+    """One run of a source, which `_run_source_sync` has made the only one."""
+    from app.services.rag_sync import RAGSyncService
+
+    async with get_worker_db_context() as db:
+        source_svc = SyncSourceService(db)
+
+        source = await source_svc.get_source(source_id)
+        assigned_collection = source.collection_name
+        if assigned_collection is not None:
+            # Deletion detaches sources under this lock. Refresh after waiting
+            # so a queued run cannot resolve the old name into a different base.
+            await hold_name(db, LockScope.COLLECTION_TEARDOWN, assigned_collection)
+            await db.refresh(source)
+        attempt_started_at = datetime.now(UTC)
+        connector_cls = CONNECTOR_REGISTRY.get(source.connector_type)
+        if not connector_cls:
+            message = f"Unknown connector: {source.connector_type}"
+            # A manual trigger already created this log and handed us its id
+            # before dispatching - refusing here without completing it left a
+            # sync stuck `running` forever, with nothing left to ever finish
+            # it. A scheduler dispatch carries no id yet: nothing to complete.
+            await _notify_sync_start_failure(
+                db,
+                source=source,
+                sync_log_id=sync_log_id,
+                started_at=attempt_started_at,
+                message=message,
+            )
+            await source_svc.update_after_sync(source_id, "error", message)
+            return {"status": "error", "message": message}
+
+        config = source.config if isinstance(source.config, dict) else json.loads(source.config)
+        if source.collection_name is None or source.collection_name != assigned_collection:
+            # Both callers guarantee this before dispatching: `trigger_sync`
+            # refuses a source with no collection, and the scheduler's own
+            # query only selects sources that have one. Guarded again here
+            # because a source can be edited between `trigger_sync`'s check and
+            # this job actually running, the same stuck-log risk as above applies.
+            message = (
+                "Source has no assigned collection."
+                if source.collection_name is None
+                else "Source collection changed before this sync started. Run it again."
+            )
+            await _notify_sync_start_failure(
+                db,
+                source=source,
+                sync_log_id=sync_log_id,
+                started_at=attempt_started_at,
+                message=message,
+            )
+            await source_svc.update_after_sync(source_id, "error", message)
+            return {"status": "error", "message": message}
+        collection_name = source.collection_name
+        sync_mode = source.sync_mode
+        organization_id = source.organization_id
+        stored_state = source.sync_state
+        fingerprint = sync_fingerprint(config, collection_name=collection_name, sync_mode=sync_mode)
+        # The credential, unsealed from this organization's vault while there is
+        # still a session. It travels beside the config rather than inside it:
+        # `config` says how to find the documents and holds nothing that has to
+        # be kept (#937). `None` here is a source with no credential, or one
+        # whose secret was deleted - the connector refuses rather than reaching
+        # for a deployment-wide fallback, because there is not one.
+        credential = await _connector_credential(db, source.secret_id, organization_id)
+
+        # The log the job was queued with - a manual trigger and the schedule both
+        # open one - or, for a source that had no collection when it was
+        # queued and has one now, one opened here. Opened, not triggered:
+        # `trigger_sync` queues a job too, and this one is already running, so it
+        # queued a second sync of the same source behind this one (Codex, #2248).
+        if sync_log_id:
+            log_id = sync_log_id
+        else:
+            log = await source_svc.open_sync_log(source, collection_name=collection_name)
+            log_id = str(log.id)
+
+        # Before a single file is downloaded: a scheduled sync answers to the
+        # same ceiling a run does, and the refusal has to land on the sync log
+        # rather than leave it running forever.
+        if organization_id is not None:
+            try:
+                await assert_organization_within_budget(db, organization_id)
+            except BudgetExceeded as exc:
+                # Through `failure_summary` like every other stored failure,
+                # which hands this one back whole: the ceiling and both numbers
+                # are ours, they are the organization's own, and they are what
+                # the person reading a stopped sync needs (#423).
+                reason = failure_summary(exc, stage=IngestionStage.SYNC)
+                log = await RAGSyncService(db).complete_sync(
+                    log_id, status="error", error_message=reason
+                )
+                await source_svc.update_after_sync(source_id, status="error", error=reason)
+                if log is not None:
+                    # The write attaches to this `complete_sync` call, not to
+                    # `update_after_sync` above: both report the same outcome,
+                    # and hooking both would double-fire the notification
+                    # (#1598, Decision 1).
+                    kb = await _knowledge_base_for(db, collection_name, organization_id)
+                    await NotificationService(db).sync_failed(
+                        organization_id=organization_id,
+                        initiator_user_id=log.triggered_by_user_id,
+                        occurrence_id=f"{log.id}:{log.started_at.isoformat()}",
+                        collection_name=collection_name,
+                        collection_id=kb.id if kb else None,
+                        error=reason,
+                    )
+                return {"status": "error", "message": reason}
+
+        # One lookup for both answers, in the session that is already open: the
+        # collection's parser settings, and the knowledge base id every document
+        # this sync creates has to carry. Without the second, a synced document
+        # was absent from the knowledge base's Documents tab, from delete and
+        # from a collection's own stats, while search over it worked (#992).
+        knowledge_base = await _knowledge_base_for(db, collection_name, organization_id)
+        ingestion_config = (
+            deployment_defaults()
+            if knowledge_base is None
+            else IngestionConfig.model_validate(knowledge_base.ingestion_config)
+        )
+        knowledge_base_id = None if knowledge_base is None else knowledge_base.id
+        # The collection's scope, read off the base while its row is loaded (the
+        # property only touches already-loaded columns): the base and its tenant -
+        # its organization for an org base, None for an app-scoped one or a
+        # collection no base claims. What this sync's rows are stamped and scoped
+        # by (#1684, #2537).
+        scope = VectorScope(tenant=None) if knowledge_base is None else knowledge_base.vector_scope
+        # Both models, resolved once for the collection rather than per file, and
+        # recorded on every row this sync writes - the provenance the documents
+        # page reads. An upload has carried them since it started tracking; a
+        # sync reported neither.
+        embedding_model = None if knowledge_base is None else knowledge_base.embedding_model
+        image_description_model = await IngestionConfigService(db).resolved_image_model(
+            organization_id, ingestion_config
+        )
+        processor = await IngestionConfigService(db).build_processor(
+            organization_id, ingestion_config
+        )
+
+    connector = connector_cls()
+
+    ingested = updated = skipped = failed = removed = 0
+    total = 0
+    # What the sync log says beyond its counts: the pages a listing could not
+    # read, a removal skipped because the listing was partial, or why the whole
+    # run stopped. Sentences this repository wrote, like every stored failure.
+    notes: list[str] = []
+    # Listed files a fetch found the source no longer holds - a sitemap page now
+    # marked `noindex`, or gone. Not failures: removed like any unlisted file.
+    withdrawn: set[str] = set()
+    # The stored documents found at listed addresses, as `(source_path,
+    # vector_document_id)`: this source lists them, so it claims them, whichever
+    # source ingested them and whether or not this run gets as far as the
+    # download (#1879).
+    kept: set[tuple[str, str]] = set()
+    ledger = SpendLedger(organization_id=organization_id)
+    version: str | None = None
+
+    async with _ingestion_service(
+        processor=processor, organization_id=organization_id, scope=scope
+    ) as ingester:
+        try:
+            # Asked before anything is listed: the same version under the same
+            # configuration as the last clean run means nothing upstream moved,
+            # and for a repository that is one `ls-remote` in place of a clone.
+            # `full` promises a re-import every time, so it never stops here,
+            # and neither does a source a dead run left half-ingested.
+            # The last clean run's version, only when it ran under this same
+            # configuration: a change feed read from another folder's position
+            # would vouch for the wrong files.
+            previous = (
+                stored_state.get("version")
+                if stored_state and stored_state.get("fingerprint") == fingerprint
+                else None
+            )
+            version = await connector.remote_version(config, credential, previous)
+            stale = await _stale_rows(source_id=UUID(source_id), collection_name=collection_name)
+            unchanged = (
+                version is not None
+                and sync_mode != "full"
+                and not stale
+                and stored_state == SyncState(version=version, fingerprint=fingerprint).model_dump()
+            )
+            listing = (
+                RemoteListing(files=[])
+                if unchanged
+                else await connector.list_files(config, credential)
+            )
+            # After the listing and before the files, so what it clears is
+            # ingested again by this same run rather than missing until the next.
+            unsettled, inherited = await _reconcile_stale_rows(
+                ingester,
+                stale=stale,
+                source_id=UUID(source_id),
+                collection_name=collection_name,
+                notes=notes,
+            )
+            files = listing.files
+            # A problem is a page the listing could not read, and a stale row
+            # that could not be settled a document this run could not put right;
+            # both count as failed, so both are in the total, or `failed`
+            # exceeds it.
+            total = len(files) + len(listing.problems) + unsettled
+            failed += len(listing.problems) + unsettled
+            notes.extend(listing.problems)
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                for remote_file in files:
+                    row_id: str | None = None
+                    try:
+                        # `sync_mode` used to reach one argument here and nothing
+                        # else, so a scheduled source re-embedded every file every
+                        # night - and on the default `new_only` it passed
+                        # `replace=False`, which skips the lookup, leaves the old
+                        # document in place and inserts a second copy. A week of
+                        # nightly syncs was seven copies of every chunk, ranked
+                        # against each other in every search (#990). The modes are
+                        # `sync_local_flow`'s, deliberately: one column feeds both
+                        # flows and they must mean the same thing.
+                        # Asked in `full` too, which re-ingests regardless: what is
+                        # stored at a listed address is what this source claims.
+                        existing = await ingester.existing_document(
+                            collection_name, remote_file.source_path
+                        )
+                        if existing.document_id:
+                            kept.add((remote_file.source_path, existing.document_id))
+                        # Before the transfer, where the answer allows it:
+                        # `update_only` has nothing to do with a file it has
+                        # never seen, and downloading one to find that out is a
+                        # transfer per new file, every run.
+                        if sync_mode == "update_only" and not existing.document_id:
+                            skipped += 1
+                            continue
+
+                        local_path = await connector.download_file(
+                            remote_file, Path(tmp_dir), config=config, credential=credential
+                        )
+
+                        # After it, because a hash needs the bytes and no remote
+                        # system on this list offers one. A stored document with no
+                        # hash is re-ingested rather than assumed current: the
+                        # embedding is the cost worth avoiding, and skipping a file
+                        # that may have changed is the answer that cannot be
+                        # corrected later.
+                        if (
+                            sync_mode != "full"
+                            and existing.content_hash
+                            and (
+                                await asyncio.to_thread(_hash_file, local_path)
+                                == existing.content_hash
+                            )
+                        ):
+                            skipped += 1
+                            continue
+
+                        stat_result = await asyncio.to_thread(local_path.stat)
+                        # Opened before the ingest, which is the order the upload
+                        # path uses and the only one that cannot leave the state this
+                        # removes: a row written afterwards and failing - a database
+                        # blip, a remote name longer than the column - left the
+                        # vector document stored and untracked, and the next
+                        # `new_only` run then matched its hash and skipped the file
+                        # before reaching the write, for good.
+                        row_id = await _open_document_row(
+                            filename=remote_file.name,
+                            filesize=stat_result.st_size,
+                            collection_name=collection_name,
+                            source_path=remote_file.source_path,
+                            organization_id=organization_id,
+                            knowledge_base_id=knowledge_base_id,
+                            ingestion_config=ingestion_config,
+                            image_description_model=image_description_model,
+                            embedding_model=embedding_model,
+                            # The same default the ingest stamps on the chunks, so
+                            # the tracked row says what the vectors carry (#1777).
+                            organizational_unit=source.organizational_unit,
+                            sync_source_id=UUID(source_id),
+                        )
+
+                        with metered_by(ledger):
+                            result = await ingester.ingest_file(
+                                filepath=local_path,
+                                rag_document_id=UUID(row_id),
+                                collection_name=collection_name,
+                                still_wanted=lambda rid=row_id: _still_ingestable(
+                                    rid, collection_name
+                                ),
+                                # Unconditional, as in `sync_local_flow`: once this
+                                # has decided to ingest, whatever it matched has to
+                                # go, or the collection grows a copy.
+                                replace=True,
+                                source_path=remote_file.source_path,
+                                # The trusted tenant already rides `ingester`'s own
+                                # bound `self._scope`, resolved from the source's
+                                # collection when it was built above; `source` is
+                                # the connector's canonical name (gdrive, s3);
+                                # doc_date is the remote file's modified time, else
+                                # this file's mtime, else ingestion time.
+                                source=source.connector_type,
+                                doc_date=iso_doc_date(
+                                    remote_file.modified_at, stat_result.st_mtime
+                                ),
+                                # The source's own default, inherited by every
+                                # document it brings in. Nothing wrote this
+                                # dimension before, so its filter matched nothing
+                                # and its facet was empty for every collection -
+                                # correct, tested, and with no data behind it
+                                # (#1777).
+                                organizational_unit=source.organizational_unit,
+                            )
+
+                        settled = await _settle_document_row(
+                            row_id,
+                            result,
+                            ingester=ingester,
+                            collection_name=collection_name,
+                            inherited=inherited.get(remote_file.source_path, frozenset()),
+                        )
+
+                        if not settled:
+                            # Deleted while it indexed: not a file this sync ingested.
+                            pass
+                        elif result.status is IngestionStatus.DONE:
+                            if result.replaced_document_id:
+                                updated += 1
+                            else:
+                                ingested += 1
+                        else:
+                            failed += 1
+                    except WithdrawnFile as e:
+                        logger.info("Not syncing %s: %s", remote_file.name, e.message)
+                        withdrawn.add(remote_file.source_path)
+                        total -= 1
+                    except Exception as e:
+                        logger.warning("Failed to sync %s: %s", remote_file.name, e)
+                        failed += 1
+                        if row_id is not None:
+                            # A row `_open_document_row` already opened, left
+                            # `PROCESSING` for ever with no per-file
+                            # `INGESTION_FAILED` if `ingest_file` (or anything
+                            # after the open) raised rather than returned a
+                            # failure `IngestionResult` - `_settle_document_row`
+                            # is what this same loop's success path already
+                            # calls for exactly that settlement.
+                            await _settle_document_row(
+                                row_id,
+                                # Through `failure_summary`, not `str(e)`: this
+                                # is stored in `rag_documents.error_message` and
+                                # copied into the failure notification, and a
+                                # connector's own exception carries endpoints,
+                                # bucket names and query strings (#423).
+                                IngestionResult(
+                                    status=IngestionStatus.ERROR,
+                                    error_message=failure_summary(e, stage=IngestionStage.INGEST),
+                                ),
+                                ingester=ingester,
+                                collection_name=collection_name,
+                                inherited=inherited.get(remote_file.source_path, frozenset()),
+                            )
+
+            if kept:
+                from app.services.rag_document import RAGDocumentService
+
+                async with get_worker_db_context() as db:
+                    await RAGDocumentService(db).claim_listed(
+                        sync_source_id=UUID(source_id),
+                        collection_name=collection_name,
+                        documents=kept,
+                    )
+            # An early stop listed nothing, which is no evidence anything went.
+            if not unchanged:
+                removed, unremoved = await _remove_unlisted(
+                    ingester,
+                    listing=listing,
+                    withdrawn=withdrawn,
+                    source_id=UUID(source_id),
+                    collection_name=collection_name,
+                    notes=notes,
+                )
+                failed += unremoved
+        except Exception as e:
+            logger.exception("Source sync failed for %s", source_id)
+            failed = max(failed, 1)
+            # Through `failure_summary`: a connector's own refusal - robots.txt
+            # unreachable, a credential of the wrong kind - is ours and kept
+            # whole, and anything else is reduced to its type (#423).
+            notes.append(failure_summary(e, stage=IngestionStage.SYNC))
+        finally:
+            await connector.aclose()
+
+    await _record_embedding_spend(ledger, organization_id=organization_id, rag_document_id=None)
+
+    async with get_worker_db_context() as db:
+        sync_svc = RAGSyncService(db)
+        source_svc = SyncSourceService(db)
+        try:
+            status = "done" if not failed else "error"
+            summary = _sync_summary(failed, notes)
+            log = await sync_svc.complete_sync(
+                log_id,
+                status=status,
+                total_files=total,
+                ingested=ingested,
+                updated=updated,
+                skipped=skipped,
+                failed=failed,
+                removed=removed,
+                error_message=summary,
+            )
+            await source_svc.update_after_sync(
+                source_id,
+                status=status,
+                error=summary if failed else None,
+                # Only a clean run is a state worth stopping early on: one with a
+                # failed file has to be read again in full, or that file waits
+                # for the next upstream change to be retried.
+                sync_state=(
+                    SyncState(version=version, fingerprint=fingerprint)
+                    if status == "done" and version is not None
+                    else None
+                ),
+            )
+            if log is not None:
+                # Attached to `complete_sync` above, not to `update_after_sync`:
+                # both report the same outcome, and hooking both would
+                # double-fire the notification (#1598, Decision 1). Fires
+                # whichever way the sync actually went - the aggregate summary
+                # a large sync's per-document events, fired once per file, do
+                # not give on their own.
+                #
+                # Best-effort, in a boundary of its own: the two settlements
+                # above are what a reader and the next scheduled run depend
+                # on, and a failure to *address* a notification (an unknown
+                # connector, a collection that lost its rows) must not be
+                # reported as a failure to record the sync's own outcome.
+                try:
+                    kb = await _knowledge_base_for(db, collection_name, organization_id)
+                    notifications = NotificationService(db)
+                    occurrence_id = f"{log.id}:{log.started_at.isoformat()}"
+                    if status == "done":
+                        await notifications.sync_completed(
+                            organization_id=organization_id,
+                            initiator_user_id=log.triggered_by_user_id,
+                            occurrence_id=occurrence_id,
+                            collection_name=collection_name,
+                            collection_id=kb.id if kb else None,
+                            ingested=ingested,
+                            updated=updated,
+                            skipped=skipped,
+                            removed=removed,
+                            failed=failed,
+                        )
+                    else:
+                        await notifications.sync_failed(
+                            organization_id=organization_id,
+                            initiator_user_id=log.triggered_by_user_id,
+                            occurrence_id=occurrence_id,
+                            collection_name=collection_name,
+                            collection_id=kb.id if kb else None,
+                            error=summary or f"{failed} files failed",
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to notify about the sync outcome for source %s", source_id
+                    )
+        except Exception:
+            logger.error("Failed to update sync status for source %s", source_id)
+
+    logger.info(
+        "Source sync complete: %s - total=%d, ingested=%d, updated=%d, skipped=%d, failed=%d, "
+        "removed=%d",
+        source_id,
+        total,
+        ingested,
+        updated,
+        skipped,
+        failed,
+        removed,
+    )
+    return {
+        "status": "done" if not failed else "error",
+        "total": total,
+        "ingested": ingested,
+        "updated": updated,
+        "skipped": skipped,
+        "removed": removed,
+        "failed": failed,
+    }
+
+
+async def apply_retention() -> None:
+    """Apply every organization's retention policy once.
+
+    Here rather than beside the other sweeps in `trigger_tasks.py` because of the
+    one class that needs more than a `DELETE`: purging an uploaded document means
+    removing its vectors, and the store that holds them rides an engine built per
+    piece of work (`_ingestion_service`, and #948's `max_connections`
+    exhaustion). This module is where that engine is built correctly, so this is
+    where the flow lives.
+
+    Daily. Every period is measured in days, so the hour a row leaves is nobody's
+    business, and a sweep that ran hourly would ask every tenant the same
+    question twenty-four times for one answer.
+
+    `commit_each` because one transaction around the whole sweep holds every
+    deleted row - and every transaction-scoped audit lock - until the last tenant
+    is done, which blocks production writes for the length of it and rolls every
+    delete back if a late organization fails, after its files and vectors are
+    already gone.
+
+    The processor is the deployment's default configuration rather than a
+    collection's. What it is used for here is `remove_document`, which deletes by
+    id and parses nothing - a document's own ingestion settings decided how it
+    was read, and reading is over.
+    """
+    from app.services.retention import RetentionService
+
+    # Bound to no base, deliberately: this ingester exists to delete by id for
+    # every organization in turn, and the tags each document's chunks carry come
+    # off its own knowledge base - so `RetentionService` passes its scope per
+    # document rather than letting the ingester's own stand in (#1684, #2537).
+    async with (
+        get_worker_db_context() as db,
+        _ingestion_service(
+            processor=DocumentProcessor(settings=settings.rag),
+            organization_id=None,
+            scope=VectorScope(tenant=None),
+        ) as ingestion,
+    ):
+        service = RetentionService(db, remove_vectors=ingestion.remove_document)
+        results = await service.sweep(commit_each=True)
+
+    for result in results:
+        logger.info(
+            "retention_swept",
+            extra={
+                "organization_id": str(result.organization_id),
+                "removed": result.removed,
+                "failed": result.failed,
+            },
+        )
+
+
+def _stopped(reason: str) -> str:
+    return f"Stopped before it finished: {reason}"
+
+
+async def settle_lost_ingest(job: IngestDocument, reason: str) -> None:
+    """A document whose ingestion job ended for good without the handler saying so.
+
+    A child killed by the memory watchdog or the kernel cannot mark its own row,
+    so the row stayed `processing` with nothing left to finish it (Codex, #2248).
+    A document the handler already settled - done, or failed with its own
+    reason - is left as it is.
+    """
+    await _fail_document(
+        str(job.rag_document_id), error_message=_stopped(reason), attempt=job.attempt
+    )
+
+
+async def settle_lost_collection_sync(job: SyncCollection, reason: str) -> None:
+    """A collection sync that ended for good with its log still running."""
+    await _close_running_log(str(job.sync_log_id), reason)
+
+
+async def settle_lost_source_sync(job: SyncConnectorSource, reason: str) -> None:
+    """A source sync that ended for good with its log still running.
+
+    Its own log, by the id it was queued with: a scheduled run opens its log
+    when it is queued, as a manual one does. Never the source's newest running
+    log, which can be a later sync's (Codex, #2248).
+    """
+    async with get_worker_db_context() as db:
+        await SyncSourceService(db).update_after_sync(str(job.source_id), "error", _stopped(reason))
+    if job.sync_log_id is not None:
+        await _close_running_log(str(job.sync_log_id), reason)
+
+
+async def _close_running_log(sync_log_id: str, reason: str) -> None:
+    async with get_worker_db_context() as db:
+        log = await sync_log_repo.get_by_id(db, UUID(sync_log_id))
+        if log is None or log.status != "running":
+            return
+    await _update_sync_log(sync_log_id, "error", error_message=_stopped(reason))

@@ -1,0 +1,269 @@
+"use client";
+
+import * as React from "react";
+import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
+import { Check, ChevronRight, Circle } from "lucide-react";
+import { cn } from "@/lib/utils";
+
+const DropdownState = React.createContext<{
+  open: boolean;
+  change: (open: boolean) => void;
+} | null>(null);
+
+function DropdownMenu({
+  open: controlled,
+  defaultOpen = false,
+  onOpenChange,
+  children,
+  ...props
+}: React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Root>) {
+  const [uncontrolled, setUncontrolled] = React.useState(defaultOpen);
+  const open = controlled ?? uncontrolled;
+  const change = (next: boolean) => {
+    if (controlled === undefined) setUncontrolled(next);
+    onOpenChange?.(next);
+  };
+  return (
+    <DropdownState.Provider value={{ open, change }}>
+      <DropdownMenuPrimitive.Root {...props} open={open} onOpenChange={change}>
+        {children}
+      </DropdownMenuPrimitive.Root>
+    </DropdownState.Provider>
+  );
+}
+
+const DropdownMenuTrigger = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Trigger>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Trigger>
+>(({ onPointerDown, onPointerCancel, onClick, onKeyDown, disabled, ...props }, ref) => {
+  const state = React.useContext(DropdownState);
+  const touch = React.useRef(false);
+  // i18n-exempt: developer error for invalid component composition, not interface copy
+  if (!state) throw new Error("DropdownMenuTrigger requires DropdownMenu");
+  return (
+    <DropdownMenuPrimitive.Trigger
+      {...props}
+      ref={ref}
+      disabled={disabled}
+      onPointerDown={(event) => {
+        touch.current = false;
+        onPointerDown?.(event);
+        if (event.defaultPrevented) return;
+        touch.current = event.pointerType === "touch" && !event.ctrlKey;
+        // Opening on touch-down can put a menu item under the same finger:
+        // its release then selects that item. Open after the completed click.
+        if (touch.current) event.preventDefault();
+      }}
+      onPointerCancel={(event) => {
+        touch.current = false;
+        onPointerCancel?.(event);
+      }}
+      onKeyDown={(event) => {
+        touch.current = false;
+        onKeyDown?.(event);
+      }}
+      onClick={(event) => {
+        onClick?.(event);
+        const completedTouch = touch.current;
+        touch.current = false;
+        if (completedTouch && !disabled && !event.defaultPrevented) state.change(!state.open);
+      }}
+    />
+  );
+});
+DropdownMenuTrigger.displayName = "DropdownMenuTrigger";
+const DropdownMenuGroup = DropdownMenuPrimitive.Group;
+const DropdownMenuPortal = DropdownMenuPrimitive.Portal;
+const DropdownMenuSub = DropdownMenuPrimitive.Sub;
+const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup;
+
+const DropdownMenuSubTrigger = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.SubTrigger>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubTrigger> & { inset?: boolean }
+>(({ className, inset, children, ...props }, ref) => (
+  <DropdownMenuPrimitive.SubTrigger
+    ref={ref}
+    className={cn(
+      "focus:bg-accent data-[state=open]:bg-accent touch:min-h-11 flex min-h-8 cursor-default touch-manipulation items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none select-none [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+      inset && "pl-8",
+      className,
+    )}
+    {...props}
+  >
+    {children}
+    <ChevronRight className="ml-auto" />
+  </DropdownMenuPrimitive.SubTrigger>
+));
+DropdownMenuSubTrigger.displayName = DropdownMenuPrimitive.SubTrigger.displayName;
+
+const DropdownMenuSubContent = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.SubContent>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubContent>
+>(({ className, ...props }, ref) => (
+  // Portalled like the menu itself. Rendered in place, a submenu is a child of
+  // a menu that clips its overflow, so it opened beside the menu and was cut
+  // off at its edge - the account menu's theme and language lists showed as a
+  // sliver behind it.
+  <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.SubContent
+      ref={ref}
+      className={cn(
+        "panel panel-glass text-popover-foreground data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 max-h-[var(--radix-dropdown-menu-content-available-height)] max-w-[calc(100vw-1.5rem)] min-w-[8rem] origin-[var(--radix-dropdown-menu-content-transform-origin)] overflow-y-auto overscroll-contain rounded-xl p-1",
+        className,
+      )}
+      {...props}
+    />
+  </DropdownMenuPrimitive.Portal>
+));
+DropdownMenuSubContent.displayName = DropdownMenuPrimitive.SubContent.displayName;
+
+const DropdownMenuContent = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Content>
+>(({ className, sideOffset = 4, ...props }, ref) => (
+  <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.Content
+      ref={ref}
+      sideOffset={sideOffset}
+      className={cn(
+        "panel panel-glass text-popover-foreground data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 max-h-[var(--radix-dropdown-menu-content-available-height)] max-w-[calc(100vw-1.5rem)] min-w-[8rem] origin-[var(--radix-dropdown-menu-content-transform-origin)] overflow-y-auto overscroll-contain rounded-xl p-1",
+        className,
+      )}
+      {...props}
+    />
+  </DropdownMenuPrimitive.Portal>
+));
+DropdownMenuContent.displayName = DropdownMenuPrimitive.Content.displayName;
+
+const DropdownMenuItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Item>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Item> & { inset?: boolean }
+>(({ className, inset, ...props }, ref) => (
+  <DropdownMenuPrimitive.Item
+    ref={ref}
+    className={cn(
+      "focus:bg-accent focus:text-accent-foreground touch:min-h-11 relative flex min-h-8 cursor-default touch-manipulation items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50 [&>svg]:size-4 [&>svg]:shrink-0",
+      inset && "pl-8",
+      className,
+    )}
+    {...props}
+  />
+));
+DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName;
+
+// Checkbox and radio items read from the left edge like every other item, with
+// the tick on the right as `SelectItem` draws it: a left gutter kept for a tick
+// most rows do not show indented the whole list.
+const DropdownMenuCheckboxItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.CheckboxItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.CheckboxItem>
+>(({ className, children, checked, ...props }, ref) => (
+  <DropdownMenuPrimitive.CheckboxItem
+    ref={ref}
+    className={cn(
+      "focus:bg-accent focus:text-accent-foreground touch:min-h-11 relative flex min-h-8 cursor-default touch-manipulation items-center rounded-md py-1.5 pr-8 pl-2 text-sm transition-colors outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className,
+    )}
+    checked={checked}
+    {...props}
+  >
+    <span className="absolute right-2 flex h-3.5 w-3.5 items-center justify-center">
+      <DropdownMenuPrimitive.ItemIndicator>
+        <Check className="h-4 w-4" />
+      </DropdownMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </DropdownMenuPrimitive.CheckboxItem>
+));
+DropdownMenuCheckboxItem.displayName = DropdownMenuPrimitive.CheckboxItem.displayName;
+
+const DropdownMenuRadioItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.RadioItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.RadioItem>
+>(({ className, children, ...props }, ref) => (
+  <DropdownMenuPrimitive.RadioItem
+    ref={ref}
+    className={cn(
+      "focus:bg-accent focus:text-accent-foreground touch:min-h-11 relative flex min-h-8 cursor-default touch-manipulation items-center rounded-md py-1.5 pr-8 pl-2 text-sm transition-colors outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+      className,
+    )}
+    {...props}
+  >
+    <span className="absolute right-2 flex h-3.5 w-3.5 items-center justify-center">
+      <DropdownMenuPrimitive.ItemIndicator>
+        <Circle className="h-2 w-2 fill-current" />
+      </DropdownMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </DropdownMenuPrimitive.RadioItem>
+));
+DropdownMenuRadioItem.displayName = DropdownMenuPrimitive.RadioItem.displayName;
+
+const DropdownMenuLabel = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Label>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Label> & { inset?: boolean }
+>(({ className, inset, ...props }, ref) => (
+  <DropdownMenuPrimitive.Label
+    ref={ref}
+    className={cn("px-2 py-1.5 text-sm font-semibold", inset && "pl-8", className)}
+    {...props}
+  />
+));
+DropdownMenuLabel.displayName = DropdownMenuPrimitive.Label.displayName;
+
+const DropdownMenuSeparator = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.Separator>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Separator>
+>(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.Separator
+    ref={ref}
+    className={cn("bg-muted -mx-1 my-1 h-px", className)}
+    {...props}
+  />
+));
+DropdownMenuSeparator.displayName = DropdownMenuPrimitive.Separator.displayName;
+
+const DropdownMenuShortcut = ({ className, ...props }: React.HTMLAttributes<HTMLSpanElement>) => {
+  return (
+    <span className={cn("ml-auto text-xs tracking-widest opacity-60", className)} {...props} />
+  );
+};
+DropdownMenuShortcut.displayName = "DropdownMenuShortcut";
+
+/**
+ * An item's name with a grey line under it saying what it does - for the menus
+ * whose actions are consequential enough that a word alone leaves somebody
+ * guessing (archive or delete?). Its item takes `DESCRIBED_ITEM`, which tops the
+ * icon to the name rather than centring it on two lines.
+ */
+const DropdownMenuItemText = ({ label, description }: { label: string; description: string }) => (
+  <span className="min-w-0">
+    <span className="block">{label}</span>
+    <span className="text-muted-foreground block text-xs leading-snug font-normal">
+      {description}
+    </span>
+  </span>
+);
+
+/** The item class that goes with `DropdownMenuItemText`. */
+const DESCRIBED_ITEM = "items-start py-2 [&>svg]:mt-0.5";
+
+export {
+  DESCRIBED_ITEM,
+  DropdownMenuItemText,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuCheckboxItem,
+  DropdownMenuRadioItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuGroup,
+  DropdownMenuPortal,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuRadioGroup,
+};

@@ -1,0 +1,156 @@
+"use client";
+
+import { useCallback } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+
+import { apiClient } from "@/lib/api-client";
+import { getErrorMessage } from "@/lib/api-error";
+import type { BrandingResponse, NoticeLevel, SignupMode } from "@/lib/branding";
+import { qk } from "@/lib/query-keys";
+
+/**
+ * This deployment's settings, as its administrator reads and writes them.
+ *
+ * The read is the whole form in one request; the write is a PATCH, so editing the
+ * name does not resend - or silently clear - the announcement. `null` for a field
+ * is a **deliberate clear**: the backend keeps it, and the renderer falls back to
+ * the built-in. That is why every field here is `string | null` rather than
+ * optional, and why the form sends the fields it touched rather than all of them.
+ *
+ * Images are their own mutations because they carry bytes rather than JSON, and
+ * their storage paths are not in the update shape at all - the server writes those
+ * itself. A caller who could name one could point this deployment's public logo at
+ * anything the storage backend holds.
+ */
+
+export interface DeploymentSettings extends BrandingResponse {
+  announcement: string | null;
+  announcement_level: NoticeLevel;
+  /**
+   * The two ceilings, or null for none - which is what an installation that has
+   * never set one has. Deliberately absent from the public branding read: a
+   * ceiling is operational, and a stranger on the sign-in page has no part in
+   * it.
+   */
+  max_organizations_per_user: number | null;
+  max_agents_per_organization: number | null;
+  /**
+   * Whether a person is emailed when an administrator acts as their account. A
+   * policy the operator sets, off until they do - the audit trail records the
+   * impersonation either way.
+   */
+  notify_impersonated_users: boolean;
+  /** Whether a new account gets an organization of its own (#2156). */
+  personal_organizations: boolean;
+  /** The organization every new account joins, or null for none. */
+  default_organization_id: string | null;
+  default_organization_role: DefaultOrganizationRole;
+  /**
+   * Whether dictation accepts WebM, Ogg and MP4 as well as raw PCM WAV. Off
+   * until an administrator accepts the risk: a compressed file states its own
+   * length, and one built by hand can understate it.
+   */
+  dictation_compressed_audio: boolean;
+  updated_at: string | null;
+}
+
+/** Every role but owner - a newcomer never gets the company's keys by default. */
+export const DEFAULT_ORGANIZATION_ROLES = [
+  "admin",
+  "builder",
+  "operator",
+  "member",
+  "viewer",
+] as const;
+
+export type DefaultOrganizationRole = (typeof DEFAULT_ORGANIZATION_ROLES)[number];
+
+export interface DeploymentSettingsPatch {
+  app_name?: string | null;
+  tagline?: string | null;
+  description?: string | null;
+  footer_text?: string | null;
+  terms_url?: string | null;
+  privacy_url?: string | null;
+  signup_mode?: SignupMode;
+  allowed_email_domains?: string[];
+  announcement?: string | null;
+  announcement_level?: NoticeLevel;
+  maintenance_mode?: boolean;
+  maintenance_message?: string | null;
+  max_organizations_per_user?: number | null;
+  max_agents_per_organization?: number | null;
+  notify_impersonated_users?: boolean;
+  personal_organizations?: boolean;
+  default_organization_id?: string | null;
+  default_organization_role?: DefaultOrganizationRole;
+  dictation_compressed_audio?: boolean;
+}
+
+/** Which of the two marks an upload replaces. */
+export type BrandingImage = "logo" | "favicon";
+
+export function useDeploymentSettings() {
+  const tErrors = useTranslations("errors");
+  const t = useTranslations("pages.admin");
+  const queryClient = useQueryClient();
+
+  const settings = useQuery({
+    queryKey: qk.admin.settings(),
+    queryFn: () => apiClient.get<DeploymentSettings>("/admin/settings"),
+  });
+
+  // The whole app reads the branding from a server-resolved context, so a saved
+  // change is only on screen after the server renders again. `router.refresh()`
+  // belongs to the page that has a router; this invalidates the form's own copy.
+  const invalidate = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: qk.admin.settings() }),
+    [queryClient],
+  );
+
+  const save = useMutation({
+    mutationFn: (patch: DeploymentSettingsPatch) =>
+      apiClient.patch<DeploymentSettings>("/admin/settings", patch),
+    onSuccess: async () => {
+      // The agent limit is one of these settings, and the Agents page reads it
+      // through its own query: without this it would offer New agent past a limit
+      // just lowered, or withhold it under one just raised, until that went stale.
+      void queryClient.invalidateQueries({ queryKey: qk.agents.ceiling() });
+      await invalidate();
+      toast.success(t("settingsSaved"));
+    },
+    onError: (error) => toast.error(getErrorMessage(error, tErrors)),
+  });
+
+  const uploadImage = useMutation({
+    mutationFn: ({ kind, file }: { kind: BrandingImage; file: File }) =>
+      apiClient.upload<DeploymentSettings>(`/admin/settings/${kind}`, file),
+    onSuccess: async () => {
+      await invalidate();
+      toast.success(t("imageUploaded"));
+    },
+    onError: (error) => toast.error(getErrorMessage(error, tErrors)),
+  });
+
+  const clearImage = useMutation({
+    mutationFn: (kind: BrandingImage) =>
+      apiClient.delete<DeploymentSettings>(`/admin/settings/${kind}`),
+    onSuccess: async () => {
+      await invalidate();
+      toast.success(t("imageCleared"));
+    },
+    onError: (error) => toast.error(getErrorMessage(error, tErrors)),
+  });
+
+  return {
+    settings: settings.data ?? null,
+    isLoading: settings.isPending,
+    error: settings.error,
+    refetch: invalidate,
+    save,
+    uploadImage,
+    clearImage,
+  };
+}

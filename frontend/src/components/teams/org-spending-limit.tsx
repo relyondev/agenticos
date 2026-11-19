@@ -1,0 +1,131 @@
+"use client";
+
+import { useState } from "react";
+import { Loader2 } from "lucide-react";
+import { toast } from "sonner";
+
+import { SettingsSection } from "@/components/settings/settings-section";
+import { Button, Input } from "@/components/ui";
+import { FormField } from "@/components/ui/form-field";
+import { useOrganizations, usePermissions, useSpend } from "@/hooks";
+import { submitFailure } from "@/lib/api-error";
+import { Perm } from "@/types/permissions";
+import type { Organization } from "@/types";
+import { useChanged } from "@/hooks/use-changed";
+import { useTranslations } from "next-intl";
+
+/** The field the server names in a refusal, so a message lands under the input. */
+const FIELD = "monthly_budget_usd";
+
+/** How the stored cap is shown in the input. An empty box means no ceiling. */
+function asInputValue(limit: string | null): string {
+  // Through `Number`: the API serializes the Decimal column as "100.000000",
+  // and the box read back six zeros nobody typed (#2075).
+  return limit === null ? "" : String(Number(limit));
+}
+
+/**
+ * The organization's monthly spending ceiling.
+ *
+ * The limit over every agent in the workspace, as opposed to the per-agent one
+ * in the Builder. Without it an organization with twelve agents has twelve
+ * independent caps and no ceiling - each one right, and the bill twelve times
+ * what anybody agreed to.
+ *
+ * Rendered only for someone who may change organization settings. The whole
+ * section is hidden rather than disabled, because the spend figure beside the
+ * input comes from an endpoint the same roles can read: a section that could
+ * only report a refusal is worse than no section.
+ */
+export function OrgSpendingLimit({ org }: { org: Organization }) {
+  const { can } = usePermissions();
+  // The form is a separate component so that its queries are not merely
+  // ignored for someone without the permission - they are never issued. A
+  // hook above this branch would still fetch, and `/spend` answers the same
+  // roles this section is for. `budgets:manage` is what the PATCH actually
+  // checks for this field, so it is what decides the section.
+  return can(Perm.budgetsManage) ? <SpendingLimitForm org={org} /> : null;
+}
+
+function SpendingLimitForm({ org }: { org: Organization }) {
+  const tErrors = useTranslations("errors");
+  const t = useTranslations("teams");
+  const { setMonthlyBudget } = useOrganizations();
+  const { spend } = useSpend();
+
+  const [value, setValue] = useState(asInputValue(org.monthly_budget_usd));
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  // Re-seed when the stored value changes underneath - another tab, or the
+  // request this form just made coming back with what the server settled on.
+  // During render: an effect would show the old figure for a frame first.
+  if (useChanged(`${org.id}|${org.monthly_budget_usd}`)) {
+    setValue(asInputValue(org.monthly_budget_usd));
+  }
+
+  const trimmed = value.trim();
+  const parsed = trimmed === "" ? null : Number(trimmed);
+  const changed = trimmed !== asInputValue(org.monthly_budget_usd);
+  const monthToDate = Number(spend?.month_to_date_usd ?? 0);
+
+  const handleSave = async () => {
+    // `null` is a real value here - it is how the ceiling is lifted - so the
+    // only thing to reject locally is a box holding something that is not a
+    // number. Everything else is the server's call.
+    if (parsed !== null && !Number.isFinite(parsed)) {
+      setError(t("enterAmountDollarsLeave"));
+      return;
+    }
+    setSaving(true);
+    try {
+      await setMonthlyBudget(org.id, parsed);
+      setError(null);
+      toast.success(parsed === null ? t("monthlyLimitRemoved") : t("monthlyLimitUpdated"));
+    } catch (failure) {
+      const problem = submitFailure(failure, { fields: [FIELD] }, tErrors);
+      setError(problem.fields[FIELD] ?? null);
+      if (problem.toast) toast.error(problem.toast);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <SettingsSection
+      title={t("monthlySpendingLimit")}
+      description={t("ceilingWhatEveryAgent") + t("monthNextAgentS") + t("emptyNoLimit")}
+    >
+      <div className="flex flex-wrap items-start gap-3">
+        <FormField label={t("limitUsd")} htmlFor="org-monthly-budget" error={error}>
+          <Input
+            id="org-monthly-budget"
+            type="number"
+            min="0"
+            step="1"
+            value={value}
+            disabled={saving}
+            onChange={(event) => {
+              setValue(event.target.value);
+              setError(null);
+            }}
+            placeholder={t("noLimit")}
+          />
+        </FormField>
+        {changed && (
+          <Button className="mt-6" onClick={handleSave} disabled={saving}>
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save"}
+          </Button>
+        )}
+      </div>
+      <p className="text-muted-foreground mt-3 text-xs">
+        {org.monthly_budget_usd === null
+          ? t("spentNoLimit", { spent: monthToDate.toFixed(2) })
+          : t("spentOfLimit", {
+              spent: monthToDate.toFixed(2),
+              limit: Number(org.monthly_budget_usd).toFixed(2),
+            })}
+      </p>
+    </SettingsSection>
+  );
+}

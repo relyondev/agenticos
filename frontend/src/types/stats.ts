@@ -1,0 +1,180 @@
+/**
+ * Types for GET /stats/usage and GET /ratings/summary - the dashboard's numbers.
+ *
+ * One composed response on purpose: the cards reading it share one query, one
+ * loading state and one failure. A `group_by` request is a different question
+ * about the same window and fills only its own section, leaving the composed
+ * blocks null - which is why they are typed nullable.
+ */
+
+import type { RunStatus } from "./runs";
+
+export type UsageScope = "org" | "own";
+
+export interface DayCount {
+  date: string;
+  runs: number;
+  completed: number;
+  /** A serialised Decimal. Display only - never arithmetic. */
+  cost_usd: string;
+}
+
+/** One step of a timeline: the runs that started in it. Mirrors `TimeBucket`. */
+export interface TimeBucket {
+  /** ISO timestamp, UTC. */
+  start: string;
+  runs: number;
+  completed: number;
+  /** A serialised Decimal. Display only - never arithmetic. */
+  cost_usd: string;
+}
+
+/**
+ * The window's runs at a step the server chose for how much there is - minutes
+ * for one afternoon, weeks for a quarter. Dense: empty steps carry zeroes.
+ */
+export interface Timeline {
+  step_seconds: number;
+  buckets: TimeBucket[];
+}
+
+export interface SurfaceCount {
+  surface: string;
+  runs: number;
+}
+
+export interface AgentCount {
+  agent_id: string;
+  name: string;
+  runs: number;
+}
+
+export interface StatusCount {
+  status: RunStatus;
+  runs: number;
+}
+
+export interface ModelCount {
+  /** Null when the run recorded no label - its own row, never folded into a model. */
+  model_label: string | null;
+  /** Which provider served it; one model through two providers is two rows. */
+  provider: string | null;
+  runs: number;
+  /** Tool calls of these runs whose malformed arguments were repaired, not retried. */
+  tool_args_repaired?: number;
+}
+
+export interface LatencyMs {
+  /** Null when nothing in the window finished - distinct from a fast zero. */
+  p50: number | null;
+  p95: number | null;
+}
+
+export interface ActiveUsers {
+  active: number;
+  total_members: number;
+}
+
+export interface ProviderCost {
+  provider: string | null;
+  /** Serialised Decimal - never parse into a float for arithmetic. */
+  cost_usd: string;
+}
+
+export interface CostBlock {
+  /**
+   * Serialised Decimals. `period_usd` is the whole bill - models plus
+   * ingestion - and the two halves below sum to it; the calendar
+   * month-to-date figure still lives on GET /spend.
+   */
+  period_usd: string;
+  previous_period_usd: string;
+  model_usd: string;
+  /** Zero at scope=own: a document is indexed by a worker, for nobody. */
+  ingestion_usd: string;
+  by_provider: ProviderCost[];
+}
+
+export interface VersionUsageRow {
+  /** Null id with a null number is "a deleted version" - kept, the runs happened. */
+  agent_version_id: string | null;
+  version: number | null;
+  runs: number;
+  completed_runs: number;
+  p95_ms: number | null;
+  avg_cost_usd: string | null;
+  like_count: number;
+  rating_count: number;
+}
+
+export interface PersonUsageRow {
+  user_id: string;
+  email: string;
+  full_name: string | null;
+  runs: number;
+  /** Serialised Decimal - never parse into a float for arithmetic. */
+  cost_usd: string;
+  last_run_at: string;
+}
+
+export interface UsageStats {
+  from: string;
+  to: string;
+  scope: UsageScope;
+  total_runs: number | null;
+  previous_total_runs: number | null;
+  by_day: DayCount[] | null;
+  timeline: Timeline | null;
+  by_surface: SurfaceCount[] | null;
+  by_agent: AgentCount[] | null;
+  by_status: StatusCount[] | null;
+  by_model: ModelCount[] | null;
+  latency_ms: LatencyMs | null;
+  cost: CostBlock | null;
+  /** scope=org only. */
+  active_users: ActiveUsers | null;
+  /** scope=own only: the caller's runs parked on somebody's decision. */
+  pending_approvals: number | null;
+  /** group_by=version only. */
+  agent_id: string | null;
+  by_version: VersionUsageRow[] | null;
+  /** group_by=user only, capped by the request's limit. */
+  by_user: PersonUsageRow[] | null;
+  /** group_by=hour only. Sparse: a slot nobody ran in is absent. */
+  by_hour: HourCount[] | null;
+}
+
+export interface HourCount {
+  /** Postgres' `dow`, so 0 is Sunday. */
+  weekday: number;
+  hour: number;
+  runs: number;
+}
+
+export interface RatingsByDay {
+  date: string;
+  likes: number;
+  dislikes: number;
+}
+
+/** Same bones as the admin summary so the chart ports, plus the window envelope. */
+export interface RatingsSummary {
+  from: string;
+  to: string;
+  scope: UsageScope;
+  total_ratings: number;
+  like_count: number;
+  dislike_count: number;
+  average_rating: number;
+  with_comments: number;
+  /** Sparse - days nobody rated are absent. */
+  ratings_by_day: RatingsByDay[];
+  /** Thumbs per surface the answer was given on - web, slack and the rest (#2084). */
+  ratings_by_surface?: SurfaceRatings[];
+}
+
+export interface SurfaceRatings {
+  surface: string;
+  likes: number;
+  dislikes: number;
+}

@@ -1,0 +1,163 @@
+---
+name: mcp-connections
+description: Work with MCP servers — connect one, add an entry to the server catalog, debug "the agent cannot see my MCP tools" or a failing OAuth flow, or change how connections are probed, prefixed or filtered. Use when the ask involves an external SaaS tool (GitHub, Linear, Notion, Slack, Stripe, Postgres…) and before writing a capability that would just be an API client for one.
+---
+
+# MCP connections
+
+**Read `docs/mcp.md`** for the model and `docs/howto/add-mcp-server.md` for adding a
+catalog entry. Code: `app/agents/mcp.py`, `app/agents/mcp_oauth.py`,
+`app/services/mcp_connection.py`, `app/services/mcp_catalog.py`.
+
+## Reach for this before writing a capability
+
+If the ask is "let the agent read our Linear issues", the answer is usually a
+connection, not code. A capability is right for something the platform must
+*guarantee* — a budget guard, a sandbox, retrieval that cites sources. MCP is right
+for the forty SaaS products a company happens to use.
+
+Adding a catalog entry is one object in `app/core/catalog/mcp_servers.json`. No code.
+And nothing needs to be in the catalog for a URL to work — the *Custom server* entry
+introspects any reachable server.
+
+## Personal vs organization
+
+Two kinds, differing in exactly two places and both are the point:
+
+|  | Personal | Organization |
+|---|---|---|
+| Reached by | Its owner, through a binding to *each person's own account* | Any agent whose spec names it |
+| Gate | Owner only | `mcp:manage` |
+| Credential sealed to | The **member** | The **organization** |
+| A spec may name it | **No** - a spec names the *service* (`account: personal`, `catalog_key`) and the owner's connection is found at run time | Yes, `account: organization`, `connection_id` |
+
+A spec binds a service one of two ways (`McpServerRef` in `app/agents/spec.py`).
+`OrgMcpServerRef` is the organization's connection, answering for everybody.
+`PersonalMcpServerRef` names a catalog key: `build_toolsets_for_agent` looks up
+the *sender's* own connection by that key on every turn - the message's author,
+never the thread's - and where there is none (an API key, the widget, a
+schedule, an unlinked chat sender) reports the gap instead of skipping the
+server, and `_with_personal_service_gaps` in the runner tells the model what is
+missing and where the person connects it. A member's connection is never named
+by id: a published agent that reached different tools depending on who built it
+could not be reviewed.
+
+A personal connection is sealed to the member rather than an organization because it
+has none, and its owner may belong to several: binding it to whichever was active
+would make the token unreadable the moment they switched.
+
+## The four behaviours that surprise people
+
+**A dead server is skipped, not raised.** Each server gets a 3-second `tools/list`
+probe before the turn; failures log a warning and the turn proceeds without those
+tools. Pydantic AI enters every toolset when a run starts, so raising would let one
+expired token abort every agent that names the connection. The trade is real: a
+skipped server means the model answers *without* the tools. It is briefed, though:
+`UnavailableUnreachableServer` for a failed probe, and `AnsweredRecently` for a
+server that answered within two minutes and fails on connect, both through
+`unreachable_briefing` in `app/agents/mcp.py`. `/test` and `last_status` are how you
+find out.
+
+**Tools are prefixed with the connection name.** `github-work` → `github_work_*`.
+Two servers exposing the same tool name make Pydantic AI raise on duplicates, which
+aborts the turn.
+
+**Two connections reducing to the same prefix are deduplicated**, first one wins, with
+a warning naming the loser. Deployment-managed servers are ordered first.
+
+**An allowlist filters before prefixing**, so it compares unprefixed names.
+
+## OAuth
+
+Five steps in `mcp_oauth.py`: discover (RFC 9728 → RFC 8414) → dynamic client
+registration (RFC 7591) → consent URL (PKCE + state + RFC 8707 resource indicator) →
+exchange → refresh. Split across two HTTP requests because this is a web app, not a
+CLI.
+
+**A server with no registration endpoint (HubSpot) refuses at step two**, and the
+only way past is a client the operator registered at the provider by hand.
+`McpOAuthStart` takes `client_id` / `client_secret` for that (#1620); the connect
+dialog collects them in `McpOAuthClientFields`, with the redirect URL the provider
+has to hold - `{FRONTEND_URL}/api/me/mcp-connections/oauth/callback`, exactly.
+
+**Every URL in that flow is SSRF-checked and pinned**, not just the one somebody
+typed — discovery means the remote server picks most of the addresses we call. The
+flow's only client is `mcp_oauth._client()`, a `PinnedAsyncClient`
+(`app/core/pinned_http.py`): it checks each request's URL with
+`sanitize.resolve_pinned_url` and then dials **that address**, with the original host
+in `Host` and in TLS SNI. Nothing resolves the name twice, so there is no window to
+rebind (#860). Do not add a request path that builds a plain `httpx.AsyncClient` —
+`_send` takes a `PinnedAsyncClient` so that mistake does not type-check.
+
+A refused hop crosses `httpx` out of the transport as a `UrlRefusedError`, and `_send`
+answers it with a fixed `OAuthError` sentence. Catch the narrow type, never
+`ValueError`: only the narrow one is a refusal written here, and every other
+`ValueError` reported as "this server pointed us at a blocked address" is a confident
+lie about whose fault a failure was (#861).
+
+Behind `HTTP_PROXY`/`HTTPS_PROXY` the proxy does the connecting, so there the pinned
+address is what the proxy is *asked* to reach. Honoured deliberately — a proxy-only
+deployment would otherwise lose OAuth entirely, and the proxy is its own egress
+control. Do not "fix" that by naming a transport on the client: an explicit transport
+turns httpx's environment-proxy mounting off, which is how it was broken once already.
+
+Two things the pin does not cover, and neither is an oversight. The **consent URL** is
+checked with `validate_mcp_url` and then handed to a browser that resolves it itself.
+The **connection's own URL** is checked at save and resolved again at run time — a
+point-in-time check (#840), bearable only because an operator typed it. A URL a *model*
+chose belongs in neither; it needs `safe_download`.
+
+The MCP allowlist (`sanitize.mcp_allowlist()`: `MCP_ALLOWED_HOSTS` plus
+`OUTBOUND_PRIVATE_ALLOWLIST`) exempts a listed host's private answer from the address half of the
+check on a connection's own URL: `_checked_url` (save, update, the sign-in probe
+and the OAuth start) always passes `honour_allowlist=True` to `validate_mcp_url`.
+Every host is resolved and every answer checked: a private answer passes only for a
+host the list admits, loopback and metadata never, and a host admitted by name
+that does not resolve yet is accepted (#840). The OAuth requests after it get
+`sanitize.allowlist_for(server_url, mcp_allowlist())` (the origin rule): the whole
+list when the connection's own host needs it, nothing otherwise.
+`resolve_pinned_url` still resolves and pins a listed host and refuses loopback,
+link-local and metadata answers for it. The catalog audit stays strict. Never
+compute the allowlist from a URL a remote server named: that is how a public
+server would aim its token endpoint at a listed host.
+
+An organization's OAuth connection is still the consenting person's grant at the
+provider. Revoking their access there breaks the organization's server.
+
+## MCP approvals
+
+`approval_required_tools` covers capability tools; MCP tools are marked separately
+by `ApprovalMarked` and enforced by the same `ApprovalGate`. A binding's `writes`
+policy trusts only `readOnlyHint: true`; missing or false hints require approval.
+`all` also gates reads, and `none` waives the binding's gate. The platform server
+always enforces at least `writes`, with deliberate exceptions in `HELD` and
+`UNGATED` in `services/platform_mcp/_tools.py`.
+
+Channel runs, including delegates and resumptions, enforce at least `writes` on
+all MCP bindings. Read-only calls no longer acquire an extra approval merely by
+running in a chat app for a linked member. Unlinked room participants still
+require approval for every MCP call, including organization reads. Personal
+connections resolve for each message's linked sender, never the publisher or a
+different participant.
+
+Cost is the same story: what a server does on its own side is outside this platform's
+budget. Only model tokens are counted.
+
+## Routes
+
+```
+GET  /api/v1/me/mcp-connections            personal
+GET  /api/v1/mcp-connections               organization  (mcp:manage)
+POST /api/v1/mcp-connections/{id}/test     probe, list tools, persist last_status
+POST /api/v1/mcp-connections/oauth/start   declared above /{id} — that route parses
+                                           its segment as a UUID and would 422
+```
+
+`PATCH` with `auth_token: ""` clears a stored credential.
+
+## Test
+
+`frontend/e2e/mcp-servers.spec.ts` covers the UI. For the backend, the interesting
+assertions are the refusals: a personal connection is not bindable by a spec, a
+connection from another organization is unreachable, and a prefix collision drops the
+second server rather than aborting the turn.

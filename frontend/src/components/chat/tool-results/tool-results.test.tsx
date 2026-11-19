@@ -1,0 +1,1093 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+
+import { GenericToolResult, RawToolView } from "./generic";
+import { RunPythonResult } from "./run-python";
+import {
+  LoadSkillResult,
+  LoadedSkillResult,
+  formatSkillName,
+  parseLoadSkillResult,
+  parseLoadedSkill,
+} from "./skills";
+import { RAGSearchResults, parseRAGResults } from "./rag";
+import { WebSearchResults, parseWebSearch } from "./web-search";
+import { GeneratedImageResult, parseGeneratedImage } from "./generated-image";
+import { GeneratedSpeechResult, parseGeneratedSpeech } from "./generated-speech";
+import { GeneratedVideoResult, parseGeneratedVideo } from "./generated-video";
+import { DesktopScreenshotResult, parseDesktopScreenshot } from "./desktop-screenshot";
+import { ContextListResult, SkillListResult, parseContextList, parseSkillList } from "./catalogs";
+import { PlanToolResult } from "./plan";
+import type { ToolCall } from "@/types";
+
+// The Markdown renderer is loaded dynamically and highlights code; what these
+// assert is what reaches it, not how it renders.
+vi.mock("../markdown-content", () => ({
+  MarkdownContent: ({ content }: { content: string }) => (
+    <div data-testid="markdown">{content}</div>
+  ),
+}));
+
+function toolCall(overrides: Partial<ToolCall> = {}): ToolCall {
+  return { id: "tc-1", name: "run_python", args: {}, status: "completed", ...overrides };
+}
+
+/**
+ * What the chat shows for a tool that ran.
+ *
+ * Each of these replaces a wall of raw text with something readable, and each has
+ * a state it must not misrepresent: a search that found nothing is not a failed
+ * search, a tool still running is not a tool that returned nothing, and a result
+ * this renderer cannot parse has to fall through to the raw view rather than
+ * render as blank.
+ */
+describe("the knowledge search", () => {
+  const RESULT = [
+    "[1] Source: handbook.pdf, page 4, chunk 2 [handbook] (score: 0.812)",
+    "Refunds are granted within thirty days.",
+    "[2] Source: handbook.pdf, page 9 (score: 0.410)",
+    "Gift cards are excluded.",
+    "[3] Source: policy.md (score: 0.220)",
+    "See the handbook.",
+  ].join("\n");
+
+  it("reads every field the tool writes", () => {
+    const items = parseRAGResults(RESULT);
+
+    expect(items).toHaveLength(3);
+    expect(items[0]).toMatchObject({
+      index: 1,
+      source: "handbook.pdf",
+      page: "4",
+      chunk: "2",
+      collection: "handbook",
+      score: "0.812",
+      content: "Refunds are granted within thirty days.",
+    });
+  });
+
+  it("reads a passage with no page, chunk or collection", () => {
+    expect(parseRAGResults(RESULT)[2]).toMatchObject({
+      source: "policy.md",
+      page: undefined,
+      chunk: undefined,
+      collection: undefined,
+    });
+  });
+
+  it("reads a passage cited by its section rather than a page (#2489)", () => {
+    // The backend names the heading a Markdown chunk opens with; a parser that
+    // only knew `page` dropped every such passage from the card and Sources.
+    const result = [
+      '[1] Source: guide.md, section "Install", chunk 2 [docs] (score: 0.900)',
+      "# Install",
+      "Run make dev.",
+      "[2] Source: handbook.pdf, page 4 (score: 0.800)",
+      "Refunds.",
+    ].join("\n");
+
+    const items = parseRAGResults(result);
+
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({
+      source: "guide.md",
+      section: "Install",
+      page: undefined,
+      chunk: "2",
+      collection: "docs",
+      content: "# Install\nRun make dev.",
+    });
+    expect(items[1]).toMatchObject({ page: "4", section: undefined });
+  });
+
+  it("reads a passage given with its surrounding text", () => {
+    const result =
+      "[1] Source: guide.md, chunk 2 [docs], with surrounding text (score: 0.900)\nBefore. Match.";
+
+    expect(parseRAGResults(result)).toEqual([
+      expect.objectContaining({ source: "guide.md", chunk: "2", collection: "docs" }),
+    ]);
+  });
+
+  it("finds nothing in text that is not a result list", () => {
+    expect(parseRAGResults("No relevant documents found.")).toEqual([]);
+  });
+
+  it("groups the chunks of one file into one card", () => {
+    // Three chunks from the same PDF used to render as three identical cards.
+    render(<RAGSearchResults result={RESULT} />);
+
+    expect(screen.getByText("3 chunks")).toBeInTheDocument();
+    expect(screen.getByText("2 sources")).toBeInTheDocument();
+    expect(screen.getAllByTitle("handbook.pdf")).toHaveLength(1);
+  });
+
+  it("uses the singular for a single chunk from a single source", () => {
+    render(<RAGSearchResults result={"[1] Source: a.md (score: 0.9)\nOne passage."} />);
+
+    // Twice: the header counts them and the file's own row repeats its count.
+    expect(screen.getAllByText("1 chunk")).toHaveLength(2);
+    expect(screen.getByText("1 source")).toBeInTheDocument();
+  });
+
+  it("names the collection a file came from, when the tool said", () => {
+    // Two collections can hold a file of the same name, and the answer depends on
+    // which one was searched.
+    render(<RAGSearchResults result={RESULT} />);
+
+    expect(screen.getByTitle("Collection: handbook")).toBeInTheDocument();
+  });
+
+  it("expands a chunk to its full text, and collapses it again", () => {
+    render(<RAGSearchResults result={RESULT} />);
+    const chunk = screen.getByText("Refunds are granted within thirty days.");
+    expect(chunk).toHaveClass("line-clamp-2");
+
+    const [first] = screen.getAllByRole("button");
+    return userEvent.click(first!).then(async () => {
+      expect(screen.getByText("Refunds are granted within thirty days.")).not.toHaveClass(
+        "line-clamp-2",
+      );
+
+      await userEvent.click(first!);
+      expect(screen.getByText("Refunds are granted within thirty days.")).toHaveClass(
+        "line-clamp-2",
+      );
+    });
+  });
+
+  it("opens one chunk at a time, so the panel does not grow without bound", async () => {
+    render(<RAGSearchResults result={RESULT} />);
+    const buttons = screen.getAllByRole("button");
+
+    await userEvent.click(buttons[0]!);
+    await userEvent.click(buttons[1]!);
+
+    expect(screen.getByText("Refunds are granted within thirty days.")).toHaveClass("line-clamp-2");
+    expect(screen.getByText("Gift cards are excluded.")).not.toHaveClass("line-clamp-2");
+  });
+
+  it("says where a passage came from inside its file", () => {
+    render(<RAGSearchResults result={RESULT} />);
+
+    expect(screen.getByText("p.4")).toBeInTheDocument();
+    expect(screen.getByText("chunk 2")).toBeInTheDocument();
+    // A passage with a page and no chunk says only the page.
+    expect(screen.getByText("p.9")).toBeInTheDocument();
+  });
+
+  it("shows a chunk number with no page, for a file that has none", () => {
+    render(<RAGSearchResults result={"[1] Source: a.md, chunk 7 (score: 0.5)\nBody."} />);
+
+    expect(screen.getByText("chunk 7")).toBeInTheDocument();
+  });
+
+  it("scores each passage, and marks how relevant it is", () => {
+    // The relevance dot is a quality signal rather than an alert, which is why
+    // there is no red in it - but it still has to differ by band.
+    const { container } = render(<RAGSearchResults result={RESULT} />);
+
+    expect(screen.getByText("0.81")).toBeInTheDocument();
+    expect(container.querySelector('[title="Relevance: 0.81"]')).toHaveClass("bg-foreground");
+    expect(container.querySelector('[title="Relevance: 0.41"]')).toHaveClass("bg-foreground/55");
+    expect(container.querySelector('[title="Relevance: 0.22"]')).toHaveClass("bg-foreground/25");
+  });
+
+  it("draws a known service's own logo, and a globe for any other site", () => {
+    const mixed = JSON.stringify({
+      kind: "web_search",
+      results: [
+        { title: "Repo", url: "https://github.com/acme/api" },
+        { title: "Blog", url: "https://blog.example/post" },
+      ],
+    });
+
+    const { container } = render(<WebSearchResults data={parseWebSearch(mixed)!} />);
+
+    expect(container.querySelectorAll(".lucide-globe")).toHaveLength(1);
+    expect(screen.getByText("github.com")).toBeInTheDocument();
+  });
+
+  it("names a hit with no title by its site", () => {
+    const untitled = JSON.stringify({
+      kind: "web_search",
+      results: [{ title: "", url: "https://ledgerly.example/pricing" }],
+    });
+
+    render(<WebSearchResults data={parseWebSearch(untitled)!} />);
+
+    expect(screen.getAllByText("ledgerly.example")).toHaveLength(2);
+  });
+
+  it("names a hit with neither a title nor a readable address by what it was given", () => {
+    const bare = JSON.stringify({ kind: "web_search", results: [{ title: "", url: "nowhere" }] });
+
+    render(<WebSearchResults data={parseWebSearch(bare)!} />);
+
+    expect(screen.getAllByText("nowhere")).toHaveLength(2);
+  });
+
+  it("says a search that found nothing found nothing", () => {
+    // Not the same as a failed search, and not the same as no search.
+    render(<RAGSearchResults result="No relevant documents found for your query." />);
+
+    expect(screen.getByText("No relevant documents found")).toBeInTheDocument();
+  });
+
+  it("renders nothing for a result it cannot read, so the raw view takes over", () => {
+    const { container } = render(<RAGSearchResults result="something else entirely" />);
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("survives a passage whose source the tool did not name", () => {
+    render(<RAGSearchResults result={"[1] Source:  (score: 0.5)\nBody."} />);
+
+    expect(screen.getByTitle("Unknown")).toBeInTheDocument();
+  });
+});
+
+describe("the web search", () => {
+  const PAYLOAD = JSON.stringify({
+    kind: "web_search",
+    query: "refund law",
+    results: [
+      {
+        title: "Consumer rights",
+        url: "https://www.gov.example/rights",
+        content: "Fourteen days.",
+        score: 0.92,
+      },
+      { title: "Acme help", url: "https://acme.example/help" },
+    ],
+  });
+
+  it("reads the payload the tool writes", () => {
+    const parsed = parseWebSearch(PAYLOAD);
+
+    expect(parsed?.query).toBe("refund law");
+    expect(parsed?.results).toHaveLength(2);
+  });
+
+  it("reads a payload with no query as one with an empty query", () => {
+    const parsed = parseWebSearch(JSON.stringify({ kind: "web_search", results: [] }));
+
+    expect(parsed).toEqual({ query: "", results: [] });
+  });
+
+  it("refuses anything that is not that payload", () => {
+    // A provider error arrives as text on the same tool, and the raw renderer is
+    // the right place for it.
+    expect(parseWebSearch("upstream refused")).toBeNull();
+    expect(parseWebSearch(JSON.stringify({ kind: "other", results: [] }))).toBeNull();
+    expect(parseWebSearch(JSON.stringify({ kind: "web_search" }))).toBeNull();
+    expect(parseWebSearch("null")).toBeNull();
+  });
+
+  it("lists each hit by title and domain", () => {
+    render(<WebSearchResults data={parseWebSearch(PAYLOAD)!} />);
+
+    expect(screen.getByText("2 web results")).toBeInTheDocument();
+    expect(screen.getByText("Consumer rights")).toBeInTheDocument();
+    expect(screen.getByText("gov.example")).toBeInTheDocument();
+  });
+
+  it("uses the singular for one hit", () => {
+    const one = JSON.stringify({
+      kind: "web_search",
+      results: [{ title: "A", url: "https://a/" }],
+    });
+
+    render(<WebSearchResults data={parseWebSearch(one)!} />);
+
+    expect(screen.getByText("1 web result")).toBeInTheDocument();
+  });
+
+  it("opens each hit in a tab that cannot reach back", () => {
+    render(<WebSearchResults data={parseWebSearch(PAYLOAD)!} />);
+
+    const link = screen.getByRole("link", { name: /Consumer rights/ });
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("shows the domain as it stands when the URL cannot be parsed", () => {
+    const malformed = JSON.stringify({
+      kind: "web_search",
+      results: [{ title: "A", url: "acme.example/help" }],
+    });
+
+    render(<WebSearchResults data={parseWebSearch(malformed)!} />);
+
+    expect(screen.getByText("acme.example/help")).toBeInTheDocument();
+  });
+
+  it("clamps a snippet in the chat and shows it whole in the panel", () => {
+    // The same component in two places: the transcript has one line to spare and
+    // the deep-dive panel has the room.
+    const { rerender } = render(<WebSearchResults data={parseWebSearch(PAYLOAD)!} />);
+    expect(screen.getByText("Fourteen days.")).toHaveClass("line-clamp-2");
+
+    rerender(<WebSearchResults data={parseWebSearch(PAYLOAD)!} detailed />);
+    expect(screen.getByText("Fourteen days.")).toHaveClass("whitespace-pre-wrap");
+  });
+
+  it("says what was searched for, and shows relevance only in the deep-dive view", () => {
+    // The query heads the cards in the chat too: "searched the web" says nothing
+    // about whether the agent asked the right question.
+    const { rerender } = render(<WebSearchResults data={parseWebSearch(PAYLOAD)!} />);
+    expect(screen.getByText(/refund law/)).toBeInTheDocument();
+    expect(screen.queryByText("92%")).toBeNull();
+
+    rerender(<WebSearchResults data={parseWebSearch(PAYLOAD)!} detailed />);
+    expect(screen.getByText(/refund law/)).toBeInTheDocument();
+    expect(screen.getByText("92%")).toBeInTheDocument();
+  });
+
+  it("says a search that found nothing found nothing", () => {
+    render(<WebSearchResults data={{ query: "x", results: [] }} />);
+
+    expect(screen.getByText("No web results found")).toBeInTheDocument();
+  });
+});
+
+describe("the generated image", () => {
+  const PAYLOAD = JSON.stringify({
+    kind: "generated_image",
+    filename: "abc123_image.png",
+    url: "/api/v1/generated/abc123_image.png",
+    media_type: "image/png",
+    prompt: "a red bicycle",
+  });
+
+  it("addresses the image through the same-origin proxy, not the backend URL", () => {
+    const parsed = parseGeneratedImage(PAYLOAD);
+
+    expect(parsed?.prompt).toBe("a red bicycle");
+    expect(parsed?.url).toBe("/api/generated/abc123_image.png");
+  });
+
+  it("has no URL when the image was generated but not stored", () => {
+    const parsed = parseGeneratedImage(
+      JSON.stringify({ kind: "generated_image", filename: null, prompt: "x" }),
+    );
+
+    expect(parsed).toEqual({ prompt: "x", url: null });
+  });
+
+  it("refuses anything that is not that payload", () => {
+    expect(parseGeneratedImage("upstream refused")).toBeNull();
+    expect(parseGeneratedImage(JSON.stringify({ kind: "web_search" }))).toBeNull();
+    expect(parseGeneratedImage("null")).toBeNull();
+  });
+
+  it("shows the image with the prompt as its caption and alt text", () => {
+    render(<GeneratedImageResult data={parseGeneratedImage(PAYLOAD)!} />);
+
+    const image = screen.getByRole("img", { name: "a red bicycle" });
+    expect(image).toHaveAttribute("src", "/api/generated/abc123_image.png");
+    expect(screen.getByText("a red bicycle")).toBeInTheDocument();
+  });
+
+  it("says so when there is nothing to show", () => {
+    render(<GeneratedImageResult data={{ prompt: "", url: null }} />);
+
+    expect(screen.getByText("The image was generated but not saved.")).toBeInTheDocument();
+  });
+});
+
+describe("running Python", () => {
+  it("closes the code once its output is the thing being read", () => {
+    // Both halves are there; only the one somebody came for is open. The code keeps
+    // its header, which is the click that brings it back.
+    render(
+      <RunPythonResult
+        toolCall={toolCall({ args: { code: "print(6*7)" } })}
+        resultText={"stdout:\n42"}
+      />,
+    );
+
+    expect(screen.queryByTestId("markdown")).toBeNull();
+    expect(screen.getByRole("button", { name: "python" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByText("42")).toBeInTheDocument();
+  });
+
+  it("shows the code while it is still running it", () => {
+    // What it is executing, while it executes - which it has in hand the whole time.
+    const { rerender } = render(
+      <RunPythonResult
+        toolCall={toolCall({ args: { code: "print(6*7)" }, status: "running" })}
+        resultText=""
+      />,
+    );
+
+    expect(screen.getByTestId("markdown")).toHaveTextContent("```python");
+    expect(screen.queryByText("Running…")).toBeNull();
+
+    // And closes itself the moment the output arrives to replace it.
+    rerender(
+      <RunPythonResult
+        toolCall={toolCall({ args: { code: "print(6*7)" } })}
+        resultText={"stdout:\n42"}
+      />,
+    );
+
+    expect(screen.queryByTestId("markdown")).toBeNull();
+  });
+
+  it("keeps the code open when the run failed, because that is what is being debugged", () => {
+    render(
+      <RunPythonResult
+        toolCall={toolCall({ args: { code: "print(x)" } })}
+        resultText="Execution failed: NameError: name 'x' is not defined"
+      />,
+    );
+
+    expect(screen.getByTestId("markdown")).toHaveTextContent("print(x)");
+  });
+
+  it("keeps the code open for a call that failed with nothing to say", () => {
+    // A tool that errored without an "Execution failed:" line still failed.
+    render(
+      <RunPythonResult
+        toolCall={toolCall({ args: { code: "print(x)" }, status: "error" })}
+        resultText="the sandbox went away"
+      />,
+    );
+
+    expect(screen.getByTestId("markdown")).toHaveTextContent("print(x)");
+  });
+
+  it("keeps a re-opened code block open through the next streaming delta", async () => {
+    // Every delta re-renders this subtree. A collapse derived from `status` at render
+    // time would close the block again under whoever just opened it.
+    const call = toolCall({ args: { code: "print(6*7)" } });
+    const { rerender } = render(<RunPythonResult toolCall={call} resultText={"stdout:\n42"} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "python" }));
+    rerender(<RunPythonResult toolCall={call} resultText={"stdout:\n42"} />);
+
+    expect(screen.getByTestId("markdown")).toHaveTextContent("```python");
+  });
+
+  it("closes the output too, so an 800-line stdout is not the whole screen", async () => {
+    render(<RunPythonResult toolCall={toolCall()} resultText={"stdout:\n42"} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Output" }));
+
+    expect(screen.queryByText("42")).toBeNull();
+  });
+
+  it("shows the returned value beside what was printed", () => {
+    render(<RunPythonResult toolCall={toolCall()} resultText={"stdout:\nworking\n\nresult: 42"} />);
+
+    expect(screen.getByText(/working/)).toBeInTheDocument();
+    expect(screen.getByText(/result: 42/)).toBeInTheDocument();
+  });
+
+  it("shows a returned value with nothing printed", () => {
+    render(<RunPythonResult toolCall={toolCall()} resultText="result: 42" />);
+
+    expect(screen.getByText("result: 42")).toBeInTheDocument();
+  });
+
+  it("shows an unrecognised result as output rather than dropping it", () => {
+    render(<RunPythonResult toolCall={toolCall()} resultText="just some text" />);
+
+    expect(screen.getByText("just some text")).toBeInTheDocument();
+  });
+
+  it("shows a failure as a failure", () => {
+    render(
+      <RunPythonResult
+        toolCall={toolCall()}
+        resultText="Execution failed: NameError: name 'x' is not defined"
+      />,
+    );
+
+    expect(screen.getByText(/NameError/)).toBeInTheDocument();
+  });
+
+  it("says code is still running when it does not have the code to show instead", () => {
+    // A replayed conversation whose arguments were not stored; anything with a `code`
+    // argument shows the code, which says the same thing and more.
+    render(<RunPythonResult toolCall={toolCall({ status: "running" })} resultText="" />);
+
+    expect(screen.getByText("Running…")).toBeInTheDocument();
+  });
+
+  it("says nothing about output for code that produced none", () => {
+    // The tool's own words for it; an empty `<pre>` reads as a broken renderer.
+    render(
+      <RunPythonResult
+        toolCall={toolCall({ args: { code: "x = 1" } })}
+        resultText="(code ran successfully with no output)"
+      />,
+    );
+
+    expect(screen.getByTestId("markdown")).toBeInTheDocument();
+    expect(screen.queryByText("Output")).toBeNull();
+  });
+
+  it("shows a result with no code and no output as plain text", () => {
+    // Reachable from a replayed conversation where the args were not stored.
+    render(
+      <RunPythonResult toolCall={toolCall()} resultText="(code ran successfully with no output)" />,
+    );
+
+    expect(screen.getByText("(code ran successfully with no output)")).toBeInTheDocument();
+  });
+
+  it("offers the output for copying, which is why it is one string", () => {
+    render(<RunPythonResult toolCall={toolCall()} resultText={"stdout:\n42\n\nresult: 43"} />);
+
+    expect(screen.getByRole("button", { name: /copy/i })).toBeInTheDocument();
+  });
+});
+
+describe("loading a skill", () => {
+  it("shows the instructions and not the envelope they arrived in", () => {
+    render(
+      <LoadedSkillResult
+        result={{ instructions: "# Skill: refunds\n\nCheck the order date." }}
+        status="completed"
+      />,
+    );
+
+    expect(screen.getByText("Check the order date.")).toBeInTheDocument();
+    expect(screen.queryByText(/# Skill:/)).toBeNull();
+  });
+
+  it("reads the payload whether it arrived as an object or as its JSON", () => {
+    const json = JSON.stringify({ instructions: "# Skill: refunds\n\nAsk for the receipt." });
+
+    expect(parseLoadedSkill(json)).toBe("Ask for the receipt.");
+    expect(parseLoadedSkill({ instructions: "Ask for the receipt." })).toBe("Ask for the receipt.");
+  });
+
+  it("finds nothing in a result that carried no instructions", () => {
+    expect(parseLoadedSkill("the tool failed")).toBeNull();
+    expect(parseLoadedSkill([{ instructions: "x" }])).toBeNull();
+    expect(parseLoadedSkill({})).toBeNull();
+    expect(parseLoadedSkill({ instructions: 7 })).toBeNull();
+    expect(parseLoadedSkill({ instructions: "# Skill: refunds\n" })).toBeNull();
+  });
+
+  it("shows a completed result it could not read rather than nothing", () => {
+    // The framework answers an unknown capability id with a retry notice, which
+    // the socket records as `completed` like any other result - so rendering
+    // nothing made a refusal look like a success (#1704 review).
+    render(
+      <LoadedSkillResult
+        result={"Unknown capability 'refnds'. Available: refunds"}
+        status="completed"
+      />,
+    );
+
+    expect(screen.getByText(/Unknown capability/)).toBeInTheDocument();
+  });
+
+  it("says it is loading, and says when it failed", () => {
+    const { rerender } = render(<LoadedSkillResult result={undefined} status="running" />);
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+
+    rerender(<LoadedSkillResult result={undefined} status="error" />);
+    expect(screen.getByText("Failed to load skill.")).toBeInTheDocument();
+  });
+
+  it("says it is loading for a result that arrived before the status did", () => {
+    render(<LoadedSkillResult result={{ instructions: "x" }} status="running" />);
+
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+  });
+
+  it("humanises a skill's stored name", () => {
+    expect(formatSkillName("market_data")).toBe("Market Data");
+    expect(formatSkillName("fire")).toBe("Fire");
+    expect(formatSkillName("__odd__name")).toBe("Odd Name");
+    expect(formatSkillName("")).toBe("");
+  });
+});
+
+/**
+ * The fallback for a tool nobody wrote a renderer for.
+ *
+ * It is the common path rather than the exceptional one: capabilities are a
+ * registry, and a backend release can add a tool the day after this file was last
+ * touched. So it has to make something readable out of anything - pretty JSON
+ * where it can, wrapped text where it cannot - and never render blank.
+ */
+describe("a tool with no renderer of its own", () => {
+  it("pretty-prints a JSON result", () => {
+    render(
+      <GenericToolResult
+        toolCall={toolCall({ name: "post_invoice" })}
+        resultText='{"id":7,"total":42}'
+      />,
+    );
+
+    expect(screen.getByText(/"total": 42/)).toBeInTheDocument();
+  });
+
+  it("wraps a result that is not JSON rather than dropping it", () => {
+    render(<GenericToolResult toolCall={toolCall()} resultText="Posted invoice 7." />);
+
+    expect(screen.getByText("Posted invoice 7.")).toBeInTheDocument();
+  });
+
+  it("treats a bare JSON scalar as text, because pretty-printing it changes nothing", () => {
+    render(<GenericToolResult toolCall={toolCall()} resultText="42" />);
+
+    expect(screen.getByText("42")).toBeInTheDocument();
+  });
+
+  it("shows nothing for a call that carried no arguments at all", () => {
+    // `args` arrives from the stream and is null for a no-argument tool.
+    // Formatted as "null" it would read as an argument the model passed.
+    render(
+      <GenericToolResult
+        toolCall={toolCall({ args: null as unknown as ToolCall["args"] })}
+        resultText="ok"
+      />,
+    );
+
+    expect(screen.queryByText("null")).not.toBeInTheDocument();
+  });
+
+  it("shows the arguments it was called with", () => {
+    render(<GenericToolResult toolCall={toolCall({ args: { invoice_id: 7 } })} resultText="ok" />);
+
+    expect(screen.getByText("Arguments")).toBeInTheDocument();
+    expect(screen.getByText(/"invoice_id": 7/)).toBeInTheDocument();
+  });
+
+  it("says nothing about arguments for a tool that takes none", () => {
+    // Three shapes mean "none": absent, an empty object, and the string `{}` a
+    // raw stream frame carries.
+    for (const args of [undefined, {}, "{}", "  "]) {
+      const { unmount } = render(
+        <GenericToolResult toolCall={toolCall({ args: args as never })} resultText="ok" />,
+      );
+
+      expect(screen.queryByText("Arguments")).toBeNull();
+      unmount();
+    }
+  });
+
+  it("reads arguments that arrived as a JSON string", () => {
+    render(<GenericToolResult toolCall={toolCall({ args: '{"a":1}' as never })} resultText="ok" />);
+
+    expect(screen.getByText(/"a": 1/)).toBeInTheDocument();
+  });
+
+  it("shows arguments that are a string and not JSON as they stand", () => {
+    render(
+      <GenericToolResult toolCall={toolCall({ args: "just text" as never })} resultText="ok" />,
+    );
+
+    expect(screen.getByText("just text")).toBeInTheDocument();
+  });
+
+  it("says it is running, and says when it failed", () => {
+    const { rerender } = render(
+      <GenericToolResult toolCall={toolCall({ status: "running" })} resultText="" />,
+    );
+    expect(screen.getByText("Running…")).toBeInTheDocument();
+
+    rerender(<GenericToolResult toolCall={toolCall({ status: "error" })} resultText="" />);
+    expect(screen.getByText("Tool failed.")).toBeInTheDocument();
+  });
+
+  it("shows a completed tool that returned nothing without claiming it is running", () => {
+    render(<GenericToolResult toolCall={toolCall()} resultText="" />);
+
+    expect(screen.queryByText("Running…")).toBeNull();
+  });
+});
+
+describe("the raw view behind every tool", () => {
+  it("shows the arguments and the exact output, both copyable", () => {
+    // The escape hatch: whatever a renderer decided to show, this is what the
+    // tool actually said.
+    render(
+      <RawToolView
+        toolCall={toolCall({ args: { a: 1 }, result: "raw output" })}
+        resultText="raw output"
+      />,
+    );
+
+    expect(screen.getByText("Arguments")).toBeInTheDocument();
+    expect(screen.getByText("Result")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /copy/i })).toHaveLength(2);
+  });
+
+  it("says a tool took no arguments rather than showing an empty block", () => {
+    render(<RawToolView toolCall={toolCall({ args: {} })} resultText="" />);
+
+    expect(screen.getByText("No arguments")).toBeInTheDocument();
+  });
+
+  it("shows no result section for a tool that has not answered", () => {
+    render(<RawToolView toolCall={toolCall({ args: { a: 1 } })} resultText="" />);
+
+    expect(screen.queryByText("Result")).toBeNull();
+  });
+
+  it("shows no result section for an answer that was empty", () => {
+    // `result` present and the text empty: a tool that returned `""`.
+    render(<RawToolView toolCall={toolCall({ args: { a: 1 }, result: "" })} resultText="" />);
+
+    expect(screen.queryByText("Result")).toBeNull();
+  });
+
+  it("treats a non-string, non-object argument as no arguments at all", () => {
+    // Reachable from a malformed stream frame.
+    render(<RawToolView toolCall={toolCall({ args: 7 as never })} resultText="" />);
+
+    expect(screen.getByText("7")).toBeInTheDocument();
+  });
+});
+
+/**
+ * What the agent found when it looked, and what it planned.
+ *
+ * Both used to open nothing: `list_context` was `render: "none"` on the grounds that
+ * a prompt fragment is not something a person reads, and `write_plan` opened its own
+ * arguments - the whole ordered list, in JSON, above a rendered copy of the same
+ * steps.
+ */
+describe("the catalogs a step looked through", () => {
+  it("lists a context file with its description, and one without", () => {
+    expect(parseContextList("- glossary: What the acronyms mean.\n- policy")).toEqual([
+      { name: "glossary", description: "What the acronyms mean." },
+      { name: "policy", description: null },
+    ]);
+  });
+
+  it("says nothing is attached rather than drawing an empty list", () => {
+    // The tool's own answer when the agent has no linked files.
+    render(<ContextListResult resultText="No reference files are attached to this agent." />);
+
+    expect(screen.getByText("No context files are attached to this agent.")).toBeInTheDocument();
+  });
+
+  it("draws the context list it was given", () => {
+    render(<ContextListResult resultText="- glossary: What the acronyms mean." />);
+
+    expect(screen.getByText("glossary")).toBeInTheDocument();
+    expect(screen.getByText("What the acronyms mean.")).toBeInTheDocument();
+  });
+});
+
+/**
+ * The two renderers nothing emits any more.
+ *
+ * A stored conversation holds the tool name it called and the result it got, so
+ * these keep an old thread looking the way it looked the day it ran rather than
+ * degrading to raw XML the next time somebody opens it (#1704 review).
+ */
+describe("a thread recorded before skills were capabilities", () => {
+  it("shows the description and not the XML it arrived in", () => {
+    render(
+      <LoadSkillResult
+        resultText={
+          "<skill><name>refunds</name><description>How refunds work.</description></skill>"
+        }
+        status="completed"
+      />,
+    );
+
+    expect(screen.getByText("How refunds work.")).toBeInTheDocument();
+    expect(screen.queryByText(/<skill>/)).toBeNull();
+  });
+
+  it("finds nothing in a result with no description", () => {
+    expect(parseLoadSkillResult("<skill><name>refunds</name></skill>")).toBeNull();
+    expect(parseLoadSkillResult("<description></description>")).toBeNull();
+    expect(parseLoadSkillResult("<description>\n  Line one.\n  Line two.\n</description>")).toEqual(
+      {
+        description: "Line one.\n  Line two.",
+      },
+    );
+  });
+
+  it("renders nothing when there is no description to show", () => {
+    const { container } = render(<LoadSkillResult resultText="<skill/>" status="completed" />);
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("says it is loading, and says when it failed", () => {
+    const { rerender } = render(<LoadSkillResult resultText="" status="running" />);
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+
+    rerender(<LoadSkillResult resultText="" status="error" />);
+    expect(screen.getByText("Failed to load skill.")).toBeInTheDocument();
+  });
+
+  it("reads the skills mapping whether it arrived as an object or as its JSON", () => {
+    const expected = [{ name: "refunds", description: "How refunds work." }];
+
+    expect(parseSkillList({ refunds: "How refunds work." })).toEqual(expected);
+    expect(parseSkillList(JSON.stringify({ refunds: "How refunds work." }))).toEqual(expected);
+    expect(parseSkillList({ refunds: "" })).toEqual([{ name: "refunds", description: null }]);
+  });
+
+  it("treats anything that is not a mapping as no list", () => {
+    expect(parseSkillList("the tool failed")).toBeNull();
+    expect(parseSkillList({})).toBeNull();
+    expect(parseSkillList([{ name: "refunds" }])).toBeNull();
+  });
+
+  it("draws the skill list it was given, and says so when it was empty", () => {
+    const { rerender } = render(<SkillListResult result={{ refunds: "How refunds work." }} />);
+    expect(screen.getByText("refunds")).toBeInTheDocument();
+    expect(screen.getByText("How refunds work.")).toBeInTheDocument();
+
+    rerender(<SkillListResult result={{}} />);
+    expect(screen.getByText("No skills are attached to this agent.")).toBeInTheDocument();
+  });
+});
+
+describe("what a planning call shows", () => {
+  it("draws the checklist the plan came back as", () => {
+    render(
+      <PlanToolResult
+        toolCall={toolCall({ name: "write_plan" })}
+        resultText={"Plan updated: 2 step(s).\n\n1. [x] Read the diff\n2. [~] Ship it"}
+      />,
+    );
+
+    expect(screen.getByText("Read the diff")).toBeInTheDocument();
+    expect(screen.getByLabelText("In progress")).toBeInTheDocument();
+  });
+
+  it("shows the sentence a granular call answered with", () => {
+    // One status changed answers with a line and no checklist; printing "no plan"
+    // there would deny a plan that exists.
+    render(
+      <PlanToolResult
+        toolCall={toolCall({ name: "update_task_status" })}
+        resultText="Updated step 'Ship it' status to 'completed'."
+      />,
+    );
+
+    expect(screen.getByText("Updated step 'Ship it' status to 'completed'.")).toBeInTheDocument();
+  });
+
+  it("says it is running rather than showing an empty plan", () => {
+    render(<PlanToolResult toolCall={toolCall({ status: "running" })} resultText="" />);
+
+    expect(screen.getByText("Running…")).toBeInTheDocument();
+  });
+
+  it("says a planning call failed", () => {
+    render(<PlanToolResult toolCall={toolCall({ status: "error" })} resultText="" />);
+
+    expect(screen.getByText("Tool failed.")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["unfinished", "Did not finish"],
+    ["awaiting_approval", "Waiting for approval"],
+  ] as const)("says a %s planning call is not running", (status, said) => {
+    // A call the turn ended without answering kept "Running…" under the
+    // finished answer, and after a reload as well (#2149).
+    render(<PlanToolResult toolCall={toolCall({ status })} resultText="" />);
+
+    expect(screen.getByText(said)).toBeInTheDocument();
+    expect(screen.queryByText("Running…")).toBeNull();
+  });
+});
+
+describe("the generated speech", () => {
+  const PAYLOAD = JSON.stringify({
+    kind: "generated_speech",
+    filename: "abc123_speech.mp3",
+    url: "/api/v1/generated/abc123_speech.mp3",
+    media_type: "audio/mpeg",
+    voice: "marin",
+    characters: 12,
+  });
+
+  it("addresses the clip through the same-origin proxy, not the backend URL", () => {
+    expect(parseGeneratedSpeech(PAYLOAD)).toEqual({
+      voice: "marin",
+      url: "/api/generated/abc123_speech.mp3",
+    });
+  });
+
+  it("has no URL when the clip was made but not stored", () => {
+    const parsed = parseGeneratedSpeech(
+      JSON.stringify({ kind: "generated_speech", filename: null }),
+    );
+
+    expect(parsed).toEqual({ voice: "", url: null });
+  });
+
+  it("refuses anything that is not that payload", () => {
+    expect(parseGeneratedSpeech("Not spoken: no key")).toBeNull();
+    expect(parseGeneratedSpeech(JSON.stringify({ kind: "generated_image" }))).toBeNull();
+    expect(parseGeneratedSpeech("null")).toBeNull();
+  });
+
+  it("plays the clip where an image would be shown, naming the voice", () => {
+    const { container } = render(<GeneratedSpeechResult data={parseGeneratedSpeech(PAYLOAD)!} />);
+
+    expect(container.querySelector("audio")).toHaveAttribute(
+      "src",
+      "/api/generated/abc123_speech.mp3",
+    );
+    expect(screen.getByText("Voice: marin")).toBeInTheDocument();
+  });
+
+  it("names no voice when none was recorded", () => {
+    const { container } = render(
+      <GeneratedSpeechResult data={{ voice: "", url: "/api/generated/x_speech.mp3" }} />,
+    );
+
+    expect(container.querySelector("figcaption")).toBeNull();
+  });
+
+  it("says the clip was not kept when there is nothing to play", () => {
+    render(<GeneratedSpeechResult data={{ voice: "marin", url: null }} />);
+
+    expect(screen.getByText("The speech was recorded but not saved.")).toBeInTheDocument();
+  });
+});
+
+describe("the generated video", () => {
+  const PAYLOAD = JSON.stringify({
+    kind: "generated_video",
+    filename: "abc123_video.mp4",
+    url: "/api/v1/generated/abc123_video.mp4",
+    media_type: "video/mp4",
+    prompt: "a red bicycle in the rain",
+    seconds: 5,
+  });
+
+  it("addresses the clip through the same-origin proxy, not the backend URL", () => {
+    expect(parseGeneratedVideo(PAYLOAD)).toEqual({
+      prompt: "a red bicycle in the rain",
+      url: "/api/generated/abc123_video.mp4",
+    });
+  });
+
+  it("addresses every kind through the page's link on a hosted page (#2309)", () => {
+    const hosted = { kind: "hosted", publicKey: "pk_abc" } as const;
+    const token = `1792689903.${"c".repeat(64)}`;
+    const signed = (kind: string, filename: string) =>
+      JSON.stringify({ kind, filename, token, prompt: "x", voice: "marin" });
+
+    expect(parseGeneratedVideo(signed("generated_video", "a_video.mp4"), hosted)?.url).toBe(
+      `/api/embed/pk_abc/generated/a_video.mp4?token=${token}`,
+    );
+    expect(parseGeneratedSpeech(signed("generated_speech", "a_speech.mp3"), hosted)?.url).toBe(
+      `/api/embed/pk_abc/generated/a_speech.mp3?token=${token}`,
+    );
+    expect(parseGeneratedImage(signed("generated_image", "a_image.png"), hosted)?.url).toBe(
+      `/api/embed/pk_abc/generated/a_image.png?token=${token}`,
+    );
+  });
+
+  it("has no URL when the clip was made but not stored", () => {
+    expect(
+      parseGeneratedVideo(JSON.stringify({ kind: "generated_video", filename: null })),
+    ).toEqual({
+      prompt: "",
+      url: null,
+    });
+  });
+
+  it("refuses anything that is not that payload", () => {
+    expect(parseGeneratedVideo("Not made: no key")).toBeNull();
+    expect(parseGeneratedVideo(JSON.stringify({ kind: "generated_image" }))).toBeNull();
+    expect(parseGeneratedVideo("null")).toBeNull();
+  });
+
+  it("plays the clip where an image would be shown, captioned by its prompt", () => {
+    const { container } = render(<GeneratedVideoResult data={parseGeneratedVideo(PAYLOAD)!} />);
+
+    expect(container.querySelector("video")).toHaveAttribute(
+      "src",
+      "/api/generated/abc123_video.mp4",
+    );
+    expect(screen.getByText("a red bicycle in the rain")).toBeInTheDocument();
+  });
+
+  it("has no caption when the prompt is empty", () => {
+    const { container } = render(
+      <GeneratedVideoResult data={{ prompt: "", url: "/api/generated/x_video.mp4" }} />,
+    );
+
+    expect(container.querySelector("figcaption")).toBeNull();
+  });
+
+  it("says the clip was not kept when there is nothing to play", () => {
+    render(<GeneratedVideoResult data={{ prompt: "x", url: null }} />);
+
+    expect(screen.getByText("The video was made but not saved.")).toBeInTheDocument();
+  });
+});
+
+describe("a desktop screenshot the agent kept", () => {
+  const PAYLOAD = JSON.stringify({
+    kind: "desktop_screenshot",
+    filename: "abc123_image.png",
+    url: "/api/v1/generated/abc123_image.png",
+    caption: "The page after the click",
+    width: 2560,
+    height: 1600,
+    workspace_path: null,
+  });
+
+  it("is read through the same-origin proxy, captioned as the agent wrote it", () => {
+    expect(parseDesktopScreenshot(PAYLOAD)).toEqual({
+      caption: "The page after the click",
+      url: "/api/generated/abc123_image.png",
+    });
+  });
+
+  it("has no URL and no caption where none were given", () => {
+    const parsed = parseDesktopScreenshot(
+      JSON.stringify({ kind: "desktop_screenshot", filename: null }),
+    );
+
+    expect(parsed).toEqual({ caption: "", url: null });
+  });
+
+  it("refuses anything that is not that payload", () => {
+    expect(parseDesktopScreenshot("The desktop did not return a screenshot.")).toBeNull();
+    expect(parseDesktopScreenshot(JSON.stringify({ kind: "generated_image" }))).toBeNull();
+    expect(parseDesktopScreenshot("null")).toBeNull();
+  });
+
+  it("shows the screenshot, opening it at full size in a tab of its own", () => {
+    render(<DesktopScreenshotResult data={parseDesktopScreenshot(PAYLOAD)!} />);
+
+    const image = screen.getByRole("img", { name: "The page after the click" });
+    expect(image).toHaveAttribute("src", "/api/generated/abc123_image.png");
+    expect(image.closest("a")).toHaveAttribute("href", "/api/generated/abc123_image.png");
+    expect(image.closest("a")).toHaveAttribute("target", "_blank");
+    expect(screen.getByText("The page after the click")).toBeInTheDocument();
+  });
+
+  it("draws no caption it was not given", () => {
+    const { container } = render(
+      <DesktopScreenshotResult data={{ caption: "", url: "/api/generated/x.png" }} />,
+    );
+
+    expect(container.querySelector("img")).toHaveAttribute("src", "/api/generated/x.png");
+    expect(container.querySelector("figcaption")).toBeNull();
+  });
+
+  it("says so when there is nothing to show", () => {
+    render(<DesktopScreenshotResult data={{ caption: "", url: null }} />);
+
+    expect(screen.getByText("The screenshot was taken but not stored.")).toBeInTheDocument();
+  });
+});

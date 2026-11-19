@@ -1,0 +1,336 @@
+import logging
+from datetime import UTC, datetime
+from uuid import UUID
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.audit import record_audit
+from app.core.exceptions import AuthorizationError, BadRequestError, NotFoundError
+from app.core.permissions import Perm, assignable_roles, role_has
+from app.db.models.organization import MembershipSource, OrganizationMember, OrgRole
+from app.repositories import (
+    api_key_repo,
+    group_repo,
+    member_repo,
+    oauth_repo,
+    organization_repo,
+    resource_grant_repo,
+    user_repo,
+)
+from app.services.organization import OrganizationService
+
+logger = logging.getLogger(__name__)
+
+
+async def end_membership(db: AsyncSession, membership: OrganizationMember) -> None:
+    """Remove a membership and every credential that acted through it.
+
+    Keys and connected apps are revoked with it, in the same transaction. Left
+    active, a missing membership only refused them for now - inviting the person
+    back would have woken every old key, and any copy of one, under the new role.
+    """
+    at = datetime.now(UTC)
+    organization_id, user_id = membership.organization_id, membership.user_id
+    await group_repo.delete_memberships_in_org(db, organization_id=organization_id, user_id=user_id)
+    await oauth_repo.revoke_grants_for_member(
+        db, organization_id=organization_id, user_id=user_id, at=at
+    )
+    await api_key_repo.revoke_for_member(
+        db, organization_id=organization_id, user_id=user_id, at=at
+    )
+    await member_repo.delete(db, membership)
+    # The editor keeps what they could always do on the leaver's pages; only the owner's
+    # standing consent to their republishes goes with the owner.
+    await resource_grant_repo.lower_edit_data(
+        db, organization_id=organization_id, owner_user_id=user_id
+    )
+
+
+class MemberService:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def list_for_org(
+        self,
+        organization_id: UUID,
+        requester_id: UUID,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> tuple[list[tuple[OrganizationMember, str, str | None, str | None, int | None, bool]], int]:
+        """List members with their joined user info and whether the caller may
+        change each one's role. Any org member may list."""
+        membership = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=requester_id
+        )
+        if not membership:
+            raise NotFoundError(
+                message="Organization not found", details={"org_id": str(organization_id)}
+            )
+
+        rows = await member_repo.list_for_org(self.db, organization_id, skip=skip, limit=limit)
+        total = await member_repo.count_for_org(self.db, organization_id)
+        # Whether the requester may change each member's role, decided here rather
+        # than in the client: the rule is catalog-derived (`assignable_roles`), so
+        # a client reimplementing it would drift, and a selector offered on a row
+        # the server then refuses is a control whose only result is a 403 (#700).
+        # The same two checks `change_role` makes - the requester holds
+        # `roles:manage`, and their role strictly outranks the target's current
+        # one. An Owner target is excluded because no role assigns `owner`.
+        may_manage = role_has(membership.role, Perm.ROLES_MANAGE)
+        assignable = assignable_roles(membership.role)
+        rows_with_flag = [(*row, may_manage and row[0].role in assignable) for row in rows]
+        return rows_with_flag, total
+
+    async def change_role(
+        self,
+        organization_id: UUID,
+        target_user_id: UUID,
+        new_role: str,
+        requester_id: UUID,
+    ) -> tuple[OrganizationMember, str, str | None, str | None, int | None]:
+        """Change a member's role.
+
+        Rules:
+        - The requester needs `roles:manage`.
+        - They may only touch a member their own role strictly outranks, and only
+          assign a role their own strictly outranks - both
+          :func:`app.core.permissions.assignable_roles`. So no requester hands out
+          `owner` or promotes a peer to their own level, and no Admin demotes a
+          peer Admin (the same authority `remove` refuses to let one Admin take).
+        - OWNER cannot be demoted via this method (use transfer_ownership).
+        - A directory-managed membership becomes a manual one: the role an
+          administrator chose outlives the next directory sign-in, which only
+          rewrites roles the directory set itself (#1773).
+        """
+        requester = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=requester_id
+        )
+        # `roles:manage`, not `members:manage`: assigning a role is deciding
+        # what someone may do, which is a different entitlement from adding and
+        # removing people. The built-in roles hold both, so nothing changes for
+        # them - but a custom role (Phase 2) must be able to take one without
+        # the other.
+        if not requester or not role_has(requester.role, Perm.ROLES_MANAGE):
+            raise AuthorizationError(message="You cannot change member roles")
+
+        # Locked for the rest of this transaction: the role checked below is the
+        # one being replaced. Without the lock an Owner could promote this target
+        # between the check and the write, and this update would overwrite the
+        # promotion with a role the requester no longer outranks (#700).
+        target = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=target_user_id, for_update=True
+        )
+        if not target:
+            raise NotFoundError(
+                message="Member not found", details={"user_id": str(target_user_id)}
+            )
+
+        if target.role == OrgRole.OWNER.value:
+            raise BadRequestError(message="Use transfer-ownership to change the Owner role")
+
+        # Whose role may be touched, not only which role may be offered. The
+        # ceiling below bounds the *new* role; without this, an Admin could demote
+        # a peer Admin to Viewer - stripping the authority `remove` refuses to let
+        # one Admin take from another (#700). A member is only administrable by a
+        # role that strictly outranks their current one, which is what
+        # `assignable_roles` already means, so the Admin-vs-Admin rule is the same
+        # rule as the assignment ceiling rather than a second one beside it.
+        if target.role not in assignable_roles(requester.role):
+            raise AuthorizationError(
+                message="You cannot change the role of a member your own does not outrank",
+                details={"target_role": target.role},
+            )
+
+        if new_role not in assignable_roles(requester.role):
+            raise AuthorizationError(
+                message="You cannot assign a role your own does not outrank",
+                details={"role": new_role},
+            )
+
+        previous_role = target.role
+        previous_source = target.source
+        updated = await member_repo.update_role(
+            self.db, target, role=new_role, source=MembershipSource.MANUAL
+        )
+        await record_audit(
+            self.db,
+            actor_user_id=requester_id,
+            organization_id=organization_id,
+            action="member.role_changed",
+            target_type="member",
+            target_id=str(target_user_id),
+            details={"from": previous_role, "to": new_role, "source_was": previous_source},
+        )
+        user = await user_repo.get_by_id(self.db, updated.user_id)
+        email = user.email if user else ""
+        full_name = user.full_name if user else None
+        avatar_url = user.avatar_url if user else None
+        avatar_color = user.avatar_color if user else None
+        return updated, email, full_name, avatar_url, avatar_color
+
+    async def remove(
+        self,
+        organization_id: UUID,
+        target_user_id: UUID,
+        requester_id: UUID,
+    ) -> None:
+        """Remove a member from the org.
+
+        Rules:
+        - OWNER or ADMIN may remove members.
+        - ADMIN cannot remove another ADMIN or OWNER.
+        - Last OWNER cannot be removed.
+        """
+        requester = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=requester_id
+        )
+        if not requester or not role_has(requester.role, Perm.MEMBERS_MANAGE):
+            raise AuthorizationError(message="You cannot remove members")
+
+        # Locked for the same reason `change_role` locks: the role read here is
+        # what decides the refusal below, and the row is written (deleted) after
+        # it. Without the lock an Owner promoting this target between the check and
+        # the delete leaves an Admin removing a member who is, by the time the row
+        # goes, a peer Admin - the authority the last rule in this method exists to
+        # protect. Found sweeping the sibling of the lock #700 added.
+        target = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=target_user_id, for_update=True
+        )
+        if not target:
+            raise NotFoundError(
+                message="Member not found", details={"user_id": str(target_user_id)}
+            )
+
+        if target.role == OrgRole.OWNER.value:
+            owners = await self._count_owners(organization_id)
+            if owners <= 1:
+                raise BadRequestError(
+                    message="Cannot remove the last Owner. Transfer ownership first."
+                )
+            if requester.role != OrgRole.OWNER.value:
+                raise AuthorizationError(message="Only an Owner can remove another Owner")
+        # Every other target is administrable only by a role that strictly
+        # outranks their current one - the catalog-derived ceiling `change_role`
+        # applies, so a custom role that does not outrank an Admin cannot remove
+        # one either, rather than the literal `admin`-vs-`admin` rule that left
+        # that hole open on this side (#700, #1066). The Owner case is decided
+        # above, because an Owner may remove a peer Owner and `assignable_roles`
+        # never offers Owner.
+        elif target.role not in assignable_roles(requester.role):
+            raise AuthorizationError(
+                message="You cannot remove a member your own role does not outrank",
+                details={"target_role": target.role},
+            )
+
+        removed_role = target.role
+        await end_membership(self.db, target)
+        await record_audit(
+            self.db,
+            actor_user_id=requester_id,
+            organization_id=organization_id,
+            action="member.removed",
+            target_type="member",
+            target_id=str(target_user_id),
+            details={"role": removed_role},
+        )
+
+    async def leave(self, organization_id: UUID, requester_id: UUID) -> None:
+        """Current user leaves the org.
+
+        OWNER must transfer ownership first (unless they are the last member - then delete org).
+        """
+        membership = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=requester_id
+        )
+        if not membership:
+            raise NotFoundError(
+                message="Organization not found", details={"org_id": str(organization_id)}
+            )
+
+        if membership.role == OrgRole.OWNER.value:
+            total = await member_repo.count_for_org(self.db, organization_id)
+            if total > 1:
+                raise BadRequestError(message="Transfer ownership before leaving the organization")
+
+        await end_membership(self.db, membership)
+
+    async def transfer_ownership(
+        self,
+        organization_id: UUID,
+        new_owner_user_id: UUID,
+        requester_id: UUID,
+    ) -> None:
+        """Transfer OWNER role to another member.
+
+        Only the current OWNER may call this.
+
+        The deployment's ceiling on organizations owned per account is checked
+        against the *new* owner, because this is a transition into the counted state
+        and a ceiling enforced on `OrganizationService.create` alone is one an
+        account at its limit walks past by being handed somebody else's
+        organization.
+
+        Raises:
+            AuthorizationError: The requester is not the Owner.
+            BadRequestError: The requester named themselves, or the new owner
+                already owns as many organizations as the deployment allows.
+            NotFoundError: The named user is not a member of this organization.
+        """
+        requester = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=requester_id
+        )
+        if not requester or not role_has(requester.role, Perm.ORG_DELETE):
+            raise AuthorizationError(message="Only the Owner can transfer ownership")
+
+        if new_owner_user_id == requester_id:
+            raise BadRequestError(message="Cannot transfer ownership to yourself")
+
+        # A personal organization is 1:1 with its creator; handing it to another
+        # member leaves it owned by someone who is not the creator, which
+        # `UserService._release_owned_rows` excludes from its ownerless-org guard -
+        # so deleting that member would orphan it (#1136).
+        org = await organization_repo.get_by_id(self.db, organization_id)
+        if org is not None and org.is_personal:
+            raise BadRequestError(message="A personal organization cannot change owner")
+
+        # Serialize with account deletion: deleting a user takes FOR UPDATE on
+        # their row (#1115). Promoting them here without conflicting with that lock
+        # could hand ownership to a membership the deletion cascade is about to
+        # remove, leaving the org with no owner (#1136). Locking the incoming
+        # owner's row makes a transfer that races their deletion wait, then find
+        # them gone at the membership check below.
+        await user_repo.get_by_id_for_update(self.db, new_owner_user_id)
+
+        new_owner = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=new_owner_user_id
+        )
+        if not new_owner:
+            raise NotFoundError(
+                message="Target user is not a member of this organization",
+                details={"user_id": str(new_owner_user_id)},
+            )
+
+        await OrganizationService(self.db).refuse_past_the_ceiling(new_owner_user_id)
+        await member_repo.update_role(self.db, requester, role=OrgRole.ADMIN.value)
+        # Manual as well as owner: the directory sync never touches an owner, and
+        # a membership it made must not read as one it still maintains.
+        await member_repo.update_role(
+            self.db, new_owner, role=OrgRole.OWNER.value, source=MembershipSource.MANUAL
+        )
+        logger.info(
+            "Ownership transferred in org %s from user %s to user %s",
+            organization_id,
+            requester_id,
+            new_owner_user_id,
+        )
+
+    async def _count_owners(self, organization_id: UUID) -> int:
+        result = await self.db.execute(
+            select(func.count(OrganizationMember.id)).where(
+                OrganizationMember.organization_id == organization_id,
+                OrganizationMember.role == OrgRole.OWNER.value,
+            )
+        )
+        return result.scalar() or 0

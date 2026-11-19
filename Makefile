@@ -1,0 +1,1137 @@
+.PHONY: ci-test-db-configure test-frontend-jobs-check test-frontend-reports-check test-frontend-merge build-frontend-pack docker-test-db docker-test-db-down docker-minio install format lint desktop-dev desktop-build desktop-check mobile-android mobile-ios mobile-check lint-backend lint-frontend check audit licenses licenses-check build-frontend test run clean help sandbox-token sandbox-runtimes deps-upgrade deps-upgrade-all db-init dev dev-down dev-logs dev-rebuild dev-frontend docker-clean dev-server dev-server-down dev-server-logs dev-server-frontend stage stage-down prod prod-down prod-frontend upgrade upgrade-dry-run upgrade-new-features upgrade-finalize docs docs-build docs-slug-check presentation audit-frontend sbom
+
+# === Environments ===========================================================
+# Three. The images are published to GHCR by `.github/workflows/images.yml`
+# (`ghcr.io/vstorm-co/agenticos-backend` and `-frontend`); every environment but
+# the laptop pulls them, and the laptop builds the same Dockerfiles from the tree:
+#
+#   make dev         local, on a laptop    docker-compose.yml
+#                                          + docker-compose.override.yml (source)
+#   make dev-server  the dev server        docker-compose-dev.yml
+#                                          docker-compose-dev.frontend.yml
+#   make prod        production            docker-compose-prod.yml
+#                                          docker-compose-prod.frontend.yml
+#
+# `docker-compose.yml` on its own - in an empty directory, no clone - is the
+# product from the published images, console included. In a clone Compose merges
+# the override over it by itself, which bind-mounts the source and reloads; the
+# console goes behind the `console` profile there so `bun dev` keeps :3000.
+# The other two publish no database port and want a reverse proxy in front
+# (nginx/nginx.conf). Each has matching -down / -logs / -frontend siblings, and
+# every one runs the migrations itself through the `migrate` service.
+COMPOSE_LOCAL := -f docker-compose.yml -f docker-compose.override.yml
+
+# Which optional compose profiles `make dev` brings up. The sandbox service is
+# on by default so an agent can be given a container without anybody reading a
+# setup guide first — it is also the one service that mounts the Docker socket,
+# so a host that will not have that removes `sandbox` from here.
+COMPOSE_DEV_PROFILES ?= --profile sandbox
+
+# Docker Desktop proxies the socket through its VM as group 0; the Mac's
+# symlink/socket group is unrelated. Linux uses the socket's actual owner.
+# Keep an explicit environment or command-line override for custom daemons.
+export DOCKER_GID ?= $(shell if [ "$$(uname -s)" = Linux ]; then stat -Lc '%g' /var/run/docker.sock 2>/dev/null; else echo 0; fi)
+
+# The sandbox service refuses to start without a token, deliberately: it can run
+# commands on this host, so an empty default would be a shared secret of "".
+# Generated into backend/.env once, and left alone afterwards — regenerating it
+# would orphan every workspace the service is currently holding.
+sandbox-token:
+	@if grep -q '^SANDBOXD_TOKEN=.' backend/.env 2>/dev/null; then \
+		echo "SANDBOXD_TOKEN already set in backend/.env"; \
+	else \
+		token=$$(python3 -c "import secrets; print(secrets.token_urlsafe(32))"); \
+		printf '\n# Authorises opening a sandbox session, and a session runs commands\n# on this host. Treat it like the Docker socket it sits in front of.\nSANDBOXD_TOKEN=%s\n' "$$token" >> backend/.env; \
+		echo "▶ Generated SANDBOXD_TOKEN in backend/.env"; \
+	fi
+
+# The runtime allowlist the compose files hand the sandbox service, written from
+# backend/app/core/catalog/sandbox_runtimes.json. Run it after editing that file;
+# `backend/tests/test_sandbox_runtime_catalog.py` is what fails when nobody did.
+sandbox-runtimes:
+	cd backend && uv run agenticos cmd sandbox-runtimes --write
+
+# === Local dev: build → up → migrate ===
+# Idempotent — re-run anytime. Migrations are no-ops when already at head;
+# admin seeding is a separate target (`make seed`) so re-running `make dev`
+# doesn't keep retrying user creation.
+# `up` pulls an image it does not build only when that tag is not on the host. That
+# is enough because the images are pinned to exact versions: a bump is a new tag,
+# so it reaches a laptop on the next `make dev`. A moving tag would not - a cached
+# `sandboxd:0.2` once served an older API than the backend's client spoke, and
+# every command failed as a lost session (#2484). `--pull missing` would add
+# nothing, and would override `pull_policy: never` on the images built here.
+dev: sandbox-token
+	@echo "▶ Building the backend image and starting the stack (migrations run as the \`migrate\` service)…"
+	@if ! docker compose $(COMPOSE_LOCAL) $(COMPOSE_DEV_PROFILES) up -d --build; then \
+		echo ""; \
+		echo "⚠ First start failed. Tearing down stale containers and retrying once…"; \
+		echo "  (volumes preserved — DB data is safe; use 'make docker-clean' for a full wipe)"; \
+		docker compose $(COMPOSE_LOCAL) down --remove-orphans; \
+		docker compose $(COMPOSE_LOCAL) $(COMPOSE_DEV_PROFILES) up -d --build; \
+	fi
+	@echo ""
+	@echo "🚀 Dev stack ready:"
+	@echo "   API:      http://localhost:8000"
+	@echo "   Docs:     http://localhost:8000/docs"
+	@echo "   Admin:    http://localhost:8000/admin"
+	@echo "   Frontend: http://localhost:3000  (run 'make dev-frontend' or 'cd frontend && bun dev')"
+	@echo ""
+	@echo "First time? Run 'make platform-bootstrap BOOTSTRAP_API_KEY=sk-...' —"
+	@echo "an organization, an owner, a model and a published agent in one step."
+	@echo "('make seed' is the older path: an admin login and nothing else.)"
+
+# === First-time setup: seed default admin user (one-shot) ===
+# Skipped when admin@example.com already exists. Safe to run again — exits
+# clean either way. Replace email/password before deploying anywhere real.
+seed:
+	@echo "▶ Seeding admin user (admin@example.com / admin123)…"
+	@if docker compose $(COMPOSE_LOCAL) exec -T app \
+		agenticos user list 2>/dev/null \
+		| grep -q "admin@example.com"; then \
+		echo "  (admin@example.com already exists — nothing to do)"; \
+	else \
+		docker compose $(COMPOSE_LOCAL) exec -T app \
+			agenticos user create \
+				--email admin@example.com --password admin123 --superuser \
+		&& echo "  ✅ Admin created. Login at http://localhost:8000/admin"; \
+	fi
+
+# Convenience: bootstrap a fresh checkout end-to-end.
+# Fresh install -> a running agent. Idempotent: safe to re-run.
+# Pass a key to make the demo agent actually answerable:
+#   make platform-bootstrap BOOTSTRAP_API_KEY=sk-...
+platform-bootstrap:
+	docker compose $(COMPOSE_LOCAL) exec -T \
+		-e BOOTSTRAP_API_KEY=$(BOOTSTRAP_API_KEY) app \
+		agenticos cmd bootstrap
+
+bootstrap: dev seed
+
+dev-down:
+	docker compose $(COMPOSE_LOCAL) $(COMPOSE_DEV_PROFILES) --profile console down
+
+# Full wipe — containers, networks, AND volumes. Use after a corrupted state
+# (e.g. detached networks, port conflicts that left orphans). DESTROYS DB data.
+docker-clean:
+	@echo "▶ Removing containers, networks, AND volumes for the dev stack…"
+	@echo "  ⚠️  This deletes all local DB data and uploaded files."
+	docker compose $(COMPOSE_LOCAL) $(COMPOSE_DEV_PROFILES) --profile console down -v --remove-orphans
+	@echo "✅ Cleaned. Run 'make dev' to start fresh."
+
+dev-logs:
+	docker compose $(COMPOSE_LOCAL) $(COMPOSE_DEV_PROFILES) --profile console logs -f
+
+dev-rebuild:
+	docker compose $(COMPOSE_LOCAL) build --no-cache app
+	docker compose $(COMPOSE_LOCAL) up -d --force-recreate app
+
+# Naming the service enables its `console` profile; `--no-deps` keeps `--build`
+# from rebuilding the backend image on the way, since `make dev` owns that.
+dev-frontend:
+	docker compose $(COMPOSE_LOCAL) up -d --build --no-deps frontend
+	@echo ""
+	@echo "✅ Frontend at http://localhost:3000  (backend must be up — 'make dev')"
+
+# === Dev server: a deployed environment, published images, no bind mounts ===
+# Not a laptop. Needs backend/.env with POSTGRES_PASSWORD and REDIS_PASSWORD;
+# neither has a default here, because a shared environment reachable with
+# `postgres/postgres` is not one you want. Pulls `edge` - whatever `main` last
+# published - unless backend/.env pins `AGENTICOS_VERSION`.
+dev-server:
+	@test -f backend/.env || (echo "❌ backend/.env missing — cp backend/.env.example backend/.env and fill it in" && exit 1)
+	docker compose --env-file backend/.env -f docker-compose-dev.yml pull
+	docker compose --env-file backend/.env -f docker-compose-dev.yml up -d
+	@echo "✅ Dev-server stack up on :8000 — put a reverse proxy in front of it"
+
+dev-server-frontend:
+	@test -f backend/.env || (echo "❌ backend/.env missing" && exit 1)
+	docker compose --env-file backend/.env -f docker-compose-dev.frontend.yml pull
+	docker compose --env-file backend/.env -f docker-compose-dev.frontend.yml up -d
+	@echo "✅ Dev-server frontend on :3000 (PUBLIC_* are read at start — a change is a restart)"
+
+dev-server-down:
+	docker compose --env-file backend/.env -f docker-compose-dev.yml down
+	docker compose --env-file backend/.env -f docker-compose-dev.frontend.yml down 2>/dev/null || true
+
+dev-server-logs:
+	docker compose --env-file backend/.env -f docker-compose-dev.yml logs -f
+
+# `make stage` was this file's old name for the dev server. Kept so an existing
+# habit or script does not silently do nothing.
+stage: dev-server
+stage-down: dev-server-down
+
+# === Production ===
+#
+# Two ways in, and `PROXY=traefik` is the difference. Without it the stack
+# publishes both ports on the loopback and a reverse proxy on the host reaches
+# them - `nginx/nginx.conf` is that template. With it, the containers join an
+# existing Traefik's network and carry the labels it discovers them by, which is
+# the shorter path where Traefik is already running. See docs/deploy.md.
+PROD_FILES := -f docker-compose-prod.yml $(if $(filter traefik,$(PROXY)),-f docker-compose-prod.traefik.yml)
+# A project of its own, and this one is not tidiness. Compose derives the project
+# name from the directory, so both invocations were `agenticos` - and the
+# frontend one then reported the five backend containers as **orphans**, with
+# compose's own suggestion to "run this command with the --remove-orphans flag to
+# clean it up". Following that advice takes the API, the database, Redis and the
+# worker down. The volumes survive; nothing else does.
+PROD_FRONTEND_FILES := -p agenticos-frontend -f docker-compose-prod.frontend.yml $(if $(filter traefik,$(PROXY)),-f docker-compose-prod.frontend.traefik.yml)
+PROD_PROXY_NOTE := $(if $(filter traefik,$(PROXY)),Traefik routes it once the certificate is issued,configure your nginx host with nginx/nginx.conf)
+
+# Pulls `latest` unless backend/.env pins `AGENTICOS_VERSION` - pin it on a host
+# you care about. The migrations are the `migrate` service the API waits on.
+prod:
+	@test -f backend/.env || (echo "❌ backend/.env missing — run 'cp backend/.env.example backend/.env' and fill in real secrets" && exit 1)
+	docker compose --env-file backend/.env $(PROD_FILES) pull
+	docker compose --env-file backend/.env $(PROD_FILES) up -d
+	@echo "✅ Production stack up — $(PROD_PROXY_NOTE)"
+
+prod-frontend:
+	@test -f backend/.env || (echo "❌ backend/.env missing" && exit 1)
+	docker compose --env-file backend/.env $(PROD_FRONTEND_FILES) pull
+	docker compose --env-file backend/.env $(PROD_FRONTEND_FILES) up -d
+	@echo "✅ Production frontend up"
+
+prod-down:
+	docker compose --env-file backend/.env $(PROD_FRONTEND_FILES) down 2>/dev/null || true
+	docker compose --env-file backend/.env $(PROD_FILES) down
+
+prod-logs:
+	docker compose --env-file backend/.env $(PROD_FILES) logs -f
+
+# Legacy alias
+quickstart: dev
+
+# === Setup ===
+# Both halves of the toolchain, because `check` runs both. eslint, prettier, tsc,
+# vitest and next all live in `frontend/node_modules` and nowhere else, so a setup
+# that installs only the backend leaves `lint`, `lint-frontend`, `test-frontend`,
+# `build-frontend` and therefore `check` failing with `eslint: command not found`
+# - and `check` runs the backend half first, so it says so four minutes in.
+# `node_modules` is per-checkout and not shared between worktrees, which is why
+# this is owed on every clone rather than once a laptop.
+#
+# `backend/.env` is the third thing a fresh checkout is missing. It is not
+# tracked - it holds credentials - and everything that runs on the *host* reads
+# it: `db-check`, `db-upgrade`, `run`, and pytest through `app.core.config`.
+# Without one `POSTGRES_PASSWORD` defaults to empty and `alembic check` is
+# refused with `fe_sendauth: no password supplied`, four minutes into `check`.
+# Copied from the example rather than generated, so there is one definition of
+# the defaults, and never overwritten: the file that exists holds somebody's
+# keys.
+#
+# It runs last on purpose. It is the step most likely to fail on a given machine -
+# no network, a proxy, a lockfile wanting a newer bun - and make stops at the first
+# line that fails, so in front of the hooks it would leave somebody with no
+# `commit-msg` hook and nothing refusing a commit on `main`, for a reason whose
+# error message was about bun.
+install:
+	@if [ -f backend/.env ]; then \
+		echo "backend/.env already exists - leaving it alone"; \
+	else \
+		cp backend/.env.example backend/.env; \
+		echo "▶ Created backend/.env from backend/.env.example"; \
+	fi
+	uv sync --directory backend --dev
+	@if git rev-parse --git-dir > /dev/null 2>&1; then \
+		uv run --project backend pre-commit install --hook-type pre-commit --hook-type commit-msg; \
+	else \
+		echo "⚠️  Not a git repository - skipping pre-commit install"; \
+		echo "   Run 'git init && make install' to set up pre-commit hooks"; \
+	fi
+	cd frontend && bun install --frozen-lockfile
+	cd desktop && bun install --frozen-lockfile
+	cd mobile && bun install --frozen-lockfile
+	@echo ""
+	@echo "✅ Installation complete!"
+	@echo ""
+	@echo "Next steps:"
+	@echo "  • make docker-db        # Start PostgreSQL"
+	@echo "  • make db-upgrade       # Apply migrations"
+	@echo "  • make run              # Start development server"
+	@echo ""
+	@echo "Note: backend/.env now holds the development defaults - edit it to"
+	@echo "      point at another database or to add a provider key on the host."
+
+# === Template upgrade — removed ===
+# `.fastapi-fullstack.json` held the generator state these targets merged
+# against: template ref, commit and the context hash. It is deleted, so the
+# 3-way merge has no base and `uvx fastapi-fullstack upgrade` cannot run.
+#
+# That is deliberate. This codebase has diverged from the template far past the
+# point where a merge helps — the agent runtime, the permission catalog, the
+# vault and the capability registry have no counterpart upstream, and a 3-way
+# merge against a generator that knows none of them produces conflicts in every
+# file worth keeping. Cherry-pick from the template repository by hand instead.
+#
+# The targets are kept as errors rather than deleted so `make upgrade` explains
+# itself instead of answering "No rule to make target".
+upgrade upgrade-dry-run upgrade-new-features upgrade-finalize:
+	@echo "❌ Template upgrades were removed with .fastapi-fullstack.json."
+	@echo "   This project has diverged from the generator; cherry-pick from"
+	@echo "   github.com/vstorm-co/full-stack-ai-agent-template by hand."
+	@exit 1
+
+# === Dependencies ===
+# Nothing is capped, so the lockfile is what holds versions still. Two targets:
+# `deps-upgrade` moves the four frameworks this platform tracks, which is the
+# one you want mid-week; `deps-upgrade-all` moves everything, which is what the
+# `dependency-freshness` workflow runs on a schedule. Either way the upgrade is
+# only done when the suite still passes.
+FRAMEWORKS := fastapi pydantic-ai-slim pydantic-ai-skills logfire genai-prices
+
+deps-upgrade:
+	uv lock --directory backend $(foreach p,$(FRAMEWORKS),--upgrade-package $(p))
+	uv sync --directory backend --dev
+	@uv run --directory backend python -c "import fastapi, logfire, genai_prices, pydantic_ai; \
+		print(f'fastapi {fastapi.__version__} | logfire {logfire.__version__} | pydantic-ai {pydantic_ai.__version__}')"
+	@echo "▶ Now run 'make test' — an upgrade that breaks the suite is not done."
+
+# Everything, not just the four - the same thing the scheduled freshness job
+# does, so a red issue from it reproduces here. Expect more fallout.
+deps-upgrade-all:
+	uv lock --directory backend --upgrade
+	uv sync --directory backend --dev
+	cd frontend && bun update
+	@echo "▶ Now run 'make check'."
+
+# === Code Quality ===
+# Every static check: both halves of the repository, plus the one check that
+# reads the whole tree at once. CI splits the halves across two jobs (`lint` and
+# the first three steps of `test-frontend`) because they need different
+# toolchains; here they are one command with callable parts, so a Python-only
+# change can run `lint-backend` and skip a minute of eslint.
+#
+# The frontend half was missing entirely until #143: `make lint` ran ruff, ty and
+# the guard scripts, while CI additionally ran eslint, prettier and tsc - so
+# `make lint` passed on a branch with a type error in a `.tsx`, and AGENTS.md's
+# "ruff + ty + eslint + tsc" described a command that ran half of that.
+lint: lint-backend lint-frontend lint-spelling lint-precommit
+
+# `ruff check .` from `backend/` reads every tracked tree there - app, tests, cli
+# and alembic - rather than the three named paths it used to, which left the nine
+# migrations and this repo's guard scripts linted by nothing (#229). `../scripts`
+# is the repository-root `scripts/` (the guards that gate every PR), which lives
+# outside `backend/` and so is a fourth path rather than a second invocation; its
+# relaxations are declared in `pyproject.toml` under `../scripts/**`.
+lint-backend:
+	uv run --directory backend ruff check . ../scripts ../deploy/updater
+	uv run --directory backend ruff format . ../scripts ../deploy/updater --check
+	uv run --directory backend ty check
+	uv run --directory backend vulture
+	uv run --directory backend deptry app cli alembic
+	# Through the pinned interpreter for all five, not whatever `python3`
+	# resolves to on the host: `check_routes.py`'s isinstance union check
+	# needs 3.10+, and a system Python older than the backend's own pin
+	# crashed it with a bare TypeError while the others happened to
+	# still work - until the next one written this way needs 3.10+ too.
+	uv run --directory backend python3 ../scripts/check_backticks.py
+	uv run --directory backend python3 ../scripts/check_routes.py
+	uv run --directory backend python3 ../scripts/check_comments.py
+	uv run --directory backend python3 ../scripts/check_docs_paragraphs.py
+	uv run --directory backend python3 ../scripts/check_docs_i18n.py
+
+# Unused functions and methods, reported rather than gated. `make lint` runs
+# vulture at a confidence high enough to be a gate (unused variables and
+# parameters, near-zero false positives); this lowers it to reach unused
+# functions too, which on a registry-driven codebase come with false positives -
+# a CLI command, a capability hook, a route handler - that a human reads before
+# deleting. The same role dependency-freshness plays for dependencies. See
+# [tool.vulture] in backend/pyproject.toml.
+#
+# The frontend half is knip's *full* report, and stays a report: on a
+# design-system codebase it flags the whole UI-primitive barrel and every
+# exported type it cannot trace a use for, so `frontend/knip.jsonc` narrows it to
+# what is worth reading and the rest is read by eye. Its one unambiguous half -
+# a declared dependency nothing imports - is a gate instead, in `lint-frontend`.
+dead-code:
+	uv run --directory backend vulture --min-confidence 60
+	cd frontend && bunx knip --no-progress
+
+# The i18n guard is the fourth step and belongs here rather than beside the Python
+# ones: since #395 it *is* TypeScript, reading `frontend/src` through
+# `ts.createSourceFile` instead of ten regexes over source text. It runs last because
+# it is the slowest of the four and the other three answer faster on a typo.
+#
+# `lint:deps` is knip narrowed to the one thing it is never wrong about: a
+# package declared in `package.json` that nothing imports, and the reverse.
+# It gates because the alternative was measured - `date-fns` was declared,
+# imported nowhere, and *listed in knip's own ignores*, so the report that
+# would have found it had been told not to (#156). The rest of knip's output
+# needs a human and stays in `make dead-code`.
+lint-frontend:
+	cd frontend && bun run lint
+	cd frontend && bunx prettier --check "scripts/**/*.ts" "src/**/*.{ts,tsx}" "e2e/**/*.ts"
+	cd frontend && bun run type-check
+	cd frontend && bun run check:i18n
+	cd frontend && bun run lint:deps
+
+# Spelling, over every tracked file rather than the ones a commit happens to
+# touch. The hook alone only ever reads changed files, so a misspelling that
+# lands with its file sits there until somebody edits that file for an unrelated
+# reason - and their commit is then refused by a word they did not write. That is
+# #188: one misspelled word reached `main` with #119, and what found it was a
+# person running the hook by hand while reconciling `make check` with CI for #143
+# - not any gate. (Spelling the word here would fail this very check.)
+#
+# It runs the hook rather than codespell directly, because a second invocation
+# would mean a second version pin and a second copy of the exclude list. The rev
+# in `.pre-commit-config.yaml` and the ignore list in `.codespellrc` stay the only
+# definitions; this target just points them at the whole tree.
+#
+# `--project backend`, not `--directory backend` as the targets above use: the
+# second changes directory, and pre-commit would then look for its config and its
+# git tree inside `backend/`.
+lint-spelling:
+	uv run --project backend pre-commit run codespell --all-files
+
+# The pre-commit-hooks basics, yamlfmt and zizmor over the whole tree rather than
+# the files a commit touches. Those hooks are per-file by nature, so nothing had
+# ever read the tree with them: a rev bump brings a new zizmor rule, every
+# workflow now violates it, and nobody notices until an unrelated one-line edit to
+# a workflow is refused by a finding that has nothing to do with the change (#203,
+# the shape of #188 one tool over).
+#
+# SKIP drops the hooks another target already gates over the tree - codespell is
+# `lint-spelling`, the ruff/ty/vulture/guard/prettier/eslint/tsc/i18n hooks are
+# `lint-backend`/`lint-frontend` - so this neither doubles their time nor lets a
+# fixer (ruff --fix, prettier --write) rewrite a file mid-check. `no-commit-to-branch`
+# fails by design when CI checks out `main`, so it goes too. A fixer that does run
+# (end-of-file-fixer, yamlfmt) reports rather than commits: pre-commit exits
+# non-zero on a modification, which is the failure CI needs.
+lint-precommit:
+	SKIP=no-commit-to-branch,codespell,ruff-format,ruff-check,ty,vulture,check-routes,check-comments,check-backticks,prettier,eslint,tsc,check-i18n \
+		uv run --project backend pre-commit run --all-files
+
+# The write side of both halves. `lint-frontend` checks prettier rather than
+# applying it, so without the second line here the only way to fix a formatting
+# failure would be to let the pre-commit hook rewrite the file for you.
+format:
+	uv run --directory backend ruff format . ../scripts ../deploy/updater
+	uv run --directory backend ruff check . ../scripts ../deploy/updater --fix
+	cd frontend && bunx prettier --write "src/**/*.{ts,tsx}" "e2e/**/*.ts"
+
+# === Testing ===
+# `test` is the gate: it fails if platform-layer coverage drops below 100%.
+#
+# The suite runs once, measuring all of `app`; the gate is a report over that
+# data narrowed to the platform layer, `[tool.coverage.run] include` in
+# backend/pyproject.toml, read from there so the list keeps one home. Measured
+# that way an included file no test imports counts at 0% rather than going
+# unreported. `coverage-all` reports the same data whole, so CI does not run the
+# suite a second time for it.
+#
+# CI adds XML for Codecov. The terminal list of uncovered lines is printed either
+# way, files at 100% skipped: a red gate that says only "99.99%" sends whoever
+# reads it hunting through every module by hand. The reports are written even
+# when a test failed, and the recipe then fails with the suite's status.
+COV_REPORT ?= term-missing
+PLATFORM_COVERAGE = $(shell uv run --quiet --directory backend python -c 'import tomllib; print(",".join(tomllib.load(open("pyproject.toml", "rb"))["tool"]["coverage"]["run"]["include"]))')
+
+# The backend suite runs against a throwaway Postgres (docker-compose.test.yml)
+# rather than the development one. The integration reset TRUNCATEs the tables
+# before every test, each TRUNCATE creates new relation files, and Postgres fsyncs
+# them - ~7 ms apiece on WSL2 or a Docker volume, which made a full run take hours
+# where CI takes minutes. That container has fsync off and a RAM data directory,
+# and it is nobody's data, so the suite cannot hurt a database with your work in it.
+#
+# `TEST_DB_PORT` moves it off :5433. `TEST_DB=external` skips the container and
+# uses the database `POSTGRES_*` / `backend/.env` already name, which is what CI
+# does (it has a service container and sets `CI=true`).
+TEST_DB_PORT ?= 5433
+ifeq ($(CI),true)
+TEST_DB ?= external
+endif
+TEST_DB ?= throwaway
+ifeq ($(filter $(TEST_DB),throwaway external),)
+$(error TEST_DB must be 'throwaway' or 'external', not '$(TEST_DB)')
+endif
+ifeq ($(TEST_DB),throwaway)
+TEST_DB_START := $(MAKE) --no-print-directory docker-test-db
+TEST_DB_ENV := env POSTGRES_HOST=localhost POSTGRES_PORT=$(TEST_DB_PORT) POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres
+else
+TEST_DB_START :=
+TEST_DB_ENV :=
+endif
+
+# Only the workflow's ephemeral service container may use reduced durability.
+ci-test-db-configure:
+	@test "$(CI)" = true && test -n "$(POSTGRES_CONTAINER)"
+	@for setting in fsync synchronous_commit full_page_writes; do \
+	  docker exec "$(POSTGRES_CONTAINER)" psql -U postgres -c "ALTER SYSTEM SET $$setting = off" || exit 1; \
+	done
+	docker exec "$(POSTGRES_CONTAINER)" psql -U postgres -c 'SELECT pg_reload_conf()'
+	docker exec "$(POSTGRES_CONTAINER)" psql -U postgres -c 'SHOW fsync' -c 'SHOW synchronous_commit' -c 'SHOW full_page_writes'
+
+# `-n auto --maxprocesses 4`: run across worker processes. The integration
+# suite is I/O-bound on one Postgres and roughly halves; the unit suite is
+# import-bound (every worker imports the app once) and gains little past four
+# workers, so `auto` is capped there - on a many-core laptop an uncapped `auto`
+# is slower than serial, all of it worker startup. pytest-cov combines the
+# per-worker data, so the 100% gate holds unchanged. A scoped `pytest <file>`
+# stays serial: worker startup is not worth paying for one file.
+test:
+	$(TEST_DB_START)
+	@status=0; \
+	$(TEST_DB_ENV) uv run --directory backend pytest tests/ -v --cov=app --cov-report= --cov-fail-under=0 -n auto --maxprocesses 4 || status=$$?; \
+	$(if $(findstring xml,$(COV_REPORT)),uv run --directory backend coverage xml -q --fail-under=0 --include="$(PLATFORM_COVERAGE)" || status=1;) \
+	uv run --directory backend coverage report --include="$(PLATFORM_COVERAGE)" || [ $$status -ne 0 ] || status=2; \
+	exit $$status
+
+# Fast loop while writing code — no coverage, no gate.
+test-fast:
+	$(TEST_DB_START)
+	$(TEST_DB_ENV) uv run --directory backend pytest tests/ -q --no-cov -n auto --maxprocesses 4
+
+# Integration tests only. These talk to a real database: the throwaway one above.
+test-integration:
+	$(TEST_DB_START)
+	$(TEST_DB_ENV) uv run --directory backend pytest tests/integration -v --no-cov -n auto --maxprocesses 4
+
+test-cov:
+	$(TEST_DB_START)
+	$(TEST_DB_ENV) uv run --directory backend pytest tests/ --cov --cov-report=html --cov-report=term-missing -n auto --maxprocesses 4
+	@echo "Open backend/htmlcov/index.html"
+
+# Just the refusal tests, by the `security` marker. This is a report, not a gate:
+# `make check` still runs everything. `--no-cov` because a subset never meets the
+# 100% bar, and `-p no:randomly` so the printed list is stable to read and diff.
+# The CI security-report step runs this same selection with `--collect-only`.
+test-security:
+	$(TEST_DB_START)
+	$(TEST_DB_ENV) uv run --directory backend pytest tests/ -m security -q --no-cov -p no:randomly
+
+# The list of refusal tests written to backend/security-tests.txt, and appended to
+# the CI job summary when one is present. Collection only - no database, no run -
+# so it is the cheap step CI calls with `if: always()`. Informational: it lists,
+# it does not gate, which is why `check` never reaches it and test_ci_parity.py
+# names it in CI_ONLY_TARGETS.
+security-report:
+	cd backend && uv run pytest tests/ -m security -p no:randomly -p no:cacheprovider --no-cov --collect-only -q > $${TMPDIR:-/tmp}/security-collect.txt 2>&1 || { echo "security-marker collection failed:"; cat $${TMPDIR:-/tmp}/security-collect.txt; exit 1; }
+	grep '::' $${TMPDIR:-/tmp}/security-collect.txt | sort > backend/security-tests.txt || true
+	@count=$$(wc -l < backend/security-tests.txt | tr -d ' '); \
+	echo "$$count tests carry the security marker -> backend/security-tests.txt"; \
+	if [ -n "$$GITHUB_STEP_SUMMARY" ]; then \
+	  { echo "## Security refusal tests"; echo; \
+	    echo "$$count tests carry the security marker. Run them with: make test-security"; echo; \
+	    echo '<details><summary>The list</summary>'; echo; echo '```'; \
+	    cat backend/security-tests.txt; echo '```'; echo; echo '</details>'; \
+	  } >> "$$GITHUB_STEP_SUMMARY"; \
+	fi
+
+# Everything, including template-inherited subsystems. Informational: those are
+# not held to the platform bar, because mock-heavy tests over code we did not
+# design buy a number rather than confidence.
+#
+# `REUSE_COVERAGE=1` reports the data `make test` just measured instead of running
+# the suite again, which is what CI does: two full runs no longer fit its job.
+coverage-all:
+	$(TEST_DB_START)
+	$(if $(REUSE_COVERAGE),,$(TEST_DB_ENV) uv run --directory backend pytest tests/ -q --cov=app --cov-report= --cov-fail-under=0 -n auto --maxprocesses 4)
+	uv run --directory backend coverage report --fail-under=0
+
+test-frontend:
+	cd frontend && bun run test:run
+
+test-frontend-cov:
+	cd frontend && bun run test:coverage $(VITEST_ARGS)
+
+test-frontend-jobs-check:
+	@test "$(LINT)" = success && test "$(BUILD)" = success && test "$(TESTS)" = success
+
+build-frontend-pack:
+	tar --exclude='.next/cache' -czf "$(RUNNER_TEMP)/frontend-build.tar.gz" -C frontend .next
+
+test-frontend-reports-check:
+	@for shard in 1 2 3 4; do test -s "frontend/.vitest-reports/blob-$$shard-4.json" || exit 1; done
+	@test "$$(find frontend/.vitest-reports -maxdepth 1 -name "blob-*.json" -type f | wc -l | tr -d " ")" = 4
+
+test-frontend-merge:
+	cd frontend && bunx vitest --merge-reports=./.vitest-reports --coverage
+
+# `next build` type-checks the route tree and fails on a server component that
+# cannot render - neither of which tsc or vitest sees, which is why CI builds on
+# every pull request and why `check` has to.
+build-frontend:
+	cd frontend && bun run build
+
+# The desktop shell is a window around a deployment's console, not a build of
+# the frontend: `desktop/ui` is the one page it carries itself, and the only file
+# it reads from `frontend/` is blobby's cast. Rust comes from rustup; the Tauri CLI is pinned in
+# `desktop/package.json`. `desktop-check` is not in `lint` or `check`, because CI
+# has no Rust toolchain yet and `tests/test_ci_parity.py` would refuse the
+# difference (docs/desktop.md).
+desktop-dev:
+	cd desktop && bun run dev
+
+desktop-build:
+	cd desktop && bun run build
+
+desktop-check:
+	cd desktop/core && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test -q
+	cd desktop/src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test -q
+
+# The phone app (#2097): the same kind of shell for iOS and Android, sharing
+# the desktop's sign-in rules through `desktop/core`. Each target needs that
+# platform's toolchain - Xcode for iOS; the Android SDK, NDK and a JDK for
+# Android - and an emulator, a simulator or a phone. Like `desktop-check`, it
+# is not in `lint` or `check`: CI has no mobile toolchain yet.
+mobile-android:
+	cd mobile && bun run android
+
+mobile-ios:
+	cd mobile && bun run ios
+
+mobile-check:
+	cd mobile/src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test -q
+
+# CI's `security` job. Audits what the lockfile resolves to - which is what a
+# deployment installs - rather than whatever this machine happens to have in its
+# virtualenv. The export is fully pinned, so `--no-deps --disable-pip` skips a
+# resolution round-trip pip-audit would otherwise do in a throwaway virtualenv.
+#
+# Needs the network: the advisory database is fetched, not vendored - one request
+# per locked distribution, 254 of them, none of which pip-audit retries and all of
+# which exit 1 the way a real advisory does. `scripts/audit_dependencies.py` is
+# what stops a single slow answer reading as a finding on a required check (#855):
+# it retries every run that reached no verdict, and says which of the four states
+# it ended in.
+#
+# It says so on its **last line**, not in its exit status, because make has no way
+# to carry one: a failed recipe becomes make's own exit 2, so a caller reaching
+# this through `make audit` - which the `Security Scan` job does - cannot tell 75
+# from 1. So the contract is `AUDIT: CLEAN|VULNERABLE|NETWORK|FAILED - detail`,
+# also appended to $GITHUB_STEP_SUMMARY inside a job. `make audit | tail -1` is
+# the whole of it; the script's own 0/1/75 is for callers that invoke it directly.
+AUDIT_ATTEMPTS ?= 3
+AUDIT_TIMEOUT ?= 30
+
+audit:
+	cd backend && uv export --frozen --no-emit-project --no-hashes -o requirements-audit.txt
+	uv run --directory backend python3 ../scripts/audit_dependencies.py requirements-audit.txt \
+		--attempts $(AUDIT_ATTEMPTS) --timeout $(AUDIT_TIMEOUT)
+
+# The frontend half of the same job. `make audit` reads `backend/uv.lock`; this
+# reads `frontend/bun.lock`, which nothing checked until #1415 - `bun audit` was
+# a line on the `SECURITY.md` checklist and in no job, so a console dependency
+# advisory was something somebody found by running it by hand.
+#
+# `bun audit` exits 1 on a finding and 0 on none, so unlike `audit` it needs no
+# verdict-line contract: make's own exit status carries the answer. The level is
+# `high`, which is the line this repository gates on - a `moderate` advisory in a
+# build-time dependency is worth knowing and is not worth a red required check.
+#
+# A finding here is fixed by raising the range in `package.json`, or - when the
+# vulnerable package is a transitive dependency whose parent has not moved yet -
+# by an entry in `overrides` there. Both are in the tree at the moment this
+# target was added: `next` and `postcss` raised, `nanoid` and `js-yaml` pinned
+# forward through their parents.
+AUDIT_LEVEL ?= high
+# The one other case is a finding with no fixed release anywhere in its chain: it
+# is named here with the path it arrives by and the condition that removes it,
+# and the audit ignores that advisory only.
+#   GHSA-vfj7-8cjw-p6xm (CVE-2026-93687): braces <= 3.0.3 has no patched release.
+#   It reaches the tree only through eslint-config-next > @next/eslint-plugin-next
+#   > fast-glob > micromatch, a lint-time dependency that the built console does
+#   not ship. Remove when braces publishes a fix or @next/eslint-plugin-next
+#   drops fast-glob. bun matches advisories by their GHSA id, not the CVE.
+AUDIT_IGNORE ?= GHSA-vfj7-8cjw-p6xm
+
+audit-frontend:
+	cd frontend && bun audit --audit-level=$(AUDIT_LEVEL) $(addprefix --ignore=,$(AUDIT_IGNORE))
+
+# A CycloneDX inventory of what the *source tree* declares, written to `sbom/`.
+#
+# **It is not the release SBOM and is named so it cannot be mistaken for one.**
+# The release documents come from `images.yml`, which scans the published
+# manifest per architecture: they carry the base image's Debian packages, the
+# built artifacts, and nothing from a development environment. A `dir:` scan
+# carries the opposite - the dev and docs dependency groups and
+# `devDependencies` if they are installed, and none of the layers underneath -
+# so the two answer different questions and only one of them answers "what is in
+# the image".
+#
+# What this is for: reading a dependency set without pulling two images, and
+# diffing one branch's declared components against another's.
+#
+# Not in `check`: it needs `syft`, which is not part of the documented setup,
+# and it gates nothing.
+SBOM_DIR ?= sbom
+
+sbom:
+	@command -v syft >/dev/null || { echo "syft not installed - https://github.com/anchore/syft"; exit 1; }
+	mkdir -p $(SBOM_DIR)
+	syft scan dir:backend --output cyclonedx-json=$(SBOM_DIR)/sbom-source-api.cdx.json
+	syft scan dir:frontend --output cyclonedx-json=$(SBOM_DIR)/sbom-source-frontend.cdx.json
+	@echo "SBOM: source-dependency inventories written to $(SBOM_DIR)/ - not the release documents"
+
+# The other half of the `security` job: what the two images ship and under which
+# licences. `licenses` regenerates THIRD_PARTY_NOTICES.md from the lockfiles;
+# `licenses-check` regenerates it in memory and fails when the committed file is
+# stale, when a component's metadata names no licence, or when one under a
+# copyleft or share-alike licence has no decision in `licenses/policy.toml`. It
+# runs under the backend virtualenv because that is where the wheels' metadata
+# is, and it needs `frontend/node_modules` for the same reason. A platform build
+# this machine does not have is read from the package index - the one place
+# this needs the network - and a lookup that fails is a failure, never a pass.
+# Same last-line contract as `audit`: `LICENSES: REVIEWED|FAILED - detail`.
+licenses:
+	uv run --directory backend python ../scripts/license_inventory.py write
+
+licenses-check:
+	uv run --directory backend python ../scripts/license_inventory.py check
+
+# Playwright starts the frontend itself; the backend and its seed are on you.
+# Checked rather than assumed: against a backend that is not there the suite
+# fails in fifty places at once, none of which say what is actually wrong.
+#
+# All three addresses are overridable so the suite can run beside another
+# checkout holding the defaults: E2E_PORT moves the frontend, E2E_STUB_MODEL_PORT
+# the stub model server, E2E_BACKEND the API the health check dials. They are
+# passed into the recipe's environment so Playwright and its specs read the same
+# values, and printed first because a suite that fails on a busy port should say
+# which one it wanted.
+E2E_BACKEND ?= http://localhost:8000
+E2E_PORT ?= 3000
+E2E_STUB_MODEL_PORT ?= 4010
+
+test-e2e:
+	@if ! curl -sf $(E2E_BACKEND)/api/v1/health > /dev/null; then \
+		echo "No backend at $(E2E_BACKEND)."; \
+		echo "  make dev && make platform-bootstrap"; \
+		exit 1; \
+	fi
+	@echo "▶ frontend :$(E2E_PORT)  ·  stub model :$(E2E_STUB_MODEL_PORT)  ·  backend $(E2E_BACKEND)"
+	cd frontend && E2E_PORT=$(E2E_PORT) E2E_STUB_MODEL_PORT=$(E2E_STUB_MODEL_PORT) bun run test:e2e $(PLAYWRIGHT_ARGS)
+
+# The load and resilience suite (NFA-004). Not part of `make check` and never in
+# CI: a load result is a measurement of one machine, and a number produced on a
+# shared runner under whatever else it was doing is worse than no number.
+# `docs/load-testing.md` has the prerequisites and how to read the report.
+LOAD_STUB_PORT ?= 4020
+LOAD_DOCUMENTS ?= 40
+# Where the stub listens, and the address the *API* reaches it on. They differ
+# whenever the API is not on this host: `make dev` runs it in a container, where
+# loopback is the container itself, so that topology needs
+# `LOAD_STUB_BIND=0.0.0.0 LOAD_STUB_URL=http://host.docker.internal:4020`.
+# docs/load-testing.md states both, because seeding the wrong one fails preflight
+# with a message about an empty collection rather than about an address.
+LOAD_STUB_BIND ?= 127.0.0.1
+LOAD_STUB_URL ?= http://127.0.0.1:$(LOAD_STUB_PORT)
+
+load-stub-model:
+	uv run --directory backend python ../loadtest/stub_model.py \
+		--host $(LOAD_STUB_BIND) --port $(LOAD_STUB_PORT)
+
+load-seed:
+	uv run --directory backend python ../loadtest/seed.py \
+		--stub-url $(LOAD_STUB_URL) --documents $(LOAD_DOCUMENTS)
+
+# The whole run from an empty database - migrate, bootstrap, stub, API, worker,
+# seed, scenario - and the thresholds as its exit status. What
+# `.github/workflows/load.yml` runs; `LOAD_SCALE`, `LOAD_REPORT` and the rest are
+# in `loadtest/cold_run.sh`.
+load-cold:
+	bash loadtest/cold_run.sh
+
+# `API_PID` and `DATABASE_URL` are optional; without them the run measures
+# requests and says which probes it could not take.
+load-test:
+	uv run --directory backend python ../loadtest/run.py \
+		$(if $(API_PID),--api-pid $(API_PID),) \
+		$(if $(DATABASE_URL),--database-url $(DATABASE_URL),)
+
+# Every CI job, in the order the workflow declares them, with the exceptions
+# named below. This is the one claim in this file that has to be exactly true:
+# a command advertised as CI that runs less than CI prints "All checks passed"
+# over a branch the build will refuse, and the cost is a review cycle plus
+# however long somebody spends believing the local answer.
+#
+# The workflow calls these targets rather than repeating the commands, and
+# `backend/tests/test_ci_parity.py` fails if the two ever drift again. It has
+# drifted four times, all four found by #143:
+#
+#   - `check` ran `test-frontend`, which measures no coverage, where CI runs
+#     `test:coverage` and its 100% gate - green locally and red for every run on
+#     `feat/sandbox` after 832d647;
+#   - `lint` ran neither eslint, prettier nor tsc, all three of which gate CI;
+#   - `check` ran neither `next build`, the docs build nor the dependency audit -
+#     three whole jobs;
+#   - and in the other direction, CI never ran the i18n guard, so a hardcoded
+#     string failed `make lint` and passed the build. It was `scripts/check_i18n.py`
+#     then and is `frontend/scripts/check-i18n.ts` now, in `lint-frontend`.
+#
+# Not here, deliberately:
+#
+#   - `e2e`, which needs a migrated database, a seeded organization and a running
+#     backend: `make dev && make platform-bootstrap && make test-e2e`.
+#   - the image build, publish and Trivy scan, which `images.yml` runs on a push
+#     to `main` and on a `v*` tag.
+#   - `test-migrations`. CI cycles the chain against its service database;
+#     locally it runs against a database of its own on the throwaway Postgres,
+#     but it is slow and rarely needed, so `check` leaves it to a hand run.
+CHECK_DB_PORT ?= 5432
+# Where `test` reached its database: the throwaway one, or the one `CHECK_DB_PORT` names.
+INTEGRATION_DB_PORT = $(if $(TEST_DB_START),$(TEST_DB_PORT),$(CHECK_DB_PORT))
+
+check: lint test db-check test-frontend-cov build-frontend docs-build docs-slug-check audit audit-frontend licenses-check
+	@echo ""
+	@echo "All checks passed — every CI job except e2e."
+	@if ! python3 -c 'import socket; socket.create_connection(("127.0.0.1", $(INTEGRATION_DB_PORT)), 1).close()' 2>/dev/null; then \
+		echo ""; \
+		echo "⚠  No database on 127.0.0.1:$(INTEGRATION_DB_PORT), so tests/integration skipped itself"; \
+		echo "   — and CI's test job has one, so it did not. '$(if $(TEST_DB_START),make docker-test-db,make docker-db)' closes that gap."; \
+	fi
+
+# === Documentation ===
+
+# The docs site, live-reloading on <http://localhost:8001>. Port 8001 because
+# 8000 is the API and serving docs there would shadow it. Override with
+# `make docs DOCS_PORT=8002` when something else already holds the port -
+# mkdocs answers a taken port with a bare OSError traceback.
+DOCS_PORT ?= 8001
+
+docs:
+	uv run --directory backend --group docs mkdocs serve -f ../mkdocs.yml -a localhost:$(DOCS_PORT)
+
+# Build the site, and fail on anything mkdocs only warns about - a dead internal
+# link or a page missing from the nav. Both are things a reader finds and a build
+# would otherwise ship.
+docs-build:
+	uv run --directory backend --group docs mkdocs build -f ../mkdocs.yml --strict
+
+# The translation guard carries its own copy of the `toc` extension's slug rule,
+# because it runs under the system interpreter with no virtualenv. A copy that
+# has drifted fails silently: the gate then compares anchors the build never
+# emits. Checking that needs the renderer, which only the `docs` group installs -
+# under `make test` the check skips for want of `pymdownx`, so it runs here,
+# beside the build that shares the group.
+docs-slug-check:
+	uv run --directory backend --group docs pytest -q \
+		tests/test_check_docs_i18n.py::test_the_slug_derivation_matches_the_renderer
+
+# Two decks are published pages, and the only copies: the 17-slide open-source
+# introduction at `docs/presentation/index.html` (served at /presentation/) and the
+# 47-slide product tour at `docs/presentation/tour/index.html` (/presentation/tour/),
+# which shares the introduction's `media/` and `fonts/`. Both are guided decks that
+# show one slide at a time, so printing either page gives one page, not a deck.
+# This checks what the README promises - each deck's slide count - and that every
+# file a deck names resolves. A PDF of every step is built from a deck's source with
+# the content-deck skill (`guided.py DECK --pdf`), not from these pages.
+#
+# CONTENT_OS points at the content toolkit behind the `content-deck` skill, which is
+# not in this repository; `scripts/gen` runs its tools with the toolkit's Python.
+CONTENT_OS ?= $(HOME)/PycharmProjects/content-os
+PRESENTATIONS := docs/presentation/index.html:17 docs/presentation/tour/index.html:47
+presentation:
+	@test -x "$(CONTENT_OS)/scripts/gen" || { echo "content toolkit not found at $(CONTENT_OS); set CONTENT_OS="; exit 1; }
+	@for entry in $(PRESENTATIONS); do \
+		deck=$${entry%%:*}; expected=$${entry##*:}; \
+		found=$$(grep -c '<section class="slide' "$$deck"); \
+		test "$$found" -eq "$$expected" || { echo "$$deck: $$found slides, expected $$expected"; exit 1; }; \
+		echo "$$deck: $$found slides"; \
+		"$(CONTENT_OS)/scripts/gen" tools/deck/verify.py assets "$$deck" || exit 1; \
+	done
+
+# Migrations against a real database, forwards and back. The only way to know a
+# backfill or a check constraint actually works.
+#
+# Locally this starts the throwaway test Postgres and cycles the chain in a
+# database it drops and creates first (`MIGRATIONS_TEST_DB`), so `downgrade base`
+# can never empty a database with your work in it. With `TEST_DB=external` (CI)
+# it runs against the database `POSTGRES_*` / `backend/.env` name, as before.
+MIGRATIONS_TEST_DB ?= agenticos_migrations_test
+test-migrations:
+ifeq ($(TEST_DB),throwaway)
+	$(TEST_DB_START)
+	docker compose -p agenticos-test -f docker-compose.test.yml exec -T db psql -U postgres -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS $(MIGRATIONS_TEST_DB) WITH (FORCE)' -c 'CREATE DATABASE $(MIGRATIONS_TEST_DB)'
+	$(TEST_DB_ENV) POSTGRES_DB=$(MIGRATIONS_TEST_DB) uv run --directory backend alembic upgrade head
+	$(TEST_DB_ENV) POSTGRES_DB=$(MIGRATIONS_TEST_DB) uv run --directory backend alembic downgrade base
+	$(TEST_DB_ENV) POSTGRES_DB=$(MIGRATIONS_TEST_DB) uv run --directory backend alembic upgrade head
+else
+	uv run --directory backend alembic upgrade head
+	uv run --directory backend alembic downgrade base
+	uv run --directory backend alembic upgrade head
+endif
+	@echo "Migration chain applies and rolls back cleanly."
+
+# Do the models and the migrations still agree? `alembic check` autogenerates
+# against the database and fails if anything is left over - the gate that catches
+# "somebody edited a model and forgot the migration", the one question
+# `test-migrations` (which only proves the chain applies and rolls back) does not
+# answer.
+#
+# Unlike `test-migrations` this belongs in `make check`: it reflects the schema
+# and diffs it, it never downgrades, so it cannot empty a laptop's working
+# database. It does need one at head - `make dev` keeps it there - and is skipped
+# rather than failed when none is reachable, the same bargain `check` strikes for
+# the integration suite. CI always has a database, so there it runs for real,
+# after `test-migrations` has left it at head.
+db-check:
+	@if python3 -c 'import socket; socket.create_connection(("127.0.0.1", $(CHECK_DB_PORT)), 1).close()' 2>/dev/null; then \
+		uv run --directory backend alembic check; \
+	else \
+		echo "⚠  No database on 127.0.0.1:$(CHECK_DB_PORT), so 'alembic check' was skipped"; \
+		echo "   — and CI's test job has one, so it did not. 'make docker-db' closes that gap."; \
+	fi
+
+
+# === Database ===
+db-init: docker-db
+	@echo "Waiting for PostgreSQL to be ready..."
+	@sleep 8
+	cd backend && uv run agenticos db migrate -m "initial" || true
+	cd backend && uv run agenticos db upgrade
+	@echo ""
+	@echo "✅ Database initialized!"
+
+db-migrate:
+	@read -p "Migration message: " msg; \
+	uv run --directory backend agenticos db migrate -m "$$msg"
+
+db-upgrade:
+	uv run --directory backend agenticos db upgrade
+
+db-downgrade:
+	uv run --directory backend agenticos db downgrade
+
+db-current:
+	uv run --directory backend agenticos db current
+
+db-history:
+	uv run --directory backend agenticos db history
+
+# === Server ===
+run:
+	uv run --directory backend agenticos server run --reload
+
+run-prod:
+	uv run --directory backend agenticos server run --host 0.0.0.0 --port 8000
+
+routes:
+	uv run --directory backend agenticos server routes
+
+# === Users ===
+create-admin:
+	@echo "Creating admin user..."
+	uv run --directory backend agenticos user create-admin
+
+user-create:
+	uv run --directory backend agenticos user create
+
+user-list:
+	uv run --directory backend agenticos user list
+
+# === Docker: Backend (Development) ===
+docker-up:
+	docker compose build app
+	docker compose up -d
+	@echo ""
+	@echo "✅ Backend services started!"
+	@echo "   API: http://localhost:8000"
+	@echo "   Docs: http://localhost:8000/docs"
+	@echo "   PostgreSQL: localhost:5432"
+	@echo "   Redis: localhost:6379"
+
+docker-down:
+	docker compose --profile console down
+
+docker-logs:
+	docker compose logs -f
+
+docker-build:
+	docker compose build
+
+docker-shell:
+	docker compose exec app /bin/bash
+
+# === Docker: Frontend (Development) ===
+docker-frontend:
+	docker compose up -d --build --no-deps frontend
+	@echo ""
+	@echo "✅ Frontend started!"
+	@echo "   URL: http://localhost:3000"
+	@echo ""
+	@echo "Note: Backend must be running (make docker-up)"
+
+docker-frontend-down:
+	docker compose --profile console stop frontend
+
+docker-frontend-logs:
+	docker compose --profile console logs -f frontend
+
+docker-frontend-build:
+	docker compose build frontend
+
+# === Docker: Production (with Traefik) ===
+docker-prod:
+	docker compose -f docker-compose-prod.yml up -d
+	@echo ""
+	@echo "✅ Production services started with Traefik!"
+	@echo ""
+	@echo "Endpoints (replace DOMAIN with your domain):"
+	@echo "   Frontend: https://$$DOMAIN"
+	@echo "   API: https://api.$$DOMAIN"
+	@echo "   Traefik: https://traefik.$$DOMAIN"
+
+docker-prod-down:
+	docker compose -f docker-compose-prod.yml down
+
+docker-prod-logs:
+	docker compose -f docker-compose-prod.yml logs -f
+
+
+# === Docker: Individual Services ===
+docker-db:
+	docker compose up -d db
+	@echo ""
+	@echo "✅ PostgreSQL started on port 5432"
+	@echo "   Connection: postgresql://postgres:postgres@localhost:5432/agenticos"
+
+docker-db-stop:
+	docker compose stop db
+
+# The suite's throwaway Postgres (see TEST_DB_PORT). `up --wait` returns once the
+# healthcheck passes and is a no-op when it is already running.
+docker-test-db:
+	@command -v docker >/dev/null || { echo "make test needs Docker for its test Postgres, or TEST_DB=external"; exit 1; }
+	docker compose -p agenticos-test -f docker-compose.test.yml up -d --wait
+	@echo "Test PostgreSQL (fsync off, in memory) on localhost:$(TEST_DB_PORT)"
+
+docker-test-db-down:
+	docker compose -p agenticos-test -f docker-compose.test.yml down -v
+
+docker-minio:
+	docker compose --profile objectstore up -d minio
+	@echo ""
+	@echo "✅ MinIO started on port 9000 (console :9001, minioadmin / minioadmin)"
+	@echo "   FILE_STORAGE_BACKEND=s3 needs a bucket; the integration suite makes its own."
+
+docker-redis:
+	docker compose up -d redis
+	@echo ""
+	@echo "✅ Redis started on port 6379"
+
+docker-redis-stop:
+	docker compose stop redis
+
+# === Vercel (Frontend Deployment) ===
+vercel-deploy:
+	cd frontend && npx vercel --prod
+	@echo ""
+	@echo "✅ Frontend deployed to Vercel!"
+	@echo "   Set these in the Vercel dashboard. All are read at runtime, so a"
+	@echo "   change is a redeploy of the same build, not a rebuild."
+	@echo "   BACKEND_URL=https://api.your-domain.com"
+	@echo "   PUBLIC_API_URL=https://api.your-domain.com"
+	@echo "   PUBLIC_WS_URL=wss://api.your-domain.com"
+	@echo "   PUBLIC_SITE_URL=https://app.your-domain.com"
+	@echo "   CHAT_MAX_UPLOAD_SIZE_MB=10"
+	@echo "   OAUTH_PROVIDERS=google"
+
+# === Cleanup ===
+clean:
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name .ty_cache -exec rm -rf {} + 2>/dev/null || true
+	rm -rf htmlcov/ .coverage coverage.xml
+
+# === Help ===
+help:
+	@echo ""
+	@echo "agenticos - Available Commands"
+	@echo "======================================"
+	@echo ""
+	@echo "🚀 Bootstrap (first-time setup):"
+	@echo "  make bootstrap      'make dev' + 'make seed' — full setup from a fresh clone"
+	@echo ""
+	@echo "Day-to-day dev:"
+	@echo "  make dev            Build + start dev stack; migrations run as a service (idempotent)"
+	@echo "  make seed           One-shot admin seed (admin@example.com / admin123)"
+	@echo "  make dev-down       Stop dev stack"
+	@echo "  make dev-logs       Tail dev container logs"
+	@echo "  make dev-rebuild    Force-rebuild backend image"
+	@echo "  make docker-clean   Wipe containers + networks + volumes (DESTROYS data)"
+	@echo "  make dev-frontend   Start frontend container (after 'make dev')"
+	@echo ""
+	@echo "📦 Other environments:"
+	@echo "  make stage          Production-like stack on localhost (no bind mounts)"
+	@echo "  make prod           Production stack (requires backend/.env + nginx)"
+	@echo ""
+	@echo "Setup (without Docker):"
+	@echo "  make install       Install Python + frontend deps and the pre-commit hooks"
+	@echo ""
+	@echo "Development:"
+	@echo "  make run           Start dev server (with hot reload)"
+	@echo "  make test          Run tests"
+	@echo "  make lint          Every static check: ruff, ty, eslint, prettier, tsc, the guards, codespell"
+	@echo "  make desktop-dev   Open the desktop shell against a console you name"
+	@echo "  make desktop-build Package the desktop shell for this machine"
+	@echo "  make desktop-check rustfmt, clippy and the shell's Rust tests"
+	@echo "  make mobile-android Run the phone app on an Android emulator or phone"
+	@echo "  make mobile-ios    Run the phone app on an iOS simulator or phone"
+	@echo "  make mobile-check  rustfmt, clippy and the phone app's Rust tests"
+	@echo "  make lint-backend  Just the Python half"
+	@echo "  make lint-frontend Just the TypeScript half"
+	@echo "  make lint-spelling Just codespell, over every tracked file"
+	@echo "  make lint-precommit yamlfmt, zizmor and the pre-commit basics, over every tracked file"
+	@echo "  make format        Auto-format code (ruff + prettier)"
+	@echo "  make check         Every CI job except e2e - before opening a pull request"
+	@echo ""
+	@echo "Load and resilience (NFA-004, nightly in CI - see docs/load-testing.md):"
+	@echo "  make load-cold        The whole run from an empty database, thresholds as exit status"
+	@echo "  make load-stub-model  The slow-on-purpose model the suite measures against"
+	@echo "  make load-seed        Build the fixture: an agent, a collection, a routine"
+	@echo "  make load-test        Offer the workload and print the report"
+	@echo ""
+	@echo "Database:"
+	@echo "  make db-init       Initialize database (start + migrate)"
+	@echo "  make db-migrate    Create new migration"
+	@echo "  make db-upgrade    Apply migrations"
+	@echo "  make db-downgrade  Rollback last migration"
+	@echo "  make db-current    Show current migration"
+	@echo ""
+	@echo "Users:"
+	@echo "  make create-admin  Create admin user (for SQLAdmin access)"
+	@echo "  make user-create   Create new user (interactive)"
+	@echo "  make user-list     List all users"
+	@echo ""
+	@echo "RAG:"
+	@echo "  uv run agenticos rag-ingest <path> -c <collection>  Ingest files"
+	@echo "  uv run agenticos rag-search <query> -c <collection>  Search"
+	@echo "  uv run agenticos rag-collections                     List collections"
+	@echo "  uv run agenticos rag-sources                         List sync sources"
+	@echo "  uv run agenticos rag-source-add                      Add sync source"
+	@echo "  uv run agenticos rag-source-sync <id>                Trigger sync"
+	@echo ""
+	@echo "Docker (Development):"
+	@echo "  make docker-up            Start backend services"
+	@echo "  make docker-down          Stop all services"
+	@echo "  make docker-logs          View backend logs"
+	@echo "  make docker-build         Build backend images"
+	@echo "  make docker-frontend      Start the console (its 'console' profile)"
+	@echo "  make docker-frontend-down Stop frontend"
+	@echo "  make docker-db            Start only PostgreSQL"
+	@echo "  make docker-redis         Start only Redis"
+	@echo ""
+	@echo "Docker (Production with Traefik):"
+	@echo "  make docker-prod          Start production stack"
+	@echo "  make docker-prod-down     Stop production stack"
+	@echo "  make docker-prod-logs     View production logs"
+	@echo ""
+	@echo "Template upgrade:"
+	@echo "  make upgrade-dry-run       Preview template updates (no changes)"
+	@echo "  make upgrade               Pull latest template changes (3-way merge)"
+	@echo "  make upgrade-new-features  Upgrade + opt into newly added features"
+	@echo "  make upgrade-finalize      Bump manifest after resolving conflicts"
+	@echo ""
+	@echo "Other:"
+	@echo "  make routes        Show all API routes"
+	@echo "  make clean         Clean cache files"
+	@echo ""
+
+.PHONY: release-cut
+release-cut: ## Plan a release train cut (BUMP=patch|minor; CREATE_PR=1 opens it)
+	python3 scripts/release_cut.py $(BUMP) $(if $(filter 1,$(CREATE_PR)),--create-pr,)

@@ -1,0 +1,251 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+
+import { CapabilityResources, resourceTabKey, type AgentResources } from "./capability-resources";
+import type { KnowledgeBase } from "@/types";
+import type { ContextFileSummary, SkillSummary } from "@/types/providers";
+
+/**
+ * What an agent is given, picked in the panel of the capability that reads it.
+ *
+ * Collections had a tab, skills had a tab, context shared the skills one - all
+ * two clicks from the switch that decides whether any of it reaches the model.
+ * The panel for "Knowledge search" offered a `top_k` field and a tool
+ * description, and the collections it searches were somewhere else entirely.
+ *
+ * The consequence worth pinning is the one no control here states alone: with the
+ * capability off, the spec still carries the selection, publish still checks it,
+ * and not one of them reaches a run.
+ */
+
+const FILE = {
+  id: "f1",
+  name: "glossary",
+  description: "What the acronyms mean.",
+  format: "md",
+  mode: "inject",
+  enabled: true,
+  size_bytes: 120,
+} as ContextFileSummary;
+
+const COLLECTION = {
+  id: "k1",
+  name: "Handbook",
+  description: "Everything HR has written down.",
+  document_count: 4,
+} as KnowledgeBase;
+
+const SKILL = {
+  id: "s1",
+  name: "refund-policy",
+  description: "How refunds work.",
+  file_count: 2,
+  category: null,
+  visibility: "org",
+  excerpt: "",
+  built_in: false,
+} satisfies SkillSummary;
+
+const RESOURCES: AgentResources = {
+  contextFiles: [FILE],
+  contextTotal: 1,
+  contextIds: [],
+  onContextToggle: vi.fn(),
+  collections: [COLLECTION],
+  collectionIds: [],
+  onCollectionToggle: vi.fn(),
+  skills: [SKILL],
+  skillTotal: 1,
+  skillIds: [],
+  onSkillToggle: vi.fn(),
+};
+
+function mount(capabilityId: string, overrides: Partial<AgentResources> = {}, enabled = true) {
+  const resources = { ...RESOURCES, ...overrides };
+  render(
+    <CapabilityResources capabilityId={capabilityId} enabled={enabled} resources={resources} />,
+  );
+  return resources;
+}
+
+describe("the tab a capability's resources get", () => {
+  it.each([
+    ["context", "contextFilesHeading"],
+    ["knowledge", "collectionsHeading"],
+    ["skills", "skillsHeading"],
+  ])("names %s with the catalog key for what it holds", (id, key) => {
+    // A key rather than a word: this is a module function, and the panel that
+    // renders the tab is what has a translator.
+    expect(resourceTabKey(id)).toBe(key);
+  });
+
+  it("gives no tab to a capability that reads nothing of the organization's", () => {
+    expect(resourceTabKey("charts")).toBeUndefined();
+  });
+});
+
+describe("what a capability reads of the organization's", () => {
+  it("offers the context files in the capability that injects them", () => {
+    mount("context");
+
+    expect(screen.getByText("glossary")).toBeInTheDocument();
+  });
+
+  it("offers the collections in the capability that searches them", () => {
+    mount("knowledge");
+
+    expect(screen.getByText("Handbook")).toBeInTheDocument();
+  });
+
+  it("offers the skills in the capability that loads them", () => {
+    mount("skills");
+
+    expect(screen.getByText("refund-policy")).toBeInTheDocument();
+  });
+
+  it("renders nothing for a capability that reads nothing of the organization's", () => {
+    const { container } = render(
+      <CapabilityResources capabilityId="charts" enabled resources={RESOURCES} />,
+    );
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("offers the artifact-pages skill, and only it, where pages are published", async () => {
+    const pages = { ...SKILL, id: "s2", name: "artifact-pages", description: "Build pages." };
+    const resources = mount("artifacts", { skills: [SKILL, pages], skillTotal: 2 });
+
+    expect(resourceTabKey("artifacts")).toBe("artifactPagesHeading");
+    expect(screen.queryByText("refund-policy")).toBeNull();
+    await userEvent.click(screen.getByText("artifact-pages"));
+    expect(resources.onSkillToggle).toHaveBeenCalledWith("s2");
+  });
+
+  it("offers the visual-design skill where the agent draws, and says when it is missing", () => {
+    const design = { ...SKILL, id: "s3", name: "visual-design", description: "Draw well." };
+    mount("visuals", { skills: [SKILL, design], skillTotal: 2 });
+
+    expect(resourceTabKey("visuals")).toBe("visualDesignHeading");
+    expect(screen.getByText("visual-design")).toBeInTheDocument();
+    expect(screen.queryByText("refund-policy")).toBeNull();
+  });
+
+  it("says the visual-design skill is missing where the library has none", () => {
+    mount("visuals");
+    expect(screen.getByText(/no visual-design skill/)).toBeInTheDocument();
+  });
+
+  it("does not call the agent's other skills missing from the page-style tab", () => {
+    // The tab lists one skill; handed every bound id, the gallery read each of
+    // the others as a skill that no longer exists.
+    const pages = { ...SKILL, id: "s2", name: "artifact-pages", description: "Build pages." };
+    mount("artifacts", { skills: [SKILL, pages], skillTotal: 2, skillIds: ["s1", "s2"] });
+
+    expect(screen.queryByText(/no longer/i)).toBeNull();
+    expect(screen.queryByText("s1")).toBeNull();
+  });
+
+  it("says where the skill comes from when this organization has none", () => {
+    mount("artifacts");
+
+    expect(screen.getByText(/has no artifact-pages skill/)).toBeInTheDocument();
+  });
+
+  it("reports a pick against the spec's own list, not the capability's config", async () => {
+    // `collection_ids` is top level; a binding's config holds how the capability
+    // behaves, never what it was given.
+    const resources = mount("knowledge");
+
+    await userEvent.click(screen.getByText("Handbook"));
+
+    expect(resources.onCollectionToggle).toHaveBeenCalledWith("k1");
+  });
+
+  it.each([
+    ["context", { contextIds: ["f1"] }, /Context is switched off/],
+    ["knowledge", { collectionIds: ["k1"] }, /Knowledge search is switched off/],
+    ["skills", { skillIds: ["s1"] }, /Skills is switched off/],
+  ])("says that %s bound to a switched-off capability reaches nothing", (id, bound, said) => {
+    mount(id, bound, false);
+
+    expect(screen.getByText(said)).toBeInTheDocument();
+  });
+
+  it("says nothing about it while the capability is on", () => {
+    mount("knowledge", { collectionIds: ["k1"] }, true);
+
+    expect(screen.queryByText(/switched off/)).not.toBeInTheDocument();
+  });
+
+  it("says nothing about it when the capability is off and nothing is bound", () => {
+    mount("knowledge", {}, false);
+
+    expect(screen.queryByText(/switched off/)).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * The Tools tab beside this one lists `list_context` and `read_context`, and the
+ * run carries neither unless something is bound for it to read on demand - which
+ * is what made an agent with one injected file look broken.
+ */
+describe("what the context capability will actually attach", () => {
+  const linked = { ...FILE, id: "f2", name: "runbook", mode: "link" } as ContextFileSummary;
+
+  it("says the read tools are not attached when every bound file is injected", () => {
+    mount("context", { contextIds: ["f1"] });
+
+    expect(screen.getByText(/read tools/)).toBeInTheDocument();
+  });
+
+  it("says nothing once a linked file gives the tools something to read", () => {
+    mount("context", { contextFiles: [FILE, linked], contextTotal: 2, contextIds: ["f1", "f2"] });
+
+    expect(screen.queryByText(/read tools/)).not.toBeInTheDocument();
+  });
+
+  it("counts a disabled linked file for nothing, because a run skips it", () => {
+    const off = { ...linked, enabled: false } as ContextFileSummary;
+    mount("context", { contextFiles: [off], contextTotal: 1, contextIds: ["f2"] });
+
+    expect(screen.getByText(/read tools/)).toBeInTheDocument();
+  });
+
+  it("says nothing about a bound file this page of the gallery cannot see", () => {
+    // An id the fetched page does not hold may be an orphan or may be on the
+    // next page; either way its mode is unknown, and guessing it is worse.
+    mount("context", { contextIds: ["f9"] });
+
+    expect(screen.queryByText(/read tools/)).not.toBeInTheDocument();
+  });
+});
+
+describe("inline resource creation", () => {
+  it.each([
+    ["skills", "New skill"],
+    ["context", "New context file"],
+  ])("offers creation in the %s panel, even when empty", async (capability, label) => {
+    const create = vi.fn();
+    mount(capability, {
+      skills: [],
+      contextFiles: [],
+      onCreateSkill: create,
+      onCreateContext: create,
+    });
+    await userEvent.click(screen.getByRole("button", { name: label }));
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("keeps creation available beside existing choices", async () => {
+    const create = vi.fn();
+    mount("skills", { onCreateSkill: create });
+    await userEvent.click(screen.getByRole("button", { name: "New skill" }));
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("does not offer creation without the caller's create permission", () => {
+    mount("skills");
+    expect(screen.queryByRole("button", { name: "New skill" })).not.toBeInTheDocument();
+  });
+});

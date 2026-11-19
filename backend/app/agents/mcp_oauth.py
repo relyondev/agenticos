@@ -1,0 +1,645 @@
+"""OAuth 2.1 authorization-code flow for MCP servers (web redirect variant).
+
+Most business MCP servers (Notion, Linear, Atlassian, …) are OAuth-gated:
+an unauthenticated request returns `401` with a `WWW-Authenticate` header
+pointing at RFC 9728 protected-resource metadata. This module drives the full
+flow for a *web* app, where the authorization redirect and its callback are
+two separate HTTP requests rather than a blocking CLI prompt:
+
+    1. :func:`discover`      - probe the server, resolve the authorization
+       server, fetch its RFC 8414 metadata (endpoints, PKCE support).
+    2. :func:`register_client` - RFC 7591 dynamic client registration.
+    3. :func:`authorization_url` - build the consent URL (PKCE + state +
+       RFC 8707 resource indicator); the browser is redirected there.
+    4. :func:`exchange_code` - swap the returned code for tokens (callback).
+    5. :func:`refresh_tokens` - refresh an expired access token.
+
+We lean on the MCP SDK's `mcp.client.auth.oauth2` helpers for discovery
+URL ordering, request building and response parsing so our behaviour matches
+the SDK's own client; the token grant/refresh POSTs are issued here so the
+flow can be split across requests and persisted between them.
+
+Every URL reached from here - discovery candidates, the token endpoint, and
+each redirect hop - is SSRF-checked *and connected to at the address that
+check approved* (see :func:`_client`), because discovery means the remote
+server, not the user, picks most of the addresses we call.
+
+A flow for a connection whose own host needs the MCP allowlist (`MCP_ALLOWED_HOSTS`
+and `OUTBOUND_PRIVATE_ALLOWLIST`) may reach the listed hosts too, and only those
+(:func:`app.core.sanitize.allowlist_for`, the origin rule): a server on the
+deployment's network often signs people in itself, so its metadata, registration
+and token endpoints sit on that same host.
+"""
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from functools import partial
+
+import httpx2
+from mcp.client.auth import PKCEParameters
+from mcp.client.auth.exceptions import OAuthFlowError
+from mcp.client.auth.oauth2 import (
+    build_oauth_authorization_server_metadata_discovery_urls,
+    build_protected_resource_metadata_discovery_urls,
+    create_client_registration_request,
+    create_oauth_metadata_request,
+    extract_resource_metadata_from_www_auth,
+    extract_scope_from_www_auth,
+    get_client_metadata_scopes,
+    handle_auth_metadata_response,
+    handle_protected_resource_response,
+    handle_registration_response,
+    resource_url_from_server_url,
+)
+from mcp.shared.auth import (
+    OAuthClientMetadata,
+    OAuthMetadata,
+    OAuthToken,
+    ProtectedResourceMetadata,
+)
+from pydantic import AnyUrl, BaseModel, ValidationError
+
+from app.agents.mcp import CONNECT_TIMEOUT_SECS
+from app.core.config import settings
+from app.core.pinned_http import PinnedAsyncClient
+from app.core.sanitize import (
+    NO_PRIVATE_ADDRESSES,
+    PrivateAllowlist,
+    UrlRefusedError,
+    allowlist_for,
+    mcp_allowlist,
+    resolve_pinned_url,
+)
+from app.core.secret_kinds import SealedStr
+
+logger = logging.getLogger(__name__)
+
+TOKEN_EXPIRY_SKEW_SECS = 60.0
+FLOW_TTL_SECS = 600.0
+_MAX_REDIRECTS = 5
+_GRANT_TYPES = ("authorization_code", "refresh_token")
+_USER_AGENT = f"{settings.PROJECT_NAME} MCP client"
+
+_HTTP_TIMEOUT = httpx2.Timeout(CONNECT_TIMEOUT_SECS, connect=CONNECT_TIMEOUT_SECS)
+
+
+class OAuthError(Exception):
+    """A recoverable failure in the OAuth flow (surfaced to the user)."""
+
+
+class OAuthGrantRevoked(OAuthError):
+    """The token endpoint said only a new consent will do: the refresh token is dead.
+
+    RFC 6749 section 5.2 reserves `invalid_grant` for a grant that is "invalid,
+    expired, revoked" - nothing a retry fixes, unlike a timeout or a 5xx. Microsoft
+    also answers a refresh with `interaction_required` (a new MFA or Conditional
+    Access policy the person has to satisfy) and `consent_required`, which a retry
+    fixes no better. Told apart so a caller can stop spending the token and ask
+    for a new consent instead.
+    """
+
+
+def _unusable_url(exc: httpx2.InvalidURL, what: str) -> OAuthError:
+    """The refusal for an endpoint no request can be built for.
+
+    `httpx2.InvalidURL` derives from `Exception` rather than from
+    `httpx2.HTTPError`, so a catch written for a request that failed does not see
+    one that was never made - and a discovery document naming
+    `https://host:client_secret=sh-key/token` answered 500 with an empty body
+    instead of the refusal every other malformed document gets (#889). No check
+    written here could have reached it: `httpx2` gives up while parsing the URL,
+    above both `PinnedAsyncClient` and `app.core.sanitize`.
+
+    Deliberately not the blocked-address refusal :func:`_send` raises, the same
+    separation #875 made: that one says this server aimed the flow somewhere the
+    deployment will not go, and this one that it wrote an address nothing can
+    dial. Reporting either as the other is a confident claim about whose fault a
+    failure was.
+
+    `InvalidURL` quotes what it could not parse - `Invalid port:
+    'client_secret=sh-key'`, `Invalid IDNA hostname: ...` - and on this flow that
+    text was written by the server being refused, so it stays in the log line
+    here and what is shown names only which endpoint was unusable.
+    """
+    logger.warning("MCP OAuth: %s cannot be requested: %s", what, exc)
+    return OAuthError(f"This server named {what} that cannot be requested - it is malformed.")
+
+
+_DISCOVERY_FAILURES = (httpx2.HTTPError, httpx2.InvalidURL, OAuthError)
+"""What ends one discovery candidate rather than the whole flow.
+
+`httpx2.InvalidURL` is named because it is not an `httpx2.HTTPError` and a catch
+that omits it is #889 again - see :func:`_unusable_url`.
+"""
+
+
+def _flow_failed(exc: Exception, *, summary: str, advice: str) -> str:
+    """The sentence a failed OAuth step may show, for an exception it may not.
+
+    Three of these refusals used to be built by interpolating whatever raised.
+    `httpx2` puts the failing request in its message, and the requests this flow
+    makes are a token grant and a client registration - so that message carries
+    the token endpoint, and a token endpoint is reached with credentials in the
+    body. A pydantic `ValidationError` over the token payload is worse again:
+    its `str()` echoes the input it rejected, and that input is the tokens. All
+    three reach the browser, as a toast since #657 (#686).
+
+    So the exception's own text stays in the `logger.exception` beside the raise
+    and goes no further, and what is shown names the step that gave up, what
+    class of thing raised, and what the reader can do. The class still goes out:
+    it separates a server we could not reach from one that refused us, and a
+    class name has never carried an endpoint or a key.
+
+    The token-payload case is the exception: its text *is* the credential, so the
+    log beside that raise carries only :func:`_validation_detail` - the field
+    locations and error types, never the values (#1626).
+    """
+    return f"{summary} ({type(exc).__name__}) - {advice}. The server log has the full error."
+
+
+def _validation_detail(exc: ValueError) -> str:
+    """The shape of a rejected token payload, with the rejected values left out.
+
+    `OAuthToken.model_validate_json` raises `ValidationError`, whose `str()` and
+    traceback echo the input it rejected - and for a token response that input is
+    the token. So the log names the field that failed and how, never what was in
+    it: `include_input=False` drops the values, `include_url=False` the docs link.
+    A plain `ValueError` (never raised by the parse today, but the caller catches
+    the wider type) reports only its class.
+    """
+    if not isinstance(exc, ValidationError):
+        return type(exc).__name__
+    return "; ".join(
+        f"{'.'.join(str(part) for part in err['loc'])}: {err['type']}"
+        for err in exc.errors(include_url=False, include_input=False)
+    )
+
+
+def _client(
+    transport: httpx2.AsyncBaseTransport | None = None,
+    *,
+    private_allowlist: PrivateAllowlist = NO_PRIVATE_ADDRESSES,
+) -> PinnedAsyncClient:
+    """The only client this flow talks through.
+
+    `PinnedAsyncClient` checks each request's URL and then dials the address
+    that passed, sending the original host in `Host` and SNI. That is what makes
+    :func:`_send`'s guarantee hold for a URL the remote server chose: without
+    the pin the check resolves the name, approves it, and `client.send` resolves
+    it again, so a hostile server can answer public to the check and private to
+    the request between them (#860).
+
+    `private_allowlist` is :func:`_allowlist_for` of the connection's own URL, and
+    of no URL a server named.
+
+    `transport` is for a test that needs to see what would go on the wire.
+    """
+    return PinnedAsyncClient(
+        timeout=_HTTP_TIMEOUT, transport=transport, private_allowlist=private_allowlist
+    )
+
+
+async def _allowlist_for(server_url: str) -> PrivateAllowlist:
+    """The MCP allowlist when the connection at *server_url* needs it, else nothing.
+
+    Off the event loop, because the origin rule may resolve DNS.
+    """
+    return await asyncio.to_thread(allowlist_for, server_url, mcp_allowlist())
+
+
+async def _send(client: PinnedAsyncClient, request: httpx2.Request) -> httpx2.Response:
+    """Send *request*, following redirects one checked-and-pinned hop at a time.
+
+    Discovery and token endpoints are chosen by the remote server, so the URL
+    the user typed is not the URL we end up talking to. Redirects are off on the
+    client and followed here so their number is bounded and each new address
+    goes through the transport's check on its own - otherwise a server could
+    answer with `302 http://169.254.169.254/` and we would fetch it from inside
+    the network.
+
+    `response.next_request` resolves a relative `Location` against the request
+    *we* built, which is the one naming the host; the substitution to the pinned
+    address happens inside the transport and never reaches this loop.
+
+    The refusal is caught as `UrlRefusedError` rather than as `ValueError`, the
+    same narrowing `mcp_connection._checked_url` makes and for the same reason
+    (#861): only that type is a refusal written here, and reporting some other
+    library's `ValueError` as "this server pointed us at a blocked address"
+    would be a confident lie about whose fault a failure was.
+    """
+    # The SDK builds its discovery requests bare, without the client's default
+    # headers, so they went out with no User-Agent at all - and Facebook answers
+    # that with a redirect to an "unsupported browser" page, which made Meta
+    # Ads read as a server with no OAuth metadata.
+    request.headers.setdefault("User-Agent", _USER_AGENT)
+    for _ in range(_MAX_REDIRECTS + 1):
+        try:
+            response = await client.send(request)
+        except UrlRefusedError as exc:
+            logger.warning("Blocked MCP OAuth request to %s: %s", request.url, exc)
+            raise OAuthError("This server pointed the OAuth flow at a blocked address.") from exc
+        if response.next_request is None:
+            return response
+        request = response.next_request
+    raise OAuthError("Too many redirects while talking to this server.")
+
+
+class McpOAuthPayload(BaseModel):
+    """Everything an OAuth connection needs, stored Fernet-encrypted as JSON.
+
+    `code_verifier` is present only while a consent redirect is in flight;
+    once tokens arrive it is dropped and `access_token`/`refresh_token` are
+    filled in. `expires_at` is epoch seconds (or None if the token doesn't
+    expire).
+
+    The three credentials are :data:`SealedStr`, so a payload that reaches a log
+    line or a traceback whole masks them, and only `model_dump_json()` - the way
+    into the vault - carries the real values. `model_copy(update=...)` skips
+    validation, so a caller folding a fresh token in wraps it in a `SecretStr`
+    itself or the next `model_dump_json()` fails.
+
+    `provider` names a non-discovery flow when one issued the payload - `"github"`
+    for a GitHub OAuth App, whose endpoints are fixed and whose token exchange has
+    its own quirks (see `app/services/portals/github_oauth.py`). `None` is the
+    ordinary MCP discovery flow, which carries a PKCE `code_verifier` instead.
+    """
+
+    server_url: str
+    started_at: float
+    authorization_endpoint: str
+    token_endpoint: str
+    registration_endpoint: str | None = None
+    client_id: str
+    client_secret: SealedStr | None = None
+    scope: str | None = None
+    resource: str
+    redirect_uri: str
+    code_verifier: str | None = None
+    access_token: SealedStr | None = None
+    refresh_token: SealedStr | None = None
+    expires_at: float | None = None
+    provider: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscoveredServer:
+    """The endpoints and metadata needed to run the flow for one server."""
+
+    authorization_endpoint: str
+    token_endpoint: str
+    registration_endpoint: str | None
+    resource: str
+    scope: str | None
+    metadata: OAuthMetadata
+    private_allowlist: PrivateAllowlist = NO_PRIVATE_ADDRESSES
+    """The hosts and networks this flow may reach - see :func:`app.core.sanitize.allowlist_for`."""
+
+
+def client_metadata(redirect_uri: str, scope: str | None) -> OAuthClientMetadata:
+    """Our app's client metadata for dynamic registration / the auth request."""
+    return OAuthClientMetadata(
+        client_name=f"{settings.PROJECT_NAME} assistant",
+        redirect_uris=[AnyUrl(redirect_uri)],
+        grant_types=list(_GRANT_TYPES),
+        response_types=["code"],
+        token_endpoint_auth_method="client_secret_post",
+        scope=scope,
+    )
+
+
+async def discover(server_url: str) -> DiscoveredServer:
+    """Resolve the authorization server and its metadata for *server_url*.
+
+    Follows the SEP-985 / RFC 9728 discovery chain: read the protected-resource
+    metadata (from the `WWW-Authenticate` header if present, else well-known
+    URIs), then the authorization-server metadata (RFC 8414, OIDC fallbacks).
+
+    A candidate the server named so badly that no request can be built for it
+    ends that candidate rather than the flow, like a candidate that answered
+    404: the `WWW-Authenticate` hint is the first of three, and the well-known
+    URIs after it are derived from the URL an operator typed (#889).
+    """
+    allowlist = await _allowlist_for(server_url)
+    async with _client(private_allowlist=allowlist) as client:
+        # 1. Probe the server unauthenticated to surface the WWW-Authenticate hint.
+        www_auth_url: str | None = None
+        www_auth_scope: str | None = None
+        try:
+            probe = await _send(
+                client,
+                client.build_request(
+                    "POST",
+                    server_url,
+                    headers={"Accept": "application/json, text/event-stream"},
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {"name": settings.PROJECT_NAME, "version": "1.0"},
+                        },
+                    },
+                ),
+            )
+            www_auth_url = extract_resource_metadata_from_www_auth(probe)
+            www_auth_scope = extract_scope_from_www_auth(probe)
+        except _DISCOVERY_FAILURES:
+            # Probe failed or was blocked - fall back to well-known discovery below.
+            pass
+
+        # 2. Protected-resource metadata → the authorization server URL.
+        auth_server_url: str | None = None
+        resource_metadata: ProtectedResourceMetadata | None = None
+        for url in build_protected_resource_metadata_discovery_urls(www_auth_url, server_url):
+            try:
+                prm = await handle_protected_resource_response(
+                    await _send(client, create_oauth_metadata_request(url))
+                )
+            except _DISCOVERY_FAILURES:
+                continue
+            if prm and prm.authorization_servers:
+                auth_server_url = str(prm.authorization_servers[0])
+                resource_metadata = prm
+                break
+
+        # 3. Authorization-server metadata (endpoints, PKCE support). Both the
+        #    candidate URLs and auth_server_url come from the server's own
+        #    metadata, so each one is checked and pinned before it is requested.
+        asm: OAuthMetadata | None = None
+        for url in build_oauth_authorization_server_metadata_discovery_urls(
+            auth_server_url, server_url
+        ):
+            try:
+                keep_going, candidate = await handle_auth_metadata_response(
+                    await _send(client, create_oauth_metadata_request(url))
+                )
+            except _DISCOVERY_FAILURES:
+                continue
+            if candidate is not None:
+                asm = candidate
+                break
+            if not keep_going:
+                break
+
+        if asm is None:
+            raise OAuthError(
+                "This server did not advertise OAuth metadata. It may not support "
+                "OAuth, or may require a static token instead."
+            )
+
+        # The consent URL is handed to the user's browser rather than fetched
+        # here, so it never passes through the pinned client - and cannot: the
+        # browser resolves it itself. A point-in-time check is all there is, made
+        # by the hops' own policy: a listed host is resolved too, and refused if
+        # it answers loopback, link-local or metadata.
+        try:
+            await asyncio.to_thread(
+                partial(
+                    resolve_pinned_url,
+                    str(asm.authorization_endpoint),
+                    private_allowlist=allowlist,
+                )
+            )
+        except UrlRefusedError as exc:
+            logger.warning(
+                "Blocked MCP OAuth authorization endpoint %s: %s", asm.authorization_endpoint, exc
+            )
+            raise OAuthError("This server pointed the OAuth flow at a blocked address.") from exc
+
+        # The spec's order: the 401's `scope`, then the protected-resource
+        # metadata, and the issuer's list only when the server names none. An
+        # issuer's list describes the issuer: Entra's is Graph's OpenID scopes,
+        # which its token endpoint refuses beside a `resource` naming Work IQ.
+        # `offline_access` is appended when the issuer offers it, or Entra
+        # issues no refresh token.
+        scope = get_client_metadata_scopes(
+            www_auth_scope, resource_metadata, asm, list(_GRANT_TYPES)
+        )
+        return DiscoveredServer(
+            authorization_endpoint=str(asm.authorization_endpoint),
+            token_endpoint=str(asm.token_endpoint),
+            registration_endpoint=(
+                str(asm.registration_endpoint) if asm.registration_endpoint else None
+            ),
+            resource=resource_url_from_server_url(server_url),
+            scope=scope,
+            metadata=asm,
+            private_allowlist=allowlist,
+        )
+
+
+async def register_client(server: DiscoveredServer, redirect_uri: str) -> tuple[str, str | None]:
+    """Dynamically register this app; return `(client_id, client_secret)`.
+
+    Public clients (no registration or no secret returned) get `None` for the
+    secret and use PKCE alone.
+    """
+    metadata = client_metadata(redirect_uri, server.scope)
+    try:
+        request = create_client_registration_request(
+            server.metadata, metadata, server.authorization_endpoint
+        )
+    except httpx2.InvalidURL as exc:
+        raise _unusable_url(exc, "a registration endpoint") from exc
+    async with _client(private_allowlist=server.private_allowlist) as client:
+        try:
+            info = await handle_registration_response(await _send(client, request))
+        except httpx2.HTTPError as exc:
+            logger.exception("MCP dynamic client registration failed at %s", request.url)
+            raise OAuthError(
+                _flow_failed(
+                    exc,
+                    summary="Client registration with this server did not complete",
+                    advice="check the server URL, then try again",
+                )
+            ) from exc
+        except OAuthFlowError as exc:
+            # The SDK puts the server's response body in the message - keep it
+            # in the log, hand the user a fixed string.
+            logger.warning("MCP dynamic client registration failed at %s: %s", request.url, exc)
+            raise OAuthError("This server rejected the client registration request.") from exc
+    if not info.client_id:
+        raise OAuthError("The server did not return a client_id during registration.")
+    return info.client_id, info.client_secret
+
+
+def authorization_url(
+    server: DiscoveredServer,
+    *,
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    code_challenge: str,
+) -> str:
+    """Build the consent URL the browser is redirected to."""
+    params: dict[str, str] = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "resource": server.resource,
+    }
+    if server.scope:
+        params["scope"] = server.scope
+        # OIDC Core 11: a provider may grant offline_access, and so a refresh
+        # token, only after an explicit consent prompt.
+        if "offline_access" in server.scope.split():
+            params["prompt"] = "consent"
+    query = httpx2.QueryParams(params)
+    sep = "&" if "?" in server.authorization_endpoint else "?"
+    return f"{server.authorization_endpoint}{sep}{query}"
+
+
+def new_pkce() -> PKCEParameters:
+    """Fresh PKCE verifier/challenge pair."""
+    return PKCEParameters.generate()
+
+
+async def exchange_code(
+    *,
+    token_endpoint: str,
+    client_id: str,
+    client_secret: str | None,
+    code: str,
+    code_verifier: str,
+    redirect_uri: str,
+    resource: str,
+    server_url: str,
+) -> OAuthToken:
+    """Exchange an authorization code for tokens (called from the callback).
+
+    `server_url` is the connection's own address, which decides the listed
+    hosts the request may reach; the token endpoint is the server's choice.
+    """
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": code_verifier,
+        "resource": resource,
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+    return await _token_request(
+        token_endpoint, data, private_allowlist=await _allowlist_for(server_url)
+    )
+
+
+async def refresh_tokens(
+    *,
+    token_endpoint: str,
+    client_id: str,
+    client_secret: str | None,
+    refresh_token: str,
+    resource: str | None,
+    scope: str | None,
+    server_url: str,
+) -> OAuthToken:
+    """Refresh an expired access token using the stored refresh token.
+
+    `resource` is RFC 8707's, which an MCP server's authorization server expects;
+    `None` leaves it out for a provider that refuses it - Microsoft's v2.0
+    endpoint answers a request carrying one with an error. `server_url` as in
+    :func:`exchange_code`. Read at every refresh, so a host taken off the list
+    stops being reached here too.
+
+    Raises:
+        OAuthGrantRevoked: The provider answered `invalid_grant`.
+        OAuthError: Any other failure.
+    """
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
+    if resource:
+        data["resource"] = resource
+    if client_secret:
+        data["client_secret"] = client_secret
+    if scope:
+        data["scope"] = scope
+    return await _token_request(
+        token_endpoint, data, private_allowlist=await _allowlist_for(server_url)
+    )
+
+
+# The token endpoint's answers that only the person signing in again can fix.
+_NEEDS_CONSENT = frozenset({"invalid_grant", "interaction_required", "consent_required"})
+
+
+def _error_code(response: httpx2.Response) -> str | None:
+    """The OAuth `error` code of a refusal, or None when the body names none."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    code = body.get("error") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
+
+
+async def _token_request(
+    token_endpoint: str,
+    data: dict[str, str],
+    *,
+    private_allowlist: PrivateAllowlist = NO_PRIVATE_ADDRESSES,
+) -> OAuthToken:
+    async with _client(private_allowlist=private_allowlist) as client:
+        try:
+            request = client.build_request(
+                "POST",
+                token_endpoint,
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        except httpx2.InvalidURL as exc:
+            raise _unusable_url(exc, "a token endpoint") from exc
+        try:
+            response = await _send(client, request)
+        except httpx2.HTTPError as exc:
+            logger.exception("MCP token request to %s failed", token_endpoint)
+            raise OAuthError(
+                _flow_failed(
+                    exc,
+                    summary="The token request did not complete",
+                    advice="start the connection again",
+                )
+            ) from exc
+    if response.status_code != 200:
+        # The body is whatever the endpoint chose to return, and this message
+        # ends up in the user's browser - log the detail, show the status.
+        logger.warning(
+            "MCP token endpoint %s returned %s: %s",
+            token_endpoint,
+            response.status_code,
+            response.text[:200],
+        )
+        if _error_code(response) in _NEEDS_CONSENT:
+            raise OAuthGrantRevoked(
+                f"Token endpoint returned {response.status_code}: the grant is no longer valid."
+            )
+        raise OAuthError(f"Token endpoint returned {response.status_code}.")
+    try:
+        return OAuthToken.model_validate_json(response.content)
+    except ValueError as exc:
+        # A `ValidationError` over the token payload echoes the input it rejected,
+        # and here that input is the token - so its `str()` and its traceback both
+        # carry a live credential. Log the field locations and error types, never
+        # the values, and do not let `logger.exception` append the raw text.
+        logger.error(
+            "MCP token endpoint %s returned an unreadable token response: %s",
+            token_endpoint,
+            _validation_detail(exc),
+        )
+        raise OAuthError(
+            _flow_failed(
+                exc,
+                summary="This server's token response could not be read",
+                advice="check that it implements OAuth 2.1",
+            )
+        ) from exc

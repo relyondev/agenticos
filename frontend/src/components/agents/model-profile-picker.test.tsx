@@ -1,0 +1,489 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useState, type ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ModelProfilePicker } from "./model-profile-picker";
+import type { ModelProfile } from "@/types/providers";
+
+vi.mock("@/lib/api-client", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api-client")>("@/lib/api-client");
+  return {
+    ...actual,
+    apiClient: { ...actual.apiClient, get: vi.fn().mockResolvedValue({ items: [], total: 0 }) },
+  };
+});
+
+const deleteProfile = vi.hoisted(() => ({ mutate: vi.fn() }));
+const refetchProfiles = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("@/hooks", () => ({ useModelProviders: () => ({ deleteProfile, refetchProfiles }) }));
+
+// The real form is a provider, a model id and a key from the vault, tested in
+// `add-model.integration.test.tsx`. What this panel owes it is the callback: a
+// model created here is also the model the agent moves onto.
+vi.mock("@/components/agents/add-model", () => ({
+  // The real form is a provider, a model id and a key from the vault, tested in
+  // `add-model.integration.test.tsx` - including that it starts on the model in
+  // use. What this panel owes it is the callback and that model, so the stand-in
+  // prints which one it was handed.
+  AddModel: ({
+    onCreated,
+    selected,
+  }: {
+    onCreated: (profile: { id: string }) => void;
+    selected?: { label: string };
+  }) => {
+    // Read once, like the real form: its fields are `useState(selected?.…)`, so a
+    // prop that arrives later moves nothing. That is the whole reason the panel
+    // keys this component, and a stand-in that re-read the prop on every render
+    // would pass with the key removed.
+    const [seeded] = useState(selected?.label ?? "nothing");
+    return (
+      <>
+        <button type="button" onClick={() => onCreated({ id: "p-new" })}>
+          Add model
+        </button>
+        <span data-testid="form-starts-on">{seeded}</span>
+      </>
+    );
+  },
+}));
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+beforeEach(() => vi.clearAllMocks());
+
+function profile(overrides: Partial<ModelProfile> = {}): ModelProfile {
+  return {
+    id: "p1",
+    label: "openai default",
+    provider: "openai",
+    model: "gpt-4.1",
+    secret_id: "s-1",
+    params: {},
+    fallback_profile_ids: [],
+    ...overrides,
+  };
+}
+
+/** A profile whose key was deleted from the vault, as the server lists it. */
+const keyless = profile({ secret_id: null, missing_key: true });
+
+function mount(props: Partial<Parameters<typeof ModelProfilePicker>[0]> = {}) {
+  render(
+    // Loaded unless a case says otherwise: every claim this panel makes about
+    // what the organization has is one the list cannot support before then.
+    <ModelProfilePicker
+      profiles={[profile()]}
+      profilesStatus="loaded"
+      value={null}
+      onChange={vi.fn()}
+      {...props}
+    />,
+    { wrapper },
+  );
+}
+
+describe("ModelProfilePicker", () => {
+  it("does not offer to add a model where it is only a choice", () => {
+    // The regression this pins: the chat popover answers "which model should
+    // this conversation run on". Adding one creates something every agent in
+    // the organization can be pointed at - from a panel somebody opened to
+    // change a single reply. It leaked in when the Builder gained the flow.
+    mount();
+
+    expect(screen.queryByRole("button", { name: "Add a model" })).toBeNull();
+    expect(screen.queryByText(/rotate a key or repoint/)).toBeNull();
+  });
+
+  it("offers it where an agent is configured, without asking first", () => {
+    // The form is the panel, not a state of it. Choosing a model is choosing a
+    // provider, a model and a key; a list of profiles somebody else created is
+    // not where that decision starts, and on a fresh deployment the list is
+    // empty and the real control was a click away behind "Add a model".
+    mount({ allowAdd: true });
+
+    expect(screen.getByRole("button", { name: "Add model" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add a model" })).toBeNull();
+  });
+
+  it("keeps the saved models one disclosure down rather than dropping them", () => {
+    // A named profile is what lets an organization rotate a key or repoint every
+    // agent at once, so it does not go away - it just stops being the first
+    // thing anybody sees.
+    mount({ allowAdd: true });
+
+    expect(screen.getByText("Use a saved model (1)")).toBeInTheDocument();
+  });
+
+  it("starts the form on the model the agent is on", () => {
+    // The panel used to answer "which model" in a line above the form and ask it in
+    // the form's two fields, which are the same question - so the fields said
+    // "Choose a provider" over a line naming the provider. They start on it now.
+    mount({ allowAdd: true, value: "p1" });
+
+    expect(screen.getByTestId("form-starts-on")).toHaveTextContent("openai default");
+  });
+
+  it("names the model in use without repeating what the fields say", () => {
+    // The line survives because it answers *which named profile* is in use, which
+    // the two fields cannot - they carry the provider and the model id. What it no
+    // longer carries is that pair, which is what made it read the model twice.
+    const derived = profile({ label: "OpenRouter · openai/gpt-5.5", provider: "openrouter" });
+
+    mount({ allowAdd: true, value: "p1", profiles: [derived] });
+
+    const current = screen.getByRole("group", { name: "Current model" });
+    expect(within(current).getByText("OpenRouter · openai/gpt-5.5")).toBeInTheDocument();
+    expect(within(current).queryByText(/openrouter · openai\/gpt-5\.5/)).toBeNull();
+  });
+
+  it("starts it on the model once the profiles arrive, not only when they were already there", () => {
+    // `value` and `profiles` do not land together: an agent already pointed at a
+    // model renders with the id while the list is still in flight, so keying the
+    // form on the id meant the key never changed once the list came back and the
+    // fields kept the nothing they mounted with. "Choose a provider" over an agent
+    // that plainly has one - which passed on a warm laptop and failed in CI.
+    const { rerender } = render(
+      <ModelProfilePicker
+        profiles={[]}
+        profilesStatus="loaded"
+        value="p1"
+        allowAdd
+        onChange={vi.fn()}
+      />,
+      { wrapper },
+    );
+    expect(screen.getByTestId("form-starts-on")).toHaveTextContent("nothing");
+
+    rerender(
+      <ModelProfilePicker
+        profiles={[profile()]}
+        profilesStatus="loaded"
+        value="p1"
+        allowAdd
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId("form-starts-on")).toHaveTextContent("openai default");
+  });
+
+  it("starts it on nothing where the agent is on nothing", () => {
+    mount({ allowAdd: true, value: null });
+
+    expect(screen.getByTestId("form-starts-on")).toHaveTextContent("nothing");
+  });
+
+  it("says a model has no key wherever it is shown", () => {
+    // The one fact that decides whether the run can answer at all. Hiding it in
+    // the chat would mean picking a model and finding out from a failed reply.
+    // Listed here because models are managed here; a picker that only chooses
+    // leaves it out, like a model an agent cannot run on (#2478).
+    mount({ profiles: [keyless], allowRemove: true });
+
+    expect(screen.getByText("no key")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "openai default" })).toBeDisabled();
+  });
+
+  it("names the model, not just the label somebody typed", () => {
+    mount();
+
+    expect(screen.getByText("openai · gpt-4.1")).toBeInTheDocument();
+  });
+
+  it("tells an empty organization what is wrong and where a model comes from", () => {
+    mount({ profiles: [] });
+
+    expect(screen.getByText(/no models yet/)).toBeInTheDocument();
+    // The path out, rather than only the problem: it names where models come from —
+    // the Builder, by a member who manages connections — without claiming this
+    // reader lacks a permission, which a picker that only knows `allowAdd` cannot
+    // tell (the delegation picker passes none yet its caller may hold it).
+    expect(screen.getByText(/added in the Builder/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add a model" })).toBeNull();
+  });
+
+  it("does not tell an organization it has no models when the read did not answer", async () => {
+    // The empty-page trap, in the one panel that turns an empty list into a
+    // sentence: a refused or failed `/providers/model-profiles` arrives here as
+    // the same `[]` an organization with no model does, so this panel told a
+    // builder with a dozen models that it had none and that its agents could not
+    // run - on a 502 (#863).
+    mount({ profiles: [], profilesStatus: "failed" });
+
+    expect(screen.queryByText(/no models yet/)).toBeNull();
+    expect(screen.getByText("Models could not be listed")).toBeInTheDocument();
+    expect(screen.getByText(/did not answer/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(refetchProfiles).toHaveBeenCalled();
+  });
+
+  it("says the saved models are missing rather than silently offering none", () => {
+    // The add-capable shape drops the disclosure when the list is empty, which
+    // is right for an organization that has saved none and wrong for a read that
+    // failed: a control that quietly is not there reads as the product not
+    // having it. The form above is untouched - this failed at listing what
+    // exists, not at writing.
+    mount({ allowAdd: true, profiles: [], profilesStatus: "failed" });
+
+    expect(screen.getByText("Models could not be listed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add model" })).toBeInTheDocument();
+  });
+
+  it("neither claims nor blames while the read is still in flight", () => {
+    // Every cold load of this panel starts here, with `[]` and nothing settled.
+    // Saying the organization has no models would be the defect this file
+    // exists for; a destructive failure panel on the ordinary path would be
+    // worse - a false alarm often enough to teach people to ignore the one that
+    // is real. It waits instead.
+    mount({ profiles: [], profilesStatus: "pending" });
+
+    expect(screen.queryByText(/no models yet/)).toBeNull();
+    expect(screen.queryByText("Models could not be listed")).toBeNull();
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+  });
+
+  it("says nothing about saved models while the read is still in flight either", () => {
+    // The add-capable shape has no gap to fill: the form is the panel and it
+    // already works, so a wait would stand in for a disclosure that may have
+    // nothing to disclose.
+    mount({ allowAdd: true, profiles: [], profilesStatus: "pending" });
+
+    expect(screen.getByRole("button", { name: "Add model" })).toBeInTheDocument();
+    expect(screen.queryByText("Models could not be listed")).toBeNull();
+    expect(screen.queryByRole("status", { name: "Loading" })).toBeNull();
+  });
+
+  it("keeps the saved models it already has when a later read fails", () => {
+    // A refetch that errors over a list already on screen leaves that list
+    // standing: stale rows somebody can still choose from beat a red panel
+    // instead of them.
+    mount({ allowAdd: true, profilesStatus: "failed" });
+
+    expect(screen.getByText("Use a saved model (1)")).toBeInTheDocument();
+    expect(screen.queryByText("Models could not be listed")).toBeNull();
+  });
+
+  it("moves the agent onto the model that was just created", async () => {
+    // Selected, not merely added: somebody who came here to choose a model has
+    // chosen one, and leaving the agent on the old value makes the work look
+    // like it did not take.
+    const onChange = vi.fn();
+    mount({ allowAdd: true, onChange });
+
+    await userEvent.click(screen.getByRole("button", { name: "Add model" }));
+
+    expect(onChange).toHaveBeenCalledWith("p-new");
+  });
+
+  it("moves the agent onto a saved model that was picked", async () => {
+    const onChange = vi.fn();
+    mount({ onChange });
+
+    await userEvent.click(screen.getByRole("radio", { name: "openai default" }));
+
+    expect(onChange).toHaveBeenCalledWith("p1");
+  });
+
+  it("marks which saved model the agent is on", () => {
+    mount({ value: "p1" });
+
+    expect(screen.getByRole("radio", { name: "openai default" })).toBeChecked();
+  });
+
+  it("deletes a saved model only where models are managed", async () => {
+    mount({ allowAdd: true, allowRemove: true });
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove openai default" }));
+
+    expect(deleteProfile.mutate).toHaveBeenCalledWith("p1");
+  });
+
+  it("offers a panel that only chooses no way to delete a model every agent may use", () => {
+    mount();
+
+    expect(screen.queryByRole("button", { name: /^Remove/ })).toBeNull();
+  });
+
+  it("lets a panel create a model without letting it destroy one", async () => {
+    // The reason the two are separate flags. The knowledge-base dialog has to be
+    // able to define the model that reads its images and store the key for it,
+    // or a fresh deployment cannot finish the form at all; deleting an
+    // organization-wide profile that agents are pointed at is a bigger claim
+    // than a collection form makes.
+    const onChange = vi.fn();
+    mount({ allowAdd: true, onChange });
+
+    expect(screen.queryByRole("button", { name: /^Remove/ })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Add model" }));
+
+    expect(onChange).toHaveBeenCalledWith("p-new");
+  });
+
+  it("states which model is in use even where the panel only chooses", () => {
+    // The line moved out of the add-capable branch: whether the chosen profile
+    // has a key is what decides whether anything runs, and in a list of a dozen
+    // saved models the chosen one's badge is a badge among twelve.
+    mount({ value: "p1", profiles: [keyless] });
+
+    const current = screen.getByRole("group", { name: "Current model" });
+    expect(within(current).getByText("openai default")).toBeInTheDocument();
+    expect(within(current).getByText("no key")).toBeInTheDocument();
+  });
+
+  it("accepts nothing from somebody who cannot edit the spec", async () => {
+    const onChange = vi.fn();
+    mount({ onChange, disabled: true });
+
+    await userEvent.click(screen.getByRole("radio", { name: "openai default" }));
+
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("counts a model keyed from the vault as keyed", () => {
+    mount({ profiles: [profile({ secret_id: "s-1" })] });
+
+    expect(screen.queryByText("no key")).toBeNull();
+  });
+
+  it("does not call a self-hosted model keyless", () => {
+    // An Ollama at an endpoint has no `secret_id` and needs none. The server's
+    // `missing_key` says so; reading the column badged every one (#2478).
+    mount({
+      profiles: [
+        profile({ provider: "ollama", secret_id: null, base_url: "http://ollama:11434/v1" }),
+      ],
+    });
+
+    expect(screen.queryByText("no key")).toBeNull();
+    expect(screen.getByRole("radio", { name: "openai default" })).toBeEnabled();
+  });
+
+  it("leaves a model whose key was deleted out of a picker that only chooses", () => {
+    mount({ profiles: [keyless, profile({ id: "p2", label: "Keyed" })] });
+
+    expect(screen.queryByRole("radio", { name: "openai default" })).toBeNull();
+    expect(screen.getByRole("radio", { name: "Keyed" })).toBeEnabled();
+  });
+
+  it("says why the model in use cannot run when its key was deleted", () => {
+    mount({ value: "p1", profiles: [keyless] });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("key was deleted from the vault");
+  });
+
+  it("says the model in use has no key, which is what decides whether it runs", () => {
+    mount({ allowAdd: true, value: "p1", profiles: [keyless] });
+
+    const current = screen.getByRole("group", { name: "Current model" });
+    expect(within(current).getByText("no key")).toBeInTheDocument();
+  });
+
+  it("says what the agent runs on once", () => {
+    // A label is derived from the provider and the model unless somebody typed
+    // their own, so appending `provider · model` after it read
+    // `OpenRouter · openai/gpt-5.5 openrouter · openai/gpt-5.5` - on the strip the
+    // choose-only panel still has, and on every row of the saved-model list.
+    const derived = profile({ label: "OpenRouter · openai/gpt-5.5", provider: "openrouter" });
+
+    mount({ value: "p1", profiles: [derived] });
+
+    const current = screen.getByRole("group", { name: "Current model" });
+    expect(within(current).getByText("OpenRouter · openai/gpt-5.5")).toBeInTheDocument();
+    expect(within(current).queryByText(/openrouter · openai\/gpt-5\.5/)).toBeNull();
+  });
+
+  it("still names the model where the label does not, on the row that offers it", () => {
+    // The other half of `modelDetail`: a name somebody chose says nothing about what
+    // runs. It is the *list* that carries it now - the line above the form carries
+    // the name, and the form's own fields carry the pair.
+    mount({ value: "p1", profiles: [profile({ label: "the cheap one" })] });
+
+    expect(screen.getByText("openai · gpt-4.1")).toBeInTheDocument();
+  });
+
+  it("names what the agent runs on rather than relying on it reading differently", () => {
+    // The strip and the selected row now hold the same string, which is what
+    // saying it once costs. The caption is what tells them apart, and it is
+    // visible rather than only an accessible name.
+    mount({ value: "p1", profiles: [profile({ label: "OpenRouter · openai/gpt-5.5" })] });
+
+    const current = screen.getByRole("group", { name: "Current model" });
+    expect(within(current).getByText("Current model")).toBeInTheDocument();
+  });
+});
+
+describe("a model an agent cannot run on (#2487)", () => {
+  const speech = profile({
+    id: "tts",
+    label: "OpenAI · gpt-4o-mini-tts",
+    model: "gpt-4o-mini-tts",
+    chat_capable: false,
+  });
+
+  it("is not offered as an agent's model", () => {
+    mount({ profiles: [profile(), speech] });
+
+    expect(screen.getByRole("radio", { name: "openai default" })).toBeInTheDocument();
+    expect(screen.queryByRole("radio", { name: "OpenAI · gpt-4o-mini-tts" })).toBeNull();
+  });
+
+  it("is not counted among the saved models", () => {
+    mount({ allowAdd: true, profiles: [profile(), speech] });
+
+    expect(screen.getByText("Use a saved model (1)")).toBeInTheDocument();
+  });
+
+  it("leaves a panel with only such models saying there is no model to choose", () => {
+    mount({ profiles: [speech] });
+
+    expect(screen.queryByRole("radio")).toBeNull();
+    expect(screen.getByText(/no models yet/i)).toBeInTheDocument();
+  });
+
+  it("stays visible, and marked, where an agent already names it", () => {
+    // Nothing disappears silently: an agent stored on a speech model still shows
+    // it, says it cannot run, and is one click from a model that can.
+    mount({ value: "tts", profiles: [profile(), speech] });
+
+    expect(screen.getByRole("radio", { name: "OpenAI · gpt-4o-mini-tts" })).toBeChecked();
+    const current = screen.getByRole("group", { name: "Current model" });
+    expect(within(current).getByText("not a chat model")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "gpt-4o-mini-tts is not a chat model - it is for text to speech, transcription, images or embeddings, and an agent cannot run on it. Choose a chat model before publishing.",
+    );
+    expect(screen.getAllByText("not a chat model")).toHaveLength(2);
+  });
+
+  it("stays listed where models are managed, so it can be removed but not chosen", async () => {
+    // The Builder is the only place the console deletes a profile; hiding one
+    // there would leave it removable through the API alone.
+    const onChange = vi.fn();
+    mount({ allowAdd: true, allowRemove: true, onChange, profiles: [profile(), speech] });
+
+    const row = screen.getByRole("radio", { name: "OpenAI · gpt-4o-mini-tts" });
+    expect(row).toBeDisabled();
+    // Counted as what can be chosen, though it is listed for removal.
+    expect(screen.getByText("Use a saved model (1)")).toBeInTheDocument();
+    await userEvent.click(row);
+    expect(onChange).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove OpenAI · gpt-4o-mini-tts" }));
+    expect(deleteProfile.mutate).toHaveBeenCalledWith("tts");
+  });
+
+  it("marks nothing for a model the server did not classify", () => {
+    mount({ value: "p1", profiles: [profile({ chat_capable: undefined })] });
+
+    expect(screen.queryByText("not a chat model")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});

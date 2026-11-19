@@ -1,0 +1,802 @@
+"""Routing a channel message to the agent behind the bot.
+
+**A bot serves exactly one agent** - `uq_exposure_bot` - so most of what this
+module does is find that agent and hand it the message. A bot user is one
+identity in the chat: on Mattermost every reply arrives from the same avatar
+and the same name whichever agent produced it, so several behind one bot meant
+somebody in a channel typing a slug to pick between things they could not see,
+and a message naming none was answered with a list of handles rather than an
+answer. Two agents is two bots, which costs an operator two minutes and makes
+the chat say which agent it is talking to.
+
+`@support what is the refund window` still works, and is now an *alias* rather
+than a router: the handle is the agent's slug - the same one the Builder shows
+and the same one the API takes - and naming an agent that is not the one behind
+this bot is refused rather than reaching it.
+
+Three rules make this safe to expose in a shared channel:
+
+*The run belongs to somebody.* A direct message is a conversation with a person,
+so an unlinked identity is refused there until it names one. A channel is a room:
+the turn runs under the *binding's* creator, the way a hosted page's visitor runs
+under the page's owner, and the chat account that typed it is recorded on the run
+(#639). What is never true is a run belonging to the bot or to the organization at
+large - budgets, resource grants and the audit trail all take a subject, and every
+path here has one.
+
+*The agent has to have been put here.* A handle resolves only against the agent
+*exposed* to this bot - see :mod:`app.services.agent_exposure`. It used to
+resolve against every published agent in the organization, which made one Slack
+app a door onto all of them; nobody decided that, it fell out of resolving the
+handle against the org rather than against the bot.
+
+*The mention decides nothing about access.* The slug is resolved inside the
+bot's organization and then handed to the registry, which applies the caller's
+role and grants exactly as it would for the same request from the web app. A
+handle typed into a public channel is a name, not a key.
+"""
+
+import asyncio
+import logging
+import re
+from collections.abc import AsyncGenerator, Set
+from dataclasses import dataclass, field
+from decimal import Decimal
+from io import BytesIO
+from typing import Any
+from uuid import UUID
+
+from botocore.exceptions import BotoCoreError, ClientError
+from PIL import Image
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agents.capabilities.channel_tools import ChannelDirectory
+from app.agents.capabilities.charts._spec import parse_chart_spec
+from app.agents.capabilities.image_generation._toolset import parse_generated_image
+from app.core.exceptions import AuthorizationError, BadRequestError, NotFoundError
+from app.core.permissions import AuthContext
+from app.db.models.agent_exposure import AgentExposure
+from app.db.models.agent_run import RunStatus, RunSurface
+from app.db.models.chat_file import ChatFile
+from app.db.models.organization import Organization
+from app.repositories import agent_exposure_repo, agent_repo, member_repo
+from app.services import generated_media, visual_render
+from app.services.access import publisher_context
+from app.services.agent_runner import AgentRunnerService, RunStream
+from app.services.channels.attachments import MAX_OUTBOUND_BYTES
+from app.services.channels.base import (
+    ROOM_HANDLES,
+    IncomingMessage,
+    OutgoingAttachment,
+    channel_key,
+)
+from app.services.channels.chart_png import render_chart_png
+from app.services.channels.formatting import (
+    LINK_ACCOUNT_INSTRUCTION,
+    authored_prompt,
+)
+from app.services.channels.next_steps import next_steps_of
+from app.services.channels.steering import current_steering, is_asked_aside
+from app.services.file_storage import get_file_storage
+from app.services.transcript import RecordedToolCall
+from app.services.usage_report import (
+    UsageReportService,
+    format_footer,
+    needs_sandbox_sample,
+    should_report,
+)
+from app.services.visual import DREW, VISUAL_TOOLS
+
+# Matches a leading handle and keeps everything after it as the prompt. Anchored
+# at the start on purpose: a slug appearing mid-sentence is someone talking
+# *about* an agent, not to it.
+_MENTION = re.compile(r"^\s*@([a-z0-9][a-z0-9-]{0,63})\b[:,]?\s*(.*)$", re.DOTALL)
+
+# What a channel turn can end waiting on that the chat itself can settle.
+_PARKED = (RunStatus.AWAITING_APPROVAL.value, RunStatus.AWAITING_ANSWER.value)
+
+# Which surface a run is stamped with, so run history can be filtered by where
+# it came from. Anything else is recorded as an API run rather than guessed at -
+# which is why every platform this router serves has to be in here. Mattermost
+# was not, so a Mattermost mention was recorded as an HTTP API call: nothing
+# errored, the number simply landed in the wrong bucket and every reader of the
+# column inherited it (#208).
+_SURFACES: dict[str, RunSurface] = {
+    "slack": RunSurface.SLACK,
+    "telegram": RunSurface.TELEGRAM,
+    "mattermost": RunSurface.MATTERMOST,
+    "teams": RunSurface.TEAMS,
+    "discord": RunSurface.DISCORD,
+}
+
+
+# Said to anyone whose channel identity has no account behind it. Deliberately
+# identical whether they never linked or were removed from the organization -
+# both are "we do not know who you are here", and telling them apart would leak
+# whether an account exists.
+def drawn_chart(called: list[RecordedToolCall]) -> bytes | None:
+    """The last chart this turn drew, as a PNG, or None if it drew none.
+
+    The *last*, because a turn that draws twice has refined the first attempt and
+    a reply carries one image. A result that no longer parses is skipped rather
+    than raised on: the payload is whatever the tool returned, and a chart that
+    cannot be drawn must not cost somebody the answer it came with.
+
+    Blocking: Pillow rasterises and PNG-encodes here, and a channel turn runs on
+    the loop the pollers and the other webhook tasks share - so the callers reach
+    it through `asyncio.to_thread`, never inline.
+    """
+    for call in reversed(called):
+        if call.tool_name != _CHART_TOOL or call.result is None:
+            continue
+        spec = parse_chart_spec(call.result)
+        if spec is None:
+            continue
+        try:
+            return render_chart_png(spec)
+        except Exception:
+            logger.exception("Could not render a chart for a channel reply")
+            return None
+    return None
+
+
+def _photo_png(content: bytes) -> bytes:
+    """Decode bounded model output before giving adapters an actual PNG."""
+    with Image.open(BytesIO(content)) as image:
+        if image.width * image.height > 4096 * 4096:
+            raise ValueError("Generated picture exceeds the pixel limit")
+        output = BytesIO()
+        image.convert("RGBA").save(output, format="PNG")
+    png = output.getvalue()
+    if len(png) > MAX_OUTBOUND_BYTES:
+        raise ValueError("Generated picture exceeds the channel byte limit")
+    return png
+
+
+async def _generated_picture(filename: str, organization_id: UUID) -> bytes | None:
+    """Read only the tenant's stored generation receipt, never its URL or workspace path."""
+    stored = await generated_media.open_generated_media(organization_id, filename)
+    if not 0 < stored.size <= MAX_OUTBOUND_BYTES:
+        return None
+    # The range also bounds a file replaced between the size check and the read.
+    stream = await get_file_storage().open_range(stored.storage_path, 0, MAX_OUTBOUND_BYTES)
+    content = bytearray()
+    try:
+        async for chunk in stream:
+            content.extend(chunk)
+    finally:
+        if isinstance(stream, AsyncGenerator):
+            await stream.aclose()
+    if len(content) > MAX_OUTBOUND_BYTES:
+        return None
+    return await asyncio.to_thread(_photo_png, bytes(content))
+
+
+async def drawn_picture(
+    called: list[RecordedToolCall],
+    *,
+    organization_id: UUID,
+    conversation_id: UUID | None,
+    notices: list[str] | None = None,
+    generated_files: Set[str] = frozenset(),
+) -> bytes | None:
+    """The last picture this turn made: a generated photo, chart, or visual the deployment's browser drew.
+
+    A reply carries one image, so it is the last picture this turn made. A visual with
+    no browser to draw it with gives none, and records a delivery notice in
+    `notices` so the channel does not silently confirm a missing picture.
+    """
+    for call in reversed(called):
+        if call.result is None:
+            continue
+        if call.tool_name == "generate_image":
+            image = parse_generated_image(call.result)
+            if image is None:
+                continue
+            try:
+                # MCP tools can reuse this name and forge a receipt. Only the
+                # runner's store-generated provenance may authorize an embed.
+                picture = None
+                if image.filename is not None and image.filename in generated_files:
+                    async with asyncio.timeout(15):
+                        picture = await _generated_picture(image.filename, organization_id)
+            except (
+                NotFoundError,
+                OSError,
+                ValueError,
+                Image.DecompressionBombError,
+                BotoCoreError,
+                ClientError,
+            ):
+                logger.warning(
+                    "Could not prepare a generated picture for a channel reply", exc_info=True
+                )
+                picture = None
+            if picture is not None:
+                return picture
+            if notices is not None:
+                notices.append(
+                    "The generated image could not be attached to this reply. "
+                    "It has not been delivered to this channel. Open the conversation in "
+                    "AgenticOS to check the image or ask the operator to check media storage."
+                )
+            return None
+        if call.tool_name == _CHART_TOOL:
+            return await asyncio.to_thread(drawn_chart, [call])
+        # A visual the tool refused - a retry, the last attempt's refusal - is no
+        # drawing; and one that cannot be drawn here leaves an earlier chart to go.
+        if call.tool_name in VISUAL_TOOLS and call.result.startswith(DREW):
+            picture = await visual_render.picture_of_turn(
+                [(c.tool_call_id, c.tool_name, c.args, c.result) for c in called],
+                organization_id=organization_id,
+                conversation_id=conversation_id,
+            )
+            if picture is not None:
+                return picture
+            if notices is not None:
+                notices.append(
+                    "The visual could not be attached to this reply. It is saved in the "
+                    "conversation in AgenticOS. Ask the deployment operator to check the "
+                    "visual renderer."
+                )
+                # One failed render already covered all this turn's visuals.
+                notices = None
+    return None
+
+
+_CHART_TOOL = "create_chart"
+"""What the charts capability registers. One name, read in one place."""
+
+_LINK_FIRST = LINK_ACCOUNT_INSTRUCTION
+
+# Said when the handle names a real agent that nobody has made available here.
+# Deliberately *not* the same answer a typo gets: the bindings are new, so the
+# common case for this message is a bot that used to answer and now does not,
+# and someone in that position should learn why from the bot rather than from a
+# changelog. The trade is that a member learns an agent by that name exists in
+# their own organization without being able to reach it - which they can already
+# infer from the registry's own refusal, and which is worth less than a channel
+# nobody can debug.
+_NOT_EXPOSED_HERE = (
+    "@{slug} is not available on this bot. Someone who can publish it has to add "
+    "this bot under 'Where this agent is available' in the Builder."
+)
+
+# Said when a message names no agent and the bot serves none. There is no
+# assistant behind a bot any more - a bot only ever relays to published agents -
+# so the fix is the same one _NOT_EXPOSED_HERE points at, phrased for the person
+# who can do it.
+_NOTHING_EXPOSED_HERE = (
+    "No agent is available on this bot yet. Publish an agent and add this bot "
+    "under 'Where this agent is available' in the Builder."
+)
+
+
+@dataclass(frozen=True)
+class Mention:
+    """A message addressed to one agent."""
+
+    slug: str
+    prompt: str
+
+
+def parse_mention(text: str) -> Mention | None:
+    """Split `@handle rest of message` into its parts, or `None`.
+
+    Returns `None` for a bare handle with nothing after it. `@support` alone
+    is a greeting, and answering it would open a billed run to say hello.
+
+    And `None` for a handle that addresses the *room* - `@channel`, `@all`,
+    `@here`, `@everyone`. They match the slug pattern, so a standup announcement
+    read as a mention of an agent nobody has, and because a channel-wide mention
+    puts every member including the bot in the platform's mention list the bot
+    considered itself named and answered under it. Nobody typing `@channel` is
+    addressing an agent, which makes this a property of the parser rather than a
+    refusal further down.
+    """
+    while match := _MENTION.match(text):
+        slug, prompt = match.group(1), match.group(2).strip()
+        if not prompt:
+            return None
+        if slug not in ROOM_HANDLES:
+            return Mention(slug=slug, prompt=prompt)
+        text = prompt
+    return None
+
+
+class UnaddressedMessage(Exception):
+    """The message names no agent, so the caller should handle it itself."""
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AnsweredTurn:
+    """What a channel should send back: words, files, and what would not fit.
+
+    A single string was enough while an agent could only talk. Now that it can
+    produce a spreadsheet, the answer and the file it is about have to arrive
+    together - a reply that posted them separately would read as two messages
+    about different things.
+    """
+
+    text: str
+    attachments: list[OutgoingAttachment] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)
+    """Produced files the reply names instead of carrying."""
+
+    delivery_notices: list[str] = field(default_factory=list)
+    """Delivery failures, already phrased for the reader rather than as file paths."""
+
+    awaiting_approval_run_id: UUID | None = None
+    """The run parked on a decision, when that is how the turn ended.
+
+    Carried so the reply can link to it. "Check the approvals queue" told
+    somebody in a chat window to go and find a page they may never have opened,
+    on a product they reach through a bot - which is most of the way to not
+    telling them at all.
+    """
+
+    parked_run_id: UUID | None = None
+    """The run, when it stopped for somebody in this chat - a decision or a question -
+    so the chat is offered the choices as buttons (#2064, #2067)."""
+
+    run_id: UUID | None = None
+    """The run that answered, so the thumbs under the answer can rate it (#2084)."""
+
+    next_steps: list[str] = field(default_factory=list)
+    """What the answer offered to do next, posted under it as buttons (#2301)."""
+
+    image_png: bytes | None = None
+    """A chart the turn drew, rendered for a surface that cannot run Recharts.
+
+    Beside the attachments rather than among them because a chart is not a file
+    somebody asked for: it is the answer, and every adapter posts it as an image
+    with the text rather than as something to download.
+    """
+
+    status: str = RunStatus.COMPLETED
+    """How the run ended, so the reply can tell an empty answer's reasons apart.
+
+    Typed `str` to match `AgentRun.status` (`Mapped[str]`) - the whole codebase
+    holds a run status as a string and compares it against the `RunStatus`
+    members, which are strings.
+
+    An empty `text` is not one thing: a run parked on an approval, one stopped
+    at its budget, and one that simply produced no words all arrive empty, and
+    only `awaiting_approval_run_id` distinguished the first - so the other two
+    were told "that needs approval", which sends somebody to a runs page over a
+    decision that was never raised.
+    """
+
+
+class ChannelAgentRouter:
+    """Answers channel messages that name a published agent."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+        self.runner = AgentRunnerService(db)
+        self.usage = UsageReportService(db)
+
+    async def answer(
+        self,
+        text: str,
+        *,
+        platform: str,
+        incoming: IncomingMessage | None = None,
+        organization_id: UUID,
+        bot_id: UUID,
+        user_id: UUID | None,
+        channel_identity_id: UUID | None = None,
+        admit_unlinked: bool = False,
+        conversation_id: UUID | None = None,
+        platform_chat_id: str | None = None,
+        memory_room_key: str | None = None,
+        channel_directory: ChannelDirectory | None = None,
+        turn: int = 0,
+        attachments: list[ChatFile] | None = None,
+        stream: RunStream | None = None,
+        message_history: list[Any] | None = None,
+    ) -> AnsweredTurn:
+        """Run the agent named in `text` and return what it said.
+
+        Args:
+            text: The raw incoming message, handle included.
+            platform: Which channel it arrived on, for the run's surface.
+            incoming: Normalized platform event for request-only author labels;
+                authorization still uses the separately resolved channel identity.
+            organization_id: The bot's organization; the slug is resolved here
+                and nowhere else, so one workspace cannot reach another's agents.
+            bot_id: The bot the message arrived on. An agent answers through it
+                only if an exposure says so - the organization is where the
+                handle is *looked up*, not what makes it reachable.
+            user_id: The platform user's linked account, or `None` if they
+                never linked one.
+            channel_identity_id: The chat account the message arrived from,
+                recorded on the run so a channel turn says who asked even when
+                nobody has linked an account to it.
+            admit_unlinked: Whether a sender with no linked account may run under
+                the binding's creator instead of being refused. True in a room,
+                false in a private conversation - the caller decides, because
+                only the caller knows which this is.
+            conversation_id: The channel session's conversation, so a thread
+                keeps its history.
+            channel_directory: This channel, ready to be asked about, for an
+                agent whose spec binds `channel_tools`. Bound by the caller
+                because it holds the bot's token, and passed through unread:
+                a run with none simply gets no channel tools.
+
+        How talkative the reply is about what a turn cost is not a parameter:
+        it is the binding's, read off the exposure this method has just
+        resolved. It used to arrive from the router as the *bot's* setting,
+        which made it the operator's rather than the agent author's - and once
+        a bot served one agent there was nothing left for two copies to say.
+
+        Returns:
+            The agent's answer, or an empty string when a tool call was parked
+            for approval - the same contract as
+            :meth:`AgentRunnerService.execute`.
+
+        Raises:
+            UnaddressedMessage: If the message names no agent. This is the
+                common case, not an error: the caller decides what an
+                unaddressed message means for its bot.
+            AuthorizationError: If the sender has no account and this is not a
+                room.
+            NotFoundError: If no agent in this organization holds that handle,
+                or the sender may not see the one that does. Both answer with
+                the same message, so a channel cannot be used to enumerate the
+                agents someone is not entitled to.
+            BadRequestError: If the agent exists but is not exposed on this bot.
+                Its own message, because "nobody put it here" has a fix and
+                "that handle does not exist" does not.
+        """
+        mention = parse_mention(text)
+        if mention is None:
+            raise UnaddressedMessage
+
+        sender = await self._membership_context(
+            organization_id,
+            user_id,
+            slug=mention.slug,
+            channel_identity_id=channel_identity_id,
+            admit_unlinked=admit_unlinked,
+        )
+
+        agent = await agent_repo.get_by_slug(self.db, mention.slug, organization_id=organization_id)
+        if agent is None:
+            raise NotFoundError(
+                message=f"No agent here answers to @{mention.slug}.",
+                details={"slug": mention.slug},
+            )
+
+        exposure = await agent_exposure_repo.get_for_bot(
+            self.db, agent_id=agent.id, channel_bot_id=bot_id
+        )
+        if exposure is None or not exposure.is_active:
+            # A paused binding and no binding say the same thing to a person in
+            # the channel: it is not available here, and someone has to change
+            # that in the Builder. Distinguishing them would only tell them which
+            # screen the switch is on.
+            raise BadRequestError(
+                message=_NOT_EXPOSED_HERE.format(slug=mention.slug),
+                details={"slug": mention.slug, "agent_id": str(agent.id)},
+            )
+
+        ctx = sender or await self._binding_context(
+            exposure, channel_identity_id=channel_identity_id
+        )
+
+        produced: list[OutgoingAttachment] = []
+        refused: list[str] = []
+        notices: list[str] = []
+        called: list[RecordedToolCall] = []
+        generated_files: set[str] = set()
+        answer, run = await self.runner.execute(
+            ctx,
+            agent.id,
+            mention.prompt,
+            said=mention.prompt,
+            attachments=attachments,
+            outbound=produced,
+            outbound_refused=refused,
+            tool_calls=called,
+            generated_files=generated_files,
+            stream=stream,
+            surface=_SURFACES.get(platform, RunSurface.API),
+            # A question is asked here as buttons and answered later (#2064) - of
+            # a linked member. An unlinked sender's turn runs as the publisher,
+            # and a question parked for them could be answered only by the
+            # publisher, never by the stranger who was asked; it is declined.
+            parks_questions=sender is not None,
+            # A `/btw` answer is not part of the thread's transcript (#2087).
+            conversation_id=None if is_asked_aside() else conversation_id,
+            # What the sender adds while this runs, and the side question (#2087).
+            steering=current_steering(),
+            aside=is_asked_aside(),
+            channel_key=(None if platform_chat_id is None else channel_key(platform_chat_id)),
+            memory_room_key=memory_room_key,
+            channel_directory=channel_directory,
+            # The thread this agent was brought into, where the router read one.
+            # Without it a named agent answered an existing thread as though it
+            # were empty, because only the default path prepended the backfill.
+            message_history=message_history,
+            channel_author_context="" if incoming is None else authored_prompt("", incoming),
+            # The same rule as the default path: a mention from a member speaks
+            # through that person's own MCP accounts, and the room reads the
+            # answer exactly as it reads the question. `sender`, not `user_id`,
+            # for the same reason - a former member's turn runs under the
+            # publisher, whose accounts must not be reached for.
+            acts_for_sender=sender is not None,
+            # The binding is what let this message through, so it is also what
+            # the run is attributed to and bounded by. Resolving it here and
+            # then not passing it on would leave a cap somebody set on this bot
+            # enforcing nothing.
+            exposure=exposure,
+        )
+        return AnsweredTurn(
+            text=await self._with_usage(
+                ctx, answer, run, usage_reporting=exposure.usage_reporting, turn=turn
+            ),
+            attachments=produced,
+            refused=refused,
+            delivery_notices=notices,
+            image_png=await drawn_picture(
+                called,
+                organization_id=run.organization_id,
+                conversation_id=run.conversation_id,
+                notices=notices,
+                generated_files=generated_files,
+            ),
+            awaiting_approval_run_id=(
+                run.id if run.status == RunStatus.AWAITING_APPROVAL else None
+            ),
+            parked_run_id=run.id if run.status in _PARKED else None,
+            status=run.status,
+            run_id=run.id,
+            next_steps=next_steps_of(called),
+        )
+
+    async def answer_default(
+        self,
+        text: str,
+        *,
+        platform: str,
+        incoming: IncomingMessage | None = None,
+        organization_id: UUID,
+        bot_id: UUID,
+        user_id: UUID | None,
+        channel_identity_id: UUID | None = None,
+        admit_unlinked: bool = False,
+        conversation_id: UUID | None = None,
+        platform_chat_id: str | None = None,
+        memory_room_key: str | None = None,
+        channel_directory: ChannelDirectory | None = None,
+        turn: int = 0,
+        attachments: list[ChatFile] | None = None,
+        message_history: list[Any] | None = None,
+        stream: RunStream | None = None,
+    ) -> AnsweredTurn:
+        """Run the only agent this bot serves and return what it said.
+
+        The unaddressed half of :meth:`answer`, and the ordinary one: a bot
+        serves exactly one agent - `uq_exposure_bot` - so a message that names
+        no handle has already said which agent it is for. The only other state
+        is a bot nobody has bound anything to, and there is nothing to run.
+
+        Args:
+            text: The whole incoming message; there is no handle to strip.
+            incoming: Normalized platform event for this turn's author labels.
+            message_history: The channel thread so far, in Pydantic AI's format.
+                Both routes receive saved turns and the initial thread backfill
+                so follow-ups retain earlier authors and tool results.
+
+        Raises:
+            BadRequestError: If the bot exposes no agent. The message says what
+                to do next, because the person reading it is standing in a chat
+                that just refused to answer.
+            AuthorizationError: If the sender has no account and this is not a
+                room.
+            NotFoundError: If the sender may not see the one exposed agent.
+        """
+        exposed = await agent_exposure_repo.list_active_for_bot(self.db, channel_bot_id=bot_id)
+        if not exposed:
+            raise BadRequestError(message=_NOTHING_EXPOSED_HERE, details={"bot_id": str(bot_id)})
+
+        # At most one, guaranteed by the unique constraint on the bot. This used
+        # to be a list to choose from, and choosing was the sender's problem:
+        # a message naming no handle was answered with a list of slugs instead
+        # of an answer, for agents they could not see.
+        exposure, agent = exposed[0]
+        sender = await self._membership_context(
+            organization_id,
+            user_id,
+            slug=agent.slug,
+            channel_identity_id=channel_identity_id,
+            admit_unlinked=admit_unlinked,
+        )
+        ctx = sender or await self._binding_context(
+            exposure, channel_identity_id=channel_identity_id
+        )
+        produced: list[OutgoingAttachment] = []
+        refused: list[str] = []
+        notices: list[str] = []
+        called: list[RecordedToolCall] = []
+        generated_files: set[str] = set()
+        answer, run = await self.runner.execute(
+            ctx,
+            agent.id,
+            text,
+            said=text,
+            attachments=attachments,
+            outbound=produced,
+            outbound_refused=refused,
+            tool_calls=called,
+            generated_files=generated_files,
+            stream=stream,
+            surface=_SURFACES.get(platform, RunSurface.API),
+            # A question is asked here as buttons and answered later (#2064) - of
+            # a linked member. An unlinked sender's turn runs as the publisher,
+            # and a question parked for them could be answered only by the
+            # publisher, never by the stranger who was asked; it is declined.
+            parks_questions=sender is not None,
+            # A `/btw` answer is not part of the thread's transcript (#2087).
+            conversation_id=None if is_asked_aside() else conversation_id,
+            # What the sender adds while this runs, and the side question (#2087).
+            steering=current_steering(),
+            aside=is_asked_aside(),
+            channel_key=(None if platform_chat_id is None else channel_key(platform_chat_id)),
+            memory_room_key=memory_room_key,
+            channel_directory=channel_directory,
+            # A sender who is a member speaks through their own MCP accounts, in
+            # a room as much as in a direct message: the account is this
+            # message's author, never the thread's. `sender`, not `user_id`: a
+            # linked account whose person has left the organization runs under
+            # the binding's publisher, and the publisher's accounts are not the
+            # room's to use.
+            acts_for_sender=sender is not None,
+            message_history=message_history,
+            channel_author_context="" if incoming is None else authored_prompt("", incoming),
+            exposure=exposure,
+        )
+        return AnsweredTurn(
+            text=await self._with_usage(
+                ctx, answer, run, usage_reporting=exposure.usage_reporting, turn=turn
+            ),
+            attachments=produced,
+            refused=refused,
+            delivery_notices=notices,
+            image_png=await drawn_picture(
+                called,
+                organization_id=run.organization_id,
+                conversation_id=run.conversation_id,
+                notices=notices,
+                generated_files=generated_files,
+            ),
+            awaiting_approval_run_id=(
+                run.id if run.status == RunStatus.AWAITING_APPROVAL else None
+            ),
+            parked_run_id=run.id if run.status in _PARKED else None,
+            status=run.status,
+            run_id=run.id,
+            next_steps=next_steps_of(called),
+        )
+
+    async def _with_usage(
+        self,
+        ctx: AuthContext,
+        answer: str,
+        run: Any,
+        *,
+        usage_reporting: dict[str, Any] | None,
+        turn: int,
+    ) -> str:
+        """The answer, with what the turn cost under it when the bot says so.
+
+        Recorded whichever way the bot is configured, and only *spoken* when its
+        mode says to. "The bot went quiet" is a question somebody asks days later,
+        and a report that was never written is no help then.
+
+        An empty answer is left empty. That is the parked-approval contract - the
+        caller turns it into "this needs approval" - and appending an accounting
+        line to nothing would make a footer look like the reply.
+
+        Never raises. This hangs off an answer somebody is waiting for; a
+        workspace that cannot be measured must not turn a good turn into an error.
+        """
+        try:
+            report = await self.usage.for_run(
+                ctx,
+                run,
+                period_spend_usd=await self.runner.monthly_spend(ctx),
+                budget_usd=await self._budget(ctx),
+                include_sandbox=needs_sandbox_sample(usage_reporting),
+            )
+        except Exception:
+            logger.warning("usage_report_failed", extra={"run_id": str(run.id)}, exc_info=True)
+            return answer
+
+        line = format_footer(report)
+        logger.info("channel_turn_usage", extra={"run_id": str(run.id), "usage": line})
+        if not answer or not should_report(usage_reporting, report, turn=turn):
+            return answer
+        return f"{answer}\n\n_{line}_"
+
+    async def _budget(self, ctx: AuthContext) -> Decimal | None:
+        """This organization's monthly cap, or `None` if it set none.
+
+        The organization's rather than the agent's: an agent's cap is its author's
+        to raise, while this one stops every agent at once - which is the one worth
+        warning a channel about before it happens.
+        """
+        organization = await self.db.get(Organization, ctx.organization_id)
+        return None if organization is None else organization.monthly_budget_usd
+
+    async def _membership_context(
+        self,
+        organization_id: UUID,
+        user_id: UUID | None,
+        *,
+        slug: str,
+        channel_identity_id: UUID | None,
+        admit_unlinked: bool,
+    ) -> AuthContext | None:
+        """The sender's own context, `None` if the turn runs under the binding.
+
+        Split from :meth:`_binding_context` so that *whether this sender may be
+        answered at all* is decided before anything is looked up. A sender who
+        may not must not learn from the refusal whether the handle they typed
+        exists - which is the property the mention path is built on, and one only
+        this ordering keeps.
+
+        A linked sender who is still a member runs as themselves: their role,
+        their grants, their name on the audit entry.
+
+        `admit_unlinked` is the caller's answer to whether this is a room or a
+        private conversation - a group chat, unless the bot's policy asks for a
+        link. Where it holds, a sender this platform cannot name runs under the
+        binding instead; where it does not, they are refused, which is every
+        direct message.
+
+        A linked account that is no longer a member takes the same path as an
+        unlinked one rather than a third: there is no membership to read a role
+        from, and in a room a former member is no more entitled than the stranger
+        beside them. A deactivated account is one of those, which is why this is
+        the joined read: the membership row outlives a deactivation, and the link
+        in `channel_identities` outlives it too, so the plain read ran an
+        offboarded Owner's turns at their full authority from a chat account
+        nobody had unlinked - refused everywhere they sign in, except here.
+        """
+        if user_id is not None:
+            membership = await member_repo.get_active(
+                self.db, organization_id=organization_id, user_id=user_id
+            )
+            if membership is not None:
+                return AuthContext(
+                    user_id=user_id,
+                    organization_id=organization_id,
+                    role=membership.role,
+                    channel_identity_id=channel_identity_id,
+                )
+
+        if not admit_unlinked:
+            raise AuthorizationError(message=_LINK_FIRST, details={"agent": slug})
+
+        return None
+
+    async def _binding_context(
+        self, exposure: AgentExposure, *, channel_identity_id: UUID | None
+    ) -> AuthContext:
+        """The context a turn nobody can name runs under: the binding creator's.
+
+        One line, because the rule and its `viewer` fallback are the same ones a
+        widget and a hosted page answer with - see `access.publisher_context`, which
+        is where the reasoning now lives so the two cannot drift apart (#640).
+        """
+        return await publisher_context(
+            self.db,
+            organization_id=exposure.organization_id,
+            publisher_user_id=exposure.created_by_user_id,
+            channel_identity_id=channel_identity_id,
+        )

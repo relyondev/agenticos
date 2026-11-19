@@ -1,0 +1,1035 @@
+import logging
+import re
+import secrets
+from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.exceptions import AuthorizationError, BadRequestError, NotFoundError
+from app.core.field_errors import refused_field
+from app.core.permissions import AuthContext, Perm
+from app.db.locks import LockScope, hold_name
+from app.db.models.knowledge_base import KBScope, KnowledgeBase
+from app.db.models.local_service import LocalServiceKind
+from app.db.models.resource_grant import Visibility
+from app.db.vector_tables import MAX_COLLECTION_NAME_LENGTH
+from app.repositories import (
+    collection_teardown_repo,
+    knowledge_base_repo,
+    local_service_repo,
+    organization_secret_repo,
+    rag_document_repo,
+    resource_grant_repo,
+)
+from app.repositories.rag_document import CollectionCounts, CollectionScope
+from app.schemas.knowledge_base import (
+    KnowledgeBaseCreate,
+    KnowledgeBaseList,
+    KnowledgeBaseRead,
+    KnowledgeBaseUpdate,
+)
+from app.services.access import COLLECTION, SECRET, resolve_access, visible_resource_ids
+from app.services.collection_access import CollectionAccessService, readable_kb, writable_kb
+from app.services.ingestion_config import (
+    IngestionConfig,
+    IngestionConfigService,
+    chosen_embedding,
+    deployment_defaults,
+)
+from app.services.model_profile import validate_endpoint_url
+from app.services.rag import embedding_providers
+from app.services.resource_usage import agents_using, groups_sharing, shared_with_group
+from app.services.sharing import SharingService
+from app.worker.jobs import BasePurge
+
+logger = logging.getLogger(__name__)
+
+
+_DERIVED_SUFFIX_BYTES = 3
+"""How much randomness a derived name carries, as bytes of `secrets.token_hex`."""
+
+_DERIVED_SLUG_LENGTH = MAX_COLLECTION_NAME_LENGTH - 1 - 2 * _DERIVED_SUFFIX_BYTES
+"""What is left for the slug: the bound, less the separator and the hex suffix."""
+
+
+def _derive_collection_name(name: str) -> str:
+    """Slugify the KB name and append a short random suffix to avoid collisions.
+
+    The result has to satisfy
+    :func:`app.db.vector_tables.validate_collection_name` like any other name,
+    and two of its rules are why this is not one line. A slug is a leading digit
+    away from an identifier the store cannot use unquoted - `2024 Reports`
+    becomes `2024_reports` - so a slug that does not start with a letter is
+    given one. And the slug is trimmed to what leaves room for the suffix,
+    rather than to whatever fit under the old absent length bound.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "kb"
+    if not slug[0].isalpha():
+        slug = f"kb_{slug}"
+    return f"{slug[:_DERIVED_SLUG_LENGTH]}_{secrets.token_hex(_DERIVED_SUFFIX_BYTES)}"
+
+
+def _check_provider_fits_scope(
+    provider: embedding_providers.EmbeddingProviderEntry, *, organization_id: UUID | None
+) -> None:
+    """Refuse a keyed provider for a collection that has no vault to pay it from.
+
+    An app-scoped collection belongs to no organization, so there is no vault
+    it could name a key from and no deployment-wide key either; the one way it
+    can embed is through a keyless endpoint on the deployment's own network
+    (#1631). Refused here, on the control that chose the provider, rather than
+    discovered on the first document that fails to index.
+    """
+    if organization_id is None and not provider.keyless:
+        raise refused_field(
+            "embedding_provider",
+            f"An app-scoped collection belongs to no organization and has no vault to hold a "
+            f"key for {provider.name}. Choose a keyless provider on the deployment's own "
+            "network, or create the collection inside an organization.",
+        )
+
+
+def _refuse_endpoint_for_keyed(
+    provider: embedding_providers.EmbeddingProviderEntry, *, endpoint_id: UUID | None
+) -> None:
+    """A vendor's address is the catalog's; a local service named for one is a mistake to record."""
+    if endpoint_id is not None:
+        raise refused_field(
+            "embedding_endpoint_id",
+            f"{provider.name} is reached at its own address; a local service applies only to "
+            "a keyless provider on the deployment's own network.",
+        )
+
+
+def _refuse_key_for_keyless(
+    provider: embedding_providers.EmbeddingProviderEntry, *, secret_id: UUID | None
+) -> None:
+    """A keyless endpoint takes no credential, so a key chosen for it is a mistake to name."""
+    if secret_id is not None:
+        raise refused_field(
+            "embedding_secret_id",
+            f"{provider.name} takes no key: it is a keyless endpoint on the deployment's own "
+            "network, and nothing is billed for its embeddings.",
+        )
+
+
+def _no_knowledge_base(kb_id: UUID) -> NotFoundError:
+    """The one refusal for a base that is absent, and for one out of reach.
+
+    Built in a single place so the two cannot drift apart: a caller must not be
+    able to tell "there is no such id" from "that id is not yours", and two
+    matching string literals in different methods is not a guarantee of that.
+    """
+    return NotFoundError(message="Knowledge base not found", details={"kb_id": str(kb_id)})
+
+
+def _with_counts(kb: KnowledgeBase, counts: CollectionCounts | None) -> KnowledgeBaseRead:
+    """A collection as the listing shows it, contents included.
+
+    `counts` is `None` for a collection nothing has been written to - the group
+    query has no row to return for it - and the zeros that stands for are the
+    schema's own defaults.
+    """
+    read = KnowledgeBaseRead.model_validate(kb)
+    if counts is None:
+        return read
+    return read.model_copy(
+        update={
+            "document_count": counts.documents,
+            "indexed_count": counts.indexed,
+            "chunk_count": counts.chunks,
+        }
+    )
+
+
+# The deleted documents one `BasePurge` of a kept base names.
+_PURGE_IDS_PER_ENTRY = 500
+
+
+class KnowledgeBaseService:
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def list_readable(
+        self, ctx: AuthContext, *, shared_with_me: bool = False, group_id: UUID | None = None
+    ) -> KnowledgeBaseList:
+        """The listing: the bases this caller may read, each with its contents.
+
+        The two halves below answer separate questions - which rows are in reach,
+        and what each one holds - and joining them is this method's whole job, so
+        the route never has to know that a listing takes two queries.
+        `group_id` narrows to the bases shared with one group.
+        """
+        items = await self.list_accessible(ctx, shared_with_me=shared_with_me)
+        in_group = await shared_with_group(
+            self.db, ctx, resource_type=COLLECTION, group_id=group_id
+        )
+        if in_group is not None:
+            items = [kb for kb in items if kb.id in set(in_group)]
+        counts = await self.counts_for(items)
+        used = await agents_using(
+            self.db, ctx, field="collection_ids", resource_ids=[kb.id for kb in items]
+        )
+        groups = await groups_sharing(
+            self.db, ctx, resource_type=COLLECTION, resource_ids=[kb.id for kb in items]
+        )
+        return KnowledgeBaseList(
+            items=[
+                _with_counts(kb, counts.get(kb.id)).model_copy(
+                    update={"used_by": used[kb.id], "shared_groups": groups[kb.id]}
+                )
+                for kb in items
+            ],
+            total=len(items),
+        )
+
+    async def list_accessible(
+        self, ctx: AuthContext, *, shared_with_me: bool = False
+    ) -> list[KnowledgeBase]:
+        """The knowledge bases this caller may read: personal + reachable org + app.
+
+        Which org rows are reachable is the caller's `collections:view` scope -
+        own plus org-visible for a Member, everything for a Builder - widened
+        by explicit grants, exactly as :func:`collection_access.readable_kb`
+        answers per row. `shared_with_me` narrows to org rows deliberately
+        shared with the caller - org-visible or explicitly granted, and not
+        their own; personal and app-scope rows were never shared with anybody.
+        """
+        shared = await visible_resource_ids(
+            self.db, ctx, resource_type=COLLECTION, perm=Perm.COLLECTIONS_VIEW
+        )
+        grant_ids = shared or []
+        if shared_with_me and shared is None:
+            # A role that reaches everything never looks its grants up - but
+            # "shared with me" is a question about grants and visibility, not
+            # reach, and without them the answer would degenerate into "the
+            # whole organization minus mine".
+            grant_ids = await resource_grant_repo.list_shared_ids(
+                self.db,
+                organization_id=ctx.organization_id,
+                subject_user_id=ctx.subject_id,
+                resource_type=COLLECTION.key,
+            )
+        return await knowledge_base_repo.get_accessible(
+            self.db,
+            user_id=ctx.subject_id,
+            organization_id=ctx.organization_id,
+            see_all_org=shared is None,
+            shared_org_ids=grant_ids,
+            shared_with_me=shared_with_me,
+        )
+
+    async def counts_for(self, bases: list[KnowledgeBase]) -> dict[UUID, CollectionCounts]:
+        """What each of these knowledge bases holds, keyed by base id.
+
+        Takes the rows the caller already resolved rather than re-deriving them:
+        this is the second half of a listing whose first half already answered
+        "which of these may they see", and asking that question twice is how the
+        two answers drift. Keyed by base rather than by collection name, because
+        bases share a name and each holds its own rows (#2486).
+        """
+        return await rag_document_repo.counts_by_scope(
+            self.db, scopes=[CollectionScope.of(kb) for kb in bases]
+        )
+
+    async def create_for_rag_collection(
+        self,
+        collection_name: str,
+        *,
+        user_id: UUID,
+        organization_id: UUID | None = None,
+    ) -> KnowledgeBase:
+        """Create a KB backed by an explicit `collection_name` (idempotent).
+
+        Used by `POST /rag/collections/{name}` so a collection created on the
+        /rag page also appears on /kb. The collection name is used verbatim
+        (the /rag endpoint already validates it) rather than slug-derived, and
+        the KB is org-scoped so it is visible to the workspace. Returns the
+        existing KB unchanged if one already maps to this collection.
+
+        The row names no vault key, because that route takes none: the
+        collection exists and can be read, and refuses to index or search until
+        `PATCH /kb/{id}` gives it a provider and a key. There is no
+        deployment-wide key it could embed on instead. The model is the first
+        the first catalogued provider serves, for the same reason the provider
+        is: the route offers no choice, and a row has to record something its
+        vector column can be created at.
+        """
+        existing = await knowledge_base_repo.get_by_collection_name(self.db, collection_name)
+        if existing:
+            return existing
+        scope = KBScope.ORG.value if organization_id else KBScope.PERSONAL.value
+        provider = embedding_providers.first()
+        built_with = provider.models[0]
+        return await knowledge_base_repo.create(
+            self.db,
+            name=collection_name,
+            collection_name=collection_name,
+            scope=scope,
+            owner_user_id=user_id if scope == KBScope.PERSONAL.value else None,
+            organization_id=organization_id,
+            # Org-visible on purpose: the /rag page creates workspace-wide
+            # collections, and an ownerless private row would be reachable
+            # only by roles whose `collections:view` spans the organization.
+            visibility=Visibility.ORG.value if scope == KBScope.ORG.value else None,
+            ingestion_config=deployment_defaults().model_dump(mode="json"),
+            embedding_model=built_with.model,
+            embedding_dim=built_with.dim,
+            embedding_provider=provider.provider,
+        )
+
+    async def delete_for_rag_collection(self, kb: KnowledgeBase) -> None:
+        """Clear a dropped collection: its documents, its KB row and its vectors.
+
+        Serves `DELETE /rag/collections/{name}`. A default KB keeps its **row** so
+        the org keeps a usable knowledge base, but its documents and vectors go all
+        the same - so a cleared default stops returning the documents deleted with
+        it, the stale-searchable-chunks bug a kept table left behind (#1361, #1364).
+        A search reads an absent table as empty and the next upload recreates it
+        (`_ensure_collection`); a non-default KB's row goes too.
+
+        Takes the row rather than the name: the caller has already resolved
+        which knowledge base it is allowed to act on, and looking the name up
+        again would find whichever row the database returned first - possibly
+        another organization's, where two of them share a collection name.
+
+        The name is not tenant-unique (#913), so what goes depends on whether a
+        base *other than this one* still holds it. If one does, the table backs
+        its chunks too and stays; only this base's document rows are deleted, by
+        its id, and the chunks filed under it are purged from the kept table by
+        the cleanup job (#2537) - for a kept default, only the deleted documents'
+        chunks, since it takes uploads again under the same id. Deleting by name
+        reached every base's rows under it, another organization's included, and
+        queued their files for unlinking (#2560). The unfiled rows the base takes
+        - its tenant's - go with it unless another base of that tenant on the
+        name takes them too, and their chunks with the purge: a kept default
+        would otherwise go on listing and serving them. If no other base holds
+        the name, every row under it goes - unfiled ones included, since nothing
+        could read them once the table is dropped - and so does the table.
+
+        The stored files, the purge and the drop are a cleanup job queued in this
+        transaction (`queue_external_state_cleanup`), not run in the request, so
+        they happen only once the delete has committed: an in-request drop stranded
+        a rolled-back delete on a dropped table, lost it to a worker restart, and
+        raced a concurrent claim (#1347, #1349, #1355). The name is held against a
+        claim while the reference check and the reservation are made, and reserved
+        in `collection_teardowns` until the drop runs, so neither a create (`claim`)
+        nor an upload (`dispatch_upload`) can slip onto the name and have this drop
+        destroy its table (#1362, #1364).
+        """
+        collection = kb.collection_name
+        # The teardown lock comes before the document and KB rows, one order across
+        # every path that takes both, so a concurrent purge cannot invert into a
+        # deadlock (#1387).
+        await hold_name(self.db, LockScope.COLLECTION_TEARDOWN, collection)
+        # Lock the base before enumerating its documents, so a concurrent upload or
+        # sync inserting a row cannot slip in between the delete and the commit and
+        # survive detached under `ON DELETE SET NULL` (#1266).
+        await knowledge_base_repo.lock(self.db, kb.id)
+        # A default keeps its own row, so it is filtered out by id.
+        others = [
+            ref
+            for ref in await knowledge_base_repo.list_by_collection_name(self.db, collection)
+            if ref.id != kb.id
+        ]
+        collections_to_drop: list[str] = []
+        base_purges: list[BasePurge] = []
+        # The documents go before the KB row: `ON DELETE SET NULL` would unfile
+        # them first, and a delete by the base's id would then find nothing.
+        if others:
+            storage_paths, base_purges = await self._delete_documents_from_kept_table(kb, others)
+        else:
+            storage_paths = await rag_document_repo.delete_by_collection(self.db, collection)
+            collections_to_drop = [collection]
+            await collection_teardown_repo.reserve(self.db, collection)
+        if not kb.is_default:
+            await CollectionAccessService(self.db).detach_sources_targeting(kb)
+            await knowledge_base_repo.delete(self.db, kb.id)
+        # Always a job: a kept table has the base's chunks to purge, and an
+        # unreferenced one is dropped.
+        from app.worker.tasks.teardown_tasks import queue_external_state_cleanup
+
+        await queue_external_state_cleanup(
+            self.db, storage_paths, collections_to_drop, base_purges=base_purges
+        )
+
+    async def drop_collection_by_name(
+        self, collection: str, *, knowledge_base_id: UUID | None = None
+    ) -> KnowledgeBase | None:
+        """Drop a collection by its name, for `rag-drop`, which has no caller to scope by.
+
+        Goes through the same teardown as `DELETE /rag/collections/{name}`: the
+        base holding the name is cleared by `delete_for_rag_collection`, so its
+        documents go, a table another base still holds stays, and the drop is a
+        cleanup job queued in this transaction under the teardown lock and a
+        reservation (#1359, #1362). The command used to drop the vector table
+        straight away, with no reference check, and left the document rows behind
+        - destroying a table another base, possibly another organization's, still
+        used (#2560).
+
+        The name is not tenant-unique (#913), so when several bases hold it the
+        operator names one by `knowledge_base_id`; without one this refuses rather
+        than pick. A name no base holds - a collection `rag-ingest` filled from
+        the command line - is dropped whole, its document rows with it.
+
+        Returns the base cleared, or `None` for a name no base holds.
+        """
+        # The teardown lock before the lookup, so the holders read here are the
+        # ones the drop decides on; `delete_for_rag_collection` takes it again,
+        # which a transaction-level advisory lock allows.
+        await hold_name(self.db, LockScope.COLLECTION_TEARDOWN, collection)
+        holders = await knowledge_base_repo.list_by_collection_name(self.db, collection)
+        if knowledge_base_id is not None:
+            kb = next((holder for holder in holders if holder.id == knowledge_base_id), None)
+            if kb is None:
+                raise NotFoundError(
+                    message="No knowledge base with this id holds the collection",
+                    details={"collection": collection, "knowledge_base_id": knowledge_base_id},
+                )
+        elif len(holders) > 1:
+            raise BadRequestError(
+                message="Several knowledge bases hold this collection name; name one by its id",
+                details={
+                    "collection": collection,
+                    "knowledge_base_ids": [holder.id for holder in holders],
+                },
+            )
+        elif holders:
+            kb = holders[0]
+        else:
+            storage_paths = await rag_document_repo.delete_by_collection(self.db, collection)
+            await collection_teardown_repo.reserve(self.db, collection)
+            from app.worker.tasks.teardown_tasks import queue_external_state_cleanup
+
+            await queue_external_state_cleanup(self.db, storage_paths, [collection])
+            return None
+        await self.delete_for_rag_collection(kb)
+        return kb
+
+    async def _delete_documents_from_kept_table(
+        self, kb: KnowledgeBase, others: list[KnowledgeBase]
+    ) -> tuple[list[str], list[BasePurge]]:
+        """Delete a base's document rows from a table `others` still hold.
+
+        Returns the stored files to unlink and the purges of the base's chunks
+        from the kept table. Its own rows go by its id; a kept default's purge
+        snapshots committed vector ids while holding the base lock, including
+        inserts not yet settled onto tracking rows, since it takes uploads again
+        under the same id. The unfiled rows the base takes - its tenant's - go
+        with it, unless another base of that tenant on the name takes them too
+        and still reads them: a kept default would otherwise go on listing them,
+        and a deleted base would hand them to its tenant's next base on the name
+        (#2560). Their chunks are purged by document id within the tenant.
+
+        Runs before the KB row is deleted: `ON DELETE SET NULL` would unfile the
+        base's rows first, and a delete by its id would then find nothing.
+        """
+        collection = kb.collection_name
+        scope = CollectionScope.of(kb)
+        takes_unfiled = scope.takes_unfiled and not any(
+            other.vector_scope.takes_unfiled and other.vector_scope.tenant == scope.tenant
+            for other in others
+        )
+        unfiled = (
+            await rag_document_repo.delete_unfiled_with_vectors(self.db, scope)
+            if takes_unfiled
+            else rag_document_repo.DeletedDocuments(storage_paths=[], vector_document_ids=[])
+        )
+        base_purges: list[BasePurge] = []
+        if kb.is_default:
+            stored = await rag_document_repo.stored_vector_ids_at_clear(
+                self.db, kb, takes_unfiled=takes_unfiled
+            )
+            deleted = await rag_document_repo.delete_by_knowledge_base_with_vectors(self.db, kb.id)
+            storage_paths = deleted.storage_paths + unfiled.storage_paths
+            named = list(
+                dict.fromkeys([*deleted.vector_document_ids, *stored, *unfiled.vector_document_ids])
+            )
+        else:
+            storage_paths = (
+                await rag_document_repo.delete_by_knowledge_base(self.db, kb.id)
+                + unfiled.storage_paths
+            )
+            named = unfiled.vector_document_ids
+            base_purges = [BasePurge(collection=collection, knowledge_base_id=kb.id)]
+        # Split, so a large purge spreads across entries and jobs rather than
+        # one payload and one array holding every document.
+        base_purges += [
+            BasePurge(
+                collection=collection,
+                knowledge_base_id=kb.id,
+                vector_document_ids=named[i : i + _PURGE_IDS_PER_ENTRY],
+                takes_unfiled=takes_unfiled,
+                tenant=scope.tenant if takes_unfiled else None,
+            )
+            for i in range(0, len(named), _PURGE_IDS_PER_ENTRY)
+        ]
+        return storage_paths, base_purges
+
+    async def get(self, kb_id: UUID, *, ctx: AuthContext) -> KnowledgeBase:
+        """The knowledge base, or "not found" - for absent and out-of-reach alike."""
+        kb = await knowledge_base_repo.get_by_id(self.db, kb_id)
+        if not kb or not await readable_kb(self.db, ctx, kb):
+            raise _no_knowledge_base(kb_id)
+        return kb
+
+    async def get_for_write(self, kb_id: UUID, *, ctx: AuthContext) -> KnowledgeBase:
+        """The knowledge base, resolved for a caller about to change it.
+
+        :meth:`get` answers for reading; every route that renames or deletes a
+        base, ingests a document, removes one, or wires a sync source resolves
+        through here instead. The read rule alone let anyone who could *see* a
+        base write into it - a Viewer holds `collections:view` and nothing
+        else, and could still upload, delete documents and point sync sources
+        at the collection.
+
+        The decision is :func:`app.services.collection_access.writable_kb`:
+        `collections:edit` reaching this row - the role's scope against the
+        row's owner and visibility, or an explicit `edit` grant lifting this
+        one base into reach. A grant widens what a role allows, it never
+        narrows it, so a Viewer shared into one base can feed it without being
+        promoted.
+
+        A base the caller cannot read stays "not found", exactly as :meth:`get`
+        answers, so the write path is not an oracle for ids. A refusal on a base
+        they can read is a 403 - concealing a row the caller can already open
+        would cost the sentence that explains the refusal and protect nothing.
+        """
+        kb = await knowledge_base_repo.get_by_id(self.db, kb_id)
+        if not kb or not await readable_kb(self.db, ctx, kb):
+            raise _no_knowledge_base(kb_id)
+        if await writable_kb(self.db, ctx, kb):
+            return kb
+        if kb.scope == KBScope.APP.value:
+            raise AuthorizationError(
+                message="App admin required to modify app-scoped knowledge base"
+            )
+        raise AuthorizationError(
+            message="Changing this knowledge base requires 'collections:edit' on it or an edit grant"
+        )
+
+    async def create(
+        self,
+        data: KnowledgeBaseCreate,
+        *,
+        ctx: AuthContext,
+    ) -> KnowledgeBase:
+        """Create a knowledge base, with the configuration its documents get.
+
+        The embedding model is the caller's choice, frozen at creation: the
+        vector column is created at the chosen model's width, so there is no
+        endpoint that changes it afterwards. Omitted, it is the deployment's
+        default - see :func:`app.services.ingestion_config.deployment_embedding`.
+        The credential can be one of the organization's own vault keys, so a
+        tenant's embeddings are billed to the tenant rather than the operator.
+
+        Unless the collection already exists, in which case the choice was made
+        by whoever created it: see :meth:`_shared_embedding`.
+
+        The collection name is claimed through
+        :meth:`app.services.collection_access.CollectionAccessService.claim`,
+        which is the same call `POST /rag/collections/{name}` makes and which
+        this route made no version of: an explicit `collection_name` was written
+        to the row unexamined, so a member with `collections:edit` could aim a
+        knowledge base at another organization's vector table and read and write
+        it through every gate that came afterwards (#367).
+
+        The derived name is claimed too, rather than trusted for having six hex
+        characters on the end. It costs one indexed lookup, it is the only way
+        the invariant "the name on this row was validated" is true of every row,
+        and the alternative to a 409 once in sixteen million is silently sharing
+        a table with a stranger.
+
+        Raises:
+            BadRequestError: If the named model has no known vector width, the
+                named key is not an API key this organization holds, the
+                collection name could not safely become an identifier, or the
+                named embedding configuration disagrees with the one the
+                collection already indexes with.
+            AlreadyExistsError: If the collection name is already held outside
+                this caller's reach.
+        """
+        self._check_create_permission(scope=data.scope, ctx=ctx)
+        collection_name = data.collection_name or _derive_collection_name(data.name)
+        await CollectionAccessService(self.db).claim(ctx, collection_name)
+        shared = await self._shared_embedding(collection_name, data)
+        config = await self._usable_config(ctx, data.ingestion_config)
+        # The creator owns what they create, org scope included: `own` in the
+        # permission matrix is meaningless for a row nobody owns, and sharing
+        # starts from an owner. App-scoped bases stay ownerless - they belong
+        # to the deployment.
+        owner_user_id = None if data.scope == KBScope.APP.value else ctx.subject_id
+        org_id = (
+            ctx.organization_id
+            if data.scope in (KBScope.ORG.value, KBScope.PERSONAL.value)
+            else None
+        )
+        if shared is not None:
+            embedding_model, embedding_dim = shared.embedding_model, shared.embedding_dim
+            provider = embedding_providers.require(
+                shared.embedding_provider, model=embedding_model, dim=embedding_dim
+            )
+            embedding_secret_id = shared.embedding_secret_id
+            embedding_endpoint_id = shared.embedding_endpoint_id
+            embedding_base_url = shared.embedding_base_url
+        else:
+            embedding_model, embedding_dim = chosen_embedding(data.embedding_model)
+            if data.embedding_provider is None:
+                raise refused_field(
+                    "embedding_provider",
+                    "Choose the provider this collection embeds through; there is no "
+                    "deployment-wide default.",
+                )
+            provider = embedding_providers.require(
+                data.embedding_provider, model=embedding_model, dim=embedding_dim
+            )
+            _check_provider_fits_scope(provider, organization_id=org_id)
+            embedding_secret_id = data.embedding_secret_id
+            embedding_endpoint_id = data.embedding_endpoint_id
+            embedding_base_url = await self._embedding_url(
+                ctx, provider.provider, data.embedding_base_url
+            )
+            if embedding_base_url is not None:
+                await embedding_providers.require_served_at(
+                    provider, embedding_base_url, model=embedding_model, field="embedding_model"
+                )
+            if provider.keyless:
+                _refuse_key_for_keyless(provider, secret_id=embedding_secret_id)
+                if embedding_endpoint_id is None:
+                    raise refused_field(
+                        "embedding_endpoint_id",
+                        f"Choose the local service {provider.name} answers at; the catalog "
+                        "holds no address for a server the deployment runs itself.",
+                    )
+                await self._check_embedding_endpoint(
+                    embedding_endpoint_id, organization_id=org_id, provider=provider
+                )
+            else:
+                _refuse_endpoint_for_keyed(provider, endpoint_id=embedding_endpoint_id)
+                if embedding_secret_id is None:
+                    raise refused_field(
+                        "embedding_secret_id",
+                        f"Choose the vault key that pays for this collection's embeddings on "
+                        f"{provider.name}; there is no deployment-wide key to fall back to.",
+                    )
+                await self._check_embedding_secret(
+                    embedding_secret_id, ctx=ctx, organization_id=org_id, provider=provider
+                )
+        kb = await knowledge_base_repo.create(
+            self.db,
+            name=data.name,
+            collection_name=collection_name,
+            scope=data.scope,
+            description=data.description,
+            owner_user_id=owner_user_id,
+            organization_id=org_id,
+            # Who in the organization reaches it is a question only an org-scoped
+            # collection asks; a personal one is its owner's and an app one everyone's.
+            visibility=data.visibility.value if data.scope == KBScope.ORG.value else None,
+            ingestion_config=config.model_dump(mode="json"),
+            embedding_model=embedding_model,
+            embedding_dim=embedding_dim,
+            embedding_provider=provider.provider,
+            embedding_secret_id=embedding_secret_id,
+            embedding_endpoint_id=embedding_endpoint_id,
+            embedding_base_url=embedding_base_url,
+        )
+        if (data.group_ids or data.user_ids) and data.scope == KBScope.ORG.value:
+            await SharingService(self.db).restrict_to(
+                ctx,
+                kb,
+                resource_type=COLLECTION,
+                group_ids=data.group_ids,
+                user_ids=data.user_ids,
+            )
+        return kb
+
+    async def _shared_embedding(
+        self, collection_name: str, data: KnowledgeBaseCreate
+    ) -> KnowledgeBase | None:
+        """The row this one shares a vector table with, if there is one.
+
+        `collection_name` is not unique and one name is one physical table, so
+        several knowledge bases can index into the same vectors. They must then
+        embed the same way: the column's width was fixed by whichever row was
+        created first, and a second row indexing at another width makes pgvector
+        refuse the comparison outright - or, where the widths happen to agree,
+        rank one embedding space's vectors against another's and answer with
+        plausible nonsense. Which row a per-collection lookup happens to pick
+        stops mattering once they all say the same thing, which is what makes
+        resolving one by organization safe (#913).
+
+        So a row joining an occupied name adopts that name's configuration - the
+        credential included, so the key that pays cannot depend on which sibling
+        was read either. An explicit and *different* choice is refused rather
+        than silently overridden: a caller who asked for `text-embedding-3-large`
+        and got the sibling's `-small` has been given something they did not ask
+        for and no way to see it.
+
+        Raises:
+            BadRequestError: If the caller named a model, provider or key the
+                collection's existing rows do not use.
+        """
+        siblings = await knowledge_base_repo.list_by_collection_name(self.db, collection_name)
+        if not siblings:
+            return None
+        held = siblings[0]
+        asked = {
+            "embedding_model": (data.embedding_model, held.embedding_model),
+            "embedding_provider": (data.embedding_provider, held.embedding_provider),
+            "embedding_secret_id": (data.embedding_secret_id, held.embedding_secret_id),
+            "embedding_endpoint_id": (data.embedding_endpoint_id, held.embedding_endpoint_id),
+            "embedding_base_url": (data.embedding_base_url, held.embedding_base_url),
+        }
+        for field, (wanted, existing) in asked.items():
+            if wanted is not None and wanted != existing:
+                raise refused_field(
+                    field,
+                    f"Collection '{collection_name}' already indexes with "
+                    f"{held.embedding_model!r}; every knowledge base on one collection "
+                    f"shares its embedding configuration.",
+                )
+        return held
+
+    async def _embedding_url(self, ctx: AuthContext, provider: str, url: str | None) -> str | None:
+        if url is not None and not ctx.has(Perm.CONNECTIONS_MANAGE):
+            raise AuthorizationError(
+                message="Managing connections is required for a custom embedding endpoint"
+            )
+        if url is None:
+            return None
+        if provider != "openrouter":
+            raise refused_field(
+                "embedding_base_url", "A custom embedding endpoint is supported only for OpenRouter"
+            )
+        try:
+            return (await validate_endpoint_url(url.strip())).rstrip("/")
+        except BadRequestError as error:
+            raise refused_field("embedding_base_url", error.message) from error
+
+    async def _check_embedding_secret(
+        self,
+        secret_id: UUID,
+        *,
+        ctx: AuthContext,
+        organization_id: UUID | None,
+        provider: embedding_providers.EmbeddingProviderEntry,
+    ) -> None:
+        """Refuse a key the organization does not hold, or one of the wrong kind.
+
+        Checked at creation, where the person choosing can fix it - the
+        resolver deliberately degrades to no key at embed time rather than
+        raising, so this is the moment a wrong choice is visible as a refusal
+        on the field.
+
+        Binding a key is lending it: the collection's embeddings bill it for
+        everyone who can write the collection. So the chooser has to be able to
+        reach the key themselves - the picker only offers what they can see, but
+        the API takes an id and an id is guessable. A key they cannot view is
+        phrased as one the vault does not hold, so a refusal cannot enumerate
+        another member's private secrets.
+        """
+        if organization_id is None:
+            raise BadRequestError(
+                message="Only an organization collection can carry a vault key",
+                details={"embedding_secret_id": str(secret_id)},
+            )
+        row = await organization_secret_repo.get(
+            self.db, secret_id, organization_id=organization_id
+        )
+        if row is None or not await resolve_access(
+            self.db, ctx, row, Perm.SECRETS_VIEW, resource_type=SECRET
+        ):
+            raise BadRequestError(
+                message="That key is not in this organization's vault",
+                details={"embedding_secret_id": str(secret_id)},
+            )
+        if row.purpose != provider.provider:
+            raise refused_field(
+                "embedding_secret_id",
+                f"That key is for {row.purpose}, and this collection embeds through "
+                f"{provider.name}. A key sent to the wrong provider is refused by it, "
+                "and is somebody else's credential in somebody else's logs.",
+                purpose=row.purpose,
+            )
+
+    async def update(
+        self,
+        kb_id: UUID,
+        data: KnowledgeBaseUpdate,
+        *,
+        ctx: AuthContext,
+    ) -> KnowledgeBase:
+        kb = await self.get_for_write(kb_id, ctx=ctx)
+        config = (
+            None
+            if data.ingestion_config is None
+            else await self._usable_config(ctx, data.ingestion_config)
+        )
+        # The provider the collection will be on when this update lands, which is
+        # what the key has to match: moving to OpenAI and choosing an OpenAI key
+        # in one request must be accepted, and either half alone must be checked
+        # against the other half as it already stands. The model and the width are
+        # the collection's own - `require` refuses a provider that cannot serve
+        # them, because the vectors already stored are in that model's space.
+        provider = embedding_providers.require(
+            data.embedding_provider or kb.embedding_provider,
+            model=kb.embedding_model,
+            dim=kb.embedding_dim,
+        )
+        url_named = "embedding_base_url" in data.model_fields_set
+        wanted_url = data.embedding_base_url if url_named else kb.embedding_base_url
+        if wanted_url is not None and provider.provider != "openrouter":
+            if url_named:
+                raise refused_field(
+                    "embedding_base_url",
+                    "A custom embedding endpoint is supported only for OpenRouter",
+                )
+            wanted_url = None
+            url_named = True
+        if url_named and wanted_url != kb.embedding_base_url:
+            if not ctx.has(Perm.CONNECTIONS_MANAGE):
+                raise AuthorizationError(
+                    message="Managing connections is required to change an embedding endpoint"
+                )
+            # Changing the destination lends the retained key to that host just
+            # as choosing a new key does. Managing connections alone is not
+            # authority to send a colleague's private credential elsewhere.
+            if (
+                kb.embedding_secret_id is not None
+                and data.embedding_secret_id is None
+                and not provider.keyless
+            ):
+                await self._check_embedding_secret(
+                    kb.embedding_secret_id,
+                    ctx=ctx,
+                    organization_id=kb.organization_id,
+                    provider=provider,
+                )
+            wanted_url = await self._embedding_url(ctx, provider.provider, wanted_url)
+            if wanted_url is not None:
+                # The model is the collection's own and cannot follow the move,
+                # so an endpoint that does not serve it is the wrong endpoint.
+                await embedding_providers.require_served_at(
+                    provider, wanted_url, model=kb.embedding_model, field="embedding_base_url"
+                )
+            shared = await knowledge_base_repo.list_by_collection_name(self.db, kb.collection_name)
+            if any(row.id != kb.id and row.embedding_base_url != wanted_url for row in shared):
+                raise refused_field(
+                    "embedding_base_url",
+                    "This collection shares its embedding configuration with another knowledge base",
+                )
+        if data.embedding_provider is not None:
+            _check_provider_fits_scope(provider, organization_id=kb.organization_id)
+        if provider.keyless:
+            # A key the row still holds from the provider it left is not
+            # refused: the resolver never opens it for a keyless endpoint, and a
+            # move back to a keyed provider checks it against that one.
+            _refuse_key_for_keyless(provider, secret_id=data.embedding_secret_id)
+            if data.embedding_endpoint_id is not None:
+                await self._check_embedding_endpoint(
+                    data.embedding_endpoint_id,
+                    organization_id=kb.organization_id,
+                    provider=provider,
+                )
+            elif data.embedding_provider is not None:
+                await self._check_kept_endpoint(kb, provider=provider)
+        else:
+            _refuse_endpoint_for_keyed(provider, endpoint_id=data.embedding_endpoint_id)
+            if data.embedding_secret_id is not None:
+                await self._check_embedding_secret(
+                    data.embedding_secret_id,
+                    ctx=ctx,
+                    organization_id=kb.organization_id,
+                    provider=provider,
+                )
+            elif data.embedding_provider is not None:
+                await self._check_kept_secret(kb, provider=provider)
+        return await knowledge_base_repo.update(
+            self.db,
+            db_kb=kb,
+            name=data.name,
+            description=data.description,
+            ingestion_config=None if config is None else config.model_dump(mode="json"),
+            embedding_provider=data.embedding_provider,
+            embedding_secret_id=data.embedding_secret_id,
+            embedding_endpoint_id=data.embedding_endpoint_id,
+            embedding_base_url=wanted_url,
+            set_embedding_base_url=url_named,
+        )
+
+    async def _check_embedding_endpoint(
+        self,
+        endpoint_id: UUID,
+        *,
+        organization_id: UUID | None,
+        provider: embedding_providers.EmbeddingProviderEntry,
+    ) -> None:
+        """Refuse a local service this collection may not name, or one of the wrong shape.
+
+        Visible means the organization's own or the deployment's; an app-scoped
+        collection, with no organization, sees the deployment's alone. A service
+        another organization registered is phrased as one that does not exist,
+        so a refusal cannot enumerate another tenant's hosts.
+        """
+        row = await local_service_repo.get_visible(
+            self.db, endpoint_id, organization_id=organization_id
+        )
+        if row is None:
+            raise refused_field(
+                "embedding_endpoint_id", "That local service is not one this collection may name."
+            )
+        if row.kind != LocalServiceKind.EMBEDDING.value or row.provider != provider.provider:
+            raise refused_field(
+                "embedding_endpoint_id",
+                f"'{row.name}' is a {row.provider} {row.kind} service, and this collection "
+                f"embeds through {provider.name}.",
+            )
+        if not row.is_active:
+            raise refused_field(
+                "embedding_endpoint_id",
+                f"'{row.name}' is turned off. Turn it on under Knowledge, or choose another.",
+            )
+
+    async def _check_kept_endpoint(
+        self, kb: KnowledgeBase, *, provider: embedding_providers.EmbeddingProviderEntry
+    ) -> None:
+        """Moving onto a keyless provider needs its address, in the same request or already on the row."""
+        if kb.embedding_endpoint_id is None:
+            raise refused_field(
+                "embedding_endpoint_id",
+                f"Moving to {provider.name} needs the local service it answers at, in the "
+                "same request.",
+            )
+        await self._check_embedding_endpoint(
+            kb.embedding_endpoint_id, organization_id=kb.organization_id, provider=provider
+        )
+
+    async def _check_kept_secret(
+        self,
+        kb: KnowledgeBase,
+        *,
+        provider: embedding_providers.EmbeddingProviderEntry,
+    ) -> None:
+        """Refuse a provider change that would leave the old key pointed at it.
+
+        The key stays where it is unless the caller says otherwise, so moving the
+        provider on its own can produce a collection holding an OpenRouter key and
+        an OpenAI address - which is the one thing this whole change exists to stop.
+        Named on `embedding_provider`, because that is the control that moved.
+        """
+        if kb.embedding_secret_id is None or kb.organization_id is None:
+            return
+        row = await organization_secret_repo.get(
+            self.db, kb.embedding_secret_id, organization_id=kb.organization_id
+        )
+        if row is None or row.purpose == provider.provider:
+            return
+        raise refused_field(
+            "embedding_provider",
+            f"This collection pays with a {row.purpose} key, which {provider.name} will "
+            "not accept. Choose a key for the new provider in the same request.",
+            purpose=row.purpose,
+        )
+
+    async def _usable_config(
+        self, ctx: AuthContext, config: IngestionConfig | None
+    ) -> IngestionConfig:
+        """The configuration to store, proven to work before it is stored.
+
+        A collection that asks for image description needs a model profile the
+        organization can actually run. Checking it while the form is open turns
+        what would be an ingestion failure an hour later - on a document the
+        uploader had nothing to do with - into a message on the field that
+        caused it. This is the same trade
+        :func:`app.services.model_profile._validate_model_id` makes.
+        """
+        chosen = config or deployment_defaults()
+        service = IngestionConfigService(self.db)
+        await service.resolved_image_model(ctx.organization_id, chosen)
+        await service.check_llamaparse_secret(ctx.organization_id, chosen)
+        await service.check_ocr_endpoint(ctx.organization_id, chosen)
+        return chosen
+
+    async def delete(self, kb_id: UUID, *, ctx: AuthContext) -> None:
+        """Delete a knowledge base and everything it owns.
+
+        The row is not the whole of it: deleting only the `knowledge_bases` row
+        left the `rag_documents` rows (their FK is `SET NULL`, so they survived
+        detached and readable by a later same-named collection), the uploaded
+        files, and the physical `rag_<collection>` vector table all behind, with
+        the collection name still blocking reuse (#1266). So the documents go, then
+        the row, then the table - dropped only when no other base still references
+        the name, which is not tenant-unique (#913).
+
+        The stored files and the vector table are torn down by a cleanup job queued
+        in this transaction (`queue_external_state_cleanup`). A worker runs it only
+        once the delete has committed, so a rollback keeps them beside the rows it
+        restores rather than stranding those rows on a missing file or a dropped
+        table (#1293, #1347), and the job survives a worker restart mid-cleanup and
+        is retried (#1349). The job re-reads the reference check on its own session
+        before dropping, because the name is not tenant-unique and a second org can
+        reclaim it in the window between the commit and the drop (#913), and it
+        builds its own vector engine - which is why this no longer takes a store.
+        When another base still holds the name, the table stays and the same job
+        deletes the chunks filed under this base instead (#2537). The unfiled rows
+        the base takes - its tenant's legacy uploads - go with it then, files and
+        chunks included, unless another base of the same tenant on the name still
+        takes them: left, they would come back with the tenant's next base on the
+        name (#2560). `delete_for_rag_collection` applies the same rule.
+        """
+        # Access first, then the rule about default bases: "cannot delete the
+        # default knowledge base" is a statement about a row, so answering it for
+        # another organization's id confirms both that the id exists and that it
+        # is their default.
+        kb = await self.get_for_write(kb_id, ctx=ctx)
+        if kb.is_default:
+            raise BadRequestError(message="Cannot delete the default knowledge base")
+        collection = kb.collection_name
+        # And the *name* before the base, because the drop below is decided by
+        # counting the bases that still claim it. `collection_name` is not
+        # tenant-unique (#913), so two teardowns of two bases sharing one name
+        # each saw the other's not-yet-committed row under READ COMMITTED, both
+        # took the "still referenced" branch, and the table nobody referenced was
+        # left behind (#1273). Held for the transaction, so the second teardown
+        # reads the first one's committed absence. Taken before the row lock so
+        # every path holds teardown then rows, one order, and a concurrent purge
+        # cannot invert it into a deadlock (#1387).
+        await hold_name(self.db, LockScope.COLLECTION_TEARDOWN, collection)
+        # Lock the base before enumerating its documents, so a concurrent upload
+        # or sync inserting a row cannot slip in between the enumeration and the
+        # base delete and survive detached under `ON DELETE SET NULL` (#1266).
+        await knowledge_base_repo.lock(self.db, kb.id)
+        others = [
+            ref
+            for ref in await knowledge_base_repo.list_by_collection_name(self.db, collection)
+            if ref.id != kb.id
+        ]
+        collections_to_drop: list[str] = []
+        base_purges: list[BasePurge] = []
+        if others:
+            # Another base keeps the shared table, so the deleted base's chunks
+            # stay in it, filed under an id no scope reads. Removed by that id
+            # after the commit, in the same durable job (#2537) - with the
+            # unfiled rows the base took, and their chunks (#2560).
+            storage_paths, base_purges = await self._delete_documents_from_kept_table(kb, others)
+        else:
+            storage_paths = await rag_document_repo.delete_by_knowledge_base(self.db, kb.id)
+            collections_to_drop = [collection]
+            # Reserve the name against reuse until the deferred drop runs, so a
+            # concurrent claim cannot adopt the still-populated table (#1362).
+            await collection_teardown_repo.reserve(self.db, collection)
+        await CollectionAccessService(self.db).detach_sources_targeting(kb)
+        await knowledge_base_repo.delete(self.db, kb.id)
+        if storage_paths or collections_to_drop or base_purges:
+            from app.worker.tasks.teardown_tasks import queue_external_state_cleanup
+
+            await queue_external_state_cleanup(
+                self.db, storage_paths, collections_to_drop, base_purges=base_purges
+            )
+
+    def _check_create_permission(self, *, scope: str, ctx: AuthContext) -> None:
+        if scope == KBScope.APP.value and not ctx.is_app_admin:
+            raise AuthorizationError(
+                message="App admin required to create app-scoped knowledge base"
+            )

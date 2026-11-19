@@ -1,0 +1,3685 @@
+"""Tests for the chat WebSocket session - every frame it sends, and every frame
+it accepts.
+
+`app/services/agent_session.py` decides the whole dashboard chat wire format, and
+it is now in the coverage gate and under strict `ty` (#165). It had been in
+neither, which is why the file it shares that format with - `use-chat.ts` - has
+twice been left switching on a name the backend had changed. So these tests are
+written against the *frames*: what reaches `websocket.send_json`, in what order,
+with which keys. A test that executes the translation without reading its output
+is what let a third of this module go unmeasured while looking tested.
+
+The template's general assistant used to answer any frame that named no agent.
+It is gone: the factory is the only way to get a runnable agent, so a frame
+without an `agent_id` is refused before anything is persisted. These pin the
+refusal - the transcript must not collect messages nothing will answer.
+
+`TestForwardingToolEvents` is here for a different reason: the one field it reads
+off a Pydantic AI event was renamed under it while this module was ungated.
+Nothing noticed until every tool call in web chat answered "❌ Error:
+'FunctionToolResultEvent' object has no attribute 'result'".
+
+`TestForwardingDelegationFrames` is here for the third reason: the delegation
+frames are a *contract with the client*, and both halves of it fail silently. A
+wire name chosen here instead of taken from the frame's own `kind` leaves the
+client switching on a case nothing sends, and a `Decimal` serialised the way
+Pydantic serialises one in JSON mode reaches a chat that formats cost as a number
+and renders `NaN`.
+
+`TestStoppingATurnMidDelegation` is here for the fourth, and it is the reason this
+module runs a real agent at all. Delegation puts work in an `asyncio.Task` the
+parent run does not await, and **this** is where a turn is cancelled: `stop`
+cancels `_turn_task`, and so does `shutdown` once a detached turn has outrun its
+grace. A background delegation cancelled correctly in isolation says nothing
+about one cancelled under this teardown, where the cancellation arrives from
+outside, travels through `Agent.iter`, and every finalizer that has to run - the
+library's task cancellation, this platform's accounting sweep - runs while a
+`CancelledError` is already propagating.
+"""
+
+import asyncio
+import contextlib
+import json
+import logging
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
+from dataclasses import replace
+from decimal import Decimal
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID, uuid4
+
+import anyio
+import pytest
+from fastapi import WebSocketDisconnect
+from pydantic_ai import Agent as PydanticAgent
+from pydantic_ai.exceptions import CallDeferred
+from pydantic_ai.messages import (
+    BinaryContent,
+    FinalResultEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    ModelMessage,
+    ModelResponse,
+    OutputToolCallEvent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturnPart,
+)
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
+from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai_harness.ask_user import AskUserAnswer, AskUserRequest, Question, QuestionOption
+from subagents_pydantic_ai import SubAgentState, TaskStatus
+
+# The library binds this itself around every delegation and exports the reader
+# rather than the binder, so a test that wants to *be* inside a delegation
+# reaches for it here. Binding through a real delegation would mean running one.
+from subagents_pydantic_ai._state import bind_subagent_state
+
+from app.agents.browser_events import BrowserEvent
+from app.agents.capabilities import CapabilityBinding, build
+from app.agents.capabilities.budget import BudgetExceeded, BudgetScope, SpendEntry, SpendLedger
+from app.agents.capabilities.guardrails import GuardrailBlocked
+from app.agents.capabilities.subagents import Delegation
+from app.agents.compaction_events import CompactionEvent
+from app.agents.connect_on_use import ConnectionRequest
+from app.agents.deps import AgentDeps
+from app.agents.loop_guard import ToolLoopStopped
+from app.agents.steering import SteeringInbox
+from app.agents.subagent_events import (
+    SubagentFinished,
+    SubagentStarted,
+    SubagentTextDelta,
+    SubagentToolCall,
+)
+from app.agents.subagent_runtime import (
+    SUBAGENT_RUNTIME_RESOURCE,
+    DelegationOutcome,
+    ResolvedSubagent,
+    SubagentRuntime,
+)
+from app.agents.visual_reports import VisualReport, VisualReports
+from app.core.config import settings
+from app.core.exceptions import AuthenticationError, AuthorizationError, BadRequestError
+from app.db.models.agent_run import RunStatus
+from app.repositories import conversation as conversation_repo
+from app.schemas.conversation import MessagePart
+from app.schemas.mention import Mentionable
+from app.services import agent_session as agent_session_module
+from app.services.agent import PersistedPrompt
+from app.services.agent_chat import ChatTurn, OpenedRun
+from app.services.agent_runner import ParkedApproval, PersonalServiceGap, PreparedRun
+from app.services.agent_session import AgentSession, _wire_text
+from app.services.chat_timeline import TurnTimeline
+from app.services.mentions import ResolvedMentions
+from app.services.message_history import build_message_history
+from app.services.run_stream import RunFrames
+from app.services.usage_report import UsageReport
+
+pytestmark = pytest.mark.anyio
+
+_CONVERSATION = "11111111-1111-1111-1111-111111111111"
+
+
+def _session() -> AgentSession:
+    websocket = MagicMock()
+    websocket.send_json = AsyncMock()
+    # A person with the fields a chat draws them by, which the room's frames read.
+    user = MagicMock(
+        id=uuid4(),
+        full_name="Kacper",
+        email="kacper@example.com",
+        avatar_url=None,
+        avatar_color=None,
+    )
+    organization = MagicMock()
+    return AgentSession(websocket, user, organization)
+
+
+def _frames(
+    session: AgentSession,
+    *,
+    timeline: TurnTimeline | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    prompt: str = "",
+) -> RunFrames:
+    """The shared streaming loop, aimed at this session's socket.
+
+    The loop is `app.services.run_stream` since both sockets drive one
+    implementation; what these tests are about is unchanged - the frames a chat
+    client reads, in the order they arrive, through this surface's own sink.
+    """
+    return RunFrames(emit=session._frame, timeline=timeline, tool_calls=tool_calls, prompt=prompt)
+
+
+def _sent_events(session: AgentSession) -> list[tuple[str, dict]]:
+    return [
+        (call.args[0]["type"], call.args[0]["data"])
+        for call in session.websocket.send_json.call_args_list
+    ]
+
+
+def _frame_types(session: AgentSession) -> list[str]:
+    return [event_type for event_type, _data in _sent_events(session)]
+
+
+def _message(text: str = "how many are open?", **extra: Any) -> dict[str, Any]:
+    """A bare frame naming an agent - what a client sends to start a turn."""
+    return {"message": text, "agent_id": str(uuid4()), **extra}
+
+
+def _finished_turn(
+    *,
+    output: str = "Two are open.",
+    parked: tuple[ParkedApproval, ...] = (),
+    usage: UsageReport | None = None,
+    summarized_history: list[dict[str, Any]] | None = None,
+    overhead_tokens: int | None = None,
+) -> ChatTurn:
+    return ChatTurn(
+        output=output,
+        model_label="gpt-4.1",
+        agent_id=uuid4(),
+        agent_version_id=uuid4(),
+        run_id=uuid4(),
+        parked=parked,
+        usage=usage,
+        summarized_history=summarized_history,
+        overhead_tokens=overhead_tokens,
+    )
+
+
+def _parked_call() -> tuple[ParkedApproval, ...]:
+    """One gated call waiting on a person - what makes a turn a parked one."""
+    return (
+        ParkedApproval(
+            approval_id=uuid4(),
+            tool_call_id="call-1",
+            tool_name="send_email",
+            tool_args={"to": "ops@example.com"},
+        ),
+    )
+
+
+@contextmanager
+def _chat(
+    run: AsyncMock,
+    *,
+    conversation: str | None = _CONVERSATION,
+    newly_created: bool = False,
+    message_id: str | None = "saved-1",
+    prompt_message_id: UUID | None = None,
+    stored: list[Any] | None = None,
+) -> Iterator[SimpleNamespace]:
+    """The session's collaborators, stubbed at the seam this module owns.
+
+    `ChatAgentRunner.run` is `agent_chat.py`'s contract - gated there, and driven
+    for real by `TestStoppingATurnMidDelegation` below. What is under test here is
+    the *frames* this session puts on the wire for a turn that ended a particular
+    way, so the runner is where the stub goes and `run` is how a test says how the
+    turn ended.
+
+    `stored` is the thread as the database holds it, which is where the history
+    handed to the model comes from since #771. Empty by default, which is what a
+    first turn reads.
+
+    Yields the two persistence stubs, for the tests that read what this module
+    hands them rather than what it puts on the wire.
+    """
+    prompt = AsyncMock(
+        return_value=PersistedPrompt(
+            conversation_id=conversation,
+            newly_created=newly_created,
+            message_id=prompt_message_id,
+        )
+    )
+    answer = AsyncMock(return_value=message_id)
+    history = AsyncMock(return_value=stored or [])
+    # The thread the model is told, and where a summary is kept. Both go through
+    # `ConversationService` since #49, so the seam this module stubs is the
+    # service rather than the repository under it.
+    conversations = MagicMock()
+    conversations.model_history = AsyncMock(
+        side_effect=lambda conversation_id, *, limit, exclude_message_id=None: (
+            build_message_history(
+                [
+                    {
+                        "role": row.role,
+                        "content": row.content,
+                        "context_used_tokens": row.context_used_tokens,
+                    }
+                    for row in (stored or [])
+                    if row.id != exclude_message_id
+                ]
+            )
+        )
+    )
+    conversations.keep_summary = AsyncMock()
+    conversations.keep_overhead = AsyncMock()
+    conversations.keep_plan = AsyncMock()
+    with (
+        patch("app.services.agent_session.persist_user_turn", new=prompt),
+        patch("app.services.agent_session.persist_assistant_turn", new=answer),
+        patch("app.services.agent_session.get_db_context") as db_context,
+        patch("app.services.agent_session.ChatAgentRunner") as runner_cls,
+        patch("app.services.agent_session.ConversationService", return_value=conversations),
+        patch.object(conversation_repo, "get_recent_messages", new=history),
+    ):
+        db_context.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+        db_context.return_value.__aexit__ = AsyncMock(return_value=False)
+        runner_cls.return_value.run = run
+        yield SimpleNamespace(
+            prompt=prompt,
+            answer=answer,
+            runner=runner_cls.return_value,
+            history=history,
+            conversations=conversations,
+        )
+
+
+def _stored(
+    role: str,
+    content: str,
+    *,
+    message_id: UUID | None = None,
+    context_used_tokens: int | None = None,
+) -> SimpleNamespace:
+    """One row as `get_recent_messages` returns it."""
+    return SimpleNamespace(
+        id=message_id or uuid4(),
+        role=role,
+        content=content,
+        context_used_tokens=context_used_tokens,
+    )
+
+
+def _next_frame(session: AgentSession) -> asyncio.Event:
+    """An event set when the session next writes to the socket.
+
+    A turn running as a background task has to be *waited* for rather than slept
+    past, and this is the only signal that means "the frames up to here are out".
+    """
+    sent = asyncio.Event()
+
+    async def record(*_args: Any, **_kwargs: Any) -> None:
+        sent.set()
+
+    session.websocket.send_json.side_effect = record
+    return sent
+
+
+async def _wait(event: asyncio.Event) -> None:
+    """Wait, with a bound - so a broken test fails rather than hanging the suite."""
+    with anyio.fail_after(5):
+        await event.wait()
+
+
+class TestFramesWithoutAnAgent:
+    async def test_a_frame_naming_no_agent_is_refused_before_anything_is_persisted(self):
+        """There is no assistant to fall back to, and a message nothing will
+        answer does not belong in the transcript."""
+        session = _session()
+
+        with patch("app.services.agent_session.persist_user_turn", new=AsyncMock()) as persist:
+            await session.process_message({"message": "hello"})
+
+        events = _sent_events(session)
+        assert len(events) == 1
+        event_type, data = events[0]
+        assert event_type == "error"
+        assert "Pick an agent" in data["message"]
+        persist.assert_not_called()
+
+    async def test_a_frame_naming_something_that_is_not_an_agent_id_is_refused(self):
+        """Ignoring a malformed id would silently run something the user never
+        picked; refusing it names the problem."""
+        session = _session()
+
+        with patch("app.services.agent_session.persist_user_turn", new=AsyncMock()) as persist:
+            await session.process_message({"message": "hello", "agent_id": "not-a-uuid"})
+
+        events = _sent_events(session)
+        assert len(events) == 1
+        event_type, data = events[0]
+        assert event_type == "error"
+        assert "not a valid agent id" in data["message"]
+        persist.assert_not_called()
+
+    async def test_an_empty_frame_is_still_refused_as_empty(self):
+        """The emptiness check stays first: a blank frame is a client bug, not
+        a missing agent."""
+        session = _session()
+
+        await session.process_message({"message": ""})
+
+        events = _sent_events(session)
+        assert events == [("error", {"message": "Empty message"})]
+
+
+class TestControlFrames:
+    """What `handle_frame` does with each `type` a client can send.
+
+    Only a *bare* frame is a message. Everything with a `type` is protocol, and
+    the wrong answer to an unknown one is to run it as a prompt.
+    """
+
+    async def test_a_control_frame_nothing_recognises_starts_no_turn(self):
+        """A named frame is a client saying something about itself. Answering it
+        out loud would put a piece of protocol in the transcript."""
+        session = _session()
+
+        await session.handle_frame({"type": "ping", "message": "hello"})
+
+        assert _sent_events(session) == []
+        assert session._turn_task is None
+
+    async def test_stopping_when_no_turn_is_running_says_nothing(self):
+        """The composer's stop button races the turn's last frame, so a `stop`
+        routinely arrives after the turn is over. A second terminal frame then
+        would end the *next* turn on the client the moment it started."""
+        session = _session()
+
+        await session.handle_frame({"type": "stop"})
+
+        assert _sent_events(session) == []
+
+    async def test_a_message_arriving_while_a_turn_is_in_flight_is_ignored(self):
+        """Two turns on one socket interleave their deltas into one message and
+        race the in-memory history the next turn's `message_history` is built
+        from. The second frame is dropped rather than queued: the client's
+        composer is disabled while a turn runs, so a second bare frame is a bug
+        somewhere rather than something a user did."""
+        session = _session()
+        running = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocks_until_released(**_kwargs: Any) -> ChatTurn:
+            running.set()
+            await release.wait()
+            return _finished_turn()
+
+        with _chat(AsyncMock(side_effect=blocks_until_released)):
+            await session.handle_frame(_message("first"))
+            turn_task = session._turn_task
+            assert turn_task is not None
+            await _wait(running)
+
+            await session.handle_frame(_message("second"))
+            release.set()
+            await turn_task
+
+        assert _frame_types(session) == [
+            "user_prompt",
+            "message_saved",
+            "complete",
+            "session_ready",
+        ]
+        assert _sent_events(session)[0][0] == "user_prompt"
+        assert _sent_events(session)[0][1]["content"] == "first"
+        assert _sent_events(session)[0][1]["message_id"] is None
+
+    async def test_a_message_arriving_after_the_previous_turn_ended_starts_a_new_one(self):
+        """The slot is freed by a done callback, which runs a loop iteration after
+        the task ended - so a frame can arrive with `_turn_task` still holding a
+        finished task. Reading `done()` rather than the slot is what keeps that
+        from looking like a turn in flight."""
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn())):
+            await session.handle_frame(_message("first"))
+            first = session._turn_task
+            assert first is not None
+            await first
+            # Put it back: awaiting it here ran the callback, which is the one
+            # thing a client's frame cannot wait for.
+            session._turn_task = first
+
+            await session.handle_frame(_message("second"))
+            second = session._turn_task
+            assert second is not None and second is not first
+            await second
+
+        assert [
+            data["content"] for event, data in _sent_events(session) if event == "user_prompt"
+        ] == [
+            "first",
+            "second",
+        ]
+
+
+class TestReauthorizingEachFrame:
+    """A socket is authenticated once, at the handshake; a session revoked while
+    it is open must not keep being served (#1437).
+
+    The single check is `ws_auth.authenticate_socket_token`, whose own refusals -
+    an ended impersonation, a suspended account, a signed-out administrator - are
+    pinned in `test_ws_auth.py`. Here it is enough that *a* refusal from it closes
+    the socket and serves no frame, and that a live credential is waved through.
+    """
+
+    def _socket_session(self, token: str = "live-token") -> AgentSession:
+        websocket = MagicMock()
+        websocket.send_json = AsyncMock()
+        websocket.close = AsyncMock()
+        return AgentSession(websocket, MagicMock(), MagicMock(), auth_token=token)
+
+    @contextmanager
+    def _revoked(self) -> Iterator[None]:
+        with (
+            patch("app.services.agent_session.get_db_context") as db_context,
+            patch(
+                "app.services.agent_session.authenticate_socket_token",
+                new=AsyncMock(side_effect=AuthenticationError(message="Impersonation has ended")),
+            ),
+        ):
+            db_context.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+            db_context.return_value.__aexit__ = AsyncMock(return_value=False)
+            yield
+
+    async def test_a_revoked_session_refuses_the_next_message(self):
+        """The core of the bug: once the session is revoked, a message frame is
+        answered by nothing - no turn persisted, no turn task started - and the
+        socket is closed with the no-retry auth code. Without the re-check the
+        turn runs, which is exactly what #1437 reports."""
+        session = self._socket_session()
+
+        with self._revoked(), patch("app.services.agent_session.persist_user_turn") as persist:
+            await session.handle_frame(_message())
+
+        persist.assert_not_called()
+        assert session._turn_task is None
+        session.websocket.close.assert_awaited_once_with(code=4001, reason="Session revoked")
+
+    async def test_a_revoked_session_follows_no_turn(self):
+        """Following another socket's turn reads a conversation, so it is refused too."""
+        session = self._socket_session()
+
+        with self._revoked(), patch.object(session, "_attach") as attach:
+            await session.handle_frame({"type": "attach", "conversation_id": "c-1"})
+
+        attach.assert_not_called()
+
+    async def test_a_revoked_session_does_not_steer(self):
+        """A correction acts on the session, so it is refused on a dead credential (#2087)."""
+        session = self._socket_session()
+        inbox = SteeringInbox()
+        session._steering = inbox
+        session._turn_task = asyncio.get_running_loop().create_future()  # a turn "running"
+
+        with self._revoked():
+            await session.handle_frame({"type": "steer", "text": "use the EU numbers"})
+
+        assert inbox.unapplied() == []
+        session._turn_task.cancel()
+
+    async def test_a_revoked_session_cancels_a_turn_already_running(self):
+        """A turn in flight when the next frame lands on a revoked session is
+        cancelled, rather than left running as the revoked identity."""
+        session = self._socket_session()
+        running = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocks_until_released(**_kwargs: Any) -> ChatTurn:
+            running.set()
+            await release.wait()
+            return _finished_turn()
+
+        with (
+            _chat(AsyncMock(side_effect=blocks_until_released)),
+            patch("app.services.agent_session.authenticate_socket_token", new=AsyncMock()) as auth,
+        ):
+            await session.handle_frame(_message("first"))
+            turn_task = session._turn_task
+            assert turn_task is not None
+            await _wait(running)
+
+            # Revoked before the next frame arrives.
+            auth.side_effect = AuthenticationError(message="Impersonation has ended")
+            await session.handle_frame({"type": "stop"})
+
+            assert turn_task.cancelled()
+
+        session.websocket.close.assert_awaited_once_with(code=4001, reason="Session revoked")
+
+    async def test_a_live_session_serves_the_frame(self):
+        """A still-valid credential is waved through: the turn runs and the socket
+        stays open. The re-check tolerates a merely-expired token
+        (`allow_expired`) so a long-lived socket is not torn down for routine
+        token aging (#1437)."""
+        session = self._socket_session()
+
+        with (
+            _chat(AsyncMock(return_value=_finished_turn())),
+            patch("app.services.agent_session.authenticate_socket_token", new=AsyncMock()) as auth,
+        ):
+            await session.handle_frame(_message())
+            task = session._turn_task
+            assert task is not None
+            await task
+
+        assert "user_prompt" in _frame_types(session)
+        session.websocket.close.assert_not_called()
+        assert auth.await_args.kwargs["allow_expired"] is True
+
+    async def test_an_unknown_control_frame_costs_no_credential_query(self):
+        """A frame that does nothing must not re-check the credential: otherwise
+        an authenticated client turns a stream of no-op frames into a stream of
+        database reads (found reviewing #1437)."""
+        session = self._socket_session()
+
+        with patch("app.services.agent_session.authenticate_socket_token", new=AsyncMock()) as auth:
+            await session.handle_frame({"type": "not-a-real-control-frame"})
+
+        auth.assert_not_awaited()
+        session.websocket.close.assert_not_called()
+        assert session._turn_task is None
+
+    async def test_a_message_arriving_mid_turn_costs_no_credential_query(self):
+        """A message dropped because a turn is already running re-checks nothing;
+        only the frame that started the turn paid for a credential query."""
+        session = self._socket_session()
+        running = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocks_until_released(**_kwargs: Any) -> ChatTurn:
+            running.set()
+            await release.wait()
+            return _finished_turn()
+
+        with (
+            _chat(AsyncMock(side_effect=blocks_until_released)),
+            patch("app.services.agent_session.authenticate_socket_token", new=AsyncMock()) as auth,
+        ):
+            await session.handle_frame(_message("first"))
+            await _wait(running)
+
+            await session.handle_frame(_message("second, while the first is still running"))
+            assert auth.await_count == 1
+
+            release.set()
+            await session._turn_task
+
+        session.websocket.close.assert_not_called()
+
+    async def test_a_revoked_session_cannot_answer_a_parked_question(self):
+        """Resuming a parked `ask_user` is serving the turn, so a revoked session
+        is refused: the answer is never applied and the socket closes, rather than
+        the run continuing on a dead credential (#1437)."""
+        session = self._socket_session()
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        session._ask_user_future = future
+
+        with self._revoked():
+            await session.handle_frame({"type": "ask_user_response", "answers": ["yes"]})
+
+        assert not future.done()
+        session.websocket.close.assert_awaited_once_with(code=4001, reason="Session revoked")
+
+    async def test_an_answer_with_no_question_waiting_costs_no_credential_query(self):
+        """An `ask_user_response` arriving with nothing parked does nothing, and
+        does it without re-checking the credential."""
+        session = self._socket_session()
+
+        with patch("app.services.agent_session.authenticate_socket_token", new=AsyncMock()) as auth:
+            await session.handle_frame({"type": "ask_user_response", "answers": ["yes"]})
+
+        auth.assert_not_awaited()
+        session.websocket.close.assert_not_called()
+
+    async def test_a_socket_already_gone_is_not_a_second_error(self):
+        """Closing a socket the client already closed raises RuntimeError from
+        Starlette; the refusal swallows it rather than crashing the receive
+        loop."""
+        session = self._socket_session()
+        session.websocket.close = AsyncMock(side_effect=RuntimeError("already closed"))
+
+        with self._revoked():
+            await session.handle_frame(_message())
+
+        assert session._turn_task is None
+
+
+class TestATurnThatFinished:
+    """The frames a completed turn puts on the wire, and their order.
+
+    Order is part of the contract: `conversation_created` carries the id the
+    `complete` frame's usage is filed under, and `tool_approval_required` has to
+    arrive while the turn is still on screen.
+    """
+
+    async def test_new_chat_starts_a_conversation_instead_of_continuing_the_open_one(self):
+        """The console sends `conversation_id: null` for a new chat. The session read
+        it as "no id given" and wrote the message into the conversation the socket
+        had open - or failed with "Conversation not found" once that one had been
+        deleted."""
+        session = _session()
+        session.current_conversation_id = "the-one-left-behind"
+
+        with _chat(AsyncMock(return_value=_finished_turn()), newly_created=True) as chat:
+            await session.process_message(_message(conversation_id=None))
+
+        assert chat.prompt.await_args.kwargs["current_conversation_id"] is None
+
+    async def test_a_frame_without_the_key_continues_the_session_s_conversation(self):
+        session = _session()
+        session.current_conversation_id = _CONVERSATION
+
+        with _chat(AsyncMock(return_value=_finished_turn())) as chat:
+            await session.process_message(_message())
+
+        assert chat.prompt.await_args.kwargs["current_conversation_id"] == _CONVERSATION
+
+    async def test_a_turn_that_started_a_conversation_announces_it_first(self):
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn()), newly_created=True):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == [
+            "conversation_created",
+            "user_prompt",
+            "message_saved",
+            "complete",
+        ]
+        assert _sent_events(session)[0] == (
+            "conversation_created",
+            {"conversation_id": _CONVERSATION},
+        )
+        assert _sent_events(session)[2] == (
+            "message_saved",
+            {"message_id": "saved-1", "conversation_id": _CONVERSATION},
+        )
+
+    async def test_both_halves_of_the_turn_are_filed_under_the_run_that_produced_them(self):
+        """`messages.run_id` is what makes a run's transcript readable from run
+        history rather than only from the conversation. The answer carries it
+        directly; the question is handed to the runner, which links it as soon as
+        it has opened a run - the prompt is written before there is one."""
+        session = _session()
+        turn = _finished_turn()
+        prompt_message_id = uuid4()
+
+        with _chat(AsyncMock(return_value=turn), prompt_message_id=prompt_message_id) as chat:
+            await session.process_message(_message())
+
+        assert chat.answer.await_args.kwargs["run_id"] == turn.run_id
+        assert chat.runner.run.await_args.kwargs["prompt_message_id"] == prompt_message_id
+
+    async def test_a_turn_in_an_existing_conversation_does_not_announce_one(self):
+        """The client creates a thread in its sidebar on this frame, so a second
+        one for a conversation it is already in would duplicate the entry."""
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn())):
+            await session.process_message(_message())
+
+        assert "conversation_created" not in _frame_types(session)
+
+    async def test_what_the_turn_cost_arrives_on_the_frame_that_ends_it(self):
+        """Its own event would be one the client could receive *after* `complete`
+        and draw against the next turn. Every number is a JSON number: the chat
+        draws a bar from them, and `Decimal` serialises as a string."""
+        session = _session()
+        report = UsageReport(
+            input_tokens=1200,
+            output_tokens=340,
+            cost_usd=Decimal("0.0042"),
+            period_spend_usd=Decimal("5.00"),
+            budget_usd=Decimal("20.00"),
+        )
+
+        with _chat(AsyncMock(return_value=_finished_turn(usage=report))):
+            await session.process_message(_message())
+
+        assert _sent_events(session)[-1] == (
+            "complete",
+            {
+                "conversation_id": _CONVERSATION,
+                "usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 340,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "cost_usd": "0.0042",
+                    # Beside the figure, because without it the figure lies on a
+                    # run that reached an unpriced model (#772).
+                    "cost_is_partial": False,
+                    "budget_percent": 25,
+                    "agent_budget_percent": None,
+                    "sandbox": None,
+                    # Null where no model request was made, which is what a
+                    # `UsageReport` built by hand carries (#774).
+                    "context": None,
+                },
+            },
+        )
+
+    async def test_a_turn_nobody_could_measure_reports_no_usage_rather_than_zero(self):
+        """Assembling the report is not allowed to lose an answer, so it can come
+        back `None`. Nothing measured and nothing spent are different things to
+        draw, and the strip leaves the previous turn's number alone for `None`."""
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn(usage=None))):
+            await session.process_message(_message())
+
+        assert _sent_events(session)[-1] == (
+            "complete",
+            {"conversation_id": _CONVERSATION, "usage": None},
+        )
+
+    async def test_a_turn_whose_conversation_was_never_persisted_still_ends(self):
+        """`persist_user_turn` logs and swallows a write failure, deliberately - a
+        lost row must not lose an answer somebody is waiting for. There is then
+        nothing to save the assistant message against, but the client still has to
+        be told the turn is over or its composer never comes back.
+
+        The frame list is what pins it: `persist_assistant_turn` is stubbed to
+        answer with an id, so a write attempted against no conversation would show
+        up here as a `message_saved` pointing at `null`."""
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn()), conversation=None):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == ["user_prompt", "complete"]
+        assert _sent_events(session)[-1] == ("complete", {"conversation_id": None, "usage": None})
+
+    async def test_an_assistant_message_that_did_not_save_is_not_announced_as_saved(self):
+        """`message_saved` is what swaps the client's temporary id for the real
+        one. Sending it without an id would leave the message unratable and
+        unreloadable, pointing at `null`."""
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn()), message_id=None):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == ["user_prompt", "complete"]
+
+    async def test_the_thread_the_database_holds_is_what_the_model_is_told(self):
+        """The history comes from the transcript, not from this socket (#771).
+
+        It used to be a list on the session, appended to as turns went by and
+        loaded from nowhere - so a conversation this socket did not itself
+        produce had no history at all, and a reopened thread was answered as
+        though it had started with the follow-up.
+        """
+        session = _session()
+        run = AsyncMock(return_value=_finished_turn())
+        stored = [_stored("user", "how many are open?"), _stored("assistant", "Two are open.")]
+
+        with _chat(run, stored=stored):
+            await session.process_message(_message("and how many of those are mine?"))
+
+        history = run.await_args.kwargs["message_history"]
+        assert [part.content for message in history for part in message.parts] == [
+            "how many are open?",
+            "Two are open.",
+        ]
+
+    async def test_a_summary_the_turn_produced_is_kept_for_the_next_one(self):
+        """Compaction reaches one run's messages. Rebuilt from the transcript, the
+        summary died at the turn boundary and the next turn bought another over a
+        history one turn longer - twice in a row, in a real conversation (#49)."""
+        session = _session()
+        summary = [{"kind": "request", "parts": []}]
+
+        with _chat(AsyncMock(return_value=_finished_turn(summarized_history=summary))) as stubs:
+            await session.process_message(_message())
+
+        assert stubs.conversations.keep_summary.await_args.args[1] == summary
+
+    async def test_a_turn_that_summarised_nothing_writes_nothing(self):
+        """Most turns. A write per turn would replace the history with itself and
+        pin the thread to whatever the last one happened to send."""
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn())) as stubs:
+            await session.process_message(_message())
+
+        stubs.conversations.keep_summary.assert_not_awaited()
+
+    async def test_what_a_request_carries_before_any_message_is_kept_too(self):
+        """Written on every turn, not only a summarising one: it is what the next
+        turn needs before it has a response of its own to measure (#49)."""
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn(overhead_tokens=3_865))) as stubs:
+            await session.process_message(_message())
+
+        assert stubs.conversations.keep_overhead.await_args.args[1] == 3_865
+
+    async def test_a_summary_is_kept_after_the_turn_it_belongs_to_is_written(self):
+        """What is stored beside it is how far it reaches. Recorded before the
+        answer, it would stop short of this turn and replay it twice."""
+        session = _session()
+        order: list[str] = []
+
+        with _chat(
+            AsyncMock(return_value=_finished_turn(summarized_history=[{"kind": "request"}]))
+        ) as stubs:
+            stubs.answer.side_effect = lambda *args, **kwargs: order.append("answer") or "saved-1"
+            stubs.conversations.keep_summary.side_effect = lambda *args, **kwargs: order.append(
+                "summary"
+            )
+            await session.process_message(_message())
+
+        assert order == ["answer", "summary"]
+
+    async def test_a_replayed_answer_carries_the_size_of_the_request_it_came_from(self):
+        """What makes compaction fire at all: its estimator anchors on a response
+        with usage on it and counts characters without one, so a history replayed
+        as bare text reads as a few tokens whatever it really cost."""
+        session = _session()
+        run = AsyncMock(return_value=_finished_turn())
+        stored = [
+            _stored("user", "how many are open?"),
+            _stored("assistant", "Two are open.", context_used_tokens=3_843),
+        ]
+
+        with _chat(run, stored=stored):
+            await session.process_message(_message("and how many of those are mine?"))
+
+        history = run.await_args.kwargs["message_history"]
+        assert history[1].usage.input_tokens == 3_843
+
+    async def test_the_turn_being_answered_is_not_also_handed_back_as_history(self):
+        """`persist_user_turn` writes the prompt before the run, so it is a row by
+        the time the history is read. Left in, the model is asked the same
+        question twice - once as the prompt and once as the turn before it."""
+        session = _session()
+        run = AsyncMock(return_value=_finished_turn())
+        prompt_id = uuid4()
+        stored = [
+            _stored("user", "how many are open?"),
+            _stored("user", "and how many are mine?", message_id=prompt_id),
+        ]
+
+        with _chat(run, stored=stored, prompt_message_id=prompt_id):
+            await session.process_message(_message("and how many are mine?"))
+
+        history = run.await_args.kwargs["message_history"]
+        assert [part.content for message in history for part in message.parts] == [
+            "how many are open?"
+        ]
+
+    async def test_a_conversation_that_does_not_exist_yet_reads_nothing(self):
+        """A first turn has no thread to read, and must not go looking for one."""
+        session = _session()
+        run = AsyncMock(return_value=_finished_turn())
+
+        with _chat(run, conversation=None) as chat:
+            await session.process_message(_message())
+
+        assert run.await_args.kwargs["message_history"] == []
+        chat.history.assert_not_awaited()
+
+    async def test_a_parked_call_is_put_in_front_of_whoever_is_looking(self):
+        """The approvals queue and the email carry the same rows; this frame is the
+        shortcut for somebody already on the tab. It arrives *before* `complete` so
+        the panel is drawn while the turn is still on screen, and `allow_edit` is
+        false on purpose: the arguments were recorded on the row the approver is
+        deciding about, so letting the chat rewrite them would approve something
+        other than what was asked."""
+        session = _session()
+        approval_id = uuid4()
+        parked = (
+            ParkedApproval(
+                approval_id=approval_id,
+                tool_call_id="call-1",
+                tool_name="send_email",
+                tool_args={"to": "ops@example.com"},
+                capability_tool_id="send_email",
+                context={"recipient": "Ops"},
+            ),
+        )
+        turn = _finished_turn(parked=parked)
+
+        with _chat(AsyncMock(return_value=turn)):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == [
+            "user_prompt",
+            "message_saved",
+            "tool_approval_required",
+            "complete",
+        ]
+        assert _sent_events(session)[2] == (
+            "tool_approval_required",
+            {
+                "run_id": str(turn.run_id),
+                "action_requests": [
+                    {
+                        "id": str(approval_id),
+                        "tool_call_id": "call-1",
+                        "tool_name": "send_email",
+                        "args": {"to": "ops@example.com"},
+                        # The tool's stable id, which the card words the call by.
+                        "capability_tool_id": "send_email",
+                        # The names the tool's describer resolved, for the sentence
+                        # the card puts above the arguments.
+                        "context": {"recipient": "Ops"},
+                        "account": None,
+                    }
+                ],
+                "review_configs": [{"tool_name": "send_email", "allow_edit": False}],
+            },
+        )
+
+    async def test_a_parked_turn_stores_which_calls_are_waiting(self):
+        """The panel above is live state; the stored turn is what a reload gets.
+        Without the parked ids the row is written `running`, which replays as a
+        step that ran - so the page said nothing about waiting and the only way
+        to find the decision was the approvals queue on another page (#601)."""
+        session = _session()
+        turn = _finished_turn(output="", parked=_parked_call())
+
+        with _chat(AsyncMock(return_value=turn)) as chat:
+            await session.process_message(_message())
+
+        assert chat.answer.await_args.kwargs["parked_tool_call_ids"] == {"call-1"}
+
+    async def test_a_parked_turn_stores_no_notice_in_the_agents_own_voice(self):
+        """Whatever this turn ends with becomes the assistant message's `content`,
+        so a sentence about the approvals queue is stored as something the agent
+        said - and it is still there, in the middle of the turn, once somebody
+        approves and the run visibly goes on (#509). The step that parked and the
+        panel below it already say it, and they stop saying it when it stops being
+        true."""
+        session = _session()
+        turn = _finished_turn(output="", parked=_parked_call())
+
+        with _chat(AsyncMock(return_value=turn)) as chat:
+            await session.process_message(_message())
+
+        assert chat.answer.await_args.args[1] == ""
+
+    async def test_a_parked_turn_keeps_what_the_model_wrote_before_it_stopped(self):
+        """`turn.output` is what the run *ended* with, and a parked run ended with
+        nothing - so the words are read off the timeline, the route a turn that
+        failed already takes. Without it a model that explained itself and then
+        asked for a gated call is written down as having said nothing at all.
+
+        Driven over a real `Agent.iter` so the text travels the way the client's
+        `text_delta` frames do: what is stored is what its reader saw."""
+        session = _session()
+
+        async def stopped_on_an_approval(**kwargs: Any) -> ChatTurn:
+            async with _answering_agent().iter("how many are open?") as agent_run:
+                await kwargs["stream"](agent_run)
+            return _finished_turn(output="", parked=_parked_call())
+
+        with _chat(AsyncMock(side_effect=stopped_on_an_approval)) as chat:
+            await session.process_message(_message())
+
+        assert chat.answer.await_args.args[1] == "Two are open."
+
+    async def test_a_turn_that_answered_nothing_leaves_no_empty_reply_in_the_history(self):
+        """The history is replayed as `ModelResponse` parts on the next request,
+        and an assistant turn with no content is a `TextPart` carrying nothing. A
+        parked turn is the ordinary way to reach one: it is stored so a reloaded
+        page still shows the step waiting, and dropped again on the way back
+        out."""
+        session = _session()
+        run = AsyncMock(return_value=_finished_turn())
+        stored = [_stored("user", "how many are open?"), _stored("assistant", "")]
+
+        with _chat(run, stored=stored):
+            await session.process_message(_message("well?"))
+
+        history = run.await_args.kwargs["message_history"]
+        assert [part.content for message in history for part in message.parts] == [
+            "how many are open?"
+        ]
+
+
+class TestATurnThatDidNotFinish:
+    """Every way a turn can end without an answer.
+
+    `error` is the frame that clears the client's processing state, so a refusal
+    that sent nothing would leave a spinner running until the tab is reloaded.
+    There is deliberately no `complete` after it: that frame means the turn
+    produced something.
+    """
+
+    async def test_a_conversation_belonging_to_another_organization_is_refused(self):
+        """The socket authenticated against one organization; resuming a thread
+        from another would read one org's history while billing a second."""
+        session = _session()
+        refusal = AuthorizationError(
+            message="Conversation belongs to a different organization",
+            details={"conversation_id": _CONVERSATION},
+        )
+
+        with patch(
+            "app.services.agent_session.persist_user_turn", new=AsyncMock(side_effect=refusal)
+        ):
+            await session.process_message(_message(conversation_id=_CONVERSATION))
+
+        assert _sent_events(session) == [
+            ("error", {"message": "Conversation belongs to a different organization"})
+        ]
+
+    async def test_what_it_said_is_saved_before_the_room_hears_it_is_over(self):
+        """The trace's end is what tells a teammate's tab to re-read the
+        transcript; read before the partial answer is written, it shows none."""
+        session = _session()
+        order: list[str] = []
+
+        async def ended(_turn: Any) -> None:
+            order.append("end")
+
+        async def kept(*_args: Any, **_kwargs: Any) -> None:
+            order.append("persist")
+
+        with (
+            _chat(AsyncMock(side_effect=RuntimeError("model went away"))),
+            patch(
+                "app.services.agent_session.live_turn.begin",
+                AsyncMock(return_value=MagicMock()),
+            ),
+            patch("app.services.agent_session.live_turn.publish", AsyncMock()),
+            patch("app.services.agent_session.live_turn.end", side_effect=ended),
+            patch.object(session, "_persist_partial_turn", side_effect=kept),
+        ):
+            await session.process_message(_message())
+
+        assert order == ["persist", "end"]
+
+    async def test_a_refused_run_is_reported_and_not_answered_by_anything_else(self):
+        """An unpublished or archived agent, or one that is not theirs to see. The
+        platform working, so it is said plainly - and nothing answers in the named
+        agent's place."""
+        session = _session()
+
+        with _chat(AsyncMock(side_effect=BadRequestError(message="That agent is not published"))):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == ["user_prompt", "error"]
+        assert _sent_events(session)[-1] == ("error", {"message": "That agent is not published"})
+
+    async def test_a_budget_stop_says_why_the_answer_stopped(self):
+        """A run cut off by a cap looks identical to a broken agent unless
+        somebody says so."""
+        session = _session()
+        stopped = BudgetExceeded(
+            limit_usd=Decimal("20.00"),
+            spent_usd=Decimal("20.0100"),
+            scope=BudgetScope.ORGANIZATION,
+        )
+
+        with _chat(AsyncMock(side_effect=stopped)):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == ["user_prompt", "error"]
+        assert _sent_events(session)[-1] == (
+            "error",
+            {"message": "Organization monthly budget exhausted: $20.0100 spent of $20.00 limit"},
+        )
+
+    async def test_a_guardrail_block_says_its_safe_reason_not_a_generic_failure(self, caplog):
+        """The streaming surface is where a block actually happens, and without its
+        own clause it hit the generic handler - logged as a crash with a stack
+        trace and shown to the visitor as "the agent could not finish this turn".
+        The guard's message names the edge and the refusal, never the offending
+        text, so it goes out whole."""
+        session = _session()
+        blocked = GuardrailBlocked(
+            edge="input", message="This request was blocked by an input guardrail."
+        )
+
+        with (
+            _chat(AsyncMock(side_effect=blocked)),
+            caplog.at_level(logging.ERROR, logger="app.services.agent_session"),
+        ):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == ["user_prompt", "error"]
+        assert _sent_events(session)[-1] == (
+            "error",
+            {"message": "This request was blocked by an input guardrail."},
+        )
+        assert "Error processing agent request" not in caplog.text
+
+    async def test_a_run_stopped_for_looping_tells_the_person_why(self, caplog):
+        session = _session()
+        stopped = ToolLoopStopped("Stopped: the agent called `search` 4 times in a row.")
+
+        with (
+            _chat(AsyncMock(side_effect=stopped)),
+            caplog.at_level(logging.ERROR, logger="app.services.agent_session"),
+        ):
+            await session.process_message(_message())
+
+        assert _sent_events(session)[-1] == ("error", {"message": str(stopped)})
+        assert "Error processing agent request" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("failure", "named"), [(RuntimeError, "RuntimeError"), (TimeoutError, "TimeoutError")]
+    )
+    async def test_an_unexpected_failure_still_reaches_the_client(self, failure, named, caplog):
+        """A provider that answered 500 is not a refusal and not a bug in the
+        spec, and the person sitting there gets told either way - by a sentence
+        written here. A provider client puts the failing request in its message
+        and that URL carries a key in its query string, so the exception's own
+        text stays in the log and only its class reaches the panel (#659).
+
+        The log keeps what an operator debugs with - the endpoint and the status -
+        and the credential in the query string is redacted there by the PII filter
+        when it is installed (#440, covered in `test_logging`). This asserts the
+        detail that is present either way, not the filter's own behaviour.
+
+        Two classes, because the class is the whole of what the frame still
+        carries: it is what separates an upstream that timed out from one that
+        refused a credential, and a sentence that named a fixed class would say
+        nothing while passing.
+        """
+        session = _session()
+        vendor_text = "503 from https://api.example.com/v1/chat?api_key=sk-live-9f2c"
+
+        with (
+            _chat(AsyncMock(side_effect=failure(vendor_text))),
+            caplog.at_level(logging.ERROR, logger="app.services.agent_session"),
+        ):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == ["user_prompt", "error"]
+        assert _sent_events(session)[-1] == (
+            "error",
+            {
+                "message": (
+                    f"The agent could not finish this turn ({named}). "
+                    "Try again; the server log has the full error."
+                )
+            },
+        )
+        assert "503 from https://api.example.com/v1/chat" in caplog.text
+
+    async def test_a_provider_out_of_credit_is_told_in_words(self):
+        """A 402 from the provider's gateway (an OpenRouter key over its limit) was
+        shown as "(ModelHTTPError)"; the reader can act on it, so it says why."""
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        session = _session()
+        refused = ModelHTTPError(
+            402, "anthropic/claude-sonnet-5.5", {"message": "can only afford 1901"}
+        )
+
+        with _chat(AsyncMock(side_effect=refused)):
+            await session.process_message(_message())
+
+        message = _sent_events(session)[-1][1]["message"]
+        assert "for want of credit (HTTP 402)" in message
+        assert "spending limit" in message
+        assert "1901" not in message
+
+    async def test_a_provider_refusal_inside_a_task_group_is_told_in_words(self):
+        """A refusal raised inside a task group arrives wrapped; the words are the
+        wrapped refusal's, not the group's class."""
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        session = _session()
+        refused = ModelHTTPError(429, "anthropic/claude-sonnet-5.5", {"message": "slow down"})
+
+        with _chat(AsyncMock(side_effect=ExceptionGroup("turn", [refused]))):
+            await session.process_message(_message())
+
+        message = _sent_events(session)[-1][1]["message"]
+        assert "429" in message
+        assert "ExceptionGroup" not in message
+
+    async def test_a_disconnect_is_not_reported_to_the_socket_that_left(self):
+        """A `WebSocketDisconnect` surfacing from inside the turn is re-raised
+        rather than turned into an `error` frame: there is nobody to read it, and
+        the turn task's callback logs a disconnect instead of a crash."""
+        session = _session()
+
+        with (
+            _chat(AsyncMock(side_effect=WebSocketDisconnect(code=1006))),
+            pytest.raises(WebSocketDisconnect),
+        ):
+            await session.process_message(_message())
+
+        assert _frame_types(session) == ["user_prompt"]
+
+
+class TestATurnTaskThatEnded:
+    """`asyncio.create_task` swallows the exception of a task nobody awaits, and
+    the turn task is never awaited on the success path - so this callback is the
+    only place a crashed turn is ever heard about."""
+
+    @staticmethod
+    async def _ran(coro: Any) -> asyncio.Task[None]:
+        task = asyncio.create_task(coro)
+        with contextlib.suppress(Exception):
+            await task
+        return task
+
+    async def test_a_crashed_turn_is_logged_with_its_traceback(self, caplog):
+        session = _session()
+
+        async def crash() -> None:
+            raise RuntimeError("the run row was written twice")
+
+        task = await self._ran(crash())
+
+        with caplog.at_level(logging.ERROR, logger="app.services.agent_session"):
+            session._on_turn_done(task)
+
+        assert "Agent turn task crashed" in caplog.text
+        assert "the run row was written twice" in caplog.text
+
+    async def test_a_disconnect_is_not_logged_as_a_crash(self, caplog):
+        """A tab closed mid-turn is how most sessions end. An error-level line for
+        it is noise an operator learns to skip past, which is how the next real
+        one gets skipped too."""
+        session = _session()
+
+        async def disconnect() -> None:
+            raise WebSocketDisconnect(code=1001)
+
+        task = await self._ran(disconnect())
+
+        with caplog.at_level(logging.INFO, logger="app.services.agent_session"):
+            session._on_turn_done(task)
+
+        assert "Client disconnected during agent turn" in caplog.text
+        assert "crashed" not in caplog.text
+
+    async def test_a_turn_that_ended_cleanly_frees_its_slot(self):
+        session = _session()
+        task = await self._ran(asyncio.sleep(0))
+        session._turn_task = task
+
+        session._on_turn_done(task)
+
+        assert session._turn_task is None
+
+    async def test_a_cancelled_turn_is_not_asked_what_went_wrong(self):
+        """`task.exception()` re-raises `CancelledError` on a cancelled task, and
+        it would raise it inside a done callback, where nothing is waiting to
+        catch it - the loop would report it against no turn at all."""
+        session = _session()
+        task = asyncio.create_task(asyncio.sleep(30))
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        session._turn_task = task
+
+        session._on_turn_done(task)
+
+        assert session._turn_task is None
+
+    async def test_a_callback_for_an_earlier_turn_does_not_free_a_later_one(self):
+        """The callback runs a loop iteration after its task ended, so a second
+        frame can already have taken the slot. Clearing it then would let a third
+        frame run concurrently with the second."""
+        session = _session()
+        earlier = await self._ran(asyncio.sleep(0))
+        later = asyncio.create_task(asyncio.sleep(30))
+        session._turn_task = later
+
+        session._on_turn_done(earlier)
+
+        assert session._turn_task is later
+        later.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await later
+
+
+class TestAskingTheUser:
+    """The pause an agent can put in the middle of a run.
+
+    Only a live surface can hold a question open, and holding it open means a
+    future nothing else will complete - so every way the answer can be malformed
+    has to release it, or the turn parks forever with the composer showing
+    questions and no way to stop it.
+    """
+
+    _QUESTIONS = [{"question": "Which region?", "options": ["eu", "us"], "allow_custom": True}]
+
+    async def test_an_answer_reaches_the_run_that_is_waiting_for_it(self):
+        session = _session()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_user(self._QUESTIONS))
+        await _wait(asked)
+
+        assert _sent_events(session) == [("ask_user", {"questions": self._QUESTIONS})]
+
+        await session.handle_frame(
+            {"type": "ask_user_response", "answers": [{"answer": "eu", "skipped": False}]}
+        )
+
+        assert await asking == [{"answer": "eu", "skipped": False}]
+        # Cleared, or the next question resolves against a future already done.
+        assert session._ask_user_future is None
+
+    async def test_an_answers_payload_that_is_not_a_list_releases_the_run_anyway(self):
+        """A client that sent `null`, or an object, would otherwise leave the run
+        parked on a future nobody completes. Empty answers render as "(no answer)"
+        for the model, which is a turn that goes on."""
+        session = _session()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_user(self._QUESTIONS))
+        await _wait(asked)
+
+        await session.handle_frame({"type": "ask_user_response", "answers": None})
+
+        assert await asking == []
+
+    async def test_an_answer_to_a_question_nobody_asked_is_ignored(self):
+        session = _session()
+
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "eu"}]})
+
+        assert _sent_events(session) == []
+        assert session._ask_user_future is None
+
+    async def test_a_second_answer_to_the_same_question_does_not_replace_the_first(self):
+        """Two frames can arrive before the run resumes - a double-submit, or a
+        reconnect replaying. `Future.set_result` on a resolved future raises
+        `InvalidStateError`, which would crash the frame dispatcher rather than
+        the turn."""
+        session = _session()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_user(self._QUESTIONS))
+        await _wait(asked)
+
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "eu"}]})
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "us"}]})
+
+        assert await asking == [{"answer": "eu"}]
+
+    async def test_a_delegates_single_question_is_put_to_the_client_and_answered(self):
+        """`_ask_one` is what a delegate's `ask_parent` reaches - one question in, one
+        answer string out, over the same batch channel a whole form uses."""
+        session = _session()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_one("Which region?", ["eu", "us"]))
+        await _wait(asked)
+
+        assert _sent_events(session) == [
+            (
+                "ask_user",
+                {
+                    "questions": [
+                        {
+                            "question": "Which region?",
+                            "header": None,
+                            "options": [
+                                {"label": "eu", "description": None},
+                                {"label": "us", "description": None},
+                            ],
+                            "multi_select": False,
+                            "allow_custom": True,
+                        }
+                    ]
+                },
+            )
+        ]
+
+        await session.handle_frame(
+            {"type": "ask_user_response", "answers": [{"answer": "eu", "skipped": False}]}
+        )
+
+        assert await asking == "eu"
+
+    async def test_an_ask_user_card_is_answered_with_the_picked_labels(self):
+        """#2064: the `ask_user` capability's batch goes out as one card on the same
+        frame, and the picks come back keyed by header - each pair also landing on
+        the turn's timeline the moment the answer arrives."""
+        session = _session()
+        session._current_timeline = TurnTimeline()
+        asked = _next_frame(session)
+        request = AskUserRequest(
+            questions=(
+                Question(
+                    header="Audience",
+                    question="Who will use it?",
+                    options=(QuestionOption(label="Everyone"), QuestionOption(label="My team")),
+                ),
+                Question(
+                    header="Tone",
+                    question="How should it sound?",
+                    options=(QuestionOption(label="Formal"), QuestionOption(label="Casual")),
+                ),
+            )
+        )
+
+        asking = asyncio.create_task(session._ask_questions(request))
+        await _wait(asked)
+        [(kind, payload)] = _sent_events(session)
+        await session.handle_frame(
+            {
+                "type": "ask_user_response",
+                "answers": [{"selected": ["My team"]}, {"answer": "Friendly but brief"}],
+            }
+        )
+        response = await asking
+
+        assert kind == "ask_user"
+        assert [item["header"] for item in payload["questions"]] == ["Audience", "Tone"]
+        assert response.answers == (
+            AskUserAnswer(header="Audience", selected=("My team",)),
+            AskUserAnswer(header="Tone", custom_answer="Friendly but brief"),
+        )
+        stored = session._current_timeline.stored()
+        assert stored is not None
+        assert [(part.question, part.answer) for part in stored] == [
+            ("Who will use it?", "My team"),
+            ("How should it sound?", "Friendly but brief"),
+        ]
+
+    async def test_an_answered_question_is_recorded_on_the_turns_timeline(self):
+        """The whole point of #502: the question and the answer land on the running
+        turn's timeline, so they are persisted and a reopened conversation shows
+        them rather than neither."""
+        session = _session()
+        session._current_timeline = TurnTimeline()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_one("Which region?", ["eu", "us"]))
+        await _wait(asked)
+        await session.handle_frame(
+            {"type": "ask_user_response", "answers": [{"answer": "eu", "skipped": False}]}
+        )
+        assert await asking == "eu"
+
+        stored = session._current_timeline.stored()
+        assert stored is not None
+        assert [(part.type, part.question, part.answer) for part in stored] == [
+            ("ask_user", "Which region?", "eu")
+        ]
+
+    async def test_a_delegated_question_records_which_delegate_asked(self):
+        """#1042. `ask_parent` hands the surface the question and nothing else,
+        so a stored question said that one was asked and not who asked it - and a
+        specialist asking reads differently in a transcript from the agent the
+        person is talking to asking.
+
+        The name is read where the question is *put*, inside the delegation, and
+        the delegation's state is bound only there: the answer arrives on the
+        receive loop, which is a different task with nothing bound.
+        """
+        session = _session()
+        session._current_timeline = TurnTimeline()
+        asked = _next_frame(session)
+
+        state = SubAgentState(ask_timeout_seconds=300.0, name="researcher")
+        with bind_subagent_state(state):
+            asking = asyncio.create_task(session._ask_one("Which region?", ["eu", "us"]))
+            await _wait(asked)
+        await session.handle_frame(
+            {"type": "ask_user_response", "answers": [{"answer": "eu", "skipped": False}]}
+        )
+        assert await asking == "eu"
+
+        stored = session._current_timeline.stored()
+        assert stored is not None
+        assert [(part.question, part.asked_by) for part in stored] == [
+            ("Which region?", "researcher")
+        ]
+
+    async def test_two_delegates_asking_at_once_each_keep_their_own_name(self):
+        """The attribution is serialized with the round it names.
+
+        `_ask_lock` already held the wire round, but which question was *open*
+        was marked outside it - so a second delegate reaching `_ask_one` while
+        the first was still waiting overwrote both fields, and the first
+        delegate's answer was persisted as the second's question under the
+        second's name. Both are set inside the lock now.
+        """
+        session = _session()
+        session._current_timeline = TurnTimeline()
+        first_asked = _next_frame(session)
+
+        with bind_subagent_state(SubAgentState(ask_timeout_seconds=300.0, name="researcher")):
+            first = asyncio.create_task(session._ask_one("Which region?", []))
+        await _wait(first_asked)
+
+        # The second delegate reaches `_ask_one` while the first is parked on its
+        # answer, which is the whole of the race.
+        second_asked = _next_frame(session)
+        with bind_subagent_state(SubAgentState(ask_timeout_seconds=300.0, name="deployer")):
+            second = asyncio.create_task(session._ask_one("Which cluster?", []))
+        await asyncio.sleep(0)
+
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "eu"}]})
+        assert await first == "eu"
+        await _wait(second_asked)
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "blue"}]})
+        assert await second == "blue"
+
+        stored = session._current_timeline.stored()
+        assert stored is not None
+        assert [(part.question, part.answer, part.asked_by) for part in stored] == [
+            ("Which region?", "eu", "researcher"),
+            ("Which cluster?", "blue", "deployer"),
+        ]
+
+    async def test_a_question_the_main_agent_asked_names_no_delegate(self):
+        """`None` rather than a placeholder: the main agent asking is the ordinary
+        case, and the transcript says nothing extra about it."""
+        session = _session()
+        session._current_timeline = TurnTimeline()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_one("Which region?", ["eu", "us"]))
+        await _wait(asked)
+        await session.handle_frame(
+            {"type": "ask_user_response", "answers": [{"answer": "eu", "skipped": False}]}
+        )
+        assert await asking == "eu"
+
+        stored = session._current_timeline.stored()
+        assert stored is not None
+        assert stored[0].asked_by is None
+
+    async def test_the_answer_is_recorded_when_the_frame_arrives_not_when_the_run_resumes(self):
+        """A `stop` sent right behind the answer cancels the turn before `_ask_one`
+        resumes past its await; recording in the frame handler is what keeps the
+        answered question from being lost in that race (#502). Here the run is never
+        resumed and the pair is on the timeline anyway."""
+        session = _session()
+        session._current_timeline = TurnTimeline()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_one("Which region?", ["eu"]))
+        await _wait(asked)
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "eu"}]})
+
+        stored = session._current_timeline.stored()
+        assert stored is not None
+        assert [(part.type, part.answer) for part in stored] == [("ask_user", "eu")]
+
+        asking.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asking
+
+    async def test_a_question_asked_between_turns_records_nothing(self):
+        """`_ask_one` is safe to reach with no turn running - the timeline is None
+        between turns - so a stray question is answered without a place to record it
+        rather than raising."""
+        session = _session()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_one("Which region?", ["eu"]))
+        await _wait(asked)
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "eu"}]})
+
+        assert await asking == "eu"
+        assert session._current_timeline is None
+
+    async def test_a_delegates_question_left_unanswered_reads_as_no_answer(self):
+        """An empty answers payload releases the delegate with "(no answer)" rather
+        than hanging it: the delegate goes on with what it already had."""
+        session = _session()
+        asked = _next_frame(session)
+
+        asking = asyncio.create_task(session._ask_one("Which region?", []))
+        await _wait(asked)
+
+        await session.handle_frame({"type": "ask_user_response", "answers": None})
+
+        assert await asking == "(no answer)"
+
+    async def test_two_delegates_asking_at_once_are_served_one_at_a_time(self):
+        """A fan-out of sync delegates can reach `ask_parent` concurrently.
+
+        The channel holds one question on the wire at a time — a single
+        `_ask_user_future` and a response frame with no correlation — so without
+        serialisation the second question would overwrite the first's future and
+        strand that delegate for the whole ask timeout, hanging the turn. Under the
+        lock the second waits for the first's answer, and each delegate gets its own.
+        """
+        session = _session()
+
+        first_out = _next_frame(session)
+        ask1 = asyncio.create_task(session._ask_one("Region?", []))
+        ask2 = asyncio.create_task(session._ask_one("Currency?", []))
+        await _wait(first_out)
+
+        # Only the first round is on the wire; the second is queued behind the lock.
+        assert _frame_types(session) == ["ask_user"]
+        assert _sent_events(session)[0][1]["questions"][0]["question"] == "Region?"
+
+        second_out = _next_frame(session)
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "eu"}]})
+        assert await ask1 == "eu"
+
+        # Answering the first releases the lock and lets the second question out.
+        await _wait(second_out)
+        assert _sent_events(session)[-1][1]["questions"][0]["question"] == "Currency?"
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "usd"}]})
+        assert await ask2 == "usd"
+
+
+class TestConnectingAnAccount:
+    """The pause `connect_account` puts in a run while somebody connects a service.
+
+    The same shape as a question: one future, completed by a response frame -
+    so every way the answer can go wrong has to release it, or the turn waits
+    forever on a card nobody can close.
+    """
+
+    _NOTION = ConnectionRequest(catalog_key="notion", name="Notion", gap="not_connected")
+
+    async def test_the_person_connecting_releases_the_run_that_asked(self):
+        session = _session()
+        asked = _next_frame(session)
+
+        waiting = asyncio.create_task(session._request_connection(self._NOTION))
+        await _wait(asked)
+
+        assert _sent_events(session) == [
+            ("connect_account", {"catalog_key": "notion", "name": "Notion", "gap": "not_connected"})
+        ]
+
+        await session.handle_frame({"type": "connect_account_response", "connected": True})
+
+        assert await waiting is True
+        assert session._connect_future is None
+
+    @pytest.mark.parametrize("answer", [False, None, "yes", 1])
+    async def test_anything_but_a_plain_yes_is_a_skip(self, answer: object):
+        """Only `true` attaches anything; a malformed frame still releases the run."""
+        session = _session()
+        asked = _next_frame(session)
+
+        waiting = asyncio.create_task(session._request_connection(self._NOTION))
+        await _wait(asked)
+        await session.handle_frame({"type": "connect_account_response", "connected": answer})
+
+        assert await waiting is False
+
+    async def test_an_answer_nobody_asked_for_is_ignored(self):
+        session = _session()
+
+        with patch("app.services.agent_session.authenticate_socket_token", new=AsyncMock()) as auth:
+            await session.handle_frame({"type": "connect_account_response", "connected": True})
+
+        assert _sent_events(session) == []
+        auth.assert_not_awaited()
+
+    async def test_a_second_answer_does_not_replace_the_first(self):
+        session = _session()
+        asked = _next_frame(session)
+
+        waiting = asyncio.create_task(session._request_connection(self._NOTION))
+        await _wait(asked)
+        await session.handle_frame({"type": "connect_account_response", "connected": False})
+        await session.handle_frame({"type": "connect_account_response", "connected": True})
+
+        assert await waiting is False
+
+    async def test_a_revoked_session_cannot_release_the_run(self):
+        websocket = MagicMock()
+        websocket.send_json = AsyncMock()
+        websocket.close = AsyncMock()
+        session = AgentSession(websocket, MagicMock(), MagicMock(), auth_token="live-token")
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        session._connect_future = future
+
+        with (
+            patch("app.services.agent_session.get_db_context") as db_context,
+            patch(
+                "app.services.agent_session.authenticate_socket_token",
+                new=AsyncMock(side_effect=AuthenticationError(message="Impersonation has ended")),
+            ),
+        ):
+            db_context.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+            db_context.return_value.__aexit__ = AsyncMock(return_value=False)
+            await session.handle_frame({"type": "connect_account_response", "connected": True})
+
+        assert not future.done()
+        websocket.close.assert_awaited_once_with(code=4001, reason="Session revoked")
+
+    async def test_a_question_asked_meanwhile_waits_for_the_connection(self):
+        """One prompt on the wire at a time: a delegate's question queued behind
+        the card is sent only once the card is answered."""
+        session = _session()
+        asked = _next_frame(session)
+
+        waiting = asyncio.create_task(session._request_connection(self._NOTION))
+        await _wait(asked)
+        question = asyncio.create_task(session._ask_one("Which region?", []))
+        await asyncio.sleep(0)
+        assert _frame_types(session) == ["connect_account"]
+
+        asked_next = _next_frame(session)
+        await session.handle_frame({"type": "connect_account_response", "connected": True})
+        assert await waiting is True
+        await _wait(asked_next)
+        assert _frame_types(session) == ["connect_account", "ask_user"]
+        await session.handle_frame({"type": "ask_user_response", "answers": [{"answer": "eu"}]})
+        assert await question == "eu"
+
+
+class TestAttachedFiles:
+    async def test_a_frame_carrying_only_a_file_is_not_an_empty_message(self):
+        """ "Have a look at this" with the sentence left off is an ordinary way to
+        send a file, and the attachment *is* the message. The rows go to the
+        runner rather than into a prompt built here: where a file lands depends on
+        whether the agent has a workspace, which only `prepare` knows."""
+        session = _session()
+        rows = [MagicMock(), MagicMock()]
+        run = AsyncMock(return_value=_finished_turn())
+        prompt_message_id = uuid4()
+
+        with (
+            _chat(run, prompt_message_id=prompt_message_id),
+            patch(
+                "app.services.agent_session.load_turn_attachments",
+                new=AsyncMock(return_value=rows),
+            ) as load,
+        ):
+            await session.process_message(
+                {"message": "", "agent_id": str(uuid4()), "file_ids": ["f1", "f2"]}
+            )
+
+        assert _frame_types(session) == [
+            "user_prompt",
+            "message_saved",
+            "complete",
+        ]
+        assert _sent_events(session)[0][1]["message_id"] == str(prompt_message_id)
+        assert run.await_args is not None
+        assert run.await_args.kwargs["attachments"] == rows
+        # Read against the message `persist_user_turn` just wrote and the caller's
+        # own ids - the ids are linked by then, and re-checking them as unlinked
+        # dropped every attachment before the model call (#1756).
+        assert load.await_args.args[1] == prompt_message_id
+        assert load.await_args.args[2] == ["f1", "f2"]
+
+    async def test_a_lost_prompt_row_still_loads_the_files(self):
+        """`persist_user_turn` swallows a transient write failure, leaving
+        `message_id` None; the files must still be loaded (the loader keeps the
+        caller's unlinked uploads for a None message) rather than dropped from a
+        billed turn (#1654 review)."""
+        session = _session()
+        rows = [MagicMock()]
+        run = AsyncMock(return_value=_finished_turn())
+
+        with (
+            _chat(run, prompt_message_id=None),
+            patch(
+                "app.services.agent_session.load_turn_attachments",
+                new=AsyncMock(return_value=rows),
+            ) as load,
+        ):
+            await session.process_message(
+                {"message": "look", "agent_id": str(uuid4()), "file_ids": ["f1"]}
+            )
+
+        assert run.await_args is not None
+        assert run.await_args.kwargs["attachments"] == rows
+        # Not short-circuited to []: the loader is called with a None message id.
+        assert load.await_args.args[1] is None
+
+
+class TestStreamingAModelResponse:
+    """Every model-request event, translated into the frame the chat reads.
+
+    Constructed from `pydantic_ai.messages` rather than mocked for the reason
+    `TestForwardingToolEvents` gives: a `MagicMock` satisfies every `isinstance`
+    this translation asks about, so a test built on one proves nothing about the
+    shapes the library actually sends.
+    """
+
+    @staticmethod
+    async def _stream(
+        session: AgentSession, *events: Any, timeline: TurnTimeline | None = None
+    ) -> str | None:
+        """Drive the translation over `events`, returning the collected reasoning.
+
+        `timeline` is passed by the tests that read the text or the order back; the
+        rest only care about the frames that went out.
+        """
+
+        async def _events() -> AsyncIterator[Any]:
+            for event in events:
+                yield event
+
+        collected = timeline if timeline is not None else TurnTimeline()
+        await _frames(session, timeline=collected).request(_events(), set())
+        return collected.thinking
+
+    async def test_a_part_that_starts_with_text_already_in_it_forwards_that_text(self):
+        """Some providers put the first chunk inside the part rather than sending
+        it as a delta. The client only appends on `text_delta`, so without this
+        the opening words of an answer are silently dropped."""
+        session = _session()
+
+        await self._stream(session, PartStartEvent(index=0, part=TextPart(content="Two ")))
+
+        assert _sent_events(session) == [
+            ("part_start", {"index": 0, "part_type": "TextPart"}),
+            ("text_delta", {"index": 0, "content": "Two "}),
+        ]
+
+    async def test_a_part_that_starts_empty_sends_no_delta(self):
+        session = _session()
+
+        await self._stream(session, PartStartEvent(index=0, part=TextPart(content="")))
+
+        assert _frame_types(session) == ["part_start"]
+
+    async def test_a_tool_call_starting_names_the_tool_it_will_call(self):
+        """The parsed arguments arrive on `tool_call`, once the model has finished
+        writing them. A large argument streams for minutes before that, and
+        without the name here a client has nothing to show in the meantime."""
+        session = _session()
+
+        await self._stream(
+            session,
+            PartStartEvent(
+                index=1, part=ToolCallPart(tool_name="count_open", args={}, tool_call_id="c1")
+            ),
+        )
+
+        assert _sent_events(session) == [
+            (
+                "part_start",
+                {
+                    "index": 1,
+                    "part_type": "ToolCallPart",
+                    "tool_name": "count_open",
+                    "tool_call_id": "c1",
+                },
+            )
+        ]
+
+    async def test_reasoning_reaches_both_the_client_and_the_transcript(self):
+        """The pane is drawn from the frame; the persisted `thinking` is drawn from
+        what is collected. One without the other is a reasoning trace that
+        disappears on reload, or one that was never shown."""
+        session = _session()
+
+        thinking = await self._stream(
+            session, PartStartEvent(index=0, part=ThinkingPart(content="Counting the open ones"))
+        )
+
+        assert _sent_events(session) == [
+            ("part_start", {"index": 0, "part_type": "ThinkingPart"}),
+            ("thinking_delta", {"index": 0, "content": "Counting the open ones"}),
+        ]
+        assert thinking == "Counting the open ones"
+
+    async def test_a_second_block_of_reasoning_is_separated_from_the_first(self):
+        """The pieces are joined into one string for persistence, so two blocks
+        run together into one word without this."""
+        session = _session()
+
+        thinking = await self._stream(
+            session,
+            PartStartEvent(index=0, part=ThinkingPart(content="Counting.")),
+            PartStartEvent(index=2, part=ThinkingPart(content="Now checking.")),
+        )
+
+        assert thinking == "Counting. Now checking."
+
+    async def test_reasoning_that_starts_empty_is_neither_shown_nor_recorded(self):
+        session = _session()
+
+        thinking = await self._stream(
+            session, PartStartEvent(index=0, part=ThinkingPart(content=""))
+        )
+
+        assert _frame_types(session) == ["part_start"]
+        assert thinking is None
+
+    async def test_a_text_delta_is_forwarded_with_the_part_it_extends(self):
+        session = _session()
+
+        await self._stream(
+            session, PartDeltaEvent(index=0, delta=TextPartDelta(content_delta="are open."))
+        )
+
+        assert _sent_events(session) == [("text_delta", {"index": 0, "content": "are open."})]
+
+    async def test_a_reasoning_delta_is_forwarded_and_recorded(self):
+        session = _session()
+
+        thinking = await self._stream(
+            session, PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta="Counting"))
+        )
+
+        assert _sent_events(session) == [("thinking_delta", {"index": 0, "content": "Counting"})]
+        assert thinking == "Counting"
+
+    async def test_a_reasoning_delta_carrying_only_a_signature_is_not_shown(self):
+        """A signature is the provider's proof it produced the reasoning, sent as
+        its own delta with no content. Forwarding it would put base64 in the
+        reasoning pane and in the persisted trace."""
+        session = _session()
+
+        thinking = await self._stream(
+            session, PartDeltaEvent(index=0, delta=ThinkingPartDelta(signature_delta="c2ln"))
+        )
+
+        assert _sent_events(session) == []
+        assert thinking is None
+
+    async def test_tool_arguments_are_forwarded_as_they_arrive(self):
+        session = _session()
+
+        await self._stream(
+            session, PartDeltaEvent(index=1, delta=ToolCallPartDelta(args_delta='{"team": '))
+        )
+
+        assert _sent_events(session) == [
+            ("tool_call_delta", {"index": 1, "args_delta": '{"team": '})
+        ]
+
+    async def test_a_call_reusing_an_id_the_conversation_holds_is_renamed_first(self):
+        """Before the console hears of it, and in the part the response keeps, so a
+        provider counting from `call_0` each turn cannot make a drawing overwrite
+        the last one (#2171)."""
+        session = _session()
+        part = ToolCallPart("draw", {}, tool_call_id="call_0")
+
+        async def _events() -> AsyncIterator[Any]:
+            yield PartStartEvent(index=0, part=part)
+
+        await _frames(session).request(_events(), {"call_0"})
+
+        assert part.tool_call_id == "call_0~2"
+        assert _sent_events(session) == [
+            (
+                "part_start",
+                {
+                    "index": 0,
+                    "part_type": "ToolCallPart",
+                    "tool_name": "draw",
+                    "tool_call_id": "call_0~2",
+                },
+            )
+        ]
+
+    async def test_the_frame_that_says_the_answer_has_started(self):
+        session = _session()
+
+        await self._stream(session, FinalResultEvent(tool_name=None, tool_call_id=None))
+
+        assert _sent_events(session) == [("final_result_start", {"tool_name": None})]
+
+    async def test_a_part_ending_needs_no_frame(self):
+        """The client redraws from the deltas it already applied, so a `part_end`
+        it does not switch on would be a frame sent for nobody to read."""
+        session = _session()
+
+        await self._stream(session, PartEndEvent(index=0, part=TextPart(content="Two are open.")))
+
+        assert _sent_events(session) == []
+
+
+def _answering_agent(*, tools: list[Any] | None = None) -> PydanticAgent[Any, Any]:
+    """An agent that answers in two chunks, optionally calling one tool first.
+
+    `output_type` matches what the factory builds, because the approval gate needs
+    `DeferredToolRequests` in the union - a run driven through a different output
+    type would take a different path out of the graph.
+    """
+
+    def answered(messages: list[ModelMessage]) -> bool:
+        return any(
+            isinstance(part, ToolReturnPart) for message in messages for part in message.parts
+        )
+
+    async def respond(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart("Two are open.")])
+
+    async def stream(
+        messages: list[ModelMessage], _info: AgentInfo
+    ) -> AsyncIterator[str | DeltaToolCalls]:
+        if tools is None or answered(messages):
+            yield "Two "
+            yield "are open."
+        else:
+            yield {
+                0: DeltaToolCall(
+                    name="count_open", json_args='{"team": "sales"}', tool_call_id="call-1"
+                )
+            }
+
+    return PydanticAgent(
+        FunctionModel(respond, stream_function=stream),
+        output_type=[str, DeferredToolRequests],
+        tools=tools or [],
+    )
+
+
+def count_open(team: str) -> int:
+    """How many are open for one team."""
+    return 2
+
+
+class TestATurnThatDidNotFinishStillKeepsWhatItSaid:
+    """The half-written answer, on the paths that never return a `ChatTurn`.
+
+    A run that failed, hit its budget, was stopped or lost its socket produces no
+    `ChatTurn`, so the write on the success path is skipped - and everything the
+    model had already streamed used to be discarded. The run stayed in history
+    pointing at a transcript holding the question and nothing else, which is the
+    run somebody opens.
+
+    Driven over a real `Agent.iter`, because the text has to travel the same route
+    the client's `text_delta` frames do: what is written down is what its reader
+    saw, and a stub bypassing the translation would prove neither half.
+    """
+
+    @staticmethod
+    def _interrupted(failure: BaseException, *, run: OpenedRun) -> AsyncMock:
+        """A `run` that opens its row, streams two chunks, and then fails."""
+
+        async def interrupted(**kwargs: Any) -> ChatTurn:
+            kwargs["on_run_open"](run)
+            async with _answering_agent().iter("how many are open?") as agent_run:
+                await kwargs["stream"](agent_run)
+            raise failure
+
+        return AsyncMock(side_effect=interrupted)
+
+    @staticmethod
+    def _opened() -> OpenedRun:
+        return OpenedRun(run_id=uuid4(), model_label="gpt-4.1", agent_version_id=uuid4())
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("the provider went away"),
+            BudgetExceeded(limit_usd=1, spent_usd=2, scope=BudgetScope.AGENT),
+            BadRequestError(message="that agent is archived"),
+        ],
+        ids=["a crash", "a budget stop", "a refusal"],
+    )
+    async def test_the_words_the_reader_saw_are_the_words_that_are_stored(self, failure):
+        session = _session()
+        run = self._opened()
+
+        with _chat(self._interrupted(failure, run=run)) as chat:
+            await session.process_message(_message())
+
+        written = chat.answer.await_args
+        assert written.args[1] == "Two are open."
+        assert written.kwargs["run_id"] == run.run_id
+        assert written.kwargs["agent_version_id"] == run.agent_version_id
+        # The model comes off the opened run, not off a `ChatTurn` that was never
+        # produced - a transcript naming no model cannot answer "which one said
+        # this" for the turn most likely to be asked about.
+        assert written.args[2] == "gpt-4.1"
+
+    async def test_no_cost_is_invented_for_a_turn_that_never_reported_one(self):
+        """The accounting is on the run row, written by `finish`. A figure guessed
+        from a partial stream would disagree with it, and the run row is the one a
+        budget is enforced against."""
+        session = _session()
+
+        with _chat(self._interrupted(RuntimeError("boom"), run=self._opened())) as chat:
+            await session.process_message(_message())
+
+        assert chat.answer.await_args.kwargs.get("usage") is None
+
+    async def test_a_turn_refused_before_its_run_existed_writes_nothing(self):
+        """An unpublished agent, or a membership revoked mid-session. There is no
+        run to file a turn under and nothing was produced, and a blank assistant
+        message would read as the agent having answered with silence."""
+        session = _session()
+        refused = AsyncMock(side_effect=BadRequestError(message="that agent is not published"))
+
+        with _chat(refused) as chat:
+            await session.process_message(_message())
+
+        chat.answer.assert_not_awaited()
+        assert _frame_types(session) == ["user_prompt", "error"]
+
+    async def test_a_turn_whose_conversation_was_never_persisted_writes_no_partial(self):
+        """`persist_user_turn` logs and swallows a write failure, so a turn can run
+        with no thread to write into. There is nowhere to put the partial answer,
+        and the run row is still the record that the work happened."""
+        session = _session()
+
+        with _chat(
+            self._interrupted(RuntimeError("boom"), run=self._opened()), conversation=None
+        ) as chat:
+            await session.process_message(_message())
+
+        chat.answer.assert_not_awaited()
+
+    async def test_a_partial_turn_that_only_asked_a_question_still_records_it(self):
+        """A turn that put a question, got an answer, then stopped before any text
+        or tool call has only its `ask_user` part - which has no column to fall
+        back to, so the partial-turn guard must treat a stored timeline as
+        produced content or the question and answer are lost on reload (#502)."""
+        session = _session()
+        session.current_conversation_id = str(uuid4())
+        part = MessagePart(type="ask_user", question="Which region?", answer="eu")
+
+        with patch(
+            "app.services.agent_session.persist_assistant_turn", new=AsyncMock()
+        ) as persisted:
+            await session._persist_partial_turn(
+                [self._opened()],
+                agent_id=uuid4(),
+                output="",
+                tool_calls=[],
+                thinking=None,
+                parts=[part],
+            )
+
+        persisted.assert_awaited_once()
+        assert persisted.await_args.kwargs["parts"] == [part]
+
+    async def test_a_turn_that_finished_is_written_once_and_not_twice(self):
+        """The `finally` cannot read `turn` to decide - that is the whole reason it
+        exists - so it reads whether the write happened. A second row here would
+        duplicate every answer in the product."""
+        session = _session()
+
+        with _chat(AsyncMock(return_value=_finished_turn())) as chat:
+            await session.process_message(_message())
+
+        chat.answer.assert_awaited_once()
+
+
+class TestDrivingTheRun:
+    """The node dispatch, over a real `Agent.iter`.
+
+    A hand-written iterator would say nothing about whether `node.stream(...)` is
+    reached, and that is where every delta in the transcript comes from.
+    """
+
+    async def test_a_turn_that_calls_a_tool_and_then_answers(self):
+        session = _session()
+        tool_calls: list[dict[str, Any]] = []
+        timeline = TurnTimeline()
+
+        async with _answering_agent(tools=[count_open]).iter("how many are open?") as agent_run:
+            await _frames(
+                session, timeline=timeline, tool_calls=tool_calls, prompt="how many are open?"
+            ).drive(agent_run)
+
+        # The same words that went out as `text_delta`, kept so a turn that never
+        # finishes can still be written down as what its reader saw.
+        assert timeline.text == "Two are open."
+        # And where they sat: the call came before the answer, which is the order a
+        # reload has to reproduce.
+        assert [(part.type, part.text or part.tool_call_id) for part in timeline.parts] == [
+            ("tool", "call-1"),
+            ("text", "Two are open."),
+        ]
+        types = _frame_types(session)
+        assert types[0] == "user_prompt_processed"
+        assert types.count("model_request_start") == 2
+        assert types.count("call_tools_start") == 2
+        assert types[-1] == "final_result"
+        assert _sent_events(session)[-1] == ("final_result", {"output": "Two are open."})
+        assert tool_calls == [
+            {
+                "tool_call_id": "call-1",
+                "tool_name": "count_open",
+                "args": {"team": "sales"},
+                "result": "2",
+            }
+        ]
+
+    async def test_the_prompt_reported_is_the_sentence_that_was_typed(self):
+        """With an attachment the assembled prompt is a list of content objects,
+        and `BinaryContent` holds the file's bytes. Forwarding that would put a
+        `repr` of a PNG in the transcript where the sentence belongs."""
+        session = _session()
+        prompt = ["have a look at this", BinaryContent(data=b"\x89PNG", media_type="image/png")]
+
+        async with _answering_agent().iter(prompt) as agent_run:
+            await _frames(session, prompt="have a look at this").drive(agent_run)
+
+        assert _sent_events(session)[0] == (
+            "user_prompt_processed",
+            {"prompt": "have a look at this"},
+        )
+
+
+_SECRET = "sk-ant-api03-ABCDEFGHIJKLMNOPQR"
+
+
+def _guarded_agent(config: dict[str, Any], *responses: list[str | DeltaToolCalls]) -> Any:
+    """An agent with the guardrails capability built from `config`, streaming `responses`.
+
+    Built through the registry, the way the factory builds it, so what is tested is
+    the capability a published spec actually gets.
+    """
+
+    async def stream(
+        messages: list[ModelMessage], _info: AgentInfo
+    ) -> AsyncIterator[str | DeltaToolCalls]:
+        for chunk in responses[sum(isinstance(m, ModelResponse) for m in messages)]:
+            yield chunk
+
+    return PydanticAgent(
+        FunctionModel(stream_function=stream),
+        output_type=[str, DeferredToolRequests],
+        tools=[count_open],
+        capabilities=build([CapabilityBinding(capability_id="guardrails", config=config)]),
+    )
+
+
+class TestAScreenedAnswerOnTheWire:
+    """An agent with an output check, through the chat's own frames (#1900).
+
+    The output guardrail redacted the finished answer, but `text_delta` had already
+    carried the raw text to the socket, and the timeline - what the turn is stored
+    as - had recorded it. Both read what the stream screen releases now.
+    """
+
+    @pytest.mark.security
+    async def test_no_frame_and_no_stored_part_carries_a_redacted_secret(self):
+        session = _session()
+        timeline = TurnTimeline()
+        agent = _guarded_agent(
+            {"redact_secrets_out": True},
+            [
+                "Your old key was sk-ant-api03-ABC",
+                "DEFGHIJKLMNOPQR.",
+                {1: DeltaToolCall(name="count_open", json_args='{"team": "sales"}')},
+            ],
+            ["The new one is ", "sk-ant-api03-ABCDEFGHIJKLMNOPQR."],
+        )
+
+        async with agent.iter("rotate my key") as agent_run:
+            await _frames(session, timeline=timeline).drive(agent_run)
+
+        assert _SECRET not in str(_sent_events(session))
+        assert _sent_events(session)[-1] == (
+            "final_result",
+            {"output": "The new one is [redacted:anthropic_key]."},
+        )
+        stored = timeline.stored()
+        assert stored is not None
+        assert [part.text for part in stored if part.type == "text"] == [
+            "Your old key was [redacted:anthropic_key].",
+            "The new one is [redacted:anthropic_key].",
+        ]
+
+    @pytest.mark.security
+    async def test_a_blocked_answer_sends_no_text_and_leaves_none_to_store(self):
+        """`_persist_partial_turn` writes `timeline.text` on a turn that raised, so a
+        block that arrived after the stream stored the very answer it refused."""
+        session = _session()
+        timeline = TurnTimeline()
+        agent = _guarded_agent(
+            {"blocked_keywords_out": "confidential"},
+            ["Strictly confidential: ", "Acme is buying Initech."],
+        )
+
+        with pytest.raises(GuardrailBlocked):
+            async with agent.iter("any news?") as agent_run:
+                await _frames(session, timeline=timeline).drive(agent_run)
+
+        assert "text_delta" not in _frame_types(session)
+        assert "Initech" not in str(_sent_events(session))
+        assert timeline.text == ""
+
+
+class TestForwardingToolEvents:
+    """What a tool call looks like on the wire, read off real event objects.
+
+    Constructed from `pydantic_ai.messages` rather than mocked, deliberately: a
+    `MagicMock` answers to `.result`, `.part` and anything else, so a test built on
+    one would have kept passing through exactly the rename that broke this.
+    """
+
+    async def test_a_tool_result_is_forwarded_with_its_content(self):
+        session = _session()
+        collected: list[dict] = []
+
+        async def _events():
+            yield FunctionToolCallEvent(
+                part=ToolCallPart(
+                    tool_name="write_file", args={"path": "/a.txt"}, tool_call_id="t1"
+                )
+            )
+            yield FunctionToolResultEvent(
+                part=ToolReturnPart(
+                    tool_name="write_file", content="wrote /a.txt", tool_call_id="t1"
+                )
+            )
+
+        await _frames(session, tool_calls=collected).tools(_events())
+
+        assert [event for event in _sent_events(session) if event[0] == "tool_result"] == [
+            ("tool_result", {"tool_call_id": "t1", "content": "wrote /a.txt"})
+        ]
+
+    async def test_the_result_is_kept_on_the_call_it_belongs_to(self):
+        """The transcript persists one row per call, so a result that did not find
+        its call is a tool call recorded as never having returned."""
+        session = _session()
+        collected: list[dict] = []
+
+        async def _events():
+            yield FunctionToolCallEvent(
+                part=ToolCallPart(tool_name="ls", args={}, tool_call_id="t1")
+            )
+            yield FunctionToolResultEvent(
+                part=ToolReturnPart(tool_name="ls", content=["/a.txt"], tool_call_id="t1")
+            )
+
+        await _frames(session, tool_calls=collected).tools(_events())
+
+        # JSON, not `str(list)`: a structured answer has to be readable on the
+        # other side, which a Python repr is not.
+        assert collected == [
+            {"tool_call_id": "t1", "tool_name": "ls", "args": {}, "result": '["/a.txt"]'}
+        ]
+
+    async def test_a_retry_is_reported_rather_than_swallowed(self, caplog):
+        """A retried tool return comes down the same stream, and a
+        card that never resolved would spin forever - so the frame still arrives,
+        naming the tool that failed. What it does not carry is the retry text: a
+        tool builds one out of whatever it caught, and `web_search` catches an
+        `httpx` error whose message holds the failing endpoint (#681).
+        """
+        session = _session()
+        vendor_text = "Tavily search failed: 401 for url 'https://api.tavily.com/search?k=sk-9f2c'"
+        collected: list[dict] = []
+
+        async def _events():
+            yield FunctionToolCallEvent(
+                part=ToolCallPart(tool_name="web_search", args={}, tool_call_id="t9")
+            )
+            yield FunctionToolResultEvent(
+                part=ToolReturnPart(
+                    content=vendor_text,
+                    tool_name="web_search",
+                    tool_call_id="t9",
+                    outcome="retried",
+                )
+            )
+
+        with caplog.at_level(logging.WARNING, logger="app.services.run_stream"):
+            await _frames(session, tool_calls=collected).tools(_events())
+
+        [(_type, data)] = [event for event in _sent_events(session) if event[0] == "tool_result"]
+        assert data == {
+            "tool_call_id": "t9",
+            "content": (
+                "The web_search call failed and the model was asked to try again. "
+                "The server log has the full error."
+            ),
+        }
+        assert collected[0]["result"] == data["content"]
+        assert vendor_text in caplog.text
+
+    async def test_a_retry_from_an_unnamed_tool_still_says_a_call_failed(self, caplog):
+        """An upstream result can carry an empty tool name. It still needs a generic
+        notice so a card does not stay open forever."""
+        session = _session()
+
+        async def _events():
+            yield FunctionToolResultEvent(
+                part=ToolReturnPart(
+                    content="path must be absolute",
+                    tool_call_id="t9",
+                    tool_name="",
+                    outcome="retried",
+                )
+            )
+
+        with caplog.at_level(logging.WARNING, logger="app.services.run_stream"):
+            await _frames(session).tools(_events())
+
+        [(_type, data)] = [event for event in _sent_events(session) if event[0] == "tool_result"]
+        assert data == {
+            "tool_call_id": "t9",
+            "content": (
+                "A tool call failed and the model was asked to try again. "
+                "The server log has the full error."
+            ),
+        }
+        assert "path must be absolute" in caplog.text
+
+    async def test_the_models_submit_final_answer_call_is_not_drawn_as_a_tool(self):
+        """`OutputToolCallEvent` arrives on this same stream and shares a base class
+        with the function-tool event. Matching the base would put a card named
+        after the output schema in every turn, and persist one per message."""
+        session = _session()
+        collected: list[dict] = []
+
+        async def _events():
+            yield OutputToolCallEvent(
+                part=ToolCallPart(
+                    tool_name="final_result", args={"output": "Two"}, tool_call_id="o1"
+                )
+            )
+
+        await _frames(session, tool_calls=collected).tools(_events())
+
+        assert _sent_events(session) == []
+        assert collected == []
+
+
+class TestForwardingCompactionFrames:
+    """What the client hears while the agent summarises its own history.
+
+    Compaction happens between two of a turn's model requests, where nothing else
+    streams. A summary is a whole request over a history that is by definition
+    long, so the chat stopped dead for the length of it - which reads as a broken
+    screen, gets the page reloaded, and cancels the very turn somebody was
+    waiting on.
+    """
+
+    async def test_a_frame_is_sent_under_the_name_the_union_gave_it(self):
+        """The wire `type` is the frame's own `kind`, for the reason the delegation
+        frames give: two spellings of one frame is a drift nothing catches."""
+        session = _session()
+
+        await session._compaction_event(
+            CompactionEvent(kind="compaction_started", messages_before=62)
+        )
+
+        assert _sent_events(session) == [
+            (
+                "compaction_started",
+                {
+                    "kind": "compaction_started",
+                    "messages_before": 62,
+                    "messages_after": None,
+                    "overhead_tokens": None,
+                    "window_tokens": None,
+                },
+            )
+        ]
+
+    async def test_the_finishing_frame_says_what_it_came_to(self):
+        """ "62 messages into 9" is the one sentence that explains both the pause
+        and why the next answer knows less than the last one did."""
+        session = _session()
+
+        await session._compaction_event(
+            CompactionEvent(kind="compaction_finished", messages_before=62, messages_after=9)
+        )
+
+        kind, frame = _sent_events(session)[0]
+        assert kind == "compaction_finished"
+        assert (frame["messages_before"], frame["messages_after"]) == (62, 9)
+
+    async def test_a_window_that_cannot_work_reaches_the_person_who_set_it(self):
+        """The one frame that describes a setting rather than an event: the fixed
+        overhead is past the trigger, so nothing will ever compact, and doing
+        nothing looks exactly like a setting that works."""
+        session = _session()
+
+        await session._compaction_event(
+            CompactionEvent(
+                kind="compaction_impossible", overhead_tokens=3_843, window_tokens=5_000
+            )
+        )
+
+        kind, frame = _sent_events(session)[0]
+        assert kind == "compaction_impossible"
+        assert (frame["overhead_tokens"], frame["window_tokens"]) == (3_843, 5_000)
+
+
+class TestForwardingDelegationFrames:
+    """What the client hears while a specialist is working."""
+
+    async def test_a_frame_is_sent_under_the_name_the_union_gave_it(self):
+        """The wire `type` is the frame's own `kind`. A name chosen in the session
+        instead would leave the client switching on a case nothing sends, and a
+        delegation would simply never appear - no error anywhere."""
+        session = _session()
+
+        await session._subagent_event(
+            SubagentStarted(
+                task_id="task-1",
+                subagent="researcher",
+                depth=0,
+                mode="sync",
+                prompt="find three papers",
+            )
+        )
+
+        assert _sent_events(session) == [
+            (
+                "subagent_start",
+                {
+                    "kind": "subagent_start",
+                    "task_id": "task-1",
+                    "subagent": "researcher",
+                    "depth": 0,
+                    "mode": "sync",
+                    "prompt": "find three papers",
+                    # On the wire even when it is `None`, because the client
+                    # switches on its presence to nest a panel: a field a surface
+                    # only sometimes receives is a field it has to guess about, and
+                    # guessing the parent is what this replaced.
+                    "parent_task_id": None,
+                    # `None` for a configured delegate; set only for a specialist the
+                    # model invented at run time, whose definition a surface offers to
+                    # keep. On the wire either way, for the same reason.
+                    "specialist": None,
+                    # Set only when the worker is a coding harness, not an agent.
+                    "harness": None,
+                },
+            )
+        ]
+
+    async def test_every_kind_reaches_the_client_under_its_own_type(self):
+        """Six literals, and the client has a branch per literal. One of them
+        dropped here is one panel that never opens, never fills or never closes."""
+        session = _session()
+        frames = [
+            SubagentTextDelta(task_id="t", subagent="researcher", depth=0, delta="found "),
+            SubagentToolCall(
+                task_id="t",
+                subagent="researcher",
+                depth=0,
+                tool_name="search_documents",
+                tool_call_id="c1",
+            ),
+        ]
+
+        for frame in frames:
+            await session._subagent_event(frame)
+
+        assert [event_type for event_type, _data in _sent_events(session)] == [
+            "subagent_text_delta",
+            "subagent_tool_call",
+        ]
+
+    async def test_what_a_delegation_cost_arrives_as_a_decimal_string(self):
+        """A `Decimal` serialises to a *string* in JSON mode, and the chat formats
+        cost as a number - the panel would have rendered `NaN` for every finished
+        delegation. The turn's own cost is already a number on this wire; a
+        delegation's share of it is the same quantity."""
+        session = _session()
+        run_id = uuid4()
+
+        await session._subagent_event(
+            SubagentFinished(
+                task_id="t",
+                subagent="researcher",
+                depth=0,
+                status="completed",
+                run_id=run_id,
+                cost_usd=Decimal("0.0042"),
+                input_tokens=1200,
+                output_tokens=340,
+            )
+        )
+
+        [(event_type, data)] = _sent_events(session)
+        assert event_type == "subagent_complete"
+        assert data["cost_usd"] == "0.0042"
+        assert isinstance(data["cost_usd"], str)
+        assert data["run_id"] == str(run_id)
+
+    async def test_a_delegation_that_recorded_no_cost_reports_none_rather_than_zero(self):
+        """Nothing measured and nothing spent are different things to draw."""
+        session = _session()
+
+        await session._subagent_event(
+            SubagentFinished(
+                task_id="t",
+                subagent="researcher",
+                depth=0,
+                status="failed",
+                error="the provider refused",
+            )
+        )
+
+        [(_event_type, data)] = _sent_events(session)
+        assert data["cost_usd"] is None
+        assert data["error"] == "the provider refused"
+
+    async def test_a_frame_arriving_after_the_tab_closed_does_not_take_the_run_down(self):
+        """A background delegation outlives the answer it was started for, so its
+        last frames can land on a socket that has gone. `send_event` reports that
+        rather than raising; a raise here would surface as a crashed turn task."""
+        session = _session()
+        session.websocket.send_json = AsyncMock(side_effect=RuntimeError("socket is closed"))
+
+        await session._subagent_event(
+            SubagentFinished(task_id="t", subagent="researcher", depth=0, status="completed")
+        )
+
+
+_DELEGATE_REQUEST = SpendEntry(
+    model_name="test", input_tokens=7, output_tokens=3, cost_usd=Decimal("2.00"), priced=True
+)
+"""What the delegate's one model request costs, before the parent is stopped.
+
+Two dollars, and the number is the point: a cancelled run that spent it and
+recorded zero is the hole cancellation opens, and nothing about it looks like an
+error.
+"""
+
+
+def _delegating_parent() -> FunctionModel:
+    """A parent that delegates in the background, then never answers.
+
+    Both halves of `FunctionModel` because the chat *iterates* its run and streams
+    each node - which is exactly why the cancellation has to be tested here: a
+    surface that awaited an answer instead would unwind through a different path.
+    """
+
+    def delegated(messages: list[ModelMessage]) -> bool:
+        return any(
+            isinstance(part, ToolReturnPart) for message in messages for part in message.parts
+        )
+
+    def call_task() -> ModelResponse:
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "task",
+                    {"description": "find the price", "subagent_type": "researcher"},
+                    tool_call_id="call-1",
+                )
+            ]
+        )
+
+    async def respond(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        if not delegated(messages):
+            return call_task()
+        await anyio.sleep(30)
+        return ModelResponse(parts=[TextPart("too late")])
+
+    async def stream(
+        messages: list[ModelMessage], _info: AgentInfo
+    ) -> AsyncIterator[str | DeltaToolCalls]:
+        if not delegated(messages):
+            yield {
+                0: DeltaToolCall(
+                    name="task",
+                    json_args='{"description": "find the price", "subagent_type": "researcher"}',
+                    tool_call_id="call-1",
+                )
+            }
+        else:
+            await anyio.sleep(30)
+            yield "too late"
+
+    return FunctionModel(respond, stream_function=stream)
+
+
+def _spending_delegate(ledger: SpendLedger, spent: asyncio.Event) -> ResolvedSubagent:
+    """A specialist that bills the run's shared ledger and then works on forever.
+
+    The billing stands in for the budget guard, which is what records a real
+    request - through `book`, as the guard does, because that is where the entry is
+    stamped with the delegation that made it. It happens *before* the sleep, and
+    `spent` is what a test waits on rather than a delay: the assertion is about
+    what a cancelled run reports having spent, so the money has to be on the
+    ledger before the stop arrives.
+    """
+
+    async def respond(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        ledger.book(_DELEGATE_REQUEST)
+        spent.set()
+        await anyio.sleep(30)
+        return ModelResponse(parts=[TextPart("too late")])
+
+    async def stream(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+        ledger.book(_DELEGATE_REQUEST)
+        spent.set()
+        await anyio.sleep(30)
+        yield "too late"
+
+    def build_it() -> PydanticAgent[Any, Any]:
+        return PydanticAgent(
+            FunctionModel(respond, stream_function=stream),
+            system_prompt="You research.",
+            output_type=[str, DeferredToolRequests],
+        )
+
+    return ResolvedSubagent(
+        name="researcher",
+        description="Researches a topic.",
+        build=build_it,
+        agent_id=uuid4(),
+        agent_version_id=uuid4(),
+    )
+
+
+class _Turn:
+    """One prepared chat turn, assembled around a real agent that delegates.
+
+    Everything the runner would have resolved from the database is supplied here;
+    what is real is the part under test - the agent, the delegation capability, the
+    run's shared ledger, and the cancellation path from `stop` to the run row.
+    """
+
+    def __init__(self, mode: str = "async") -> None:
+        self.ledger = SpendLedger()
+        self.spent = asyncio.Event()
+        self.outcomes: list[DelegationOutcome] = []
+        self.finished: list[tuple[RunStatus, Decimal, int, int]] = []
+        self.runtime = SubagentRuntime(
+            subagents=(_spending_delegate(self.ledger, self.spent),),
+            record=self._record,
+            depth_remaining=1,
+            ledger=self.ledger,
+        )
+        capabilities = build(
+            [CapabilityBinding(capability_id="subagents", config={"mode": mode})],
+            resources={SUBAGENT_RUNTIME_RESOURCE: self.runtime},
+        )
+        (delegation,) = capabilities
+        assert isinstance(delegation, Delegation)
+        self.delegation = delegation
+        self.prepared = self._prepared(
+            PydanticAgent(
+                _delegating_parent(),
+                system_prompt="You orchestrate.",
+                output_type=[str, DeferredToolRequests],
+                capabilities=capabilities,
+            )
+        )
+
+    async def _record(self, outcome: DelegationOutcome) -> UUID | None:
+        self.outcomes.append(outcome)
+        return uuid4()
+
+    async def _finish(self, prepared: Any, **kwargs: Any) -> MagicMock:
+        """Stand in for the runner's terminal write, recording what it would write.
+
+        The row's numbers are `prepared.built.ledger` read at this moment, so
+        capturing them here is capturing the row: that `finish` writes exactly
+        these is `tests/test_agent_runner.py::TestRunAccounting`'s job, and
+        repeating it would be a second copy of one assertion. What is *not*
+        established anywhere else is that this is reached at all when the turn is
+        cancelled, with the delegate's spend already on the ledger.
+        """
+        ledger = prepared.built.ledger
+        self.finished.append(
+            (kwargs["status"], ledger.total_usd, ledger.input_tokens, ledger.output_tokens)
+        )
+        return MagicMock()
+
+    def _prepared(self, agent: PydanticAgent[Any, Any]) -> PreparedRun:
+        """A real `PreparedRun`: `iterate` is what meters the turn, so a mock of
+        the prepared run would never reach the agent this class assembled."""
+        built = MagicMock()
+        built.agent = agent
+        built.ledger = self.ledger
+        built.model_label = "gpt-4.1"
+        built.deps = AgentDeps(organization_id=uuid4(), run_id=uuid4())
+        # Real `None` rather than a mock: Pydantic AI reads this per request.
+        built.usage_limits = None
+        return PreparedRun(
+            run=MagicMock(id=uuid4(), agent_version_id=uuid4(), channel_identity_id=None),
+            agent=MagicMock(id=uuid4()),
+            spec=MagicMock(budget=None),
+            built=built,
+            approvals=MagicMock(parked={}, requested=[]),
+        )
+
+    @contextmanager
+    def patched(self) -> Iterator[None]:
+        """Everything between the frame and the agent that needs a database."""
+        with (
+            patch("app.services.agent_session.persist_user_turn", new=AsyncMock()) as persist,
+            patch("app.services.agent_session.get_db_context") as db_context,
+            patch("app.services.agent_chat.member_repo") as members,
+            patch("app.services.agent_chat.AgentRunnerService") as runner_cls,
+            # The thread this turn continues, which since #771 is read from the
+            # transcript rather than from the socket, and since #49 through the
+            # service that also keeps a summary. Empty here: what this class
+            # drives is a delegation's teardown, not what the model was told.
+            patch("app.services.agent_session.ConversationService") as conversations,
+        ):
+            persist.return_value = PersistedPrompt(
+                conversation_id=_CONVERSATION, newly_created=False
+            )
+            db_context.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(commit=AsyncMock())
+            )
+            db_context.return_value.__aexit__ = AsyncMock(return_value=False)
+            members.get = AsyncMock(return_value=MagicMock())
+            runner_cls.return_value.prepare = AsyncMock(return_value=self.prepared)
+            runner_cls.return_value.finish = self._finish
+            conversations.return_value.model_history = AsyncMock(return_value=[])
+            conversations.return_value.keep_summary = AsyncMock()
+            conversations.return_value.keep_overhead = AsyncMock()
+            conversations.return_value.keep_plan = AsyncMock()
+            yield
+
+    async def in_flight(self) -> None:
+        """Wait until the delegate has made a request of its own and is still working.
+
+        The delegate's own model sets this, which is the only signal that means
+        what the tests need it to: the background task exists, it has reached the
+        model, and the money is on the ledger - so a stop arriving now is a stop
+        arriving mid-delegation rather than a race with one.
+        """
+        with anyio.fail_after(5):
+            await self.spent.wait()
+
+
+class TestStoppingATurnMidDelegation:
+    """`stop` while a delegation is running, through the real teardown.
+
+    One scenario, four assertions, because the failures are independent: a leaked
+    task keeps spending against a closed session, a missing terminal frame leaves
+    the client's spinner running forever, an unrecorded delegation loses its cost,
+    and a run row written as if nothing was spent is a bill nobody can explain.
+
+    Both modes, because the library covers neither of them the same way and
+    covered `sync` - **the default** - not at all: a sync delegation has a handle
+    and no task, so `TaskManager.cancel_all` never sees it, and
+    `asyncio.CancelledError` is a `BaseException`, so `_run_sync`'s handlers never
+    see it either.
+    """
+
+    async def test_a_stopped_sync_delegation_is_cancelled_rather_than_left_running(self):
+        """The default mode, stopped mid-delegation.
+
+        Every failure this class exists for at once, and none of them raises: the
+        handle stayed `RUNNING`, so the delegation was filed as still going, its
+        two dollars were attributed to nothing, the fan-out slot was never
+        released, and the panel the client had opened was never closed.
+        """
+        turn = _Turn(mode="sync")
+        session = _session()
+        alive_before = len(asyncio.all_tasks())
+
+        with turn.patched():
+            await session.handle_frame({"message": "price this up", "agent_id": str(uuid4())})
+            await turn.in_flight()
+            assert turn.delegation.journal.in_flight() == 1
+
+            await session.handle_frame({"type": "stop"})
+
+        journal = turn.delegation.journal
+        # A sync delegation has no asyncio task of its own, so the handle is the
+        # only place its status lives - and it is what decides whether the
+        # delegation is ever recorded.
+        assert [handle.status for handle in journal.tasks.list_handles()] == [TaskStatus.CANCELLED]
+        assert journal.in_flight() == 0
+        assert len(asyncio.all_tasks()) == alive_before
+        assert session._turn_task is None
+
+        assert _sent_events(session)[-2:] == [
+            ("complete", {"conversation_id": _CONVERSATION, "stopped": True}),
+            ("session_ready", {"conversation_id": _CONVERSATION}),
+        ]
+        assert [
+            event_type for event_type, _data in _sent_events(session) if "subagent" in event_type
+        ] == ["subagent_start", "subagent_complete"]
+
+        # What the ledger accumulated while the delegate was running, on the
+        # delegation's own record and on the run row.
+        (outcome,) = turn.outcomes
+        assert outcome.status == "cancelled"
+        assert outcome.cost_usd == _DELEGATE_REQUEST.cost_usd
+        assert turn.finished == [(RunStatus.CANCELLED, _DELEGATE_REQUEST.cost_usd, 7, 3)]
+
+    async def test_a_stopped_turn_leaves_nothing_running_and_still_books_what_it_spent(self):
+        turn = _Turn()
+        session = _session()
+        alive_before = len(asyncio.all_tasks())
+
+        with turn.patched():
+            await session.handle_frame({"message": "price this up", "agent_id": str(uuid4())})
+            await turn.in_flight()
+            assert turn.delegation.journal.in_flight() == 1
+
+            await session.handle_frame({"type": "stop"})
+
+        # Nothing survives the stop: not the delegate's task, not the turn's.
+        assert turn.delegation.journal.tasks.list_active_tasks() == []
+        assert len(asyncio.all_tasks()) == alive_before
+        assert session._turn_task is None
+
+        # The client is told the turn is over, or its composer never comes back.
+        assert _sent_events(session)[-2:] == [
+            ("complete", {"conversation_id": _CONVERSATION, "stopped": True}),
+            ("session_ready", {"conversation_id": _CONVERSATION}),
+        ]
+
+        # The delegation's share is attributed, and the run row carries it. A
+        # cancelled run that spent two dollars and recorded zero is the whole
+        # reason this test exists.
+        (outcome,) = turn.outcomes
+        assert outcome.status == "cancelled"
+        assert outcome.cost_usd == _DELEGATE_REQUEST.cost_usd
+        assert turn.finished == [
+            (RunStatus.CANCELLED, _DELEGATE_REQUEST.cost_usd, 7, 3),
+        ]
+
+    async def test_the_panel_a_delegation_opened_is_closed_on_the_way_out(self):
+        """The frames a client draws with, on the path that produces none of the
+        usual ones. A `subagent_start` with no `subagent_complete` is a panel that
+        narrates a specialist still working on a turn that ended minutes ago."""
+        turn = _Turn()
+        session = _session()
+
+        with turn.patched():
+            await session.handle_frame({"message": "price this up", "agent_id": str(uuid4())})
+            await turn.in_flight()
+            await session.handle_frame({"type": "stop"})
+
+        delegation_frames = [
+            (event_type, data)
+            for event_type, data in _sent_events(session)
+            if event_type.startswith("subagent_")
+        ]
+        assert [event_type for event_type, _ in delegation_frames] == [
+            "subagent_start",
+            "subagent_complete",
+        ]
+        opened, closed = (data for _type, data in delegation_frames)
+        assert opened["mode"] == "async"
+        assert closed["status"] == "cancelled"
+        assert closed["cost_usd"] == str(_DELEGATE_REQUEST.cost_usd)
+
+    async def test_a_turn_that_outruns_its_detached_grace_is_cancelled_the_same_way(self):
+        """`shutdown` is the other caller, and it runs when nobody is watching -
+        a closed tab, a dropped connection, a refreshed credential. It no longer
+        cancels on arrival (see `TestASocketThatWentAway`), but a turn still
+        running when the grace expires goes through this same cancellation, so a
+        delegation cannot be left running by the path with no client to notice.
+        """
+        turn = _Turn()
+        session = _session()
+
+        with (
+            turn.patched(),
+            patch.object(settings, "CHAT_DETACHED_TURN_MINUTES", 0.05 / 60),
+            # Who is told is `TestTellingThePersonWhoLeft`'s; this is about the cancel.
+            patch.object(AgentSession, "_tell_the_absent", AsyncMock()),
+        ):
+            await session.handle_frame({"message": "price this up", "agent_id": str(uuid4())})
+            await turn.in_flight()
+            await session.shutdown()
+
+        assert turn.delegation.journal.tasks.list_active_tasks() == []
+        assert [outcome.status for outcome in turn.outcomes] == ["cancelled"]
+        assert [status for status, *_ in turn.finished] == [RunStatus.CANCELLED]
+
+
+class TestASocketThatWentAway:
+    """`shutdown` when the reader has gone, which is not the same act as `stop`.
+
+    A refreshed access token used to close the chat socket under a streaming
+    answer, and this method cancelled the turn on the spot: the run was written
+    `CANCELLED`, its half-finished reply was labelled *stopped* in the
+    transcript, and the client - already on a new socket - never received the
+    frame that would have ended the turn on screen. Nobody had asked for any of
+    it.
+
+    So the turn is now allowed to reach its own end. `send_event` already answers
+    a closed socket with `False` rather than raising, and `process_message` writes
+    the answer to the transcript rather than to the socket, so the only thing the
+    cancel was protecting against was a turn running for ever - which is what
+    `CHAT_DETACHED_TURN_MINUTES` bounds instead.
+    """
+
+    async def test_a_turn_is_given_time_to_finish_rather_than_cancelled(self):
+        session = _session()
+        finished = asyncio.Event()
+
+        async def turn() -> None:
+            await asyncio.sleep(0.01)
+            finished.set()
+
+        task = asyncio.create_task(turn())
+        session._turn_task = task
+
+        await session.shutdown()
+
+        assert finished.is_set()
+        assert not task.cancelled()
+
+    async def test_a_turn_still_running_when_the_grace_ends_is_stopped(self):
+        session = _session()
+        task = asyncio.create_task(asyncio.sleep(30))
+        session._turn_task = task
+
+        with patch.object(settings, "CHAT_DETACHED_TURN_MINUTES", 0.01 / 60):
+            await session.shutdown()
+
+        assert task.cancelled()
+
+    async def test_a_question_nobody_can_answer_no_longer_holds_the_turn_open(self):
+        """A run parked on `ask_user` cannot reach its own end: it is waiting for
+        somebody who has closed the tab. Left waiting it would spend the whole
+        grace doing nothing and be cancelled anyway, so the wait is ended with an
+        empty answer - which `_ask_one` already renders."""
+        session = _session()
+        answered: list[list[dict[str, Any]]] = []
+        asked = asyncio.Event()
+
+        async def turn() -> None:
+            asked.set()
+            answered.append(await session._ask_user([{"question": "which invoice?"}]))
+
+        task = asyncio.create_task(turn())
+        # `_ask_user` assigns the future before its first await, so the turn is
+        # parked on it by the time this returns.
+        await asked.wait()
+        assert session._ask_user_future is not None
+        session._turn_task = task
+
+        await session.shutdown()
+
+        assert answered == [[]]
+        assert not task.cancelled()
+
+    async def test_the_runs_own_question_left_open_parks_the_run(self):
+        """An `ask_user` card the person walked away from is not a decline: the run
+        parks on it, and answering it later - on this device or another -
+        continues the run (#2064)."""
+        session = _session()
+        asked = _next_frame(session)
+        request = AskUserRequest(
+            questions=(
+                Question(
+                    header="Tone",
+                    question="How should it sound?",
+                    options=(QuestionOption(label="Formal"), QuestionOption(label="Casual")),
+                ),
+            )
+        )
+        parked: list[bool] = []
+
+        async def turn() -> None:
+            # What the run does with it: the tool call ends deferred.
+            try:
+                await session._ask_questions(request)
+            except CallDeferred:
+                parked.append(True)
+
+        session._turn_task = asyncio.create_task(turn())
+        await _wait(asked)
+
+        await session.shutdown()
+
+        assert parked == [True]
+        assert session._round_parks is False
+
+    async def test_a_delegates_question_left_open_is_still_no_answer(self):
+        """Only the run's own agent parks: a delegate asking through `ask_parent`
+        has nowhere to park, so it carries on with what it had."""
+        session = _session()
+        asked = _next_frame(session)
+        request = AskUserRequest(
+            questions=(
+                Question(
+                    header="Region",
+                    question="Which region?",
+                    options=(QuestionOption(label="EU"), QuestionOption(label="US")),
+                ),
+            )
+        )
+        with patch.object(agent_session_module, "asking_delegate", return_value="researcher"):
+            asking = asyncio.create_task(session._ask_questions(request))
+            await _wait(asked)
+        session._turn_task = asking
+
+        await session.shutdown()
+
+        assert (await asking).cancelled
+
+    async def test_a_connection_nobody_can_make_no_longer_holds_the_turn_open(self):
+        """The same for a run waiting on `connect_account`: nobody is there to
+        connect anything, so the wait ends as a skip and the turn goes on."""
+        session = _session()
+        answered: list[bool] = []
+        asked = asyncio.Event()
+
+        async def turn() -> None:
+            asked.set()
+            answered.append(
+                await session._request_connection(
+                    ConnectionRequest(catalog_key="notion", name="Notion", gap="not_connected")
+                )
+            )
+
+        task = asyncio.create_task(turn())
+        await asked.wait()
+        assert session._connect_future is not None
+        session._turn_task = task
+
+        await session.shutdown()
+
+        assert answered == [False]
+        assert not task.cancelled()
+
+    async def test_a_session_with_no_turn_in_flight_returns_at_once(self):
+        session = _session()
+
+        await session.shutdown()
+
+        assert session._turn_task is None
+
+    async def test_a_shutdown_cancelled_from_outside_stops_the_turn_and_unwinds(self):
+        """A redeploy: uvicorn drains, so the connection's own task tree is
+        cancelled while this is waiting. The turn must not be left running, and
+        the cancellation must not be swallowed - a `shutdown` that returned
+        normally here would report a clean drain over a turn still going."""
+        session = _session()
+        task = asyncio.create_task(asyncio.sleep(30))
+        session._turn_task = task
+
+        waiting = asyncio.create_task(session.shutdown())
+        await asyncio.sleep(0.01)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+
+        assert task.cancelled()
+
+
+class TestTellingTheClientTheSandboxIsStillOpening:
+    async def test_the_frame_says_so_and_carries_nothing_else(self):
+        """#2222: minutes of an image build in which nothing else streams."""
+        session = _session()
+
+        await session._sandbox_wait_event(True)
+        await session._sandbox_wait_event(False)
+
+        assert _sent_events(session) == [("sandbox_preparing", {}), ("sandbox_ready", {})]
+
+
+class TestTellingTheClientWhatThePersonCannotReach:
+    """The card with the button that connects an account is drawn from this frame."""
+
+    async def test_the_frame_carries_every_gap_under_its_own_name(self):
+        session = _session()
+
+        await session._personal_gaps_event(
+            [PersonalServiceGap(catalog_key="notion", name="Notion", gap="not_connected")]
+        )
+
+        assert _sent_events(session) == [
+            (
+                "personal_services_unavailable",
+                {
+                    "services": [
+                        {
+                            "catalog_key": "notion",
+                            "name": "Notion",
+                            "gap": "not_connected",
+                        }
+                    ]
+                },
+            )
+        ]
+
+
+class TestForwardingBrowserFrames:
+    """What the client hears while the agent is driving a browser.
+
+    A `browse_web` call is the longest tool call this platform makes, and the
+    only one where watching it is how somebody notices it acting on a page they
+    did not expect. Without these frames the chat shows a tool call named
+    `browse_web` and then, a minute later, a paragraph.
+    """
+
+    async def test_a_frame_is_sent_under_the_name_the_union_gave_it(self):
+        session = _session()
+
+        await session._browser_event(
+            BrowserEvent(
+                kind="browser_step",
+                call_id="call-1",
+                step=3,
+                url="https://example.test/pricing",
+                title="Pricing",
+                operation="CLICK",
+                target="Accept all",
+                reason="Close the cookie banner",
+            )
+        )
+
+        name, payload = _sent_events(session)[0]
+        assert name == "browser_step"
+        assert payload["kind"] == "browser_step"
+        assert (payload["call_id"], payload["step"]) == ("call-1", 3)
+        assert (payload["operation"], payload["target"]) == ("CLICK", "Accept all")
+        # What a person watching reads to tell where the browse is heading.
+        assert payload["reason"] == "Close the cookie banner"
+
+    async def test_a_picture_travels_as_a_data_url_on_its_own_frame(self):
+        """Separate from the narration so encoding one never holds up the other."""
+        session = _session()
+
+        await session._browser_event(
+            BrowserEvent(
+                kind="browser_frame",
+                call_id="call-1",
+                step=3,
+                image="data:image/jpeg;base64,AAAA",
+            )
+        )
+
+        name, payload = _sent_events(session)[0]
+        assert name == "browser_frame"
+        assert payload["image"] == "data:image/jpeg;base64,AAAA"
+        assert payload["operation"] is None
+
+    async def test_the_finishing_frame_carries_the_outcome_and_why(self):
+        """`blocked` is an answer about the page, and the spinner has to stop for it."""
+        session = _session()
+
+        await session._browser_event(
+            BrowserEvent(
+                kind="browser_finished",
+                call_id="call-1",
+                step=4,
+                outcome="blocked",
+                detail="The engine found no available action that serves the goal.",
+            )
+        )
+
+        name, payload = _sent_events(session)[0]
+        assert name == "browser_finished"
+        assert payload["outcome"] == "blocked"
+        assert "no available action" in payload["detail"]
+
+
+class TestAddingToARunningTurn:
+    """`steer` adds to the turn the person is watching (#2087)."""
+
+    async def test_a_correction_reaches_the_running_turn_and_is_shown_where_it_landed(self):
+        session = _session()
+        running = asyncio.Event()
+        release = asyncio.Event()
+
+        async def runs_until_released(**kwargs: Any) -> ChatTurn:
+            running.set()
+            await release.wait()
+            # What the model's next request does with it: tells the surface.
+            steering = kwargs["steering"]
+            for steer in steering.take():
+                await steering.on_applied(steer.text)
+            return _finished_turn()
+
+        with _chat(AsyncMock(side_effect=runs_until_released)) as chat:
+            await session.handle_frame(_message("draft the report"))
+            turn = session._turn_task
+            assert turn is not None
+            await _wait(running)
+
+            await session.handle_frame({"type": "steer", "text": "  use the EU numbers  "})
+            release.set()
+            await turn
+
+        assert ("steer_applied", {"text": "use the EU numbers"}) in _sent_events(session)
+        parts = chat.answer.await_args.kwargs["parts"]
+        assert MessagePart(type="steer", text="use the EU numbers") in parts
+        assert session._steering is None
+
+    async def test_one_that_arrived_after_the_last_request_is_handed_back(self):
+        session = _session()
+        running = asyncio.Event()
+        release = asyncio.Event()
+
+        async def runs_until_released(**_kwargs: Any) -> ChatTurn:
+            running.set()
+            await release.wait()
+            return _finished_turn()
+
+        with _chat(AsyncMock(side_effect=runs_until_released)):
+            await session.handle_frame(_message("go"))
+            turn = session._turn_task
+            assert turn is not None
+            await _wait(running)
+            await session.handle_frame({"type": "steer", "text": "and the totals"})
+            release.set()
+            await turn
+
+        assert ("steer_unapplied", {"texts": ["and the totals"]}) in _sent_events(session)
+
+    async def test_with_nothing_running_it_is_handed_back_at_once(self):
+        session = _session()
+
+        await session.handle_frame({"type": "steer", "text": "hello"})
+        await session.handle_frame({"type": "steer", "text": "   "})
+
+        assert _sent_events(session) == [("steer_unapplied", {"texts": ["hello"]})]
+
+
+class TestTellingThePersonWhoLeft:
+    """#2108: write to an agent, leave, and hear when the answer lands.
+
+    A turn left running when its socket went is finished without anybody
+    watching (`TestASocketThatWentAway`); the person is then told how it ended,
+    in the inbox and by email, with a link back to the conversation.
+    """
+
+    @contextmanager
+    def _left(self, ends: Any, *, saved_as: str | None = "saved-1") -> Iterator[SimpleNamespace]:
+        """A turn that waits for the socket to go, then ends as `ends` says."""
+        gone = asyncio.Event()
+        run_id = uuid4()
+
+        async def run(**kwargs: Any) -> ChatTurn:
+            kwargs["on_run_open"](OpenedRun(run_id=run_id, model_label="m", agent_version_id=None))
+            await gone.wait()
+            if isinstance(ends, BaseException):
+                raise ends
+            return replace(ends, run_id=run_id)
+
+        notifications = MagicMock()
+        notifications.answered_while_away = AsyncMock()
+        run_row, agent_row = MagicMock(), MagicMock()
+        with (
+            _chat(AsyncMock(side_effect=run), message_id=saved_as),
+            patch("app.services.agent_session.NotificationService", return_value=notifications),
+            patch.object(
+                agent_session_module.agent_run_repo, "get_run", AsyncMock(return_value=run_row)
+            ),
+            patch.object(agent_session_module.agent_repo, "get", AsyncMock(return_value=agent_row)),
+        ):
+            yield SimpleNamespace(
+                gone=gone, run_id=run_id, told=notifications.answered_while_away, run=run_row
+            )
+
+    async def _leave(self, session: AgentSession, left: SimpleNamespace) -> None:
+        await session.handle_frame(_message())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        shutting = asyncio.create_task(session.shutdown())
+        await asyncio.sleep(0)
+        left.gone.set()
+        await shutting
+
+    async def test_an_answer_that_lands_after_they_left_is_announced_with_its_conversation(self):
+        session = _session()
+        with self._left(_finished_turn()) as left:
+            await self._leave(session, left)
+
+        left.told.assert_awaited_once()
+        assert left.told.await_args.args == (left.run,)
+        assert left.told.await_args.kwargs["conversation_id"] == UUID(_CONVERSATION)
+        assert left.told.await_args.kwargs["error"] is None
+
+    async def test_an_answer_that_lands_while_they_leave_the_room_is_announced(self):
+        """Leaving the room waits on Redis. A turn that ended meanwhile read as no
+        turn at all, and the person who had already gone was never told."""
+        session = _session()
+        with self._left(_finished_turn()) as left:
+            await session.handle_frame(_message())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            async def the_answer_lands(*_args: Any) -> None:
+                left.gone.set()
+                await session._turn_task
+
+            session._room = _CONVERSATION
+            with patch.object(
+                agent_session_module.chat_room, "leave", AsyncMock(side_effect=the_answer_lands)
+            ):
+                await session.shutdown()
+
+        left.told.assert_awaited_once()
+        assert left.told.await_args.kwargs["error"] is None
+
+    async def test_a_turn_already_over_when_the_socket_closes_is_not_announced(self):
+        """Finished while they watched, its slot not yet cleared: nobody left early."""
+        session = _session()
+
+        async def done() -> None:
+            return None
+
+        finished = asyncio.create_task(done())
+        await finished
+        session._turn_task = finished
+        with patch.object(session, "_tell_the_absent", AsyncMock()) as told:
+            await session.shutdown()
+        told.assert_not_awaited()
+
+    async def test_an_answer_whose_write_failed_is_not_announced_as_answered(self):
+        """The run finished but the message did not save, so the link would open
+        a conversation ending in the question."""
+        session = _session()
+        with self._left(_finished_turn(), saved_as=None) as left:
+            await self._leave(session, left)
+
+        assert left.told.await_args.kwargs["error"] == "the answer could not be saved."
+
+    async def test_a_turn_that_failed_after_they_left_says_why(self):
+        session = _session()
+        with self._left(RuntimeError("the provider fell over")) as left:
+            await self._leave(session, left)
+
+        assert left.told.await_args.kwargs["error"]
+
+    async def test_a_turn_refused_after_its_run_opened_says_why(self):
+        """A budget stop or a guardrail block mid-turn is told as what it was."""
+        session = _session()
+        with self._left(BadRequestError(message="The monthly budget is spent")) as left:
+            await self._leave(session, left)
+
+        assert left.told.await_args.kwargs["error"] == "The monthly budget is spent"
+
+    async def test_a_turn_that_parked_on_an_approval_says_nothing_more(self):
+        """The approval already told them, through `approval_requested`."""
+        session = _session()
+        with self._left(_finished_turn(output="", parked=_parked_call())) as left:
+            await self._leave(session, left)
+
+        left.told.assert_not_awaited()
+
+    async def test_a_turn_stopped_at_the_end_of_the_grace_says_it_was_stopped(self):
+        session = _session()
+        with (
+            self._left(_finished_turn()) as left,
+            patch.object(settings, "CHAT_DETACHED_TURN_MINUTES", 0.01 / 60),
+        ):
+            await session.handle_frame(_message())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            await session.shutdown()
+
+        assert "stopped" in left.told.await_args.kwargs["error"]
+
+    async def test_a_turn_watched_to_its_end_tells_nobody(self):
+        """The ordinary chat: the ending was on screen."""
+        session = _session()
+        with _chat(AsyncMock(return_value=_finished_turn())):
+            notifications = MagicMock()
+            with patch(
+                "app.services.agent_session.NotificationService", return_value=notifications
+            ):
+                await session.process_message(_message())
+                await session.shutdown()
+
+        notifications.answered_while_away.assert_not_called()
+
+
+def test_an_id_field_that_is_not_text_is_left_out_rather_than_parsed() -> None:
+    """A number or an object where an id belongs would raise past the refusal
+    handling and leave the client waiting for an answer."""
+    assert _wire_text("p-1") == "p-1"
+    assert [_wire_text(raw) for raw in (None, "", 7, {"id": 1})] == [None] * 4
+
+
+class TestMentions:
+    """`@`-mentions on a frame (#2189): resolved as the person, before anything runs."""
+
+    async def test_a_mention_reaches_the_model_as_a_note_and_the_transcript_as_a_chip(self):
+        session = _session()
+        drive = Mentionable(kind="mcp", id="gdrive", name="Google Drive", detail="gdrive_*")
+        resolved = ResolvedMentions(mentions=[drive], note="Use Google Drive.")
+        run = AsyncMock(return_value=_finished_turn())
+
+        frame = _message("find the brief", mentions=[{"kind": "mcp", "id": "gdrive"}])
+        with _chat(run) as chat:
+            chat.runner.mentions = AsyncMock(return_value=resolved)
+            await session.process_message(frame)
+
+        assert chat.runner.mentions.await_args.kwargs["refs"][0].id == "gdrive"
+        assert chat.prompt.await_args.kwargs["mentions"] == [drive]
+        # A mention never changes who answers.
+        assert str(run.await_args.kwargs["agent_id"]) == frame["agent_id"]
+        assert run.await_args.kwargs["user_input"] == "find the brief\n\nUse Google Drive."
+
+    async def test_a_frame_whose_mentions_cannot_be_read_runs_nothing(self):
+        session = _session()
+        run = AsyncMock()
+
+        with _chat(run) as chat:
+            await session.process_message(_message(mentions=[{"kind": "spaceship", "id": "x"}]))
+
+        assert _frame_types(session) == ["error"]
+        chat.prompt.assert_not_awaited()
+        run.assert_not_awaited()
+
+    async def test_a_turn_without_mentions_is_unchanged(self):
+        session = _session()
+        run = AsyncMock(return_value=_finished_turn())
+
+        with _chat(run) as chat:
+            await session.process_message(_message("hi"))
+
+        assert chat.prompt.await_args.kwargs["mentions"] == []
+        assert run.await_args.kwargs["user_input"] == "hi"
+
+
+class TestVisualReports:
+    """How a drawing rendered in this tab reaches the `draw` call waiting on it (#2171)."""
+
+    def _session(self) -> AgentSession:
+        websocket = MagicMock()
+        websocket.send_json = AsyncMock()
+        return AgentSession(websocket, MagicMock(), MagicMock())
+
+    async def test_a_report_reaches_the_running_turn(self):
+        session = self._session()
+        reports = VisualReports()
+        session._visual_reports = reports
+        session._turn_task = asyncio.get_running_loop().create_future()
+
+        await session.handle_frame(
+            {"type": "visual_report", "tool_call_id": "toolu_1", "errors": ["boom", 3]}
+        )
+
+        assert await reports.wait("toolu_1", 1) == VisualReport(errors=("boom", "3"))
+        session._turn_task.cancel()
+
+    @pytest.mark.parametrize(
+        "frame",
+        [
+            {"type": "visual_report", "tool_call_id": 7, "errors": []},
+            {"type": "visual_report", "tool_call_id": "toolu_1", "errors": "boom"},
+        ],
+    )
+    async def test_a_malformed_report_is_dropped(self, frame: dict[str, Any]):
+        session = self._session()
+        reports = VisualReports()
+        session._visual_reports = reports
+        session._turn_task = asyncio.get_running_loop().create_future()
+
+        await session.handle_frame(frame)
+
+        assert reports._futures == {}
+        session._turn_task.cancel()
+
+    async def test_a_report_between_turns_reaches_nothing(self):
+        session = self._session()
+        reports = VisualReports()
+        session._visual_reports = reports
+
+        await session.handle_frame({"type": "visual_report", "tool_call_id": "t", "errors": []})
+
+        assert reports._futures == {}
+
+    async def test_a_report_on_a_revoked_session_is_refused(self):
+        websocket = MagicMock(send_json=AsyncMock(), close=AsyncMock())
+        session = AgentSession(websocket, MagicMock(), MagicMock(), auth_token="live")
+        reports = VisualReports()
+        session._visual_reports = reports
+        session._turn_task = asyncio.get_running_loop().create_future()
+
+        with (
+            patch("app.services.agent_session.get_db_context") as db_context,
+            patch(
+                "app.services.agent_session.authenticate_socket_token",
+                new=AsyncMock(side_effect=AuthenticationError(message="Session ended")),
+            ),
+        ):
+            db_context.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
+            db_context.return_value.__aexit__ = AsyncMock(return_value=False)
+            await session.handle_frame({"type": "visual_report", "tool_call_id": "t", "errors": []})
+
+        assert reports._futures == {}
+        session._turn_task.cancel()
+
+    async def test_a_drawing_s_pictures_are_sent_to_the_tab(self):
+        session = self._session()
+        await session._visual_images("toolu_1", {"logo": "data:image/png;base64,AA=="})
+        sent = session.websocket.send_json.await_args.args[0]
+        assert sent["type"] == "visual_images"
+        assert sent["data"] == {
+            "tool_call_id": "toolu_1",
+            "images": {"logo": "data:image/png;base64,AA=="},
+        }
+
+
+async def test_session_readiness_waits_for_cleanup_and_frees_the_admission_slot() -> None:
+    session = _session()
+    cleaning = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def process(_data: dict[str, object]) -> None:
+        await session._emit("complete", {})
+        cleaning.set()
+        await finish.wait()
+
+    with patch.object(session, "process_message", side_effect=process):
+        await session.handle_frame(_message("first"))
+        task = session._turn_task
+        assert task is not None
+        await _wait(cleaning)
+        assert _frame_types(session) == ["complete"]
+        finish.set()
+        await task
+        assert session._turn_task is None
+        assert _frame_types(session) == ["complete", "session_ready"]
+        await session.handle_frame(_message("second"))
+        next_task = session._turn_task
+        assert next_task is not None
+        await next_task
+        assert _frame_types(session) == ["complete", "session_ready", "complete", "session_ready"]
+
+
+@pytest.mark.security
+async def test_local_file_origins_hide_private_paths_in_shared_frames() -> None:
+    session = _session()
+    run = AsyncMock(return_value=_finished_turn())
+    publish = AsyncMock()
+    with (
+        _chat(run),
+        patch("app.services.agent_session.live_turn.begin", AsyncMock(return_value=MagicMock())),
+        patch("app.services.agent_session.live_turn.publish", publish),
+        patch("app.services.agent_session.live_turn.end", AsyncMock()),
+    ):
+        await session.process_message(
+            _message(local={"folder": "/Users/alice/private", "mode": "full_access"})
+        )
+    frames = dict(_sent_events(session))
+    source = frames["user_prompt"]["file_source"]
+    assert source["kind"] == "local"
+    assert UUID(source["id"])
+    assert set(source) == {"kind", "id"}
+    shared = next(call.args[2] for call in publish.await_args_list if call.args[1] == "turn_prompt")
+    assert shared["file_source"] == source
+    assert "/Users/alice" not in json.dumps(shared)
+    assert run.await_args.kwargs["local"].folder == "/Users/alice/private"

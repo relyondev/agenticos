@@ -1,0 +1,223 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { ArrowRightLeft, Building2, Check, Plus } from "lucide-react";
+
+import { CreateOrgDialog } from "@/components/teams";
+import { PageHeader } from "@/components/dashboard/page-header";
+import {
+  Button,
+  Badge,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  Skeleton,
+  EntityAvatar,
+} from "@/components/ui";
+import { useOrganizations } from "@/hooks";
+import { ROUTES } from "@/lib/constants";
+import { useChanged } from "@/hooks/use-changed";
+import { useTranslations } from "next-intl";
+
+/**
+ * The list's frame, drawn whether or not there is anything in it - the same
+ * always-visible container the vault draws around its keys. Same header, same
+ * border, in every state: what changes is what is inside it.
+ */
+function WorkspacesCard({ count, children }: { count: number | null; children: ReactNode }) {
+  const t = useTranslations("pages.orgs");
+  return (
+    <Card className="flex flex-1 flex-col">
+      <CardHeader className="flex-row items-center justify-between space-y-0 border-b px-5 py-4">
+        <div className="space-y-1">
+          <CardTitle className="text-sm">{t("workspaces")}</CardTitle>
+          <CardDescription className="text-xs">
+            {/* `null` is "the request has not answered". Rendering "0 workspaces"
+                there would state something nothing has said yet. */}
+            {count === null ? <Skeleton className="h-3 w-24" /> : t("storedCount", { count })}
+          </CardDescription>
+        </div>
+      </CardHeader>
+      <CardContent className="flex-1 p-4">{children}</CardContent>
+    </Card>
+  );
+}
+
+export default function OrgsPage() {
+  const t = useTranslations("pages.orgs");
+  const tc = useTranslations("common");
+  const { orgs, activeOrgId, fetchOrgs, switchOrg } = useOrganizations();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // `?create=1` opens the dialog. Read during render rather than written from
+  // an effect: it is a value the URL already carries, not a thing to sync.
+  if (useChanged(searchParams.get("create")) && searchParams.get("create") === "1") {
+    setCreateOpen(true);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      await fetchOrgs();
+      if (!cancelled) setIsLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [fetchOrgs, searchParams]);
+
+  return (
+    <div className="flex flex-1 flex-col space-y-4">
+      <PageHeader
+        title={t("organizations")}
+        description={t("switchBetweenWorkspacesManage")}
+        actions={
+          <Button data-tour="orgs-new" onClick={() => setCreateOpen(true)}>
+            <Plus className="h-4 w-4" />
+            {t("newOrganization")}
+          </Button>
+        }
+      />
+
+      <WorkspacesCard count={isLoading ? null : orgs.length}>
+        {isLoading ? (
+          // The same tiles the populated grid draws, as skeletons - a skeleton
+          // that draws a different shape is a layout jump on every load.
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {[0, 1].map((tile) => (
+              <div key={tile} className="border-border flex flex-col gap-4 rounded-xl border p-5">
+                <div className="flex items-start gap-3">
+                  <Skeleton className="h-11 w-11 shrink-0 rounded-full" />
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <Skeleton className="h-4 w-32" />
+                    <Skeleton className="h-3 w-24" />
+                  </div>
+                </div>
+                <Skeleton className="h-8 w-full" />
+              </div>
+            ))}
+          </div>
+        ) : orgs.length === 0 ? (
+          // Inline rather than an `EmptyState`: that component draws its own
+          // bordered box, and inside a card it would frame one message twice.
+          <div className="px-6 py-12 text-center">
+            <div className="bg-muted text-muted-foreground mx-auto flex h-11 w-11 items-center justify-center rounded-xl">
+              <Building2 className="h-5 w-5" />
+            </div>
+            <p className="text-foreground mt-4 text-sm font-medium">{t("noOrganizationsYet")}</p>
+            <p className="text-muted-foreground mx-auto mt-1 max-w-sm text-sm">
+              {t("createYourFirstWorkspace")}
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-5"
+              onClick={() => setCreateOpen(true)}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              {t("createOrganization")}
+            </Button>
+          </div>
+        ) : (
+          <ul className="rise-in grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {orgs.map((org) => {
+              const isActive = org.id === activeOrgId;
+              return (
+                <li
+                  key={org.id}
+                  className="peek-card border-border bg-card hover:border-foreground/30 relative flex flex-col gap-4 rounded-xl border p-5"
+                >
+                  {/* Whole-row link, under the one real control. The link is an
+                      absolute overlay at z-10, so static content beneath it
+                      clicks through to the detail page; the Switch button sits
+                      in a z-20 wrapper above it and handles its own click - a
+                      sibling of the link, so nothing bubbles into a navigation.
+                      The wrapper (not the button) carries the z-index because a
+                      disabled button is `pointer-events-none`: without it, a
+                      click on "Current" would fall through to the link and
+                      navigate, and a control that reads as inert must be inert.
+                      Changing the avatar lives on that detail page, not here. */}
+                  <Link
+                    href={ROUTES.ORG_MEMBERS(org.id)}
+                    className="focus-visible:ring-ring absolute inset-0 z-10 rounded-[inherit] focus-visible:ring-2 focus-visible:outline-none"
+                    aria-label={tc("openNamed", { name: org.name })}
+                  />
+
+                  <div className="flex items-start gap-3">
+                    {/* The face the organization switcher shows for it - its
+                        picture, or its initials in its colour - rather than one
+                        building for every workspace. */}
+                    <EntityAvatar
+                      seed={org.id}
+                      name={org.name}
+                      imageSrc={`/api/orgs/${org.id}/avatar?v=${org.updated_at ?? ""}`}
+                      hasImage={!!org.avatar_url}
+                      colorSlot={org.avatar_color}
+                      className="h-11 w-11 shrink-0 rounded-full text-sm"
+                    />
+
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h2 className="text-foreground truncate text-sm font-semibold">
+                          {org.name}
+                        </h2>
+                        {/* The same badges every other card uses, rather than a
+                            shouty uppercase pair of its own. */}
+                        {org.is_personal && <Badge variant="outline">{t("personal")}</Badge>}
+                      </div>
+                      {/* Only the parts there are: an organization with no tier
+                          used to read "· admin", a separator in front of nothing. */}
+                      <p className="text-muted-foreground mt-0.5 truncate text-xs">
+                        {org.subscription_tier && (
+                          <span className="capitalize">{org.subscription_tier}</span>
+                        )}
+                        {org.subscription_tier && org.slug && <span aria-hidden> · </span>}
+                        {org.slug && <span className="font-mono">{org.slug}</span>}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="relative z-20">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="w-full"
+                      disabled={isActive}
+                      onClick={() => {
+                        switchOrg(org.id);
+                        router.push(ROUTES.DASHBOARD);
+                      }}
+                    >
+                      {/* The one place the card says it is the open one: a badge
+                          beside the name said it as well, twice on one card. */}
+                      {isActive ? (
+                        <Check className="h-3.5 w-3.5" />
+                      ) : (
+                        <ArrowRightLeft className="h-3.5 w-3.5" />
+                      )}
+                      {isActive ? t("current") : t("switch")}
+                    </Button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </WorkspacesCard>
+
+      <CreateOrgDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreated={() => fetchOrgs(true)}
+      />
+    </div>
+  );
+}

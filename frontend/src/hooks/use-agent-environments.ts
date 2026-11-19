@@ -1,0 +1,109 @@
+"use client";
+
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+
+import { getErrorMessage } from "@/lib/api-error";
+import { apiClient } from "@/lib/api-client";
+import { invalidateSpeechSettings } from "@/lib/dictation-api";
+import { qk } from "@/lib/query-keys";
+import type { AgentEnvironment, AgentEnvironmentList } from "@/types/agents";
+
+/**
+ * An agent's named environments - which published version answers under which
+ * name. Promotion is an update that repoints `version_id`; there is no
+ * unpinned state, so every mutation leaves each name answering with something
+ * somebody chose.
+ */
+export function useAgentEnvironments(agentId: string | null) {
+  const tErrors = useTranslations("errors");
+  const t = useTranslations("agents");
+  const queryClient = useQueryClient();
+  const base = `/agents/${agentId}/environments`;
+
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: qk.environments.list(agentId ?? ""),
+    queryFn: () => apiClient.get<AgentEnvironmentList>(base),
+    enabled: agentId !== null,
+  });
+
+  // Dictation readiness and channel voice notes read the version an
+  // environment pins, so moving a pin changes their answer too.
+  const invalidate = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: qk.environments.list(agentId ?? "") }),
+      invalidateSpeechSettings(queryClient),
+    ]);
+
+  const create = useMutation({
+    mutationFn: (input: { name: string; version_id?: string; tracks_latest?: boolean }) =>
+      apiClient.post<AgentEnvironment>(base, input),
+    onSuccess: invalidate,
+    onError: (error) => toast.error(getErrorMessage(error, tErrors, t("failedCreateEnvironment"))),
+  });
+
+  const promote = useMutation({
+    mutationFn: ({ environmentId, versionId }: { environmentId: string; versionId: string }) =>
+      apiClient.patch<AgentEnvironment>(`${base}/${environmentId}`, { version_id: versionId }),
+    onSuccess: () => {
+      invalidate();
+      toast.success(t("promoted"));
+    },
+    onError: (error) => toast.error(getErrorMessage(error, tErrors, t("failedPromote"))),
+  });
+
+  /**
+   * Switch an environment between waiting to be promoted onto and following
+   * every publish.
+   *
+   * Turning it on adopts the newest version now rather than at the next
+   * publish - a mode that claims to follow and does not until something else
+   * happens is the half-true state the setting exists to remove.
+   */
+  const setReleaseMode = useMutation({
+    mutationFn: ({
+      environmentId,
+      tracksLatest,
+    }: {
+      environmentId: string;
+      tracksLatest: boolean;
+    }) =>
+      apiClient.patch<AgentEnvironment>(`${base}/${environmentId}`, {
+        tracks_latest: tracksLatest,
+      }),
+    onSuccess: () => {
+      invalidate();
+      toast.success(t("releaseModeSaved"));
+    },
+    onError: (error) => toast.error(getErrorMessage(error, tErrors, t("failedReleaseMode"))),
+  });
+
+  const rename = useMutation({
+    mutationFn: ({ environmentId, name }: { environmentId: string; name: string }) =>
+      apiClient.patch<AgentEnvironment>(`${base}/${environmentId}`, { name }),
+    onSuccess: () => {
+      invalidate();
+      toast.success(t("renamed"));
+    },
+    onError: (error) => toast.error(getErrorMessage(error, tErrors, t("failedRenameEnvironment"))),
+  });
+
+  const remove = useMutation({
+    mutationFn: (environmentId: string) => apiClient.delete<void>(`${base}/${environmentId}`),
+    onSuccess: invalidate,
+    onError: (error) => toast.error(getErrorMessage(error, tErrors, t("failedRemoveEnvironment"))),
+  });
+
+  return {
+    environments: data?.items ?? [],
+    isLoading,
+    error,
+    refetch,
+    create,
+    promote,
+    setReleaseMode,
+    rename,
+    remove,
+  };
+}

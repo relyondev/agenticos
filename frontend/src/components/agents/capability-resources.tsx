@@ -1,0 +1,258 @@
+"use client";
+
+import type { ReactNode } from "react";
+import { AlertTriangle } from "lucide-react";
+
+import { CollectionPicker } from "@/components/agents/collection-picker";
+import { ContextGallery, type ContextChoice } from "@/components/agents/context-gallery";
+import { SkillGallery, type SkillChoice } from "@/components/agents/skill-gallery";
+import {
+  ARTIFACTS_ID,
+  COMPANION_SKILLS,
+  VISUALS_ID,
+  CONTEXT_ID,
+  KNOWLEDGE_ID,
+  SKILLS_ID,
+} from "@/lib/agent-spec";
+import type { KnowledgeBase } from "@/types";
+import type { ContextSettings } from "@/lib/context-settings";
+import { useTranslations } from "next-intl";
+
+/**
+ * What an agent is given, as opposed to what it may do.
+ *
+ * Three capabilities read something the organization owns - context files,
+ * knowledge collections, skills - and all three keep their selection at the top
+ * of the spec (`context_ids`, `collection_ids`, `skill_ids`) rather than in the
+ * capability's config blob. One bundle so the workbench takes one prop for the
+ * lot instead of twelve.
+ */
+export interface AgentResources {
+  contextFiles: ContextChoice[];
+  onCreateContext?: () => void;
+  contextTotal: number;
+  contextIds: string[];
+  onContextToggle: (fileId: string) => void;
+  collections: KnowledgeBase[];
+  collectionIds: string[];
+  onCollectionToggle: (collectionId: string) => void;
+  skills: SkillChoice[];
+  onCreateSkill?: () => void;
+  skillTotal: number;
+  skillIds: string[];
+  onSkillToggle: (skillId: string) => void;
+}
+
+/**
+ * The catalog key naming what a capability reads, or undefined where it reads
+ * nothing of the organization's.
+ *
+ * The tab's label, resolved by whoever renders the panel: a module constant
+ * cannot call a translator, so this answers with a key and the workbench turns it
+ * into words.
+ */
+export function resourceTabKey(capabilityId: string): string | undefined {
+  if (capabilityId === CONTEXT_ID) return "contextFilesHeading";
+  if (capabilityId === KNOWLEDGE_ID) return "collectionsHeading";
+  if (capabilityId === SKILLS_ID) return "skillsHeading";
+  if (capabilityId === ARTIFACTS_ID) return "artifactPagesHeading";
+  if (capabilityId === VISUALS_ID) return "visualDesignHeading";
+  return undefined;
+}
+
+/**
+ * The picker a capability opens on, where it has one.
+ *
+ * Each of these used to be a card in a tab of its own - Knowledge and Skills had
+ * a whole tab each, context shared the Skills one - two clicks from the switch
+ * that decides whether any of it reaches the model. Which is the part that made
+ * them findable by accident only: what the panel for "Knowledge search" offered
+ * was a `top_k` field and a tool description, and the collections it searches
+ * were somewhere else entirely.
+ *
+ * It gets the panel's first tab, and the panel opens on it: what a capability was
+ * given is what somebody came to this panel to change, where `top_k` and the
+ * prompt text of a tool are things they will set once. Under Settings, where it
+ * started, the picker was the top of a scroll whose first screen was a form.
+ *
+ * Returns null for a capability that reads nothing of the organization's, which
+ * is most of them.
+ */
+export function CapabilityResources({
+  capabilityId,
+  enabled,
+  resources,
+  disabled,
+  fileSettings = {},
+  onFileSettingsChange,
+}: {
+  fileSettings?: ContextSettings;
+  onFileSettingsChange?: (settings: ContextSettings) => void;
+  capabilityId: string;
+  /** Whether the capability is granted - see the warning below. */
+  enabled: boolean;
+  resources: AgentResources;
+  disabled?: boolean;
+}) {
+  const t = useTranslations("agents");
+
+  if (capabilityId === CONTEXT_ID) {
+    return (
+      <ResourceGroup
+        detail={t("contextFilesDetail")}
+        warning={contextWarning(t, enabled, resources, fileSettings)}
+      >
+        <ContextGallery
+          onCreate={resources.onCreateContext}
+          files={resources.contextFiles}
+          total={resources.contextTotal}
+          selectedIds={resources.contextIds}
+          onToggle={resources.onContextToggle}
+          disabled={disabled}
+          settings={fileSettings}
+          onSettingsChange={onFileSettingsChange}
+        />
+      </ResourceGroup>
+    );
+  }
+
+  if (capabilityId === KNOWLEDGE_ID) {
+    return (
+      <ResourceGroup
+        detail={t("collectionsDetail")}
+        warning={
+          enabled || resources.collectionIds.length === 0 ? null : t("collectionsOffButBound")
+        }
+      >
+        <CollectionPicker
+          collections={resources.collections}
+          selectedIds={resources.collectionIds}
+          onToggle={resources.onCollectionToggle}
+          disabled={disabled}
+        />
+      </ResourceGroup>
+    );
+  }
+
+  if (capabilityId === SKILLS_ID) {
+    return (
+      <ResourceGroup
+        detail={t("skillsDetail")}
+        warning={enabled || resources.skillIds.length === 0 ? null : t("skillsOffButBound")}
+      >
+        <SkillGallery
+          onCreate={resources.onCreateSkill}
+          skills={resources.skills}
+          total={resources.skillTotal}
+          selectedIds={resources.skillIds}
+          onToggle={resources.onSkillToggle}
+          disabled={disabled}
+        />
+      </ResourceGroup>
+    );
+  }
+
+  const companion = COMPANION_SKILLS[capabilityId];
+  if (companion !== undefined) {
+    // The one skill this capability is better with, offered where its work is
+    // done rather than left for somebody to find in the Skills panel. Missing
+    // from this page of the organization's skills - deleted, renamed, or past
+    // the first page - it is simply not offered.
+    const offered = resources.skills.filter((skill) => skill.name === companion);
+    // Only this skill's own binding: the gallery reads any selected id it does not
+    // list as a skill that no longer exists, and every other bound skill would
+    // be reported as one - they are the Skills tab's to show.
+    const offeredIds = new Set(offered.map((skill) => skill.id));
+    const visuals = capabilityId === VISUALS_ID;
+    return (
+      <ResourceGroup
+        detail={visuals ? t("visualDesignDetail") : t("artifactPagesDetail")}
+        warning={null}
+      >
+        {offered.length === 0 ? (
+          <p className="text-muted-foreground text-xs">
+            {visuals ? t("visualDesignMissing") : t("artifactPagesMissing")}
+          </p>
+        ) : (
+          <SkillGallery
+            skills={offered}
+            total={offered.length}
+            selectedIds={resources.skillIds.filter((id) => offeredIds.has(id))}
+            onToggle={resources.onSkillToggle}
+            disabled={disabled}
+          />
+        )}
+      </ResourceGroup>
+    );
+  }
+
+  return null;
+}
+
+/**
+ * The one thing the Context panel cannot say by drawing its controls.
+ *
+ * Two shapes, and both have been asked about. With the capability off, a bound
+ * file reaches nothing - not even an injected one, because the injection happens
+ * here. With it on and nothing bound that the run will actually read on demand,
+ * the *tools* are not attached: the builder hands back instructions and no
+ * toolset (`app/agents/capabilities/context/_capability.py`), so the Tools tab
+ * beside this one promises a `list_context` and a `read_context` the run will
+ * not carry - which is how "the agent cannot see the context tools" gets asked
+ * about an agent that is working as designed. A disabled file counts for
+ * nothing here because `resolve_for_agent` skips it.
+ *
+ * It says nothing about a binding it cannot see: the gallery holds a page of
+ * the organization's files, so a bound id missing from it may be an orphan or
+ * may simply be on another page.
+ */
+function contextWarning(
+  t: (key: string) => string,
+  enabled: boolean,
+  resources: AgentResources,
+  settings: ContextSettings,
+): string | null {
+  if (resources.contextIds.length === 0) return null;
+  if (!enabled) return t("contextOffButBound");
+  const known = new Map(resources.contextFiles.map((file) => [file.id, file]));
+  const bound = resources.contextIds.map((id) => known.get(id));
+  if (bound.some((file) => file === undefined)) return null;
+  const reads = bound.some(
+    (file) =>
+      file &&
+      (settings[file.id]?.mode ?? file.mode) === "link" &&
+      (settings[file.id]?.enabled ?? file.enabled),
+  );
+  return reads ? null : t("contextInjectOnlyNoTools");
+}
+
+/**
+ * A picker under what it is for, with the one state no control here can state
+ * alone: the spec still carries the selection, publish still checks it exists,
+ * and with the capability off not one of them reaches a run. Silence there is how
+ * "why does it not know the glossary" becomes unanswerable.
+ *
+ * No heading - the tab this sits in is the heading.
+ */
+function ResourceGroup({
+  detail,
+  warning,
+  children,
+}: {
+  detail: string;
+  warning: string | null;
+  children: ReactNode;
+}) {
+  return (
+    <section className="space-y-3">
+      {warning !== null && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+          <p className="text-xs">{warning}</p>
+        </div>
+      )}
+      <p className="text-muted-foreground text-xs">{detail}</p>
+      {children}
+    </section>
+  );
+}

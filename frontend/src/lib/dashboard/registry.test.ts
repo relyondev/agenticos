@@ -1,0 +1,208 @@
+import { describe, expect, it } from "vitest";
+
+import { ROW_CLASS, SPAN_CLASS } from "./layouts";
+import {
+  WIDGETS,
+  WIDGET_IDS,
+  accentDecoration,
+  isAccentColour,
+  isPresetAccent,
+  normaliseAccent,
+  optionSpec,
+  resolveStyle,
+  type WidgetId,
+} from "./registry";
+import { ROUTES } from "@/lib/constants";
+import { Perm, type Permission } from "@/types/permissions";
+
+const canOnly =
+  (...held: Permission[]) =>
+  (permission: Permission) =>
+    held.includes(permission);
+
+const NOBODY = () => false;
+
+/** Which single permission opens each widget - the truth table of the page.
+ * `"everyone"` is the one card whose primary read needs no permission at all. */
+const GATE_TABLE: Record<WidgetId, Permission | "app_admin" | "everyone"> = {
+  summary: Perm.runsView,
+  "activity-rhythm": Perm.runsView,
+  channels: Perm.channelsManage,
+  routines: Perm.agentsView,
+  knowledge: Perm.collectionsView,
+  tables: Perm.tablesView,
+  workflows: Perm.workflowsView,
+  "approval-outcomes": Perm.workflowsView,
+  "workflow-logs": Perm.workflowsView,
+  platform: "app_admin",
+  health: "app_admin",
+  "background-jobs": "app_admin",
+  "top-orgs": "app_admin",
+  "platform-ratings": "app_admin",
+  runs: Perm.runsView,
+  outcomes: Perm.runsView,
+  surfaces: Perm.runsView,
+  agents: Perm.runsView,
+  latency: Perm.runsView,
+  "active-users": Perm.runsView,
+  "top-people": Perm.runsView,
+  spend: Perm.runsView,
+  "model-mix": Perm.runsView,
+  "version-compare": Perm.runsView,
+  approvals: Perm.approvalsDecide,
+  "recent-failures": Perm.runsView,
+  "budget-headroom": Perm.runsView,
+  "department-spend": Perm.runsView,
+  "mcp-health": Perm.mcpManage,
+  "knowledge-freshness": Perm.collectionsView,
+  members: Perm.membersManage,
+  "org-ratings": Perm.runsView,
+  "department-quality": Perm.runsView,
+  "my-agents": Perm.agentsView,
+  conversations: Perm.agentsRun,
+  "my-activity": Perm.agentsRun,
+  "my-summary": Perm.agentsRun,
+  "my-top-agents": Perm.agentsRun,
+  "my-quality": Perm.agentsRun,
+  "shared-with-you": Perm.agentsView,
+  artifacts: Perm.artifactsView,
+  "voice-minutes": Perm.runsView,
+  projects: Perm.projectsView,
+  "recent-visuals": Perm.agentsRun,
+  "sandbox-capacity": Perm.connectionsView,
+  "sandbox-sessions": Perm.connectionsView,
+  "sandbox-policy": Perm.connectionsView,
+  notifications: "everyone",
+  suggestions: Perm.agentsRun,
+};
+
+describe("the widget catalog", () => {
+  it("holds all forty-nine widgets", () => {
+    expect(WIDGET_IDS).toHaveLength(49);
+  });
+
+  it.each(WIDGET_IDS)("%s opens on exactly its own permission", (id) => {
+    const expected = GATE_TABLE[id];
+    const { gate } = WIDGETS[id];
+
+    if (expected === "app_admin") {
+      expect(gate(NOBODY, true)).toBe(true);
+      expect(gate(() => true, false)).toBe(false);
+    } else if (expected === "everyone") {
+      expect(gate(NOBODY, false)).toBe(true);
+    } else {
+      expect(gate(canOnly(expected), false)).toBe(true);
+      // Holding everything except the gate's permission is not enough.
+      expect(
+        gate((permission) => permission !== expected, false),
+        `${id} must demand ${expected} and nothing else`,
+      ).toBe(false);
+    }
+  });
+
+  it("shows a caller with no permissions only the one card that needs none", () => {
+    // Every own inbox is a person's own, not an organization's - the same
+    // reason a Viewer, who holds nothing else on this page, still gets it.
+    const visible = WIDGET_IDS.filter((id) => WIDGETS[id].gate(NOBODY, false));
+
+    expect(visible).toEqual(["notifications"]);
+  });
+
+  it("every widget's default span is a class the grid knows", () => {
+    for (const id of WIDGET_IDS) {
+      expect(SPAN_CLASS[WIDGETS[id].defaultSpan], id).toBeTruthy();
+    }
+  });
+
+  it("every widget's default height is a class the grid knows", () => {
+    for (const id of WIDGET_IDS) {
+      expect(ROW_CLASS[WIDGETS[id].defaultRows], id).toBeTruthy();
+    }
+  });
+
+  it("every see-all destination is a route that exists", () => {
+    const known = new Set<string>(
+      Object.values<unknown>(ROUTES).filter((value) => typeof value === "string") as string[],
+    );
+    for (const id of WIDGET_IDS) {
+      const destination = WIDGETS[id].seeAll;
+      if (destination !== undefined) {
+        // A destination may narrow what it opens - the approvals card points at
+        // Activity's queue rather than its run history - so the route is the
+        // part before the query.
+        const { pathname } = new URL(destination, "http://dashboard.test");
+        expect(known.has(pathname), `${id} points at ${destination}`).toBe(true);
+      }
+    }
+  });
+
+  it("sends the approvals card to the queue rather than to the run history", () => {
+    // "See all" under a count of what is waiting used to open Activity on Runs,
+    // where nothing can be decided. There was no URL for the tab until #934.
+    expect(WIDGETS.approvals.seeAll).toBe("/runs?tab=approvals");
+  });
+});
+
+describe("section accents", () => {
+  it("recognises a named preset and nothing else as a preset", () => {
+    expect(isPresetAccent("violet")).toBe(true);
+    expect(isPresetAccent("#ff0000")).toBe(false);
+    expect(isPresetAccent("neutral")).toBe(false);
+  });
+
+  it("treats only a preset or a valid hex as a colour that paints", () => {
+    expect(isAccentColour("blue")).toBe(true);
+    expect(isAccentColour("#A1B2C3")).toBe(true);
+    expect(isAccentColour("neutral")).toBe(false);
+    expect(isAccentColour(null)).toBe(false);
+    expect(isAccentColour("not-a-colour")).toBe(false);
+  });
+
+  it("canonicalises a stored accent, lower-casing a hex and dropping the unknown", () => {
+    expect(normaliseAccent(null)).toBe("neutral");
+    expect(normaliseAccent("neutral")).toBe("neutral");
+    expect(normaliseAccent("green")).toBe("green");
+    expect(normaliseAccent("#AABBCC")).toBe("#aabbcc");
+    expect(normaliseAccent("chartreuse")).toBe("neutral");
+  });
+
+  it("decorates a preset with its class, a hex inline, and neutral with nothing", () => {
+    expect(accentDecoration("amber")).toEqual({ className: "dash-accent-amber" });
+    expect(accentDecoration("#AABBCC")).toEqual({
+      className: "",
+      style: { "--dash-solid": "#aabbcc" },
+    });
+    expect(accentDecoration("neutral")).toEqual({ className: "" });
+  });
+});
+
+describe("what a card lets a person change", () => {
+  it("offers nothing for a widget that declared nothing", () => {
+    // The honest answer for a card whose data has no window and no subject -
+    // the health probes, the sandbox host. The editor draws no button at all.
+    expect(optionSpec("mcp-health")).toEqual({});
+  });
+
+  it("draws a widget in the style it was asked for, when it offers it", () => {
+    expect(resolveStyle("runs", "bars")).toBe("bars");
+  });
+
+  it("falls back to the widget's own default rather than rendering nothing", () => {
+    // A stored option outlives the release that wrote it: a style this widget
+    // never offered, or one a later build renamed, still has to draw a card.
+    expect(resolveStyle("runs", "donut")).toBe("area");
+    expect(resolveStyle("runs", undefined)).toBe("area");
+  });
+
+  it("answers null for a widget with one presentation, so nothing branches on it", () => {
+    expect(resolveStyle("mcp-health", "bars")).toBeNull();
+  });
+
+  it("only offers a narrowing the endpoint behind the card can honour", () => {
+    // `/stats/usage` takes an agent and a person; the ratings summary takes
+    // neither, so the quality cards offer a window and nothing else.
+    expect(optionSpec("org-ratings")).toEqual({ period: true });
+    expect(optionSpec("department-quality")).toEqual({ period: true });
+    expect(optionSpec("runs").agent).toBe(true);
+  });
+});

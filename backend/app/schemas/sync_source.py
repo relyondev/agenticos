@@ -1,0 +1,138 @@
+"""Sync source configuration schemas."""
+
+from typing import Any
+from uuid import UUID
+
+from pydantic import Field, field_validator
+
+from app.schemas.base import BaseSchema
+
+
+def blank_is_absent(value: str | None) -> str | None:
+    """An all-whitespace organizational unit means there is none.
+
+    The values reach a chunk's metadata and the facet endpoint reports the
+    distinct ones a collection holds, so an empty string would be an
+    organizational unit named "" - offered in the filter, matching only the
+    documents whose field was left blank. Clearing the field in the form sends
+    `""` rather than omitting the key, and this is what makes that a clear
+    rather than a value. Shared with the upload routes, whose multipart field
+    is not a schema and so arrives untrimmed (#1777).
+    """
+    return (value or "").strip() or None
+
+
+class ConnectorInfo(BaseSchema):
+    """Metadata about an available connector type.
+
+    `config_schema` is the JSON Schema of the connector's `CONFIG_MODEL`, the
+    same shape `CapabilityCatalogEntry.config_schema` carries, so the wizard
+    renders it with `SchemaForm` - the component the agent Builder and the vault
+    secret forms already use - rather than a second renderer (#1093).
+
+    `secret_kind` is what a credential for this connector has to be, so the
+    wizard can offer the organization's matching vault secrets and nothing else -
+    a Drive source takes a service account, an S3 one an AWS key pair.
+    """
+
+    type: str
+    name: str
+    config_schema: dict[str, Any] = Field(
+        description="JSON Schema the configuration form is generated from"
+    )
+    secret_kind: str
+    enabled: bool
+
+
+class SyncSourceCreate(BaseSchema):
+    """Schema for creating a new sync source.
+
+    `collection_name` is optional - a source without it is an org-level
+    integration not yet assigned to a knowledge base.
+
+    `secret_id` names the vault secret the connector authenticates with. It is
+    optional here and not in the column for one reason: a source can be created
+    before its credential exists, and a sync then refuses rather than running on
+    nothing. What it may *not* carry is the credential itself - see
+    `SyncSourceService.create_source`, which refuses a config holding one (#937).
+
+    `organizational_unit` is a per-source default stamped on every chunk this
+    source ingests, so a retrieval can narrow on the part of the organization a
+    document belongs to (FA-039). Free text, trimmed; the facet endpoint reports
+    the distinct values a collection actually holds, which is the vocabulary
+    rather than a list somebody has to maintain first (#1777).
+    """
+
+    name: str
+    connector_type: str
+    collection_name: str | None = None
+    config: dict[str, object]
+    secret_id: UUID | None = None
+    organizational_unit: str | None = Field(default=None, max_length=255)
+    sync_mode: str = "new_only"
+    schedule_minutes: int | None = None
+
+    _unit_blank_is_absent = field_validator("organizational_unit")(blank_is_absent)
+
+
+class SyncSourceClone(BaseSchema):
+    """Schema for cloning a sync source into a different knowledge base."""
+
+    collection_name: str
+    name: str | None = None
+
+
+class SyncSourceUpdate(BaseSchema):
+    """Schema for updating an existing sync source."""
+
+    name: str | None = None
+    config: dict[str, object] | None = None
+    secret_id: UUID | None = None
+    organizational_unit: str | None = Field(default=None, max_length=255)
+    sync_mode: str | None = None
+    schedule_minutes: int | None = None
+    is_active: bool | None = None
+    collection_name: str | None = None
+
+    _unit_blank_is_absent = field_validator("organizational_unit")(blank_is_absent)
+
+
+class SyncSourceRead(BaseSchema):
+    """Schema for reading a sync source.
+
+    `config` is returned as stored, unmasked, because there is nothing in it to
+    mask: the credential is `secret_id`, and what that points at never leaves the
+    vault. `secret_hint` is the four characters the vault records so a reader can
+    tell *which* credential without being shown it.
+    """
+
+    id: str
+    organization_id: str
+    name: str
+    connector_type: str
+    collection_name: str | None
+    config: dict[str, object]
+    secret_id: str | None
+    secret_hint: str | None = None
+    organizational_unit: str | None = None
+    sync_mode: str
+    schedule_minutes: int | None
+    is_active: bool
+    last_sync_at: str | None
+    last_sync_status: str | None
+    last_error: str | None
+    created_at: str | None
+
+
+class SyncSourceList(BaseSchema):
+    """Paginated list of sync sources."""
+
+    items: list[SyncSourceRead]
+    total: int
+
+
+class ConnectorList(BaseSchema):
+    """List of available connectors."""
+
+    items: list[ConnectorInfo]
+    total: int

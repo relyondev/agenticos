@@ -1,0 +1,1905 @@
+import { useWorkOnStore } from "@/stores/work-on-store";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+
+import { useConversations, type ConversationQuery } from "./use-conversations";
+import { apiClient } from "@/lib/api-client";
+import * as invalidation from "@/lib/coalesced-invalidation";
+import { qk } from "@/lib/query-keys";
+import {
+  useAgentSelectionStore,
+  useAuthStore,
+  useChatStore,
+  useConversationStore,
+  useOrgStore,
+  useLiveFeedStore,
+  useWorkingStore,
+} from "@/stores";
+
+vi.mock("@/lib/api-client", () => ({
+  apiClient: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
+}));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryDefaults(qk.organizations.list(), { staleTime: Infinity });
+  client.setQueryData(qk.organizations.list(), [{ id: "fallback", is_personal: true }]);
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+function conversation(id: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    title: `Conversation ${id}`,
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: null,
+    is_archived: false,
+    ...overrides,
+  };
+}
+
+/** The list route, plus whatever `/messages` should answer with. */
+function serve({
+  items = [conversation("c-1")],
+  messages = [{ id: "m-1", role: "user", content: "hi" }],
+}: { items?: unknown[]; messages?: unknown[] } = {}) {
+  vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+    if (path.includes("/messages")) return { items: messages, total: messages.length };
+    return { items, total: items.length };
+  });
+}
+
+async function hook(query: Partial<ConversationQuery> = {}) {
+  const rendered = renderHook(() => useConversations(query), { wrapper });
+  await waitFor(() => expect(rendered.result.current.isLoading).toBe(false));
+  return rendered.result;
+}
+
+/** The path the list was last fetched from. */
+function lastListRequest(): string {
+  const calls = vi.mocked(apiClient.get).mock.calls.map(([path]) => path as string);
+  return calls.filter((path) => !path.includes("/messages")).at(-1) ?? "";
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  window.history.replaceState({}, "", "/chat");
+  useConversationStore.getState().reset();
+  useChatStore.setState({ messages: [], isStreaming: false });
+  useAgentSelectionStore.setState({ selectedAgentId: null, defaultAgentId: null });
+  useOrgStore.setState({ activeOrgId: null });
+  serve();
+  vi.mocked(apiClient.post).mockResolvedValue(conversation("c-new"));
+  vi.mocked(apiClient.patch).mockResolvedValue({});
+  vi.mocked(apiClient.delete).mockResolvedValue(undefined);
+});
+
+/**
+ * The conversation sidebar and what is open in it.
+ *
+ * Three rules here are the ones that produce bug reports when they break.
+ *
+ * A rapid switch between conversations aborts the previous message fetch: without
+ * it, a slower earlier request resolves last and the messages of a conversation
+ * nobody is looking at appear under the title of the one they are.
+ *
+ * The `?id=` parameter is the source of truth on load - a link somebody was sent
+ * has to win over whatever the store persisted - and an id that cannot be read is
+ * cleared rather than left selected against an empty thread.
+ *
+ * Starting a new chat reuses the current conversation when it is empty. Otherwise
+ * every stray click on "New chat" leaves an untitled empty row in the sidebar.
+ */
+describe("the conversation list", () => {
+  it("asks for both tabs' threads when no view is named", async () => {
+    const result = await hook();
+
+    expect(result.current.conversations).toHaveLength(1);
+    expect(apiClient.get).toHaveBeenCalledWith(
+      "/conversations?limit=30&sort_by=updated_at&sort_dir=desc&include_archived=true",
+    );
+  });
+
+  it("reads the list again while a thread on it is at work, and stops once none is", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    serve({ items: [conversation("c-1", { running_since: "2026-10-13T12:00:00Z" })] });
+    await hook();
+    const lists = () =>
+      vi.mocked(apiClient.get).mock.calls.filter(([path]) => !String(path).includes("/messages"))
+        .length;
+    const first = lists();
+
+    serve({ items: [conversation("c-1", { running_since: null })] });
+    await act(async () => vi.advanceTimersByTimeAsync(4_000));
+    await waitFor(() => expect(lists()).toBe(first + 1));
+    // Nothing at work now, so no further read comes.
+    await act(async () => vi.advanceTimersByTimeAsync(8_000));
+    expect(lists()).toBe(first + 1);
+    vi.useRealTimers();
+  });
+
+  it("asks only now and then while the live-update socket carries the run's end", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    useLiveFeedStore.setState({ connected: true });
+    serve({ items: [conversation("c-1", { running_since: "2026-10-13T12:00:00Z" })] });
+    await hook();
+    const lists = () =>
+      vi.mocked(apiClient.get).mock.calls.filter(([path]) => !String(path).includes("/messages"))
+        .length;
+    const first = lists();
+
+    await act(async () => vi.advanceTimersByTimeAsync(8_000));
+    expect(lists()).toBe(first);
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    await waitFor(() => expect(lists()).toBe(first + 1));
+    useLiveFeedStore.setState({ connected: false });
+    vi.useRealTimers();
+  });
+
+  it("reads the list again while a thread this tab left mid-answer is not on it yet", async () => {
+    // The listing has not seen the run the tab let go; polling is how it does.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    useWorkingStore.getState().start("c-1", "2026-10-13T12:00:00Z");
+    useWorkingStore.getState().handOff("c-1");
+    serve({ items: [conversation("c-1", { running_since: null })] });
+    await hook();
+    const lists = () =>
+      vi.mocked(apiClient.get).mock.calls.filter(([path]) => !String(path).includes("/messages"))
+        .length;
+    const first = lists();
+
+    await act(async () => vi.advanceTimersByTimeAsync(4_000));
+    await waitFor(() => expect(lists()).toBe(first + 1));
+    useWorkingStore.getState().reset();
+    vi.useRealTimers();
+  });
+
+  it("marks a thread read and does not invent an unread badge after a later failure", async () => {
+    serve({ items: [conversation("c-1", { unread: true })] });
+    const result = await hook();
+
+    await act(async () => result.current.markRead("c-1"));
+    expect(apiClient.post).toHaveBeenCalledWith("/conversations/c-1/read", {});
+    await waitFor(() => expect(result.current.conversations[0]?.unread).toBe(false));
+
+    vi.mocked(apiClient.post).mockRejectedValueOnce(new Error("offline"));
+    await act(async () => result.current.markRead("c-1"));
+    await waitFor(() => expect(result.current.conversations[0]?.unread).toBe(false));
+  });
+
+  it("counts what matches rather than what was fetched", async () => {
+    // A page is thirty rows and the deployment holds more: `total` is the
+    // server's count of the list, which is what the sidebar puts on screen.
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [conversation("c-1")], total: 214 });
+    const result = await hook();
+
+    expect(result.current.total).toBe(214);
+  });
+
+  it("narrows on the server, not over the page it happens to hold", async () => {
+    // The whole reason these are query parameters: the hook holds the pages
+    // fetched so far, so a filter applied to `conversations` would search
+    // thirty threads and answer "nothing" for one from March.
+    await hook({ view: "archived", search: "  refunds  ", agentId: "a-1" });
+
+    expect(lastListRequest()).toBe(
+      "/conversations?limit=30&sort_by=updated_at&sort_dir=desc&archived_only=true&search=refunds&agent_id=a-1",
+    );
+  });
+
+  it("asks for the active threads alone when the active tab is showing", async () => {
+    await hook({ view: "active" });
+
+    const request = lastListRequest();
+    expect(request).not.toContain("include_archived");
+    expect(request).not.toContain("archived_only");
+  });
+
+  it("sends no search at all when the box holds only spaces", async () => {
+    await hook({ search: "   " });
+
+    expect(lastListRequest()).not.toContain("search=");
+  });
+
+  it("carries the sort the caller chose", async () => {
+    await hook({ sortBy: "title", sortDir: "asc" });
+
+    expect(lastListRequest()).toContain("sort_by=title&sort_dir=asc");
+  });
+
+  it("keeps two filters in two cache entries", async () => {
+    // One key for two lists is the search box answering with the previous
+    // search's rows, which is what putting the parameters in the key prevents.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryDefaults(qk.organizations.list(), { staleTime: Infinity });
+    client.setQueryData(qk.organizations.list(), [{ id: "fallback", is_personal: true }]);
+    const shared = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+
+    serve({ items: [conversation("refund")] });
+    const first = renderHook(() => useConversations({ search: "refunds" }), { wrapper: shared });
+    await waitFor(() => expect(first.result.current.conversations).toHaveLength(1));
+
+    serve({ items: [conversation("holiday-a"), conversation("holiday-b")] });
+    const second = renderHook(() => useConversations({ search: "holiday" }), { wrapper: shared });
+    await waitFor(() => expect(second.result.current.conversations).toHaveLength(2));
+
+    expect(first.result.current.conversations.map((c) => c.id)).toEqual(["refund"]);
+  });
+
+  it("looks for another page again once the filters move", async () => {
+    // A short page means "no more"; the next list is a different list and has
+    // its own last page, so the scroll handler has to be allowed to ask again.
+    const rendered = renderHook((query: Partial<ConversationQuery>) => useConversations(query), {
+      wrapper,
+      initialProps: {},
+    });
+    await waitFor(() => expect(rendered.result.current.hasMore).toBe(false));
+
+    rendered.rerender({ search: "refunds" });
+
+    expect(rendered.result.current.hasMore).toBe(true);
+  });
+
+  it("says there is more to load only when the page came back full", async () => {
+    serve({ items: Array.from({ length: 30 }, (_, index) => conversation(`c-${index}`)) });
+    const result = await hook();
+
+    expect(result.current.hasMore).toBe(true);
+  });
+
+  it("says there is no more when the page came back short", async () => {
+    const result = await hook();
+
+    expect(result.current.hasMore).toBe(false);
+  });
+
+  it("appends the next page from where the list ends", async () => {
+    serve({ items: Array.from({ length: 30 }, (_, index) => conversation(`c-${index}`)) });
+    const result = await hook();
+
+    serve({ items: [conversation("c-later")] });
+    await act(async () => {
+      await result.current.fetchMoreConversations();
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      "/conversations?limit=30&sort_by=updated_at&sort_dir=desc&include_archived=true&skip=30",
+    );
+    await waitFor(() => expect(result.current.conversations).toHaveLength(31));
+  });
+
+  it("does not list a conversation twice when a refetch raced the append", async () => {
+    serve({ items: Array.from({ length: 30 }, (_, index) => conversation(`c-${index}`)) });
+    const result = await hook();
+
+    await act(async () => {
+      await result.current.fetchMoreConversations();
+    });
+
+    expect(result.current.conversations).toHaveLength(30);
+  });
+
+  it("asks for no further page once the list is exhausted", async () => {
+    const result = await hook();
+    const before = vi.mocked(apiClient.get).mock.calls.length;
+
+    await act(async () => {
+      await result.current.fetchMoreConversations();
+    });
+
+    expect(vi.mocked(apiClient.get).mock.calls.length).toBe(before);
+  });
+
+  it("does not build a list out of a page that arrives before the first one", async () => {
+    // Nothing has measured the list yet, so a scroll is allowed to ask for
+    // another page while the first is still in flight. `setQueryData` creates a
+    // key that is not there, so the arriving page would *become* the list -
+    // starting at the thirty-first conversation, with the real first page
+    // overwriting it a moment later. The same guard is what stops a page landing
+    // after an organization switch has removed every query from resurrecting
+    // the previous organization's sidebar.
+    vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+      if (path.includes("skip=")) return { items: [conversation("c-later")], total: 1 };
+      return new Promise(() => {}); // the first page never lands
+    });
+
+    const rendered = renderHook(() => useConversations(), { wrapper });
+    await act(async () => {
+      await rendered.result.current.fetchMoreConversations();
+    });
+
+    expect(rendered.result.current.conversations).toEqual([]);
+    expect(rendered.result.current.total).toBe(0);
+  });
+
+  it("does not fire two page loads at once", async () => {
+    // The sidebar's scroll handler fires repeatedly; two in flight would append
+    // the same page twice.
+    serve({ items: Array.from({ length: 30 }, (_, index) => conversation(`c-${index}`)) });
+    const result = await hook();
+    const before = vi.mocked(apiClient.get).mock.calls.length;
+
+    await act(async () => {
+      await Promise.all([
+        result.current.fetchMoreConversations(),
+        result.current.fetchMoreConversations(),
+      ]);
+    });
+
+    expect(vi.mocked(apiClient.get).mock.calls.length).toBe(before + 1);
+  });
+
+  it("survives a refused next page without emptying the list", async () => {
+    serve({ items: Array.from({ length: 30 }, (_, index) => conversation(`c-${index}`)) });
+    const result = await hook();
+
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("offline"));
+    await act(async () => {
+      await result.current.fetchMoreConversations();
+    });
+
+    expect(result.current.conversations).toHaveLength(30);
+  });
+
+  it("drops a next page that arrives after somebody else has signed in", async () => {
+    // Writing the cache is not the same as reading it: the sign-in that emptied
+    // it has already happened, so this would put one page of A's titles back
+    // under the key B is reading.
+    useAuthStore.getState().setUser({ id: "u-a", email: "a@example.com" } as never);
+    serve({ items: Array.from({ length: 30 }, (_, index) => conversation(`c-${index}`)) });
+    const result = await hook();
+
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.get).mockImplementation(() => new Promise((resolve) => (answer = resolve)));
+    let loading: Promise<void>;
+    await act(async () => {
+      loading = result.current.fetchMoreConversations();
+      await waitFor(() => expect(apiClient.get).toHaveBeenCalledTimes(2));
+    });
+
+    await act(async () => {
+      useAuthStore.getState().setUser({ id: "u-b", email: "b@example.com" } as never);
+      answer({ items: [conversation("c-private")], total: 31 });
+      await loading!;
+    });
+
+    expect(result.current.conversations.map((c) => c.id)).not.toContain("c-private");
+    // And the pagination the page answered with. `writeCache` holds the list on
+    // its own; this is the other half, and it is the reason the early return is
+    // there rather than only the guard inside the write.
+    expect(result.current.hasMore).toBe(true);
+  });
+
+  it("refreshes the list on demand", async () => {
+    const result = await hook();
+
+    await act(async () => {
+      await result.current.fetchConversations();
+    });
+
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe("the conversation named in the address bar", () => {
+  it("does nothing for a refresh already cancelled", async () => {
+    const result = await hook();
+    const controller = new AbortController();
+    controller.abort();
+    vi.mocked(apiClient.get).mockClear();
+    await result.current.fetchConversations(controller.signal);
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it.each(["account", "organization"])(
+    "does not open a link after the %s changes during invalidation",
+    async (changed) => {
+      window.history.replaceState({}, "", "/chat?id=c-9");
+      const result = await hook();
+      let finish = () => {};
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const invalidate = vi.spyOn(invalidation, "invalidateSoon").mockReturnValue(pending);
+      try {
+        const fetching = result.current.fetchConversations();
+        if (changed === "account")
+          useAuthStore.setState({
+            user: {
+              id: "next-account",
+              email: "next@example.com",
+              is_active: true,
+              created_at: "2026-10-24T00:00:00Z",
+            },
+          });
+        else await act(async () => useOrgStore.getState().setActiveOrgId("next-org"));
+        await act(async () => {
+          finish();
+          await fetching;
+        });
+        expect(useConversationStore.getState().currentConversationId).toBeNull();
+      } finally {
+        invalidate.mockRestore();
+      }
+    },
+  );
+
+  it.each(["answer", "refusal"])("ignores a message %s after cancellation", async (outcome) => {
+    window.history.replaceState({}, "", "/chat?id=c-9");
+    const result = await hook();
+    let answer: (value: unknown) => void = () => {};
+    let refuse: (reason: unknown) => void = () => {};
+    vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+      if (path.includes("/messages"))
+        return new Promise((resolve, reject) => {
+          answer = resolve;
+          refuse = reject;
+        });
+      return { items: [], total: 0 };
+    });
+    const controller = new AbortController();
+    const fetching = result.current.fetchConversations(controller.signal);
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenCalledWith(
+        "/conversations/c-9/messages?latest=true&limit=101",
+        {
+          signal: controller.signal,
+        },
+      ),
+    );
+    controller.abort();
+    useConversationStore.getState().setCurrentConversationId("c-current");
+    await act(async () => {
+      if (outcome === "answer") answer({ items: [{ id: "m-late" }], cost: null });
+      else refuse(new DOMException("cancelled", "AbortError"));
+      await fetching;
+    });
+    expect(useConversationStore.getState().currentConversationId).toBe("c-current");
+    expect(useConversationStore.getState().currentMessages).toEqual([]);
+  });
+
+  it.each(["new chat", "A to C to A"])(
+    "does not reopen a delayed deep link after choosing %s",
+    async (choice) => {
+      window.history.replaceState({}, "", "/chat?id=c-9");
+      if (choice !== "new chat") useConversationStore.getState().setCurrentConversationId("c-1");
+      const result = await hook();
+      let finish!: (value: unknown) => void;
+      const pending = new Promise((resolve) => {
+        finish = resolve;
+      });
+      vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+        if (path === "/conversations/c-9/messages?latest=true&limit=101") return pending;
+        return { items: [], total: 0, cost: null };
+      });
+      const fetching = result.current.fetchConversations();
+      await waitFor(() =>
+        expect(apiClient.get).toHaveBeenCalledWith(
+          "/conversations/c-9/messages?latest=true&limit=101",
+          {
+            signal: undefined,
+          },
+        ),
+      );
+      await act(async () => {
+        if (choice === "new chat") await result.current.startNewChat();
+        else {
+          await result.current.selectConversation("c-2");
+          await result.current.selectConversation("c-1");
+        }
+      });
+      await act(async () => {
+        finish({ items: [{ id: "late" }], cost: null });
+        await fetching;
+      });
+      expect(useConversationStore.getState().currentConversationId).toBe(
+        choice === "new chat" ? null : "c-1",
+      );
+      expect(useConversationStore.getState().currentMessages).toEqual([]);
+    },
+  );
+
+  it("opens the one the link points at, and its messages", async () => {
+    // A shared link has to win over whatever the store remembered.
+    window.history.replaceState({}, "", "/chat?id=c-9");
+    const result = await hook();
+
+    await act(async () => {
+      await result.current.fetchConversations();
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      "/conversations/c-9/messages?latest=true&limit=101",
+      {
+        signal: undefined,
+      },
+    );
+    expect(useConversationStore.getState().currentConversationId).toBe("c-9");
+    expect(useConversationStore.getState().currentMessages).toHaveLength(1);
+  });
+
+  it("clears an id it cannot read rather than showing an empty thread under it", async () => {
+    // A deleted conversation, or one belonging to somebody else.
+    window.history.replaceState({}, "", "/chat?id=c-gone");
+    const result = await hook();
+    await act(async () => result.current.selectConversation("c-old"));
+    window.history.replaceState({}, "", "/chat?id=c-gone");
+    useConversationStore.setState({
+      currentCost: { input_tokens: 1, output_tokens: 2, cost_usd: "4.00", cost_is_partial: false },
+    });
+    vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+      if (path.includes("/messages")) throw new Error("404");
+      return { items: [], total: 0 };
+    });
+
+    await act(async () => {
+      await result.current.fetchConversations();
+    });
+
+    expect(useConversationStore.getState().currentConversationId).toBeNull();
+    expect(useConversationStore.getState().currentMessages).toEqual([]);
+    expect(useConversationStore.getState().currentCost).toBeNull();
+  });
+
+  it("drops a linked thread that arrives after somebody else has signed in", async () => {
+    // Same race as a select, through the other door: the address bar's `?id=`
+    // is read on every refresh, and its request can outlive the session too.
+    window.history.replaceState({}, "", "/chat?id=c-9");
+    useAuthStore.getState().setUser({ id: "u-a", email: "a@example.com" } as never);
+    const result = await hook();
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+      if (path.includes("/messages")) return new Promise((resolve) => (answer = resolve));
+      return { items: [], total: 0 };
+    });
+
+    let fetching: Promise<void>;
+    await act(async () => {
+      fetching = result.current.fetchConversations();
+      await waitFor(() =>
+        expect(apiClient.get).toHaveBeenCalledWith(
+          "/conversations/c-9/messages?latest=true&limit=101",
+          {
+            signal: undefined,
+          },
+        ),
+      );
+    });
+
+    await act(async () => {
+      useAuthStore.getState().setUser({ id: "u-b", email: "b@example.com" } as never);
+      answer({ items: [{ id: "m-private" }], total: 1 });
+      await fetching!;
+    });
+
+    expect(useConversationStore.getState().currentMessages).toEqual([]);
+  });
+
+  it("keeps a refusal meant for one account out of the next one's screen", async () => {
+    // The failure belongs to whoever asked. A late 404 for A's link used to
+    // clear the conversation B had open by then.
+    window.history.replaceState({}, "", "/chat?id=c-9");
+    useAuthStore.getState().setUser({ id: "u-a", email: "a@example.com" } as never);
+    const result = await hook();
+    let refuse: (reason: unknown) => void = () => {};
+    vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+      if (path.includes("/messages")) return new Promise((_, reject) => (refuse = reject));
+      return { items: [], total: 0 };
+    });
+
+    let fetching: Promise<void>;
+    await act(async () => {
+      fetching = result.current.fetchConversations();
+      await waitFor(() =>
+        expect(apiClient.get).toHaveBeenCalledWith(
+          "/conversations/c-9/messages?latest=true&limit=101",
+          {
+            signal: undefined,
+          },
+        ),
+      );
+    });
+
+    await act(async () => {
+      useAuthStore.getState().setUser({ id: "u-b", email: "b@example.com" } as never);
+      useConversationStore.getState().setCurrentConversationId("c-b");
+      refuse(new Error("404"));
+      await fetching!;
+    });
+
+    expect(useConversationStore.getState().currentConversationId).toBe("c-b");
+  });
+
+  it("does not re-read the messages of the conversation already open", async () => {
+    window.history.replaceState({}, "", "/chat?id=c-1");
+    useConversationStore.getState().setCurrentConversationId("c-1");
+    const result = await hook();
+
+    await act(async () => {
+      await result.current.fetchConversations();
+    });
+
+    expect(apiClient.get).not.toHaveBeenCalledWith(
+      "/conversations/c-1/messages?latest=true&limit=101",
+    );
+  });
+});
+
+describe("opening a conversation", () => {
+  it("reads its messages and puts it in the address bar", async () => {
+    // So a refresh, or a link somebody copies, lands back on the same thread.
+    const result = await hook();
+
+    await act(async () => {
+      await result.current.selectConversation("c-1");
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      "/conversations/c-1/messages?latest=true&limit=101",
+      {
+        signal: expect.any(AbortSignal),
+      },
+    );
+    expect(window.location.search).toBe("?id=c-1");
+    expect(useConversationStore.getState().currentMessages).toHaveLength(1);
+  });
+
+  it("clears the streamed messages of the thread being left", async () => {
+    // Otherwise the previous conversation's live bubbles render above the new
+    // conversation's history.
+    const result = await hook();
+    useChatStore.getState().addMessage({
+      id: "m-live",
+      role: "assistant",
+      content: "from the last thread",
+      timestamp: new Date("2026-07-31T12:00:00Z"),
+    });
+
+    await act(async () => {
+      await result.current.selectConversation("c-1");
+    });
+
+    expect(useChatStore.getState().messages).toEqual([]);
+  });
+
+  it("abandons a slower earlier fetch rather than letting it win", async () => {
+    // The bug this exists for: click A, click B, and A's messages arrive last and
+    // render under B's title.
+    const result = await hook();
+    const pending = new Map<string, (value: unknown) => void>();
+    vi.mocked(apiClient.get).mockImplementation(
+      (path: string) =>
+        new Promise((resolve) => {
+          pending.set(path, resolve);
+        }),
+    );
+
+    let first: Promise<void>;
+    let second: Promise<void>;
+    await act(async () => {
+      first = result.current.selectConversation("c-1");
+      second = result.current.selectConversation("c-2");
+      await waitFor(() => expect(pending.size).toBe(2));
+    });
+
+    await act(async () => {
+      // The superseded request answers last, with the wrong thread's messages.
+      pending.get("/conversations/c-2/messages?latest=true&limit=101")!({
+        items: [{ id: "m-2" }],
+        total: 1,
+      });
+      pending.get("/conversations/c-1/messages?latest=true&limit=101")!({
+        items: [{ id: "m-1" }],
+        total: 1,
+      });
+      await Promise.all([first!, second!]);
+    });
+
+    expect(useConversationStore.getState().currentConversationId).toBe("c-2");
+    expect(useConversationStore.getState().currentMessages).toEqual([{ id: "m-2" }]);
+  });
+
+  it("drops messages that arrive after somebody else has signed in", async () => {
+    // The abort controller settles two selects by the same person. It does not
+    // settle a request that outlives the session: A opens a thread, signs out,
+    // B signs in, and A's messages land in B's chat.
+    useAuthStore.getState().setUser({ id: "u-a", email: "a@example.com" } as never);
+    const result = await hook();
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.get).mockImplementation(() => new Promise((resolve) => (answer = resolve)));
+
+    let selecting: Promise<void>;
+    await act(async () => {
+      selecting = result.current.selectConversation("c-1");
+      await waitFor(() => expect(answer).not.toBe(undefined));
+    });
+
+    await act(async () => {
+      useAuthStore.getState().setUser({ id: "u-b", email: "b@example.com" } as never);
+      answer({ items: [{ id: "m-private" }], total: 1 });
+      await selecting!;
+    });
+
+    expect(useConversationStore.getState().currentMessages).toEqual([]);
+  });
+
+  it("keeps a failed select from writing an error onto the next account's screen", async () => {
+    // The matrix cell the other tests miss: select *fails*, and the account has
+    // changed by the time it does. The refusal was A's; B is looking at the
+    // chat that shows it.
+    useAuthStore.getState().setUser({ id: "u-a", email: "a@example.com" } as never);
+    const result = await hook();
+    let refuse: (reason: unknown) => void = () => {};
+    vi.mocked(apiClient.get).mockImplementation(
+      () => new Promise((_, reject) => (refuse = reject)),
+    );
+
+    let selecting: Promise<void>;
+    await act(async () => {
+      selecting = result.current.selectConversation("c-1");
+      await waitFor(() => expect(apiClient.get).toHaveBeenCalledTimes(2));
+    });
+
+    await act(async () => {
+      useAuthStore.getState().setUser({ id: "u-b", email: "b@example.com" } as never);
+      refuse(new Error("boom"));
+      await selecting!;
+    });
+
+    expect(useConversationStore.getState().error).toBeNull();
+  });
+
+  it("says nothing about an aborted request, because it was not a failure", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.get).mockRejectedValue(
+      new DOMException("The operation was aborted", "AbortError"),
+    );
+
+    await act(async () => {
+      await result.current.selectConversation("c-1");
+    });
+
+    expect(useConversationStore.getState().error).toBeNull();
+  });
+
+  it("says what went wrong when the messages cannot be read", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("Not your conversation"));
+
+    await act(async () => {
+      await result.current.selectConversation("c-1");
+    });
+
+    expect(useConversationStore.getState().error).toBe("Not your conversation");
+    expect(useConversationStore.getState().isLoading).toBe(false);
+  });
+
+  it("falls back to its own sentence for a failure that carries none", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.get).mockRejectedValue("boom");
+
+    await act(async () => {
+      await result.current.selectConversation("c-1");
+    });
+
+    expect(useConversationStore.getState().error).toBe("Failed to fetch messages");
+  });
+});
+
+describe("creating, renaming and removing a conversation", () => {
+  it("hands back the new conversation and refetches the list it belongs in", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.post).mockResolvedValue(conversation("c-new", { title: "Refunds" }));
+    serve({ items: [conversation("c-new", { title: "Refunds" }), conversation("c-1")] });
+
+    let created: unknown;
+    await act(async () => {
+      created = await result.current.createConversation("Refunds");
+    });
+
+    expect(apiClient.post).toHaveBeenCalledWith("/conversations", { title: "Refunds" });
+    expect(created).toMatchObject({ id: "c-new", title: "Refunds" });
+    await waitFor(() => expect(result.current.conversations[0]?.id).toBe("c-new"));
+  });
+
+  it("hands back nothing and says why when creation is refused", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("Rate limited"));
+
+    let created: unknown;
+    await act(async () => {
+      created = await result.current.createConversation();
+    });
+
+    expect(created).toBeNull();
+    expect(useConversationStore.getState().error).toBe("Rate limited");
+    expect(useConversationStore.getState().isLoading).toBe(false);
+  });
+
+  it("falls back to its own sentence when creation fails without one", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.post).mockRejectedValue("boom");
+
+    await act(async () => {
+      await result.current.createConversation();
+    });
+
+    expect(useConversationStore.getState().error).toBe("Failed to create conversation");
+  });
+
+  it("archives and restores by asking the server again, not by patching the row", async () => {
+    // Which list a thread belongs to is the server's answer now: archiving it
+    // takes it out of the active view, and a patched row would sit there with
+    // `is_archived` set, under a tab it no longer belongs to.
+    serve({ items: [conversation("c-1"), conversation("c-2")] });
+    const result = await hook();
+
+    serve({ items: [conversation("c-2")] });
+    await act(async () => {
+      await result.current.archiveConversation("c-1");
+    });
+    expect(apiClient.patch).toHaveBeenCalledWith("/conversations/c-1", { is_archived: true });
+    await waitFor(() => expect(result.current.conversations.map((c) => c.id)).toEqual(["c-2"]));
+
+    serve({ items: [conversation("c-1"), conversation("c-2")] });
+    await act(async () => {
+      await result.current.unarchiveConversation("c-1");
+    });
+    expect(apiClient.patch).toHaveBeenCalledWith("/conversations/c-1", { is_archived: false });
+    await waitFor(() => expect(result.current.conversations).toHaveLength(2));
+  });
+
+  it("reports a refused archive and a refused restore", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.patch).mockRejectedValue("boom");
+
+    await act(async () => {
+      await result.current.archiveConversation("c-1");
+    });
+    expect(toast.error).toHaveBeenCalledWith("Failed to archive conversation");
+
+    await act(async () => {
+      await result.current.unarchiveConversation("c-1");
+    });
+    expect(toast.error).toHaveBeenCalledWith("Failed to restore conversation");
+  });
+
+  it("renames, then reads back the list - a new title can leave a search", async () => {
+    serve({ items: [conversation("c-1"), conversation("c-2")] });
+    const result = await hook();
+
+    serve({
+      items: [conversation("c-1", { title: "Refund policy" }), conversation("c-2")],
+    });
+    await act(async () => {
+      await result.current.renameConversation("c-1", "Refund policy");
+    });
+
+    expect(apiClient.patch).toHaveBeenCalledWith("/conversations/c-1", { title: "Refund policy" });
+    await waitFor(() => expect(result.current.conversations[0]?.title).toBe("Refund policy"));
+    expect(result.current.conversations[1]?.title).toBe("Conversation c-2");
+  });
+
+  it("reports a refused rename", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.patch).mockRejectedValue(new Error("Too long"));
+
+    await act(async () => {
+      await result.current.renameConversation("c-1", "x");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Too long");
+  });
+
+  it("drops a deleted conversation, and clears the selection if it was open", async () => {
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-1");
+
+    serve({ items: [] });
+    await act(async () => {
+      await result.current.deleteConversation("c-1");
+    });
+
+    expect(apiClient.delete).toHaveBeenCalledWith("/conversations/c-1");
+    await waitFor(() => expect(result.current.conversations).toEqual([]));
+    expect(useConversationStore.getState().currentConversationId).toBeNull();
+  });
+
+  it("takes a deleted open conversation off the screen and out of the address", async () => {
+    // Left in `?id=`, the next list fetch or reload adopted the deleted id again and
+    // the next message went to a conversation that no longer exists.
+    window.history.replaceState(null, "", "/chat?id=c-1");
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-1");
+    useChatStore.getState().addMessage({
+      id: "m-1",
+      role: "user",
+      content: "hello",
+      timestamp: new Date(),
+    });
+
+    serve({ items: [] });
+    await act(async () => {
+      await result.current.deleteConversation("c-1");
+    });
+
+    expect(new URLSearchParams(window.location.search).get("id")).toBeNull();
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useConversationStore.getState().currentMessages).toEqual([]);
+  });
+
+  it("keeps the selection when a different conversation is deleted", async () => {
+    serve({ items: [conversation("c-1"), conversation("c-2")] });
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-1");
+
+    await act(async () => {
+      await result.current.deleteConversation("c-2");
+    });
+
+    expect(useConversationStore.getState().currentConversationId).toBe("c-1");
+  });
+
+  it("reports a refused deletion", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.delete).mockRejectedValue("boom");
+
+    await act(async () => {
+      await result.current.deleteConversation("c-1");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Failed to delete conversation");
+  });
+});
+
+describe("starring a conversation", () => {
+  /**
+   * A pending star is the tab's, not this render's - `favouriteChains` is a
+   * module constant, because a request does not stop when the sidebar unmounts.
+   * So a test that holds a star or an unstar open has to release it before it
+   * finishes, or that promise stays at the head of the conversation's chain for
+   * every test after it.
+   *
+   * The star is the one thing this hook patches rather than refetching, and the
+   * boundary is exact: which list a thread belongs to is the server's answer,
+   * but whether *this reader* starred it is a fact about the row the client
+   * just decided. Patching it is what makes the click instant; the band it
+   * moves into still comes from the server (#929).
+   */
+  async function hook(query?: ConversationQuery) {
+    const rendered = renderHook(() => useConversations(query), { wrapper });
+    await waitFor(() => expect(rendered.result.current.isLoading).toBe(false));
+    return rendered.result;
+  }
+
+  beforeEach(() => {
+    serve({ items: [conversation("c-1"), conversation("c-2")] });
+    useAuthStore.getState().setUser({ id: "u-a", email: "a@example.com" } as never);
+  });
+
+  it("shows the star before the server has answered", async () => {
+    const result = await hook();
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+    });
+
+    await waitFor(() =>
+      expect(result.current.conversations.find((c) => c.id === "c-1")?.is_favourite).toBe(true),
+    );
+    expect(apiClient.post).toHaveBeenCalledWith("/conversations/c-1/favourite", {});
+    act(() => settle({}));
+  });
+
+  it("unstars through the DELETE, not a second POST", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.delete).mockResolvedValue({});
+
+    await act(async () => {
+      await result.current.setFavourite("c-1", false);
+    });
+
+    expect(apiClient.delete).toHaveBeenCalledWith("/conversations/c-1/favourite");
+  });
+
+  it("asks the server for the list again, because the band is an ordering", async () => {
+    const result = await hook();
+    vi.mocked(apiClient.post).mockResolvedValue({});
+    serve({ items: [conversation("c-2", { is_favourite: true }), conversation("c-1")] });
+
+    await act(async () => {
+      await result.current.setFavourite("c-2", true);
+    });
+
+    await waitFor(() =>
+      expect(result.current.conversations.map((c) => c.id)).toEqual(["c-2", "c-1"]),
+    );
+  });
+
+  it("leaves the next account's row alone when the refusal outlives the first", async () => {
+    // Every other request here captures the account it started as. A star
+    // refused after somebody else signed in would roll back *their* cached row
+    // and show them the previous account's error.
+    const result = await hook();
+    let refuse: (reason: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((_resolve, reject) => {
+        refuse = reject;
+      }),
+    );
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+    });
+    await waitFor(() =>
+      expect(result.current.conversations.find((c) => c.id === "c-1")?.is_favourite).toBe(true),
+    );
+
+    act(() => {
+      useAuthStore.getState().setUser({ id: "u-next", email: "next@example.com" } as never);
+    });
+    await act(async () => {
+      refuse("boom");
+      await Promise.resolve();
+    });
+
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("does not refetch the next account's lists when the star lands after a switch", async () => {
+    // The mirror of the case above: a *successful* star resolving into
+    // somebody else's session must not invalidate their sidebar either.
+    const result = await hook();
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+    });
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    const before = vi.mocked(apiClient.get).mock.calls.length;
+
+    act(() => {
+      useAuthStore.getState().setUser({ id: "u-next", email: "next@example.com" } as never);
+    });
+    await act(async () => {
+      settle({});
+      await Promise.resolve();
+    });
+
+    expect(vi.mocked(apiClient.get).mock.calls.length).toBe(before);
+  });
+
+  it("holds a second click until the first request has answered", async () => {
+    // The POST and the DELETE are separate requests and nothing made the second
+    // wait for the first, so a double click could have them answered out of
+    // order - the DELETE first, the POST committing after it - leaving the
+    // thread starred with nothing on screen saying so and no further click to
+    // reconcile them (#1254).
+    const result = await hook();
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+    vi.mocked(apiClient.delete).mockResolvedValue({});
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+      void result.current.setFavourite("c-1", false);
+    });
+
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    expect(apiClient.delete).not.toHaveBeenCalled();
+    // The screen is already showing the second click, which is the point of
+    // patching first: only the request is queued.
+    expect(result.current.conversations.find((c) => c.id === "c-1")?.is_favourite).toBe(false);
+
+    await act(async () => {
+      settle({});
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(apiClient.delete).toHaveBeenCalledWith("/conversations/c-1/favourite"),
+    );
+  });
+
+  it("queues per conversation, so one slow star does not hold another thread's", async () => {
+    const result = await hook();
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+    vi.mocked(apiClient.delete).mockResolvedValue({});
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+      void result.current.setFavourite("c-2", false);
+    });
+
+    await waitFor(() =>
+      expect(apiClient.delete).toHaveBeenCalledWith("/conversations/c-2/favourite"),
+    );
+    act(() => settle({}));
+  });
+
+  it("does not roll back from a refusal two clicks old", async () => {
+    // Star, unstar, star: the row is starred and the first POST is the one that
+    // fails. Undoing it would take the star off a thread the reader has since
+    // put it back on, and the queued requests still decide what the server
+    // holds - so only the newest click owns what is on screen.
+    const result = await hook();
+    let refuse: (reason: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        refuse = reject;
+      }),
+    );
+    // The queued DELETE is held rather than answered, so nothing refetches the
+    // list and what is asserted below is the patched cache rather than a fresh
+    // page. Released at the end, because the queue is the tab's: a star left
+    // pending here would be at the head of c-1's chain for every test after it.
+    let release: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.delete).mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+      void result.current.setFavourite("c-1", false);
+      void result.current.setFavourite("c-1", true);
+    });
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      refuse("boom");
+      await Promise.resolve();
+    });
+
+    expect(result.current.conversations.find((c) => c.id === "c-1")?.is_favourite).toBe(true);
+    expect(toast.error).toHaveBeenCalledWith("Could not change the favourite");
+    await act(async () => {
+      release({});
+      await Promise.resolve();
+    });
+  });
+
+  it("drops a queued click when the account changed while it waited", async () => {
+    // The queue's own hazard: a click waiting its turn is sent with whatever
+    // cookies the browser holds when it gets one, so waiting out a sign-out
+    // would land A's star as B's on a thread they can both read. The account is
+    // checked before the request goes, not only after it answers.
+    const result = await hook();
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+      void result.current.setFavourite("c-1", false);
+    });
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+
+    act(() => {
+      useAuthStore.getState().setUser({ id: "u-next", email: "next@example.com" } as never);
+    });
+    await act(async () => {
+      settle({});
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiClient.delete).not.toHaveBeenCalled();
+  });
+
+  it("does not hold the next click behind the list refetch", async () => {
+    // The refetch is outside the chain, because what has to be serialized is
+    // the write. Behind it, a slow GET leaves an unstar optimistic while the
+    // server keeps the star - and a reload then loses the reader's last choice.
+    const result = await hook();
+    vi.mocked(apiClient.post).mockResolvedValue({});
+    vi.mocked(apiClient.delete).mockResolvedValue({});
+    vi.mocked(apiClient.get).mockImplementation(() => new Promise(() => {}));
+
+    await act(async () => {
+      void result.current.setFavourite("c-1", true);
+      await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+      void result.current.setFavourite("c-1", false);
+    });
+
+    await waitFor(() =>
+      expect(apiClient.delete).toHaveBeenCalledWith("/conversations/c-1/favourite"),
+    );
+  });
+
+  it("still queues behind a star that outlived the sidebar", async () => {
+    // Leaving the chat unmounts the sidebar; the request it started carries on,
+    // because nothing aborts it. A queue that lived on the hook would be
+    // discarded with it, and the unstar on the way back would be sent without
+    // waiting - which is the ordering bug the queue exists to prevent, reached
+    // by a different route.
+    const first = renderHook(() => useConversations({}), { wrapper });
+    await waitFor(() => expect(first.result.current.isLoading).toBe(false));
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+    vi.mocked(apiClient.delete).mockResolvedValue({});
+
+    act(() => {
+      void first.result.current.setFavourite("c-1", true);
+    });
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    first.unmount();
+
+    const second = await hook();
+    await act(async () => {
+      void second.current.setFavourite("c-1", false);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(apiClient.delete).not.toHaveBeenCalled();
+
+    await act(async () => {
+      settle({});
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(apiClient.delete).toHaveBeenCalledWith("/conversations/c-1/favourite"),
+    );
+  });
+
+  it("drops a queued click when the organization changed while it waited", async () => {
+    // `apiClient` stamps `X-Organization-Id` from the store when the request is
+    // sent, so a click queued across a switch is refused for a conversation in
+    // the tenant it was made in - and the server keeps the previous click's
+    // answer with nothing on screen saying so.
+    useOrgStore.setState({ activeOrgId: "org-a" });
+    const result = await hook();
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+      void result.current.setFavourite("c-1", false);
+    });
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+
+    act(() => {
+      useOrgStore.setState({ activeOrgId: "org-b" });
+    });
+    await act(async () => {
+      settle({});
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiClient.delete).not.toHaveBeenCalled();
+  });
+
+  it("leaves the refetch to the newest click", async () => {
+    // A superseded click would answer with the state its own request left
+    // behind - the server's star, while the reader has since unstarred it - and
+    // patch that over the newer row.
+    const result = await hook();
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+    let release: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.delete).mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+
+    act(() => {
+      void result.current.setFavourite("c-1", true);
+      void result.current.setFavourite("c-1", false);
+    });
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    const before = vi.mocked(apiClient.get).mock.calls.length;
+
+    await act(async () => {
+      settle({});
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The POST answered and was superseded, so it refetched nothing; the DELETE
+    // that replaced it will, once it lands.
+    expect(vi.mocked(apiClient.get).mock.calls.length).toBe(before);
+    expect(result.current.conversations.find((c) => c.id === "c-1")?.is_favourite).toBe(false);
+    await act(async () => {
+      release({});
+      await Promise.resolve();
+    });
+  });
+
+  it("does not queue the next account behind a hung request", async () => {
+    // A request that hangs never drains its chain, so a key shared across
+    // accounts would leave whoever signs in next waiting on a promise that will
+    // not settle - on a thread they can genuinely see.
+    useAuthStore.getState().setUser({ id: "u-a", email: "a@example.com" } as never);
+    const first = await hook();
+    let settle: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockReturnValue(
+      new Promise((resolve) => {
+        settle = resolve;
+      }),
+    );
+    vi.mocked(apiClient.delete).mockResolvedValue({});
+
+    act(() => {
+      void first.current.setFavourite("c-1", true);
+    });
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+
+    act(() => {
+      useAuthStore.getState().setUser({ id: "u-b", email: "b@example.com" } as never);
+    });
+    const second = await hook();
+    act(() => {
+      void second.current.setFavourite("c-1", false);
+    });
+
+    await waitFor(() =>
+      expect(apiClient.delete).toHaveBeenCalledWith("/conversations/c-1/favourite"),
+    );
+    act(() => settle({}));
+  });
+
+  it("puts the star back when the request is refused", async () => {
+    // The cost of patching first: a refusal has to undo it, or the row keeps a
+    // star the server never recorded and a reload takes it away without a word.
+    const result = await hook();
+    vi.mocked(apiClient.post).mockRejectedValue("boom");
+
+    await act(async () => {
+      await result.current.setFavourite("c-1", true);
+    });
+
+    expect(result.current.conversations.find((c) => c.id === "c-1")?.is_favourite).toBe(false);
+    expect(toast.error).toHaveBeenCalledWith("Could not change the favourite");
+  });
+});
+
+describe("a request that outlives the account that made it", () => {
+  it("keeps a conversation created by one account out of the next one's list", async () => {
+    // The one write that adds a row rather than mapping over the rows already
+    // there, so it is the one that can put A's conversation in B's sidebar.
+    useAuthStore.getState().setUser({ id: "u-a", email: "a@example.com" } as never);
+    const result = await hook();
+
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockImplementation(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    let creating: Promise<unknown>;
+    await act(async () => {
+      creating = result.current.createConversation("A's thread");
+      await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    });
+
+    await act(async () => {
+      useAuthStore.getState().setUser({ id: "u-b", email: "b@example.com" } as never);
+      answer({
+        id: "c-private",
+        title: "A's thread",
+        created_at: "2026-07-01T00:00:00Z",
+        updated_at: null,
+        is_archived: false,
+      });
+      await creating!;
+    });
+
+    expect(result.current.conversations.map((c) => c.id)).not.toContain("c-private");
+  });
+});
+
+describe("starting a new chat", () => {
+  it("leaves even an empty stored conversation so its project cannot leak into a new draft", async () => {
+    // A stored conversation has a fixed project identity, even before any messages.
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-1");
+    useConversationStore.getState().setCurrentMessages([]);
+    window.history.replaceState({}, "", "/chat?id=c-1");
+
+    await act(async () => {
+      await result.current.startNewChat();
+    });
+
+    expect(useConversationStore.getState().currentConversationId).toBeNull();
+    expect(window.location.search).toBe("");
+  });
+
+  it("starts outside the last chat's project", async () => {
+    const result = await hook();
+    useConversationStore.getState().setPendingProjectId("p-1");
+
+    await act(async () => {
+      await result.current.startNewChat();
+    });
+
+    expect(useConversationStore.getState().pendingProjectId).toBeNull();
+  });
+
+  it("leaves a conversation that has messages, and strips the stale id at once", async () => {
+    // A refresh mid-flight has to land on a fresh chat rather than the old thread;
+    // the new id arrives over the websocket with the first message.
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-1");
+    useConversationStore
+      .getState()
+      .setCurrentMessages([{ id: "m-1", role: "user", content: "hi" } as never]);
+    window.history.replaceState({}, "", "/chat?id=c-1");
+
+    await act(async () => {
+      await result.current.startNewChat();
+    });
+
+    expect(useConversationStore.getState().currentConversationId).toBeNull();
+    expect(useConversationStore.getState().currentMessages).toEqual([]);
+    expect(window.location.search).toBe("");
+  });
+
+  it("leaves a conversation that has answered but was never fetched", async () => {
+    // The one this got wrong. A conversation created over the websocket never has
+    // its messages fetched, so `currentMessages` stays empty for a thread that has
+    // just answered - and judging emptiness on that list alone reused it: the
+    // transcript was cleared while the id and the `?id=` survived, so the strip
+    // under the input went on reporting the previous turn's cost and its workspace
+    // fill, and the next message landed in the conversation the user had left.
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-1");
+    useConversationStore.getState().setCurrentMessages([]);
+    useChatStore.setState({
+      messages: [{ id: "m-live", role: "assistant", content: "there" } as never],
+      isStreaming: false,
+    });
+    window.history.replaceState({}, "", "/chat?id=c-1");
+
+    await act(async () => {
+      await result.current.startNewChat();
+    });
+
+    expect(useConversationStore.getState().currentConversationId).toBeNull();
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(window.location.search).toBe("");
+  });
+
+  it("starts a fresh chat when nothing was open", async () => {
+    const result = await hook();
+
+    await act(async () => {
+      await result.current.startNewChat();
+    });
+
+    expect(useConversationStore.getState().currentConversationId).toBeNull();
+  });
+
+  it("starts on the starred agent, which is what makes a default a default", async () => {
+    // Mid-thread switches stay per-thread; a new chat is the reset point.
+    const result = await hook();
+    useAgentSelectionStore.setState({ selectedAgentId: "a-other", defaultAgentId: "a-default" });
+
+    await act(async () => {
+      await result.current.startNewChat();
+    });
+
+    expect(useAgentSelectionStore.getState().selectedAgentId).toBe("a-default");
+  });
+
+  it("leaves the selection alone when nobody starred an agent", async () => {
+    const result = await hook();
+    useAgentSelectionStore.setState({ selectedAgentId: "a-other", defaultAgentId: null });
+
+    await act(async () => {
+      await result.current.startNewChat();
+    });
+
+    expect(useAgentSelectionStore.getState().selectedAgentId).toBe("a-other");
+  });
+});
+
+describe("reading an open conversation again (#54)", () => {
+  it("replaces its messages in place, with nothing cleared and no loading flag", async () => {
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-1");
+    useChatStore.getState().addMessage({
+      id: "m-live",
+      role: "user",
+      content: "still on screen",
+      timestamp: new Date("2026-07-31T12:00:00Z"),
+    });
+    serve({
+      messages: [
+        { id: "m-1", role: "user", content: "hi" },
+        { id: "m-2", role: "assistant", content: "hello" },
+      ],
+    });
+    const loading = vi.fn();
+    const stop = useConversationStore.subscribe((state) => loading(state.isLoading));
+
+    await act(async () => {
+      await result.current.rereadConversation("c-1");
+    });
+    stop();
+
+    expect(useConversationStore.getState().currentMessages).toHaveLength(2);
+    expect(loading).not.toHaveBeenCalledWith(true);
+    // The chat's own copy is the container's to replace; nothing here emptied it.
+    expect(useChatStore.getState().messages).toHaveLength(1);
+  });
+
+  it("drops an answer for a conversation no longer open, or an older re-read", async () => {
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-2");
+    await act(async () => {
+      await result.current.rereadConversation("c-1");
+    });
+    expect(useConversationStore.getState().currentMessages).toEqual([]);
+
+    useConversationStore.getState().setCurrentConversationId("c-1");
+    const pending: ((value: unknown) => void)[] = [];
+    vi.mocked(apiClient.get).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    act(() => {
+      first = result.current.rereadConversation("c-1");
+      second = result.current.rereadConversation("c-1");
+    });
+    await act(async () => {
+      pending[1]?.({ items: [{ id: "new" }, { id: "newer" }], total: 2 });
+      await second;
+      pending[0]?.({ items: [{ id: "old" }], total: 1 });
+      await first;
+    });
+    expect(useConversationStore.getState().currentMessages).toHaveLength(2);
+  });
+
+  it("keeps what is shown when the read fails", async () => {
+    const result = await hook();
+    useConversationStore.getState().setCurrentConversationId("c-1");
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("offline"));
+    await act(async () => {
+      await result.current.rereadConversation("c-1");
+    });
+    expect(useConversationStore.getState().error).toBeNull();
+  });
+});
+
+it("starts a project draft without reusing an unrelated empty conversation or folder", async () => {
+  const result = await hook();
+  useConversationStore.getState().setCurrentConversationId("empty-other-project");
+  useConversationStore.getState().setCurrentMessages([]);
+  useChatStore.setState({ messages: [] });
+  useWorkOnStore.getState().applyProject("old-project", { folder: "/old", mode: "read_only" });
+  await act(async () => {
+    await result.current.startNewChat("new-project");
+  });
+  expect(useConversationStore.getState().currentConversationId).toBeNull();
+  expect(useConversationStore.getState().pendingProjectId).toBe("new-project");
+  expect(useWorkOnStore.getState().targetFor(null)).toBeNull();
+});
+
+describe("transcript request ownership", () => {
+  it.each(["organization", "selection"])(
+    "drops a late select after the %s changes",
+    async (changed) => {
+      const result = await hook();
+      let finish!: (value: unknown) => void;
+      vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+        if (path.includes("/messages"))
+          return new Promise((resolve) => {
+            finish = resolve;
+          });
+        return { items: [], total: 0 };
+      });
+      let reading!: Promise<void>;
+      act(() => {
+        reading = result.current.selectConversation("old");
+      });
+      act(() => {
+        if (changed === "organization") useOrgStore.setState({ activeOrgId: "new-org" });
+        useConversationStore.getState().reset();
+        if (changed === "selection")
+          useConversationStore.setState({ currentConversationId: "new" });
+      });
+      await act(async () => {
+        finish({ items: [{ id: "old-message" }], total: 1 });
+        await reading;
+      });
+      expect(useConversationStore.getState().currentMessages).toEqual([]);
+      expect(useConversationStore.getState().error).toBeNull();
+    },
+  );
+});
+
+it("opens the newest transcript page and prepends older messages without losing the last turn", async () => {
+  const all = Array.from({ length: 102 }, (_, index) => ({
+    id: `m-${index}`,
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `message ${index}`,
+  }));
+  vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+    if (!path.includes("/messages")) return { items: [conversation("long")], total: 1 };
+    const params = new URL(path, "http://localhost").searchParams;
+    const before = params.get("before");
+    const available = before
+      ? all.slice(
+          0,
+          all.findIndex((message) => message.id === before),
+        )
+      : all;
+    return {
+      items:
+        params.get("latest") === "true"
+          ? available.slice(-Number(params.get("limit")))
+          : available.slice(0, 100),
+      total: all.length,
+      cost: null,
+    };
+  });
+  const result = await hook();
+  await act(async () => result.current.selectConversation("long"));
+  expect(result.current.currentMessages.map((message) => message.id)).toEqual(
+    all.slice(2).map((message) => message.id),
+  );
+  expect(result.current.hasEarlierMessages).toBe(true);
+  await act(async () => result.current.loadEarlierMessages());
+  expect(result.current.currentMessages.map((message) => message.id)).toEqual(
+    all.map((message) => message.id),
+  );
+  expect(result.current.hasEarlierMessages).toBe(false);
+});
+
+it("leaves the loaded transcript intact when loading earlier messages fails, and permits retry", async () => {
+  const result = await hook();
+  const rows = Array.from({ length: 101 }, (_, index) => ({
+    id: `m-${index}`,
+    role: "user",
+    content: `${index}`,
+  }));
+  vi.mocked(apiClient.get).mockResolvedValue({ items: rows, total: 201, cost: null });
+  await act(async () => result.current.selectConversation("paged"));
+  vi.mocked(apiClient.get).mockRejectedValue(new Error("earlier unavailable"));
+  await act(async () => result.current.loadEarlierMessages());
+  expect(result.current.currentMessages).toHaveLength(100);
+  expect(result.current.error).toBeTruthy();
+  expect(result.current.isLoadingEarlier).toBe(false);
+  vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 201, cost: null });
+  await act(async () => result.current.loadEarlierMessages());
+  expect(result.current.hasEarlierMessages).toBe(false);
+  const called = vi.mocked(apiClient.get).mock.calls.length;
+  await act(async () => result.current.loadEarlierMessages());
+  expect(apiClient.get).toHaveBeenCalledTimes(called);
+});
+
+it("drops an earlier page that arrives after another conversation was selected", async () => {
+  const result = await hook();
+  const rows = Array.from({ length: 101 }, (_, index) => ({
+    id: `m-${index}`,
+    role: "user",
+    content: `${index}`,
+  }));
+  vi.mocked(apiClient.get).mockResolvedValue({ items: rows, total: 201, cost: null });
+  await act(async () => result.current.selectConversation("paged"));
+  let finish!: (value: unknown) => void;
+  vi.mocked(apiClient.get).mockImplementation(
+    async () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  let request!: Promise<void>;
+  act(() => {
+    request = result.current.loadEarlierMessages();
+  });
+  await act(async () => result.current.loadEarlierMessages());
+  act(() => useConversationStore.getState().reset());
+  await act(async () => {
+    finish({ items: rows, total: 201 });
+    await request;
+  });
+  expect(result.current.currentMessages).toEqual([]);
+});
+
+it("does not revive a read badge from a refresh started during the read write", async () => {
+  serve({ items: [conversation("c-1", { unread: true })] });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(qk.organizations.list(), [{ id: "fallback", is_personal: true }]);
+  function localWrapper({ children }: { children: ReactNode }) {
+    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  }
+  const { result } = renderHook(() => useConversations({}), { wrapper: localWrapper });
+  await waitFor(() => expect(result.current.conversations).toHaveLength(1));
+  let saved: (() => void) | undefined;
+  vi.mocked(apiClient.post).mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        saved = resolve;
+      }),
+  );
+  let marking: Promise<void> | undefined;
+  act(() => {
+    marking = result.current.markRead("c-1");
+  });
+  await waitFor(() => expect(saved).toBeDefined());
+  let oldList: ((value: unknown) => void) | undefined;
+  vi.mocked(apiClient.get).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        oldList = resolve;
+      }),
+  );
+  let refreshing: Promise<void> | undefined;
+  act(() => {
+    refreshing = client.refetchQueries({ queryKey: qk.conversations.list() });
+  });
+  await waitFor(() => expect(oldList).toBeDefined());
+  await act(async () => {
+    saved?.();
+    await marking;
+  });
+  await act(async () => {
+    oldList?.({ items: [conversation("c-1", { unread: true })], total: 1 });
+    await refreshing;
+  });
+  expect(result.current.conversations[0]?.unread).toBe(false);
+});
+
+it("does not roll back a newer read when an older read fails late", async () => {
+  serve({ items: [conversation("c-1", { unread: true })] });
+  const result = await hook();
+  let fail: ((error: Error) => void) | undefined;
+  vi.mocked(apiClient.post).mockImplementationOnce(
+    () =>
+      new Promise((_resolve, reject) => {
+        fail = reject;
+      }),
+  );
+  let first: Promise<void> | undefined;
+  act(() => {
+    first = result.current.markRead("c-1");
+  });
+  await waitFor(() => expect(fail).toBeDefined());
+  await act(async () => {
+    await result.current.markRead("c-1");
+  });
+  await act(async () => {
+    fail?.(new Error("old request failed"));
+    await first;
+  });
+  expect(result.current.conversations[0]?.unread).toBe(false);
+});
+
+it("ignores an older successful read after a newer read has completed", async () => {
+  serve({ items: [conversation("c-1", { unread: true })] });
+  const result = await hook();
+  let finish: (() => void) | undefined;
+  vi.mocked(apiClient.post).mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  let first: Promise<void> | undefined;
+  act(() => {
+    first = result.current.markRead("c-1");
+  });
+  await waitFor(() => expect(finish).toBeDefined());
+  await act(async () => {
+    await result.current.markRead("c-1");
+  });
+  await act(async () => {
+    finish?.();
+    await first;
+  });
+  expect(result.current.conversations[0]?.unread).toBe(false);
+});
+
+it("keeps the first list alive when a chat is marked read before it arrives", async () => {
+  let arrive: (value: unknown) => void = () => {
+    throw new Error("List not requested");
+  };
+  vi.mocked(apiClient.get).mockImplementation((path) =>
+    path.startsWith("/conversations?")
+      ? new Promise((resolve) => {
+          arrive = resolve;
+        })
+      : Promise.resolve({ items: [], total: 0 }),
+  );
+  vi.mocked(apiClient.post).mockResolvedValue(undefined);
+  const { result } = renderHook(() => useConversations(), { wrapper });
+  let marked: Promise<void> | undefined;
+  act(() => {
+    marked = result.current.markRead("c-1");
+  });
+  await waitFor(() => expect(apiClient.post).toHaveBeenCalledWith("/conversations/c-1/read", {}));
+  await act(async () => {
+    arrive({
+      items: [
+        conversation("c-1", {
+          unread: true,
+          agents: [{ id: "writer", name: "Writer" }],
+          running_since: "2026-10-27T12:00:00Z",
+        }),
+      ],
+      total: 1,
+    });
+    await marked;
+  });
+  expect(result.current.conversations[0]).toMatchObject({
+    unread: false,
+    agents: [{ id: "writer", name: "Writer" }],
+    running_since: "2026-10-27T12:00:00Z",
+  });
+});
+
+it("does not send a read marker after the organization changes during query cancellation", async () => {
+  serve({ items: [conversation("c-1", { unread: true })] });
+  const result = await hook();
+  let finishCancellation: (() => void) | undefined;
+  const cancel = vi.spyOn(QueryClient.prototype, "cancelQueries").mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        finishCancellation = resolve;
+      }),
+  );
+  let marked: Promise<void> | undefined;
+  try {
+    act(() => {
+      marked = result.current.markRead("c-1");
+    });
+    await waitFor(() => expect(finishCancellation).toBeDefined());
+    act(() => {
+      useOrgStore.setState({ activeOrgId: "another-organization" });
+    });
+    await act(async () => {
+      finishCancellation?.();
+      await marked;
+    });
+    expect(apiClient.post).not.toHaveBeenCalled();
+  } finally {
+    cancel.mockRestore();
+  }
+});

@@ -1,0 +1,591 @@
+"""Tests for the sharing service - changing who reaches a resource.
+
+Sharing is an edit: only someone who can already change the resource may change
+who else can. Every change is audited, which is what makes "who gave whom
+access" answerable after the fact.
+"""
+
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.core.exceptions import AuthorizationError, BadRequestError, NotFoundError
+from app.core.permissions import AuthContext, OrgRoleName
+from app.db.models.resource_grant import GrantLevel, Visibility
+from app.services import access, sharing
+from app.services.access import COLLECTION
+from app.services.sharing import (
+    _GUARDS,
+    Deferred,
+    ShareChange,
+    SharingService,
+    register_sharing_guard,
+)
+
+
+def _ctx(role: str, org_id=None, user_id=None) -> AuthContext:
+    return AuthContext(
+        user_id=user_id or uuid.uuid4(),
+        organization_id=org_id or uuid.uuid4(),
+        role=role,
+    )
+
+
+def _resource(org_id, owner_user_id=None, visibility=Visibility.PRIVATE):
+    resource = MagicMock()
+    resource.id = uuid.uuid4()
+    resource.organization_id = org_id
+    resource.owner_user_id = owner_user_id
+    resource.visibility = visibility.value
+    return resource
+
+
+def _db():
+    db = MagicMock()
+    db.flush = AsyncMock()
+    db.add = MagicMock()
+    return db
+
+
+class TestGetSharing:
+    @pytest.mark.anyio
+    async def test_a_member_who_cannot_see_the_resource_is_told_it_does_not_exist(self):
+        """Anything else turns the share list into a way to confirm ids exist.
+
+        Refusing with "forbidden" would answer the only question the caller
+        actually had, so the refusal has to look like an absence - and it must
+        happen before the grant rows are read, not after.
+        """
+        ctx = _ctx(OrgRoleName.MEMBER)
+        resource = _resource(ctx.organization_id, owner_user_id=uuid.uuid4())
+
+        with (
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.services.sharing.resource_grant_repo.list_for_resource", new=AsyncMock()
+            ) as listed,
+            pytest.raises(NotFoundError) as refused,
+        ):
+            await SharingService(_db()).get_sharing(ctx, resource, resource_type=COLLECTION)
+
+        assert refused.value.details == {"resource_id": str(resource.id)}
+        assert listed.await_count == 0
+
+    @pytest.mark.anyio
+    async def test_the_share_list_resolves_emails_only_inside_the_organization(self):
+        """A grant stores a user id; the list shows an address, and the gap between
+        them must not become a directory lookup. Resolving the id org-wide would
+        let anyone who can see one shared resource read the email of a user who
+        is not a member here.
+        """
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+        subject = uuid.uuid4()
+        grant = MagicMock(subject_user_id=subject, subject_group_id=None)
+
+        with (
+            patch(
+                "app.services.sharing.resource_grant_repo.list_for_resource",
+                new=AsyncMock(return_value=[grant]),
+            ) as listed,
+            patch(
+                "app.services.sharing.member_repo.get_emails_for_users",
+                new=AsyncMock(return_value={subject: "colleague@example.com"}),
+            ) as emails,
+            patch("app.services.sharing.group_repo.get_names", new=AsyncMock(return_value={})),
+        ):
+            state = await SharingService(_db()).get_sharing(ctx, resource, resource_type=COLLECTION)
+
+        assert state.grants == [grant]
+        assert state.emails == {subject: "colleague@example.com"}
+        assert listed.call_args.kwargs["organization_id"] == ctx.organization_id
+        assert listed.call_args.kwargs["resource_type"] == COLLECTION.key
+        assert listed.call_args.kwargs["resource_id"] == resource.id
+        assert emails.call_args.kwargs["organization_id"] == ctx.organization_id
+        assert emails.call_args.kwargs["user_ids"] == [subject]
+
+    @pytest.mark.anyio
+    async def test_group_names_are_resolved_inside_the_organization_only(self):
+        """A grant names a group id; the panel shows its name, looked up in this tenant."""
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+        group_id = uuid.uuid4()
+        grant = MagicMock(subject_user_id=None, subject_group_id=group_id)
+
+        with (
+            patch(
+                "app.services.sharing.resource_grant_repo.list_for_resource",
+                new=AsyncMock(return_value=[grant]),
+            ),
+            patch(
+                "app.services.sharing.member_repo.get_emails_for_users",
+                new=AsyncMock(return_value={}),
+            ) as emails,
+            patch(
+                "app.services.sharing.group_repo.get_names",
+                new=AsyncMock(return_value={group_id: "Finance"}),
+            ) as names,
+        ):
+            state = await SharingService(_db()).get_sharing(ctx, resource, resource_type=COLLECTION)
+
+        assert state.group_names == {group_id: "Finance"}
+        assert names.call_args.kwargs == {
+            "organization_id": ctx.organization_id,
+            "group_ids": [group_id],
+        }
+        # A group grant has no person to look an address up for.
+        assert emails.call_args.kwargs["user_ids"] == []
+
+
+class TestShare:
+    @pytest.mark.anyio
+    async def test_owner_can_share_and_the_change_is_audited(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+        subject = uuid.uuid4()
+
+        with (
+            patch("app.services.sharing.member_repo.get", new=AsyncMock(return_value=MagicMock())),
+            patch(
+                "app.services.sharing.resource_grant_repo.upsert",
+                new=AsyncMock(return_value=MagicMock()),
+            ) as upsert,
+            patch("app.services.sharing.record_audit", new=AsyncMock()) as audit,
+        ):
+            await SharingService(_db()).share(
+                ctx,
+                resource,
+                resource_type=COLLECTION,
+                subject_user_id=subject,
+                level=GrantLevel.EDIT,
+            )
+
+        assert upsert.call_args.kwargs["subject_user_id"] == subject
+        assert upsert.call_args.kwargs["level"] is GrantLevel.EDIT
+        assert audit.call_args.kwargs["action"] == "resource.share"
+
+    @pytest.mark.anyio
+    async def test_member_cannot_share_someone_elses_resource(self):
+        ctx = _ctx(OrgRoleName.MEMBER)
+        resource = _resource(ctx.organization_id, owner_user_id=uuid.uuid4())
+
+        with (
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            pytest.raises(AuthorizationError),
+        ):
+            await SharingService(_db()).share(
+                ctx,
+                resource,
+                resource_type=COLLECTION,
+                subject_user_id=uuid.uuid4(),
+                level=GrantLevel.READ,
+            )
+
+    @pytest.mark.anyio
+    async def test_cannot_share_with_someone_outside_the_organization(self):
+        """A grant pointing at a non-member would be a hole waiting to open."""
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+
+        with (
+            patch("app.services.sharing.member_repo.get", new=AsyncMock(return_value=None)),
+            pytest.raises(BadRequestError),
+        ):
+            await SharingService(_db()).share(
+                ctx,
+                resource,
+                resource_type=COLLECTION,
+                subject_user_id=uuid.uuid4(),
+                level=GrantLevel.READ,
+            )
+
+
+class TestShareWithGroup:
+    @pytest.mark.anyio
+    async def test_sharing_with_a_group_writes_a_group_grant_and_audits_it(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+        group = MagicMock(id=uuid.uuid4())
+
+        with (
+            patch(
+                "app.services.sharing.group_repo.get", new=AsyncMock(return_value=group)
+            ) as found,
+            patch(
+                "app.services.sharing.resource_grant_repo.upsert_for_group",
+                new=AsyncMock(return_value=MagicMock()),
+            ) as upsert,
+            patch("app.services.sharing.record_audit", new=AsyncMock()) as audit,
+            # Who is told is `test_group_leads_and_shares`'s, over a real database.
+            patch.object(SharingService, "_tell_the_group", new=AsyncMock()),
+        ):
+            await SharingService(_db()).share_with_group(
+                ctx,
+                resource,
+                resource_type=COLLECTION,
+                group_id=group.id,
+                level=GrantLevel.USE,
+            )
+
+        assert found.call_args.kwargs["organization_id"] == ctx.organization_id
+        assert upsert.call_args.kwargs["subject_group_id"] == group.id
+        assert upsert.call_args.kwargs["level"] is GrantLevel.USE
+        assert audit.call_args.kwargs["action"] == "resource.share"
+        assert audit.call_args.kwargs["details"] == {
+            "subject_group_id": str(group.id),
+            "level": "use",
+        }
+
+    @pytest.mark.anyio
+    @pytest.mark.security
+    async def test_a_group_of_another_organization_is_refused(self):
+        """The lookup is scoped to the caller's tenant, so a foreign group id is absent."""
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+
+        with (
+            patch("app.services.sharing.group_repo.get", new=AsyncMock(return_value=None)),
+            patch(
+                "app.services.sharing.resource_grant_repo.upsert_for_group", new=AsyncMock()
+            ) as upsert,
+            pytest.raises(BadRequestError),
+        ):
+            await SharingService(_db()).share_with_group(
+                ctx,
+                resource,
+                resource_type=COLLECTION,
+                group_id=uuid.uuid4(),
+                level=GrantLevel.READ,
+            )
+
+        assert upsert.await_count == 0
+
+    @pytest.mark.anyio
+    @pytest.mark.security
+    async def test_a_member_who_cannot_edit_cannot_share_with_a_group(self):
+        ctx = _ctx(OrgRoleName.MEMBER)
+        resource = _resource(ctx.organization_id, owner_user_id=uuid.uuid4())
+
+        with (
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("app.services.sharing.group_repo.get", new=AsyncMock()) as found,
+            pytest.raises(AuthorizationError),
+        ):
+            await SharingService(_db()).share_with_group(
+                ctx,
+                resource,
+                resource_type=COLLECTION,
+                group_id=uuid.uuid4(),
+                level=GrantLevel.READ,
+            )
+
+        assert found.await_count == 0
+
+    @pytest.mark.anyio
+    async def test_revoking_a_group_share_is_audited(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+        group_id = uuid.uuid4()
+
+        with (
+            patch(
+                "app.services.sharing.resource_grant_repo.revoke_for_group",
+                new=AsyncMock(return_value=True),
+            ) as revoked,
+            patch("app.services.sharing.record_audit", new=AsyncMock()) as audit,
+        ):
+            await SharingService(_db()).revoke_group(
+                ctx, resource, resource_type=COLLECTION, group_id=group_id
+            )
+
+        assert revoked.call_args.kwargs["subject_group_id"] == group_id
+        assert audit.call_args.kwargs["action"] == "resource.unshare"
+        assert audit.call_args.kwargs["details"] == {"subject_group_id": str(group_id)}
+
+    @pytest.mark.anyio
+    async def test_revoking_a_group_share_that_does_not_exist_is_not_found(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+
+        with (
+            patch(
+                "app.services.sharing.resource_grant_repo.revoke_for_group",
+                new=AsyncMock(return_value=False),
+            ),
+            pytest.raises(NotFoundError),
+        ):
+            await SharingService(_db()).revoke_group(
+                ctx, resource, resource_type=COLLECTION, group_id=uuid.uuid4()
+            )
+
+
+class TestRevoke:
+    @pytest.mark.anyio
+    async def test_revoking_a_missing_share_is_not_found(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+
+        with (
+            patch(
+                "app.services.sharing.resource_grant_repo.revoke",
+                new=AsyncMock(return_value=False),
+            ),
+            pytest.raises(NotFoundError),
+        ):
+            await SharingService(_db()).revoke(
+                ctx, resource, resource_type=COLLECTION, subject_user_id=uuid.uuid4()
+            )
+
+    @pytest.mark.anyio
+    async def test_revoke_is_audited(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+
+        with (
+            patch(
+                "app.services.sharing.resource_grant_repo.revoke",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("app.services.sharing.record_audit", new=AsyncMock()) as audit,
+        ):
+            await SharingService(_db()).revoke(
+                ctx, resource, resource_type=COLLECTION, subject_user_id=uuid.uuid4()
+            )
+
+        assert audit.call_args.kwargs["action"] == "resource.unshare"
+
+
+class TestVisibility:
+    @pytest.mark.anyio
+    async def test_visibility_change_records_both_ends(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+
+        with patch("app.services.sharing.record_audit", new=AsyncMock()) as audit:
+            await SharingService(_db()).set_visibility(
+                ctx, resource, resource_type=COLLECTION, visibility=Visibility.ORG
+            )
+
+        assert resource.visibility == Visibility.ORG.value
+        assert audit.call_args.kwargs["details"] == {"from": "private", "to": "org"}
+
+    @pytest.mark.anyio
+    async def test_viewer_cannot_publish_a_resource_to_the_org(self):
+        ctx = _ctx(OrgRoleName.VIEWER)
+        resource = _resource(ctx.organization_id, owner_user_id=uuid.uuid4())
+
+        with (
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            pytest.raises(AuthorizationError),
+        ):
+            await SharingService(_db()).set_visibility(
+                ctx, resource, resource_type=COLLECTION, visibility=Visibility.ORG
+            )
+
+    @pytest.mark.anyio
+    async def test_making_an_unowned_resource_private_gives_it_an_owner(self):
+        """Private to whom? An organization-wide vault secret has no owner, and
+        an unowned private row is one nobody can see and nobody can delete -
+        which the database refuses outright, arriving as a 500.
+
+        The caller becomes the owner rather than being told to "transfer it
+        first", because nothing in this product transfers ownership: that
+        instruction has no way to be followed. It gives away nothing either -
+        whoever gets here already passed the edit check, and editing a key
+        includes rotating and deleting it."""
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=None, visibility=Visibility.ORG)
+
+        with patch("app.services.sharing.record_audit", new=AsyncMock()) as audit:
+            await SharingService(_db()).set_visibility(
+                ctx, resource, resource_type=COLLECTION, visibility=Visibility.PRIVATE
+            )
+
+        assert resource.owner_user_id == ctx.user_id
+        assert resource.visibility == Visibility.PRIVATE.value
+        # Its own entry: "who owns this now" is not a question a visibility
+        # change should answer quietly.
+        assert [call.kwargs["action"] for call in audit.call_args_list] == [
+            "resource.owner_claimed",
+            "resource.visibility_changed",
+        ]
+
+    @pytest.mark.anyio
+    async def test_an_owner_already_set_is_left_alone(self):
+        """Going private must not quietly move somebody else's key to whoever
+        happened to change its visibility."""
+        ctx = _ctx(OrgRoleName.OWNER)
+        owner = uuid.uuid4()
+        resource = _resource(ctx.organization_id, owner_user_id=owner, visibility=Visibility.ORG)
+
+        with patch("app.services.sharing.record_audit", new=AsyncMock()) as audit:
+            await SharingService(_db()).set_visibility(
+                ctx, resource, resource_type=COLLECTION, visibility=Visibility.PRIVATE
+            )
+
+        assert resource.owner_user_id == owner
+        assert [call.kwargs["action"] for call in audit.call_args_list] == [
+            "resource.visibility_changed"
+        ]
+
+
+class TestSharingGuard:
+    """A guard registered for a resource type is asked before a visibility change and owns
+    adoption; a type without one keeps the generic behaviour (tests above)."""
+
+    @staticmethod
+    def _guard(refuse: bool = False):
+        guard = MagicMock()
+        guard.before_visibility = AsyncMock(
+            side_effect=AuthorizationError(message="nope") if refuse else None
+        )
+        guard.before_share = AsyncMock(return_value=None)
+        guard.adopt = AsyncMock()
+        return guard
+
+    @pytest.mark.anyio
+    async def test_the_guard_is_asked_before_the_change_and_may_refuse_it(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=None, visibility=Visibility.ORG)
+        guard = self._guard(refuse=True)
+
+        with (
+            patch.dict("app.services.sharing._GUARDS", {COLLECTION.key: guard}),
+            pytest.raises(AuthorizationError),
+        ):
+            await SharingService(_db()).set_visibility(
+                ctx, resource, resource_type=COLLECTION, visibility=Visibility.PRIVATE
+            )
+
+        guard.before_visibility.assert_awaited_once()
+        guard.adopt.assert_not_awaited()
+        assert resource.visibility == Visibility.ORG.value
+        assert resource.owner_user_id is None
+
+    @pytest.mark.anyio
+    async def test_the_guard_adopts_an_ownerless_row_in_place_of_the_generic_claim(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=None, visibility=Visibility.ORG)
+        guard = self._guard()
+
+        with (
+            patch.dict("app.services.sharing._GUARDS", {COLLECTION.key: guard}),
+            patch("app.services.sharing.record_audit", new=AsyncMock()) as audit,
+        ):
+            await SharingService(_db()).set_visibility(
+                ctx, resource, resource_type=COLLECTION, visibility=Visibility.PRIVATE
+            )
+
+        guard.adopt.assert_awaited_once()
+        assert resource.owner_user_id is None  # the guard's `adopt` sets it, not the service
+        assert [call.kwargs["action"] for call in audit.call_args_list] == [
+            "resource.visibility_changed"
+        ]
+
+    @pytest.mark.anyio
+    async def test_a_row_with_an_owner_is_not_adopted(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(
+            ctx.organization_id, owner_user_id=uuid.uuid4(), visibility=Visibility.ORG
+        )
+        guard = self._guard()
+
+        with (
+            patch.dict("app.services.sharing._GUARDS", {COLLECTION.key: guard}),
+            patch("app.services.sharing.record_audit", new=AsyncMock()),
+        ):
+            await SharingService(_db()).set_visibility(
+                ctx, resource, resource_type=COLLECTION, visibility=Visibility.PRIVATE
+            )
+
+        guard.adopt.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_guard_that_defers_a_grant_stops_it_being_applied(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+        subject, group = uuid.uuid4(), uuid.uuid4()
+        guard = self._guard()
+        deferred = Deferred(request_id=uuid.uuid4(), waiting_for=None)
+        guard.before_share = AsyncMock(return_value=deferred)
+
+        with (
+            patch.dict("app.services.sharing._GUARDS", {COLLECTION.key: guard}),
+            patch("app.services.sharing.member_repo.get", new=AsyncMock(return_value=object())),
+            patch("app.services.sharing.group_repo.get", new=AsyncMock(return_value=MagicMock())),
+            patch("app.services.sharing.resource_grant_repo.upsert", new=AsyncMock()) as person,
+            patch(
+                "app.services.sharing.resource_grant_repo.upsert_for_group", new=AsyncMock()
+            ) as groups,
+            patch("app.services.sharing.record_audit", new=AsyncMock()) as audit,
+        ):
+            shared = await SharingService(_db()).share(
+                ctx,
+                resource,
+                resource_type=COLLECTION,
+                subject_user_id=subject,
+                level=GrantLevel.READ,
+            )
+            with_group = await SharingService(_db()).share_with_group(
+                ctx, resource, resource_type=COLLECTION, group_id=group, level=GrantLevel.EDIT
+            )
+
+        assert shared is deferred and with_group is deferred
+        asked = [call.args[3] for call in guard.before_share.await_args_list]
+        assert asked[0] == ShareChange(subject_user_id=subject, level=GrantLevel.READ)
+        assert asked[1].subject_group_id is not None and asked[1].level is GrantLevel.EDIT
+        assert person.await_count == groups.await_count == audit.await_count == 0
+
+    @pytest.mark.anyio
+    async def test_a_guard_that_defers_a_visibility_leaves_it_as_it_was(self):
+        ctx = _ctx(OrgRoleName.OWNER)
+        resource = _resource(ctx.organization_id, owner_user_id=ctx.user_id)
+        guard = self._guard()
+        deferred = Deferred(request_id=uuid.uuid4(), waiting_for=None)
+        guard.before_share = AsyncMock(return_value=deferred)
+
+        with (
+            patch.dict("app.services.sharing._GUARDS", {COLLECTION.key: guard}),
+            patch("app.services.sharing.record_audit", new=AsyncMock()) as audit,
+        ):
+            changed = await SharingService(_db()).set_visibility(
+                ctx, resource, resource_type=COLLECTION, visibility=Visibility.ORG
+            )
+
+        assert changed is deferred
+        assert resource.visibility == Visibility.PRIVATE.value
+        assert audit.await_count == 0
+        assert guard.before_share.await_args.args[3] == ShareChange(visibility=Visibility.ORG)
+
+    def test_registering_a_guard_installs_it_for_its_type(self):
+        guard = self._guard()
+        with patch.dict("app.services.sharing._GUARDS", clear=False):
+            register_sharing_guard(COLLECTION, guard)
+            assert _GUARDS[COLLECTION.key] is guard
+
+
+@pytest.mark.parametrize(
+    "resource_type",
+    # Every kind `access` defines, so the next one added is checked without a
+    # second list to remember.
+    [kind for kind in vars(access).values() if isinstance(kind, access.ResourceType)],
+    ids=lambda kind: kind.key,
+)
+def test_every_shareable_kind_has_a_page_a_share_notification_opens(resource_type) -> None:
+    """A kind missing here made every share of it with a group a `KeyError`: the
+    notification is written in the same transaction, so the share rolled back
+    with a 500 - every project shared with a department."""
+    assert sharing._CONSOLE_PATHS[resource_type.key].startswith("/")

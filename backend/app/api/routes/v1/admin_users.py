@@ -1,0 +1,214 @@
+from typing import Annotated, Any, Literal
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Query, Request, status
+from pydantic import StringConstraints
+
+from app.api.deps import (
+    CurrentAppAdmin,
+    DBSession,
+    ImpersonationSvc,
+    PersonalDataSvc,
+    UserSvc,
+    limit_personal_data_export,
+)
+from app.core.audit import record_audit
+from app.schemas.personal_data import PersonalDataExport
+from app.schemas.user import (
+    AdminUserDetail,
+    AdminUserList,
+    ImpersonateResponse,
+    UserRead,
+    UserUpdate,
+)
+from app.services.notifications import NotificationService
+
+router = APIRouter()
+
+
+@router.get("", response_model=AdminUserList)
+async def list_users(
+    _: CurrentAppAdmin,
+    service: UserSvc,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    search: str | None = Query(None),
+    sort_by: Literal["email", "full_name", "conversations", "created_at"] = Query(
+        "created_at", description="Sort column"
+    ),
+    sort_dir: Literal["asc", "desc"] = Query("desc", description="Sort direction"),
+) -> Any:
+    return await service.admin_list_with_counts(
+        skip=skip, limit=limit, search=search, sort_by=sort_by, sort_dir=sort_dir
+    )
+
+
+@router.get("/{user_id}", response_model=UserRead)
+async def get_user(
+    user_id: UUID,
+    _: CurrentAppAdmin,
+    service: UserSvc,
+) -> Any:
+    return await service.get_by_id(user_id)
+
+
+@router.get("/{user_id}/detail", response_model=AdminUserDetail)
+async def get_user_detail(
+    user_id: UUID,
+    _: CurrentAppAdmin,
+    service: UserSvc,
+) -> Any:
+    """Where this person has access, when they were last here, what is open.
+
+    Its own route rather than fields on `GET /{user_id}`, because it is a view
+    assembled from three tables and a user is read in a dozen places that need
+    none of it. What it answers is what a deployment admin is about to decide
+    on: an account with no membership anywhere and no session in three months
+    is a different decision from one that owns two organizations (#942).
+    """
+    return await service.admin_detail(user_id)
+
+
+@router.patch("/{user_id}", response_model=UserRead)
+async def update_user(
+    user_id: UUID,
+    user_in: UserUpdate,
+    request: Request,
+    admin: CurrentAppAdmin,
+    db: DBSession,
+    service: UserSvc,
+) -> Any:
+    user = await service.admin_update(user_id, user_in, acting_admin_id=admin.id)
+    notifications = NotificationService(db)
+    # Which fields were set, never what they were set to. `UserUpdate` carries
+    # `password`, so dumping the submitted body wrote the plaintext an
+    # administrator typed into `app_admin_audit_logs.details`, where it sat in a
+    # JSONB column for as long as the trail is kept (agenticos#412). The names
+    # are what the trail is for; the values are on the row. `model_fields_set`
+    # rather than `model_dump`, so the plaintext is not even built to be thrown
+    # away.
+    # Before the audit entry, never after it: `record_audit` holds the
+    # chain lock to the end of the transaction, and the notification
+    # below reaches for a `users` row that `admin_delete` takes first
+    # and the chain second (#1763).
+    audience = await notifications.hold_security_audience(None)
+    entry = await record_audit(
+        db,
+        actor_user_id=admin.id,
+        action="admin.user.update",
+        target_type="user",
+        target_id=str(user_id),
+        details={"fields": sorted(user_in.model_fields_set)},
+        ip_address=request.client.host if request.client else None,
+    )
+    await notifications.security_event(entry, recipients=audience)
+    return user
+
+
+@router.get(
+    "/{user_id}/export",
+    response_model=PersonalDataExport,
+    dependencies=[Depends(limit_personal_data_export)],
+)
+async def export_user_data(
+    user_id: UUID,
+    service: PersonalDataSvc,
+    admin: CurrentAppAdmin,
+    reason: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=3, max_length=500),
+        Query(description="Why this export was made. Recorded in the audit trail."),
+    ],
+) -> Any:
+    """Everything this deployment holds about one person, for a data-protection request.
+
+    The administrator's half of `GET /me/data/export`, for the case the person
+    cannot make the request themselves - a DPO forwarding an art. 15 request
+    about somebody who has left, most often.
+
+    **The reason is required, and that is the point of having it.** An
+    administrator reading a colleague's entire conversation history is a
+    legitimate act about twice a year and a serious one every time; an entry
+    saying only that it happened tells whoever reviews the trail nothing they
+    can act on. It is recorded verbatim, so it is also the administrator's own
+    account of why - stripped before it is measured, because three spaces
+    satisfied a length check and told the trail nothing.
+
+    **Rate-limited like `/me/data/export`, on the same counter.** The threat the
+    limit exists for is a stolen privileged session walking the deployment's
+    people, and that session uses this route rather than that one.
+    """
+    return await service.export(user_id, actor_user_id=admin.id, reason=reason)
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def delete_user(
+    user_id: UUID,
+    request: Request,
+    admin: CurrentAppAdmin,
+    db: DBSession,
+    service: UserSvc,
+    reason: str | None = Query(
+        default=None,
+        max_length=500,
+        description="Why this account was deleted. Recorded in the audit trail.",
+    ),
+) -> None:
+    """Delete an account and everything this deployment holds about the person.
+
+    What goes and what stays is the inventory in `docs/security.md`, and the
+    short version is: what is *about* them goes - their threads, their ratings,
+    their sessions, what agents wrote down about them, the platform accounts
+    they linked - and what they *created* on the organization's behalf is handed
+    on rather than removed.
+
+    `reason` is optional here where the export requires one, and the asymmetry is
+    deliberate: a deletion is often a routine offboarding with nothing to
+    explain, while reading somebody's conversations never is.
+    """
+    target = await service.get_by_id(user_id)
+    await service.admin_delete(user_id, acting_admin_id=admin.id)
+    details: dict[str, Any] = {"email": target.email}
+    if reason is not None:
+        details["reason"] = reason
+    notifications = NotificationService(db)
+    # Before the audit entry, never after it: `record_audit` holds the
+    # chain lock to the end of the transaction, and the notification
+    # below reaches for a `users` row that `admin_delete` takes first
+    # and the chain second (#1763).
+    audience = await notifications.hold_security_audience(None)
+    entry = await record_audit(
+        db,
+        actor_user_id=admin.id,
+        action="admin.user.delete",
+        target_type="user",
+        target_id=str(user_id),
+        details=details,
+        ip_address=request.client.host if request.client else None,
+    )
+    await notifications.security_event(entry, recipients=audience)
+
+
+@router.post("/{user_id}/impersonate", response_model=ImpersonateResponse)
+async def impersonate_user(
+    request: Request,
+    user_id: UUID,
+    admin: CurrentAppAdmin,
+    impersonation: ImpersonationSvc,
+) -> Any:
+    """Start acting as the target user, for an hour or until it is ended.
+
+    The answer is a session, not a bare credential: the token names a row in
+    `sessions` and is refused the moment that row is ended, so an impersonation
+    stops when the administrator ends it, when the target signs out everywhere or
+    resets their password by email, when the administrator is suspended, or when
+    the hour is up - whichever is first (#1044).
+    It carries the administrator as an `act` claim, so every action taken with it
+    is attributable to who was really acting (#943).
+    """
+    return await impersonation.start(
+        admin=admin,
+        target_id=user_id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("User-Agent"),
+    )

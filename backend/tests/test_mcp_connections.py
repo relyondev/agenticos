@@ -1,0 +1,6563 @@
+"""Tests for MCP connections: agents/mcp toolset building + the service layer."""
+
+import asyncio
+import contextlib
+import json
+import logging
+import re
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import httpx2
+
+# Imported before any test here patches `mcp.client.streamable_http`, and for that
+# reason only. It loads FastMCP's HTTP transport, which binds
+# `streamable_http_client` by name at import: first imported lazily inside one of
+# the patches below, it kept the fake for the rest of the worker, and every real
+# MCP client after it opened two strings as streams (`test_platform_mcp`).
+import pydantic_ai.mcp  # noqa: F401
+import pytest
+from mcp.shared.auth import OAuthMetadata, OAuthToken
+from pydantic import AnyUrl, SecretStr, ValidationError
+from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets.abstract import ToolsetTool
+from sqlalchemy.exc import IntegrityError
+
+from app.agents import mcp_oauth
+from app.agents.mcp import (
+    ANSWERED_FOR,
+    CONNECT_TIMEOUT_SECS,
+    MAX_INPUT_SCHEMA_BYTES,
+    TOOL_NAME_LIMIT,
+    AnsweredRecently,
+    FittedNames,
+    McpProbeError,
+    McpServerSpec,
+    McpToolInfo,
+    ToolOrigins,
+    _answered,
+    _make_toolset,
+    _mcp_transport,
+    build_mcp_toolsets,
+    fitted_tool_name,
+    prefix_collisions,
+    probe_error_message,
+    probe_mcp_server,
+    tool_prefix,
+)
+from app.agents.mcp_oauth import McpOAuthPayload
+from app.agents.spec import OrgMcpServerRef, PersonalMcpServerRef, PlatformMcpServerRef
+from app.core.config import settings
+from app.core.exceptions import (
+    AlreadyExistsError,
+    AuthorizationError,
+    BadRequestError,
+    NotFoundError,
+)
+from app.core.permissions import AuthContext, OrgRoleName
+from app.core.pinned_http import PinnedAsyncClient
+from app.core.secret_kinds import GithubOAuthAppSecret
+from app.core.vault import VaultScope, seal, unseal
+from app.db.models.mcp_connection import AUTHORIZATION_EXPIRED, McpConnection
+from app.schemas.mcp_connection import (
+    McpConnectionCreate,
+    McpConnectionRead,
+    McpConnectionUpdate,
+    McpOAuthStart,
+    OrgMcpConnectionCreate,
+    OrgMcpConnectionUpdate,
+)
+from app.services import impersonation as impersonation_service
+from app.services import mcp_connection as mcp_connection_service
+from app.services.impersonation import ActiveImpersonation
+from app.services.mcp_connection import (
+    AccountNote,
+    McpConnectionService,
+    UnavailablePersonalService,
+    UnavailablePlatformServer,
+    UnavailablePrefixCollision,
+    UnavailableUnreachableServer,
+    _apply_token,
+    connection_scope,
+    resolve_auth_headers,
+    watched_connection_spec,
+)
+from app.services.organization_secret import OrganizationSecretService
+from app.services.portals import exceptions as portals_exceptions
+from app.services.portals import github_oauth
+
+
+@contextlib.asynccontextmanager
+async def _acm(value):
+    """Minimal async context manager yielding *value* (fakes a transport client)."""
+    yield value
+
+
+@contextlib.contextmanager
+def _impersonating():
+    """Run the block as an administrator acting as another account (#1438)."""
+    token = impersonation_service._active.set(
+        ActiveImpersonation(
+            session_id=uuid4(),
+            user_id=uuid4(),
+            impersonator_id=uuid4(),
+            expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+    )
+    try:
+        yield
+    finally:
+        impersonation_service._active.reset(token)
+
+
+def _allow_any_url(monkeypatch) -> None:
+    """Skip SSRF validation for tests that are about something else (it resolves
+    DNS, so it must not run against made-up hostnames)."""
+
+    async def _passthrough(url: str, **_kwargs: object) -> str:
+        return url
+
+    monkeypatch.setattr(mcp_connection_service, "validate_mcp_url", _passthrough)
+
+
+class _AnyIdMap(dict):
+    """A `get_org_scoped_by_ids` result that answers `value` for any id (#954)."""
+
+    def __init__(self, value):
+        super().__init__()
+        self._value = value
+
+    def get(self, _key, _default=None):
+        return self._value
+
+
+def _attached(resolved: mcp_connection_service.ResolvedMcpToolsets) -> list[object]:
+    """The toolsets attached, without the wrapper noting an org server's tools."""
+    return [
+        toolset.wrapped if isinstance(toolset, ToolOrigins) else toolset
+        for toolset in resolved.toolsets
+    ]
+
+
+def _batch(value):
+    """An `AsyncMock` for `get_org_scoped_by_ids`, returning `value` for any id."""
+    return AsyncMock(return_value=_AnyIdMap(value))
+
+
+def _connection(**overrides) -> McpConnection:
+    defaults: dict = {
+        "id": uuid4(),
+        "user_id": uuid4(),
+        "organization_id": None,
+        "created_by_user_id": None,
+        # Personal unless a test says otherwise - an in-memory row gets no
+        # column default, and a scope of None would fail every ownership check
+        # for a reason that has nothing to do with what the test is about.
+        "scope": "user",
+        "catalog_key": None,
+        "is_default": False,
+        "label": None,
+        "name": "github",
+        "url": "https://example.com/mcp",
+        "auth_token": None,
+        "secret_key_version": 1,
+        "allowed_tools": None,
+        "is_enabled": True,
+        "include_instructions": False,
+        "auth_type": "bearer",
+        "oauth_state": None,
+        "oauth_payload": None,
+        "oauth_pending_payload": None,
+        "last_status": None,
+        "last_error": None,
+        "last_checked_at": None,
+        "created_at": datetime.now(UTC),
+        "updated_at": None,
+    }
+    defaults.update(overrides)
+    conn = McpConnection()
+    for key, value in defaults.items():
+        setattr(conn, key, value)
+    return conn
+
+
+def _seal_into(conn: McpConnection, plaintext: str) -> str:
+    """Seal a value for this row's owner, exactly as the service would.
+
+    Sealing depends on the row, so a fixture cannot prepare a ciphertext before
+    the row exists - which is the whole point: a personal token is bound to the
+    member, an organization one to the organization.
+    """
+    return seal(
+        plaintext, scope=connection_scope(conn), key_version=conn.secret_key_version
+    ).ciphertext
+
+
+def _open_from(conn: McpConnection, ciphertext: str) -> str:
+    return unseal(ciphertext, scope=connection_scope(conn), key_version=conn.secret_key_version)
+
+
+_PREFIX_CASES = json.loads(
+    (Path(__file__).resolve().parents[2] / "frontend/src/lib/mcp-tool-prefix.cases.json").read_text(
+        encoding="utf-8"
+    )
+)
+
+
+class TestToolPrefix:
+    @pytest.mark.parametrize("case", _PREFIX_CASES, ids=lambda c: c["name"])
+    def test_it_matches_the_shared_parity_cases(self, case: dict[str, str]):
+        """The cases are shared with the frontend `mcpToolPrefix` test, so the two
+        normalisers cannot drift apart behind two hand-copied lists (#545). A
+        connection name reaches the client only as this prefix, so a mismatch draws
+        a step "Github Work Create Issue" where it means "GitHub - Create issue"."""
+        assert tool_prefix(case["name"]) == case["prefix"]
+
+
+class TestPrefixCollisions:
+    """The one arithmetic publish and the run share (#1442)."""
+
+    def test_names_that_reduce_to_one_prefix_are_grouped_winner_first(self):
+        # `github`, `GitHub` and `github-` all normalise to `github`; `notion-work`
+        # keeps its inner separator as `notion_work` and stands alone.
+        assert prefix_collisions(
+            [("github", "a"), ("GitHub", "b"), ("github-", "c"), ("notion-work", "d")]
+        ) == {"github": ["a", "b", "c"]}
+
+    def test_names_that_stay_distinct_collide_with_nobody(self):
+        assert prefix_collisions([("notion", "a"), ("linear", "b")]) == {}
+
+
+class TestTransportSelection:
+    """`_mcp_transport` must pick SSE vs streamable HTTP from the URL alone."""
+
+    @pytest.mark.anyio
+    async def test_sse_url_uses_sse_client(self, monkeypatch):
+        calls: list = []
+        import mcp.client.sse as sse_mod
+
+        def sse_client(url, headers=None, timeout=None):
+            calls.append(("sse", url, headers, timeout))
+            return _acm(("sse-read", "sse-write"))
+
+        monkeypatch.setattr(sse_mod, "sse_client", sse_client)
+        async with _mcp_transport("https://mcp.atlassian.com/v1/sse", {"h": "1"}, timeout=10.0) as (
+            r,
+            w,
+        ):
+            assert (r, w) == ("sse-read", "sse-write")
+        assert calls == [
+            ("sse", "https://mcp.atlassian.com/v1/sse", {"h": "1"}, CONNECT_TIMEOUT_SECS)
+        ]
+
+    @pytest.mark.anyio
+    async def test_http_url_uses_streamable_client(self, monkeypatch):
+        calls: list = []
+        import mcp.client.streamable_http as http_mod
+
+        def streamable_http_client(url, *, http_client=None):
+            calls.append(("http", url, http_client))
+            return _acm(("http-read", "http-write"))
+
+        monkeypatch.setattr(http_mod, "streamable_http_client", streamable_http_client)
+        async with _mcp_transport("https://example.com/mcp", None, timeout=10.0) as (r, w):
+            assert (r, w) == ("http-read", "http-write")
+        assert [(kind, url) for kind, url, _ in calls] == [("http", "https://example.com/mcp")]
+
+    @pytest.mark.anyio
+    async def test_the_headers_reach_the_client_the_streamable_transport_is_given(
+        self, monkeypatch
+    ):
+        """MCP 2.0 took `headers` off the transport and put a client in its
+        place, so a rename alone compiles and silently drops every
+        `Authorization` a connection carries - the whole of what reaches a
+        private server (#1820)."""
+        import mcp.client.streamable_http as http_mod
+
+        clients: list = []
+
+        def streamable_http_client(url, *, http_client=None):
+            clients.append(http_client)
+            return _acm(("http-read", "http-write"))
+
+        monkeypatch.setattr(http_mod, "streamable_http_client", streamable_http_client)
+        async with _mcp_transport(
+            "https://example.com/mcp", {"Authorization": "Bearer sh"}, timeout=10.0
+        ):
+            pass
+
+        assert clients and clients[0].headers["authorization"] == "Bearer sh"
+
+    @pytest.mark.anyio
+    async def test_the_client_fails_a_dead_host_fast_and_waits_for_a_slow_one(self, monkeypatch):
+        """Connecting is bounded by the short timeout, each request by the
+        probe's budget: a host that is down is still left out within seconds, and
+        a server that answers every request slowly is still answered."""
+        import mcp.client.streamable_http as http_mod
+
+        clients: list = []
+
+        def streamable_http_client(url, *, http_client=None):
+            clients.append(http_client)
+            return _acm(("http-read", "http-write"))
+
+        monkeypatch.setattr(http_mod, "streamable_http_client", streamable_http_client)
+        async with _mcp_transport("https://example.com/mcp", None, timeout=30.0):
+            pass
+
+        assert clients[0].timeout.connect == CONNECT_TIMEOUT_SECS
+        assert clients[0].timeout.read == 30.0
+
+    @pytest.mark.anyio
+    async def test_the_client_it_built_is_closed_with_the_transport(self, monkeypatch):
+        """Owned here rather than left to the SDK: a client that outlives the
+        transport is a connection pool nobody closes."""
+        import mcp.client.streamable_http as http_mod
+
+        clients: list = []
+
+        def streamable_http_client(url, *, http_client=None):
+            clients.append(http_client)
+            return _acm(("http-read", "http-write"))
+
+        monkeypatch.setattr(http_mod, "streamable_http_client", streamable_http_client)
+        async with _mcp_transport("https://example.com/mcp", None, timeout=10.0):
+            assert not clients[0].is_closed
+
+        assert clients[0].is_closed
+
+
+class TestFittedNames:
+    """A prefixed MCP tool name a provider would refuse takes down the whole request."""
+
+    def test_a_name_within_the_limit_is_left_alone(self):
+        assert fitted_tool_name("github_search_issues") == "github_search_issues"
+        assert fitted_tool_name("a" * TOOL_NAME_LIMIT) == "a" * TOOL_NAME_LIMIT
+
+    def test_a_long_name_is_cut_to_the_limit_and_kept_apart(self):
+        first = fitted_tool_name("work_notion_" + "query_database_with_filters_and_sorts" * 2)
+        second = fitted_tool_name(
+            "work_notion_" + "query_database_with_filters_and_sorts" * 2 + "_v2"
+        )
+
+        assert len(first) == TOOL_NAME_LIMIT
+        assert first.startswith("work_notion_query_database")
+        assert first != second
+
+    def test_a_refused_character_is_replaced(self):
+        fitted = fitted_tool_name("jira_issues.search/advanced")
+
+        assert re.fullmatch(r"[a-zA-Z0-9_-]+", fitted)
+        assert fitted.startswith("jira_issues_search_advanced_")
+
+    @pytest.mark.anyio
+    async def test_the_model_sees_the_fitted_name_and_the_server_gets_the_real_one(self):
+        long_name = "notion_" + "x" * 70
+        inner = MagicMock()
+        inner.get_tools = AsyncMock(
+            return_value={
+                long_name: ToolsetTool(
+                    toolset=inner,
+                    tool_def=ToolDefinition(name=long_name),
+                    max_retries=1,
+                    args_validator=MagicMock(),
+                ),
+                "notion_search": ToolsetTool(
+                    toolset=inner,
+                    tool_def=ToolDefinition(name="notion_search"),
+                    max_retries=1,
+                    args_validator=MagicMock(),
+                ),
+            }
+        )
+        inner.call_tool = AsyncMock(return_value="done")
+        toolset = FittedNames(inner)
+
+        tools = await toolset.get_tools(MagicMock())
+        (short,) = [name for name in tools if name != "notion_search"]
+        assert len(short) == TOOL_NAME_LIMIT
+        assert tools[short].tool_def.name == short
+        assert tools["notion_search"].tool_def.name == "notion_search"
+
+        @dataclass
+        class Ctx:
+            tool_name: str | None = None
+
+        result = await toolset.call_tool(short, {"q": 1}, Ctx(), tools[short])
+
+        assert result == "done"
+        called_name, called_args, ctx, tool = inner.call_tool.await_args.args
+        assert (called_name, called_args, ctx.tool_name, tool.tool_def.name) == (
+            long_name,
+            {"q": 1},
+            long_name,
+            long_name,
+        )
+
+
+class TestMakeToolset:
+    def test_without_allowlist_returns_prefixed_server(self):
+        from pydantic_ai.mcp import MCPToolset
+        from pydantic_ai.toolsets import PrefixedToolset
+
+        spec = McpServerSpec(name="github-work", url="https://example.com/mcp")
+        fitted = _make_toolset(spec).wrapped
+        assert isinstance(fitted, FittedNames)
+        toolset = fitted.wrapped
+        assert isinstance(toolset, PrefixedToolset)
+        assert toolset.prefix == "github_work"
+        assert isinstance(toolset.wrapped, MCPToolset)
+
+    @pytest.mark.parametrize("include", [True, False])
+    def test_the_server_instructions_join_only_when_the_connection_opted_in(self, include):
+        spec = McpServerSpec(
+            name="notion", url="https://example.com/mcp", include_instructions=include
+        )
+
+        assert _make_toolset(spec).wrapped.wrapped.wrapped.include_instructions is include
+
+    def test_a_run_connects_on_the_short_timeout(self, monkeypatch):
+        """A server that answered a probe recently is entered with no probe, so
+        a run's own connect-and-initialize is what notices it went down - in
+        seconds, not in the probe's whole-session budget."""
+        from pydantic_ai.mcp import MCPToolset
+
+        made = MagicMock(wraps=MCPToolset)
+        monkeypatch.setattr("app.agents.mcp.MCPToolset", made)
+
+        _make_toolset(McpServerSpec(name="slow", url="https://example.com/mcp"))
+
+        assert made.call_args.kwargs["init_timeout"] == CONNECT_TIMEOUT_SECS
+
+    def test_a_tool_error_is_shown_to_the_model_not_spent_as_a_retry(self):
+        """A retry spends the tool's single attempt, and the error after it ends
+        the run with `UnexpectedModelBehavior` - how most failed runs ended: a
+        Notion query the server refused twice. `failed` hands the model the
+        refusal as the call's result instead."""
+        spec = McpServerSpec(name="notion", url="https://example.com/mcp")
+
+        assert _make_toolset(spec).wrapped.wrapped.wrapped.tool_error_behavior == "failed"
+
+    def test_with_allowlist_filters_before_prefixing(self):
+        from pydantic_ai.toolsets import FilteredToolset, PrefixedToolset
+
+        spec = McpServerSpec(
+            name="github",
+            url="https://example.com/mcp",
+            allowed_tools=["search_issues"],
+        )
+        toolset = _make_toolset(spec).wrapped.wrapped
+        assert isinstance(toolset, PrefixedToolset)
+        filtered = toolset.wrapped
+        assert isinstance(filtered, FilteredToolset)
+        # The filter runs before prefixing → unprefixed names.
+        allowed_tool = MagicMock()
+        allowed_tool.name = "search_issues"
+        blocked_tool = MagicMock()
+        blocked_tool.name = "delete_repo"
+        assert filtered.filter_func(None, allowed_tool) is True
+        assert filtered.filter_func(None, blocked_tool) is False
+
+
+class TestApprovalMarks:
+    """#2060: an MCP tool waits for a person unless its binding says otherwise."""
+
+    @pytest.mark.parametrize(
+        ("policy", "read_only", "expected"),
+        [
+            ("writes", True, False),
+            ("writes", False, True),
+            ("writes", None, True),
+            ("all", True, True),
+            ("none", False, False),
+        ],
+    )
+    def test_the_policy_and_the_read_only_hint_decide(self, policy, read_only, expected):
+        from app.agents.mcp import needs_approval
+
+        assert needs_approval(_mcp_tool("t", read_only), policy) is expected
+
+    @pytest.mark.anyio
+    async def test_every_tool_the_server_lists_carries_the_mark(self):
+        from pydantic_ai.toolsets.abstract import ToolsetTool
+
+        from app.agents.mcp import NEEDS_APPROVAL, ApprovalMarked
+
+        inner = MagicMock()
+        listed = {
+            name: ToolsetTool(
+                toolset=inner,
+                tool_def=_mcp_tool(name, read_only),
+                max_retries=1,
+                args_validator=MagicMock(),
+            )
+            for name, read_only in (("read", True), ("delete", False))
+        }
+        inner.get_tools = AsyncMock(return_value=listed)
+
+        marked = await ApprovalMarked(inner, policy="writes").get_tools(MagicMock())
+
+        assert marked["read"].tool_def.metadata[NEEDS_APPROVAL] is False
+        assert marked["delete"].tool_def.metadata[NEEDS_APPROVAL] is True
+        # What the server sent is kept beside the mark.
+        assert marked["read"].tool_def.metadata["annotations"] == {"readOnlyHint": True}
+
+    @pytest.mark.anyio
+    async def test_a_binding_with_an_account_stamps_it_on_every_tool(self):
+        from pydantic_ai.toolsets.abstract import ToolsetTool
+
+        from app.agents.mcp import ACCOUNT, ApprovalMarked
+
+        inner = MagicMock()
+        inner.get_tools = AsyncMock(
+            return_value={
+                "send": ToolsetTool(
+                    toolset=inner,
+                    tool_def=_mcp_tool("send", False),
+                    max_retries=1,
+                    args_validator=MagicMock(),
+                )
+            }
+        )
+
+        named = await ApprovalMarked(inner, policy="all", account="Work").get_tools(MagicMock())
+        unnamed = await ApprovalMarked(inner, policy="all").get_tools(MagicMock())
+
+        assert named["send"].tool_def.metadata[ACCOUNT] == "Work"
+        assert ACCOUNT not in unnamed["send"].tool_def.metadata
+
+    @pytest.mark.anyio
+    @pytest.mark.security
+    async def test_an_ungated_write_runs_unasked_under_every_policy_and_only_it(self):
+        """The platform's language switch (#2301): its own server names it, and no
+        other tool - the publish beside it above all - slips through with it."""
+        from pydantic_ai.toolsets.abstract import ToolsetTool
+
+        from app.agents.mcp import NEEDS_APPROVAL, ApprovalMarked
+
+        inner = MagicMock()
+        inner.get_tools = AsyncMock(
+            return_value={
+                name: ToolsetTool(
+                    toolset=inner,
+                    tool_def=_mcp_tool(name, False),
+                    max_retries=1,
+                    args_validator=MagicMock(),
+                )
+                for name in ("agenticos_set_my_language", "agenticos_publish_agent")
+            }
+        )
+
+        marked = await ApprovalMarked(
+            inner, policy="all", ungated=frozenset({"agenticos_set_my_language"})
+        ).get_tools(MagicMock())
+
+        assert marked["agenticos_set_my_language"].tool_def.metadata[NEEDS_APPROVAL] is False
+        assert marked["agenticos_publish_agent"].tool_def.metadata[NEEDS_APPROVAL] is True
+
+    def test_only_the_platform_s_own_server_names_ungated_tools(self):
+        from app.agents.mcp import (
+            PLATFORM_UNGATED_TOOLS,
+            McpServerSpec,
+            _make_toolset,
+            platform_spec,
+        )
+
+        platform = platform_spec("aos_key", allowed_tools=None, approval="writes")
+        assert platform.ungated == PLATFORM_UNGATED_TOOLS
+        assert McpServerSpec(name="notion", url="https://mcp.notion.com/mcp").ungated == frozenset()
+        assert _make_toolset(platform).ungated == frozenset({"agenticos_set_my_language"})
+
+
+class TestToolOrigins:
+    @pytest.mark.anyio
+    async def test_every_tool_listed_is_noted_under_its_connection(self):
+        inner = MagicMock()
+        inner.get_tools = AsyncMock(return_value={"linear_search": "a", "linear_create": "b"})
+        connection_id = uuid4()
+        seen = {"notion_search": uuid4()}
+
+        tools = await ToolOrigins(inner, connection_id=connection_id, seen=seen).get_tools(
+            MagicMock()
+        )
+
+        assert tools == {"linear_search": "a", "linear_create": "b"}
+        assert seen["linear_search"] == seen["linear_create"] == connection_id
+        assert "notion_search" in seen
+
+
+def _mcp_tool(name, read_only):
+    from pydantic_ai.tools import ToolDefinition
+
+    annotations = None if read_only is None else {"readOnlyHint": read_only}
+    return ToolDefinition(name=name, metadata={"annotations": annotations, "meta": None})
+
+
+class TestBuildMcpToolsets:
+    @pytest.mark.anyio
+    async def test_empty_specs_no_probing(self):
+        assert await build_mcp_toolsets([]) == []
+
+    @pytest.mark.anyio
+    async def test_unreachable_server_is_skipped(self, monkeypatch):
+        async def failing_probe(url, headers=None, timeout=None):
+            raise TimeoutError("no route")
+
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", failing_probe)
+        specs = [McpServerSpec(name="dead", url="https://example.com/mcp")]
+        assert await build_mcp_toolsets(specs) == []
+
+    @pytest.mark.anyio
+    async def test_reachable_server_yields_toolset(self, monkeypatch):
+        async def ok_probe(url, headers=None, timeout=None):
+            return [McpToolInfo(name="t", description="")]
+
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", ok_probe)
+        specs = [McpServerSpec(name="live", url="https://example.com/mcp")]
+        toolsets = await build_mcp_toolsets(specs)
+        assert len(toolsets) == 1
+
+    @pytest.mark.anyio
+    async def test_colliding_tool_prefix_is_dropped(self, monkeypatch):
+        """Two servers sharing a prefix would make pydantic-ai raise on
+        duplicate tool names and kill the turn - the later one is skipped."""
+        probed: list[str] = []
+
+        async def ok_probe(url, headers=None, timeout=None):
+            probed.append(url)
+            return [McpToolInfo(name="t", description="")]
+
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", ok_probe)
+        specs = [
+            # Workspace server first - it wins over the user's connection.
+            McpServerSpec(name="github", url="https://workspace.example/mcp"),
+            McpServerSpec(name="GitHub", url="https://user.example/mcp"),
+        ]
+        toolsets = await build_mcp_toolsets(specs)
+        assert len(toolsets) == 1
+        assert probed == ["https://workspace.example/mcp"]
+
+
+class TestRecentAnswers:
+    """A server that answered a probe a moment ago is not probed again every turn."""
+
+    @staticmethod
+    def _counting_probe(calls: list[str]):
+        async def probe(url, headers=None, timeout=None):
+            calls.append(url)
+            return [McpToolInfo(name="t", description="")]
+
+        return probe
+
+    @pytest.mark.anyio
+    async def test_a_second_turn_skips_the_probe(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe(calls))
+        spec = McpServerSpec(name="live", url="https://example.com/mcp")
+
+        await build_mcp_toolsets([spec])
+        toolsets = await build_mcp_toolsets([spec])
+
+        assert calls == ["https://example.com/mcp"]
+        assert isinstance(toolsets[0], AnsweredRecently)
+
+    @pytest.mark.anyio
+    async def test_the_answer_goes_stale(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe(calls))
+        clock = [1000.0]
+        monkeypatch.setattr("app.agents.mcp.time.monotonic", lambda: clock[0])
+        spec = McpServerSpec(name="live", url="https://example.com/mcp")
+
+        await build_mcp_toolsets([spec])
+        clock[0] += ANSWERED_FOR
+        await build_mcp_toolsets([spec])
+
+        assert len(calls) == 2
+
+    @pytest.mark.anyio
+    async def test_another_credential_is_another_answer(self, monkeypatch):
+        """Two people's accounts on one server: one person's answer says nothing of the other's token."""
+        calls: list[str] = []
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe(calls))
+        url = "https://example.com/mcp"
+
+        await build_mcp_toolsets(
+            [McpServerSpec(name="a", url=url, headers={"Authorization": "Bearer one"})]
+        )
+        await build_mcp_toolsets(
+            [McpServerSpec(name="a", url=url, headers={"Authorization": "Bearer two"})]
+        )
+
+        assert len(calls) == 2
+        assert all("Bearer" not in key for key in _answered)
+
+    @pytest.mark.anyio
+    async def test_a_server_down_since_its_answer_leaves_the_turn(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe(calls))
+        spec = McpServerSpec(name="flaky", url="https://example.com/mcp")
+        await build_mcp_toolsets([spec])
+        (toolset,) = await build_mcp_toolsets([spec])
+
+        async def refuse(*_args):
+            raise ConnectionError("connection refused")
+
+        monkeypatch.setattr(toolset.wrapped, "__aenter__", refuse)
+        async with toolset:
+            assert await toolset.get_tools(MagicMock()) == {}
+        assert toolset.down
+        # Forgotten, so the next turn asks the server again and can report it down.
+        await build_mcp_toolsets([spec])
+        assert len(calls) == 2
+
+    @pytest.mark.anyio
+    async def test_a_server_down_since_its_answer_is_briefed_to_the_model(self, monkeypatch):
+        """No probe ran, so no gap was briefed before the turn: the toolset briefs it.
+
+        Left out silently, the model read the missing tools as an empty answer -
+        the same "no data" the probe's own briefing exists to prevent."""
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe([]))
+        spec = McpServerSpec(name="semrush", url="https://example.com/mcp")
+        await build_mcp_toolsets([spec])
+        (toolset,) = await build_mcp_toolsets([spec])
+
+        async def refuse(*_args):
+            raise ConnectionError("connection refused")
+
+        monkeypatch.setattr(toolset.wrapped, "__aenter__", refuse)
+        seen: list[str | None] = []
+
+        def answer(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            seen.append(info.instructions)
+            return ModelResponse(parts=[TextPart("Semrush could not be reached.")])
+
+        await Agent(FunctionModel(answer), toolsets=[toolset]).run("Keyword volume?")
+
+        assert seen and seen[0] is not None
+        assert "The semrush server is not available this turn" in seen[0]
+        assert "none of its semrush_* tools are attached" in seen[0]
+        assert "if it keeps failing the connection needs checking" in seen[0]
+
+    @pytest.mark.anyio
+    async def test_an_answering_server_keeps_its_own_instructions(self):
+        toolset = AnsweredRecently(
+            FunctionToolset(instructions="Use search first."), name="live", key="k"
+        )
+        seen: list[str | None] = []
+
+        def answer(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            seen.append(info.instructions)
+            return ModelResponse(parts=[TextPart("ok")])
+
+        await Agent(FunctionModel(answer), toolsets=[toolset]).run("Search.")
+
+        assert seen == ["Use search first."]
+
+    @pytest.mark.anyio
+    async def test_a_cancelled_connect_is_not_taken_for_an_outage(self, monkeypatch):
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe([]))
+        spec = McpServerSpec(name="live", url="https://example.com/mcp")
+        await build_mcp_toolsets([spec])
+        (toolset,) = await build_mcp_toolsets([spec])
+
+        async def cancelled(*_args):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(toolset.wrapped, "__aenter__", cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            await toolset.__aenter__()
+        assert not toolset.down
+
+    @pytest.mark.anyio
+    async def test_a_cancellation_inside_a_task_group_is_not_taken_for_an_outage(self, monkeypatch):
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe([]))
+        spec = McpServerSpec(name="live", url="https://example.com/mcp")
+        await build_mcp_toolsets([spec])
+        (toolset,) = await build_mcp_toolsets([spec])
+
+        async def cancelled(*_args):
+            raise BaseExceptionGroup("connect", [asyncio.CancelledError()])
+
+        monkeypatch.setattr(toolset.wrapped, "__aenter__", cancelled)
+        with pytest.raises(BaseExceptionGroup):
+            await toolset.__aenter__()
+        assert not toolset.down
+
+    @pytest.mark.anyio
+    async def test_an_answering_server_is_entered_and_left(self, monkeypatch):
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe([]))
+        spec = McpServerSpec(name="live", url="https://example.com/mcp")
+        await build_mcp_toolsets([spec])
+        (toolset,) = await build_mcp_toolsets([spec])
+        entered, left = AsyncMock(), AsyncMock(return_value=None)
+        monkeypatch.setattr(toolset.wrapped, "__aenter__", entered)
+        monkeypatch.setattr(toolset.wrapped, "__aexit__", left)
+        monkeypatch.setattr(
+            toolset.wrapped, "get_tools", AsyncMock(return_value={"live_t": "tool"})
+        )
+
+        async with toolset:
+            assert await toolset.get_tools(MagicMock()) == {"live_t": "tool"}
+
+        entered.assert_awaited_once()
+        left.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_a_server_found_down_is_not_entered_again(self, monkeypatch):
+        monkeypatch.setattr("app.agents.mcp.probe_mcp_server", self._counting_probe([]))
+        spec = McpServerSpec(name="flaky", url="https://example.com/mcp")
+        await build_mcp_toolsets([spec])
+        (toolset,) = await build_mcp_toolsets([spec])
+        refuse = AsyncMock(side_effect=ConnectionError("refused"))
+        monkeypatch.setattr(toolset.wrapped, "__aenter__", refuse)
+
+        await toolset.__aenter__()
+        await toolset.__aenter__()
+
+        refuse.assert_awaited_once()
+
+
+class TestProbeSuccess:
+    @pytest.mark.anyio
+    async def test_a_reachable_server_lists_its_tools(self, monkeypatch):
+        """The probe's whole product: the tool names an admin picks from,
+        with a missing description read as empty rather than None, and each
+        tool's argument schema kept unless it is too large to store."""
+        schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+        described = MagicMock(description="Search issues", input_schema=schema)
+        described.name = "search"
+        described.annotations = MagicMock(read_only_hint=True)
+        oversized = {"type": "object", "description": "x" * (MAX_INPUT_SCHEMA_BYTES + 1)}
+        bare = MagicMock(description=None, input_schema=oversized, annotations=None)
+        bare.name = "create_issue"
+        session = AsyncMock()
+        session.list_tools = AsyncMock(return_value=MagicMock(tools=[described, bare]))
+
+        monkeypatch.setattr(
+            "app.agents.mcp._mcp_transport",
+            lambda url, headers, **_: _acm((MagicMock(), MagicMock())),
+        )
+        monkeypatch.setattr("mcp.ClientSession", lambda read, write: _acm(session))
+
+        tools = await probe_mcp_server("https://example.com/mcp")
+
+        # A tool says it only reads through `readOnlyHint`; one that says nothing
+        # is a write, the same reading the approval policy gives it.
+        assert tools == [
+            McpToolInfo(
+                name="search", description="Search issues", input_schema=schema, read_only=True
+            ),
+            McpToolInfo(name="create_issue", description="", input_schema=None),
+        ]
+        session.initialize.assert_awaited_once()
+
+
+class TestProbeErrors:
+    """A dead server must never abort the turn - including when the failure
+    arrives as an exception group out of the anyio task group."""
+
+    @staticmethod
+    def _slow_session(monkeypatch, *, each: float) -> None:
+        """A server answering every request, each after *each* seconds."""
+
+        async def slowly(*_args: object) -> MagicMock:
+            await asyncio.sleep(each)
+            return MagicMock(tools=[])
+
+        session = AsyncMock()
+        session.initialize = AsyncMock(side_effect=slowly)
+        session.list_tools = AsyncMock(side_effect=slowly)
+        monkeypatch.setattr(
+            "app.agents.mcp._mcp_transport",
+            lambda url, headers, **_: _acm((MagicMock(), MagicMock())),
+        )
+        monkeypatch.setattr("mcp.ClientSession", lambda read, write: _acm(session))
+
+    @pytest.mark.anyio
+    async def test_a_session_longer_than_the_connect_timeout_still_answers(self, monkeypatch):
+        """An OAuth proxy checks each request's token at its identity provider,
+        so two slow requests together outlast the connect timeout while the
+        server is up. Only the handshake budget bounds the whole session."""
+        monkeypatch.setattr("app.agents.mcp.CONNECT_TIMEOUT_SECS", 0.05)
+        monkeypatch.setattr("app.agents.mcp.HANDSHAKE_TIMEOUT_SECS", 1.0)
+        self._slow_session(monkeypatch, each=0.04)
+
+        assert await probe_mcp_server("https://example.com/mcp") == []
+
+    @pytest.mark.anyio
+    async def test_a_session_past_the_handshake_budget_is_a_timeout(self, monkeypatch):
+        monkeypatch.setattr("app.agents.mcp.HANDSHAKE_TIMEOUT_SECS", 0.05)
+        self._slow_session(monkeypatch, each=1.0)
+
+        with pytest.raises(McpProbeError, match="timed out after"):
+            await probe_mcp_server("https://example.com/mcp")
+
+    @pytest.mark.anyio
+    async def test_a_callers_budget_reaches_the_transport_and_the_refusal(self, monkeypatch):
+        """The catalog audit passes its own `--timeout`; a fixed read timeout
+        under it would fail a server the operator gave longer, and the refusal
+        would name a budget nobody set."""
+        budgets: list[float] = []
+
+        @contextlib.asynccontextmanager
+        async def hanging_transport(url, headers, *, timeout):
+            budgets.append(timeout)
+            await asyncio.sleep(1.0)
+            yield MagicMock(), MagicMock()  # pragma: no cover
+
+        monkeypatch.setattr("app.agents.mcp._mcp_transport", hanging_transport)
+
+        with pytest.raises(McpProbeError, match=r"timed out after 0\.05s"):
+            await probe_mcp_server("https://example.com/mcp", timeout=0.05)
+
+        assert budgets == [0.05]
+
+    def test_a_connect_timeout_names_the_connect_budget(self):
+        message = probe_error_message(httpx2.ConnectTimeout("no route"))
+
+        assert message == f"Connection timed out after {CONNECT_TIMEOUT_SECS:g}s"
+
+    @pytest.mark.anyio
+    async def test_exception_group_becomes_probe_error(self, monkeypatch):
+        @contextlib.asynccontextmanager
+        async def failing_transport(url, headers, **_):
+            raise BaseExceptionGroup("unhandled errors in a TaskGroup", [ConnectionError("boom")])
+            yield  # pragma: no cover
+
+        monkeypatch.setattr("app.agents.mcp._mcp_transport", failing_transport)
+        # McpProbeError is an Exception, so `except Exception` callers catch it.
+        with pytest.raises(McpProbeError, match="boom"):
+            await probe_mcp_server("https://example.com/mcp")
+
+    @pytest.mark.anyio
+    async def test_cancellation_is_not_swallowed(self, monkeypatch):
+        import asyncio
+
+        @contextlib.asynccontextmanager
+        async def cancelled_transport(url, headers, **_):
+            raise BaseExceptionGroup("cancelled", [asyncio.CancelledError()])
+            yield  # pragma: no cover
+
+        monkeypatch.setattr("app.agents.mcp._mcp_transport", cancelled_transport)
+        with pytest.raises(BaseExceptionGroup):
+            await probe_mcp_server("https://example.com/mcp")
+
+
+class TestToolsetsForAgent:
+    """What a *published* agent reaches: the servers its spec named, nothing else.
+
+    An agent that picked up whatever the person triggering it had enabled would
+    answer differently depending on who asked, and would run on that person's
+    tokens.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch) -> list[list[McpServerSpec]]:
+        """Replace the probe with a recorder of the specs it was given, every one reachable."""
+        seen: list[list[McpServerSpec]] = []
+
+        async def fake_probe(specs: list[McpServerSpec]) -> list[tuple[McpServerSpec, str]]:
+            seen.append(specs)
+            return [(spec, spec.name) for spec in specs]
+
+        monkeypatch.setattr(mcp_connection_service, "probe_toolsets", fake_probe)
+        return seen
+
+    @pytest.mark.anyio
+    async def test_only_the_servers_the_spec_names_are_attached(self, monkeypatch):
+        """The deployment's own MCP_SERVERS are ambient config nobody bound here.
+
+        Including them would put tools in a published agent that its spec does
+        not mention and that publish-time validation never checked.
+        """
+        seen = self._capture(monkeypatch)
+        bound = _connection(name="linear", url="https://mcp.linear.app/sse")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            _batch(bound),
+        )
+
+        toolsets = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[OrgMcpServerRef(connection_id=bound.id)]
+        )
+
+        assert _attached(toolsets) == ["linear"]
+        assert [spec.name for spec in seen[0]] == ["linear"]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("include", [True, False])
+    async def test_the_connection_decides_whether_the_server_instructions_join(
+        self, monkeypatch, include
+    ):
+        seen = self._capture(monkeypatch)
+        bound = _connection(name="linear", include_instructions=include)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo, "get_org_scoped_by_ids", _batch(bound)
+        )
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[OrgMcpServerRef(connection_id=bound.id)]
+        )
+
+        assert [spec.include_instructions for spec in seen[0]] == [include]
+
+    @pytest.mark.anyio
+    async def test_a_prefix_collision_drops_the_loser_and_reports_it(self, monkeypatch):
+        """The run-time half of the publish check (#1442). Two servers whose names
+        reduce to one prefix would make pydantic-ai raise on the duplicate tool
+        names; the first is attached and the second reported on `unavailable`, so
+        the model can say it is missing rather than a log line nobody reads. Both
+        are probed - the decision is taken among the servers that answered."""
+        seen = self._capture(monkeypatch)
+        first = _connection(name="github", url="https://ws.example/mcp")
+        second = _connection(name="GitHub", url="https://user.example/mcp")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            AsyncMock(return_value={first.id: first, second.id: second}),
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[
+                OrgMcpServerRef(connection_id=first.id),
+                OrgMcpServerRef(connection_id=second.id),
+            ],
+        )
+
+        assert [spec.name for spec in seen[0]] == ["github", "GitHub"]
+        assert _attached(resolved) == ["github"]
+        assert resolved.unavailable == [
+            UnavailablePrefixCollision(
+                server="GitHub",
+                prefix="github",
+                kept="github",
+                server_binding="the connection 'GitHub'",
+                kept_binding="the connection 'github'",
+            )
+        ]
+
+    @pytest.mark.anyio
+    async def test_the_platform_with_nobody_to_act_as_is_briefed_not_silent(self, monkeypatch):
+        """A visitor or a schedule acting as nobody gets no platform server - and
+        the model is told, rather than reaching for tools it lacks."""
+        seen = self._capture(monkeypatch)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            AsyncMock(return_value={}),
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[PlatformMcpServerRef(account="platform")],
+        )
+
+        assert not any(seen)
+        assert resolved.unavailable == [UnavailablePlatformServer()]
+
+    @pytest.mark.anyio
+    async def test_a_server_that_did_not_answer_is_briefed_not_silent(self, monkeypatch):
+        """A bound server whose probe failed is left out of the turn, and reported.
+
+        Left out only in the log, it was invisible to the model: an agent whose
+        Semrush bridge missed the connect timeout answered "no keyword data is
+        available" as though the service had returned nothing. Reported, the run
+        can say the service did not answer and that a retry may work."""
+        live = _connection(name="notion", url="https://live.example/mcp")
+        slow = _connection(name="semrush", url="https://slow.example/mcp")
+
+        async def fake_probe(
+            specs: list[McpServerSpec],
+        ) -> list[tuple[McpServerSpec, str | None]]:
+            return [(spec, None if spec.url == slow.url else spec.name) for spec in specs]
+
+        monkeypatch.setattr(mcp_connection_service, "probe_toolsets", fake_probe)
+        # The silent server opens an outage after the run commits (#2100) - not this test's subject.
+        monkeypatch.setattr(
+            mcp_connection_service, "spawn_after_commit", lambda db, coro, *, name: coro.close()
+        )
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            AsyncMock(return_value={live.id: live, slow.id: slow}),
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[
+                OrgMcpServerRef(connection_id=live.id),
+                OrgMcpServerRef(connection_id=slow.id),
+            ],
+        )
+
+        assert _attached(resolved) == ["notion"]
+        assert resolved.unavailable == [
+            UnavailableUnreachableServer(server="semrush", binding="the connection 'semrush'")
+        ]
+
+    @pytest.mark.anyio
+    async def test_an_unreachable_first_holder_neither_wins_nor_is_reported_as_attached(
+        self, monkeypatch
+    ):
+        """The winner is the first server that *answered*. Decided before the probe,
+        an unreachable first holder would lose the turn to its probe and still be
+        named as the one attached, while the reachable second was dropped for
+        colliding with it - a turn with neither, told it had one (#1442 review).
+
+        The dead one is still briefed, naming whose `github_*` tools are attached:
+        told nothing, the model would take the live account's results for the
+        dead one's."""
+        first = _connection(name="github", url="https://dead.example/mcp")
+        second = _connection(name="GitHub", url="https://live.example/mcp")
+
+        async def fake_probe(
+            specs: list[McpServerSpec],
+        ) -> list[tuple[McpServerSpec, str | None]]:
+            return [(spec, None if spec.url == first.url else spec.name) for spec in specs]
+
+        monkeypatch.setattr(mcp_connection_service, "probe_toolsets", fake_probe)
+        # The dead holder opens an outage after the run commits (#2100) - not this test's subject.
+        monkeypatch.setattr(
+            mcp_connection_service, "spawn_after_commit", lambda db, coro, *, name: coro.close()
+        )
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            AsyncMock(return_value={first.id: first, second.id: second}),
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[
+                OrgMcpServerRef(connection_id=first.id),
+                OrgMcpServerRef(connection_id=second.id),
+            ],
+        )
+
+        assert _attached(resolved) == ["GitHub"]
+        assert resolved.unavailable == [
+            UnavailableUnreachableServer(
+                server="github",
+                binding="the connection 'github'",
+                held_by="the connection 'GitHub'",
+            )
+        ]
+
+    @pytest.mark.anyio
+    async def test_one_connection_bound_twice_and_answering_once_is_not_missing(self, monkeypatch):
+        """The answering copy carries the same binding, so nothing is absent to brief."""
+        conn = _connection(name="github", url="https://ws.example/mcp")
+
+        async def fake_probe(
+            specs: list[McpServerSpec],
+        ) -> list[tuple[McpServerSpec, str | None]]:
+            return [(spec, None if at == 0 else spec.name) for at, spec in enumerate(specs)]
+
+        monkeypatch.setattr(mcp_connection_service, "probe_toolsets", fake_probe)
+        monkeypatch.setattr(
+            mcp_connection_service, "spawn_after_commit", lambda db, coro, *, name: coro.close()
+        )
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            AsyncMock(return_value={conn.id: conn}),
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[OrgMcpServerRef(connection_id=conn.id), OrgMcpServerRef(connection_id=conn.id)],
+        )
+
+        assert _attached(resolved) == ["github"]
+        assert resolved.unavailable == []
+
+    @pytest.mark.anyio
+    async def test_a_same_named_duplicate_is_dropped_but_not_reported(self, monkeypatch):
+        """One connection bound twice is a duplicate of a service the kept spec
+        still serves, so it is dropped to spare pydantic-ai the clash but reported
+        as nothing - saying that service is unavailable would be false, since its
+        tools are present (#1442 review)."""
+        seen = self._capture(monkeypatch)
+        conn = _connection(name="github", url="https://ws.example/mcp")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            AsyncMock(return_value={conn.id: conn}),
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[
+                OrgMcpServerRef(connection_id=conn.id),
+                OrgMcpServerRef(connection_id=conn.id),
+            ],
+        )
+
+        assert [spec.name for spec in seen[0]] == ["github", "github"]
+        assert _attached(resolved) == ["github"]
+        assert resolved.unavailable == []
+
+    @pytest.mark.anyio
+    async def test_every_id_is_resolved_inside_the_agents_own_organization(self, monkeypatch):
+        """A spec is data and can name any UUID; the tenant it resolves in is not
+        negotiable, and neither is the connection being an organization one."""
+        self._capture(monkeypatch)
+        organization_id = uuid4()
+        connection_id = uuid4()
+        lookup = _batch(_connection(id=connection_id))
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo, "get_org_scoped_by_ids", lookup
+        )
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=organization_id,
+            refs=[OrgMcpServerRef(connection_id=connection_id)],
+        )
+
+        assert lookup.await_args.kwargs == {
+            "connection_ids": [connection_id],
+            "organization_id": organization_id,
+        }
+
+    @pytest.mark.anyio
+    async def test_the_allowlist_the_admin_picked_travels_with_the_server(self, monkeypatch):
+        """An agent must not reach tools somebody deliberately excluded."""
+        seen = self._capture(monkeypatch)
+        bound = _connection(name="github", allowed_tools=["search_issues"])
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            _batch(bound),
+        )
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[OrgMcpServerRef(connection_id=bound.id)]
+        )
+
+        assert seen[0][0].allowed_tools == ["search_issues"]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("connection", "reason"),
+        [
+            (None, "deleted, or moved out of the organization, after publish"),
+            (_connection(is_enabled=False), "switched off by an administrator"),
+        ],
+    )
+    async def test_a_binding_that_no_longer_resolves_narrows_the_agent_rather_than_failing_the_run(
+        self, monkeypatch, connection, reason
+    ):
+        """Same call as :meth:`AgentRunnerService._collection_names` makes for a
+        deleted collection: the answer gets worse, it does not disappear. What
+        refuses a broken binding is publish, while somebody can still fix it."""
+        seen = self._capture(monkeypatch)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            _batch(connection),
+        )
+
+        toolsets = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[OrgMcpServerRef(connection_id=uuid4())]
+        )
+
+        assert _attached(toolsets) == []
+        assert seen[0] == []
+
+    @pytest.mark.anyio
+    async def test_a_server_whose_credentials_are_unusable_is_dropped_not_sent_unauthenticated(
+        self, monkeypatch
+    ):
+        """An expired OAuth grant or a rotated SECRET_KEY must not become an
+        anonymous request to somebody's Linear workspace."""
+        seen = self._capture(monkeypatch)
+        broken = _connection(name="linear", auth_token="enc:not-valid-ciphertext")
+        healthy = _connection(name="github")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            AsyncMock(return_value={broken.id: broken, healthy.id: healthy}),
+        )
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[
+                OrgMcpServerRef(connection_id=broken.id),
+                OrgMcpServerRef(connection_id=healthy.id),
+            ],
+        )
+
+        assert [spec.name for spec in seen[0]] == ["github"]
+
+
+class TestWhichToolsABindingMayCall:
+    """Two allowlists, and neither overrides the other (#1341).
+
+    `allowed_tools` on the connection is one administrator's decision for
+    everybody bound to it; on the binding it narrows within that, per agent. So
+    the same server can serve a read-only agent and an editing one, and neither
+    can reach past the ceiling - not even an agent published before a tool was
+    excluded from the connection.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch) -> list[list[McpServerSpec]]:
+        seen: list[list[McpServerSpec]] = []
+
+        async def fake_probe(specs: list[McpServerSpec]) -> list[tuple[McpServerSpec, str]]:
+            seen.append(specs)
+            return [(spec, spec.name) for spec in specs]
+
+        monkeypatch.setattr(mcp_connection_service, "probe_toolsets", fake_probe)
+        return seen
+
+    async def _tools(self, monkeypatch, *, on_connection, on_binding) -> list[str] | None:
+        seen = self._capture(monkeypatch)
+        bound = _connection(name="notion", allowed_tools=on_connection)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            _batch(bound),
+        )
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[OrgMcpServerRef(connection_id=bound.id, allowed_tools=on_binding)],
+        )
+        return seen[0][0].allowed_tools
+
+    @pytest.mark.anyio
+    async def test_neither_narrowing_is_every_tool_the_server_offers(self, monkeypatch):
+        assert await self._tools(monkeypatch, on_connection=None, on_binding=None) is None
+
+    @pytest.mark.anyio
+    async def test_the_binding_alone_narrows_to_what_it_names(self, monkeypatch):
+        """The case the field exists for: two agents, one server, different reach."""
+        assert await self._tools(monkeypatch, on_connection=None, on_binding=["search"]) == [
+            "search"
+        ]
+
+    @pytest.mark.anyio
+    async def test_the_connection_alone_still_decides(self, monkeypatch):
+        """A binding that names nothing takes the connection's list, which is
+        what every binding did before this field existed."""
+        assert await self._tools(monkeypatch, on_connection=["search"], on_binding=None) == [
+            "search"
+        ]
+
+    @pytest.mark.anyio
+    async def test_a_binding_cannot_reach_past_the_connections_ceiling(self, monkeypatch):
+        """Named on the binding, excluded on the connection: excluded. An
+        administrator's decision is not something a spec can widen."""
+        tools = await self._tools(
+            monkeypatch, on_connection=["search"], on_binding=["search", "create-pages"]
+        )
+
+        assert tools == ["search"]
+
+    @pytest.mark.anyio
+    async def test_a_binding_naming_only_excluded_tools_loses_them_not_the_server(
+        self, monkeypatch
+    ):
+        """The server stays attached with no tools rather than the run failing:
+        the same narrowing every other broken binding gets."""
+        assert await self._tools(monkeypatch, on_connection=["search"], on_binding=["delete"]) == []
+
+
+class TestEachPersonsOwnAccount:
+    """A personal binding: the sender's own connection, found by catalog key.
+
+    The tool prefix is the catalog key whatever the person called their
+    connection, so the agent presents the same tools to everybody - each further
+    account of theirs adding its label (#2125) - and the
+    allowlist is the binding's ceiling intersected with their own. Where the
+    binding cannot be honoured it is *reported* rather than skipped: a server
+    that silently goes missing reads as a broken agent to the person asking,
+    where a reported one is a sentence telling them what to connect.
+    """
+
+    @staticmethod
+    def _capture(monkeypatch) -> list[list[McpServerSpec]]:
+        seen: list[list[McpServerSpec]] = []
+
+        async def fake_probe(specs: list[McpServerSpec]) -> list[tuple[McpServerSpec, str]]:
+            seen.append(specs)
+            return [(spec, spec.name) for spec in specs]
+
+        monkeypatch.setattr(mcp_connection_service, "probe_toolsets", fake_probe)
+        return seen
+
+    @staticmethod
+    def _owns(monkeypatch, connections) -> AsyncMock:
+        lookup = AsyncMock(return_value=connections)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "list_user_scoped_by_catalog_key",
+            lookup,
+        )
+        return lookup
+
+    @staticmethod
+    def _personal(**overrides) -> PersonalMcpServerRef:
+        return PersonalMcpServerRef(account="personal", catalog_key="notion", **overrides)
+
+    @pytest.mark.anyio
+    async def test_the_senders_own_connection_answers_under_the_catalog_key(self, monkeypatch):
+        """Their URL and their credential; the organization's vocabulary. A tool
+        the model was told about must not change its name because of who is in
+        the chat, and nothing stops a person calling their Notion `my-notion`."""
+        seen = self._capture(monkeypatch)
+        mine = _connection(
+            name="my-notion",
+            url="https://mine.example.com/mcp",
+            catalog_key="notion",
+            allowed_tools=["search"],
+        )
+        self._owns(monkeypatch, [mine])
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=uuid4()
+        )
+
+        assert [(spec.name, spec.url) for spec in seen[0]] == [
+            ("notion", "https://mine.example.com/mcp")
+        ]
+        assert seen[0][0].allowed_tools == ["search"]
+        assert _attached(resolved) == ["notion"]
+        assert resolved.unavailable == []
+
+    @pytest.mark.anyio
+    async def test_a_collision_between_same_named_bindings_names_the_binding(self, monkeypatch):
+        """An organization connection called `notion` and each person's own
+        `notion` present their tools under one name - two different servers, not a
+        duplicate - so the report has to say *which* binding was dropped: the
+        names alone would tell the model that `notion` is both attached and
+        unavailable, and dropping it silently would lose a person's own account
+        the way the log line used to (#1442 review)."""
+        seen = self._capture(monkeypatch)
+        shared = _connection(name="notion", url="https://org.example/mcp", scope="org")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo, "get_org_scoped_by_ids", _batch(shared)
+        )
+        self._owns(monkeypatch, [_connection(name="my-notion", catalog_key="notion")])
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[OrgMcpServerRef(connection_id=shared.id), self._personal()],
+            sender_user_id=uuid4(),
+        )
+
+        assert [spec.name for spec in seen[0]] == ["notion", "notion"]
+        assert _attached(resolved) == ["notion"]
+        assert resolved.unavailable == [
+            UnavailablePrefixCollision(
+                server="notion",
+                prefix="notion",
+                kept="notion",
+                server_binding="each person's own notion",
+                kept_binding="the connection 'notion'",
+            )
+        ]
+
+    @pytest.mark.anyio
+    async def test_only_the_organization_server_notes_the_connection_its_calls_are_logged_under(
+        self, monkeypatch
+    ):
+        """A server's call log reads the connection recorded on each call (#2072),
+        so the organization's server notes its own, sharing one mapping per run,
+        and a person's own account notes nothing - its calls are not the server's."""
+        self._capture(monkeypatch)
+        shared = _connection(name="linear", url="https://org.example/mcp", scope="org")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo, "get_org_scoped_by_ids", _batch(shared)
+        )
+        self._owns(monkeypatch, [_connection(name="my-notion", catalog_key="notion")])
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[OrgMcpServerRef(connection_id=shared.id), self._personal()],
+            sender_user_id=uuid4(),
+        )
+
+        organization, personal = resolved.toolsets
+        assert isinstance(organization, ToolOrigins)
+        assert organization.connection_id == shared.id
+        assert organization.seen is resolved.origins
+        assert personal == "notion"
+
+    @pytest.mark.anyio
+    async def test_the_lookup_is_scoped_to_the_sender_and_the_service(self, monkeypatch):
+        self._capture(monkeypatch)
+        owned = self._owns(monkeypatch, [])
+        user_id = uuid4()
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=user_id
+        )
+
+        assert owned.await_args.kwargs == {"user_id": user_id, "catalog_key": "notion"}
+
+    @pytest.mark.anyio
+    async def test_nobody_at_the_keyboard_is_reported_rather_than_looked_up(self, monkeypatch):
+        """An API key, the widget, a schedule and an unlinked channel sender all
+        arrive with no sender. There is no account to speak through and nobody
+        whose connections it would be right to read."""
+        seen = self._capture(monkeypatch)
+        owned = self._owns(monkeypatch, [_connection(catalog_key="notion")])
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()]
+        )
+
+        assert seen[0] == []
+        assert resolved.unavailable == [UnavailablePersonalService("notion", "nobody_to_speak_as")]
+        owned.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_person_with_no_connection_of_their_own_is_told_so(self, monkeypatch):
+        """The common case the day an agent is switched to personal accounts."""
+        self._capture(monkeypatch)
+        self._owns(monkeypatch, [])
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=uuid4()
+        )
+
+        assert _attached(resolved) == []
+        assert resolved.unavailable == [UnavailablePersonalService("notion", "not_connected")]
+
+    @pytest.mark.anyio
+    async def test_every_account_they_hold_answers_each_under_its_own_prefix(self, monkeypatch):
+        """Two mailboxes on one agent at once (#2125): the first connected keeps
+        the service's own prefix, the other adds its label, and the run is told
+        which prefix is which account."""
+        seen = self._capture(monkeypatch)
+        self._owns(
+            monkeypatch,
+            [
+                _connection(name="work", url="https://a/mcp", catalog_key="notion"),
+                _connection(
+                    name="side", label="Side project", url="https://b/mcp", catalog_key="notion"
+                ),
+            ],
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=uuid4()
+        )
+
+        assert [(spec.name, spec.url) for spec in seen[0]] == [
+            ("notion", "https://a/mcp"),
+            ("notion-side-project", "https://b/mcp"),
+        ]
+        assert _attached(resolved) == ["notion", "notion-side-project"]
+        assert resolved.unavailable == []
+        assert resolved.accounts == [
+            AccountNote(service="notion", prefix="notion", account="work", whose="personal"),
+            AccountNote(
+                service="notion",
+                prefix="notion_side_project",
+                account="Side project",
+                whose="personal",
+            ),
+        ]
+
+    @pytest.mark.anyio
+    async def test_the_account_they_nominated_keeps_the_services_own_prefix(self, monkeypatch):
+        """Two accounts, one marked: the mark decides which is plain `notion`."""
+        seen = self._capture(monkeypatch)
+        self._owns(
+            monkeypatch,
+            [
+                _connection(name="side", url="https://side/mcp", catalog_key="notion"),
+                _connection(
+                    name="work", url="https://work/mcp", catalog_key="notion", is_default=True
+                ),
+            ],
+        )
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=uuid4()
+        )
+
+        assert [(spec.name, spec.url) for spec in seen[0]] == [
+            ("notion", "https://work/mcp"),
+            ("notion-side", "https://side/mcp"),
+        ]
+        # Two accounts on one service: an approval says which one is acting.
+        assert [spec.account for spec in seen[0]] == ["work", "side"]
+
+    @pytest.mark.anyio
+    async def test_two_labels_that_read_alike_still_get_a_prefix_each(self, monkeypatch):
+        """Codex on #2062: `Sales US` and `Sales-US` shared a prefix and one was dropped."""
+        seen = self._capture(monkeypatch)
+        twin = _connection(name="b", url="https://b/mcp", catalog_key="notion", label="Sales-US")
+        self._owns(
+            monkeypatch,
+            [
+                _connection(name="main", url="https://main/mcp", catalog_key="notion"),
+                _connection(name="a", url="https://a/mcp", catalog_key="notion", label="Sales US"),
+                twin,
+            ],
+        )
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=uuid4()
+        )
+
+        assert [spec.name for spec in seen[0]] == [
+            "notion",
+            "notion-sales-us",
+            f"notion-sales-us-{twin.id.hex[:8]}",
+        ]
+
+    @pytest.mark.anyio
+    async def test_an_account_that_no_longer_authorizes_leaves_the_others_answering(
+        self, monkeypatch
+    ):
+        seen = self._capture(monkeypatch)
+        self._owns(
+            monkeypatch,
+            [
+                _connection(
+                    name="work", catalog_key="notion", auth_token="enc:not-valid-ciphertext"
+                ),
+                _connection(name="side", url="https://side/mcp", catalog_key="notion"),
+            ],
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=uuid4()
+        )
+
+        assert [spec.url for spec in seen[0]] == ["https://side/mcp"]
+        assert resolved.unavailable == []
+        # One account answered, so there is nothing to tell apart.
+        assert resolved.accounts == []
+
+    @pytest.mark.anyio
+    async def test_two_of_the_organizations_accounts_on_one_service_are_told_apart(
+        self, monkeypatch
+    ):
+        """The company mailbox and `info@`, both the organization's: two
+        connections, two prefixes, and the labels the run is briefed with."""
+        seen = self._capture(monkeypatch)
+        main = _connection(name="outlook", label="Company", catalog_key="outlook", scope="org")
+        info = _connection(name="outlook-info", catalog_key="outlook", scope="org")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            AsyncMock(return_value={main.id: main, info.id: info}),
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[OrgMcpServerRef(connection_id=main.id), OrgMcpServerRef(connection_id=info.id)],
+        )
+
+        assert resolved.accounts == [
+            AccountNote(
+                service="outlook", prefix="outlook", account="Company", whose="organization"
+            ),
+            AccountNote(
+                service="outlook",
+                prefix="outlook_info",
+                account="outlook-info",
+                whose="organization",
+            ),
+        ]
+        # An organization's connection is named on an approval by its label alone.
+        assert [spec.account for spec in seen[0]] == ["Company", None]
+
+    @pytest.mark.parametrize(
+        ("name", "label", "expected"),
+        [
+            ("notion-2", None, "notion-2"),
+            ("x", "Notion Work", "notion-work"),
+            ("x", "Sales inbox", "notion-sales-inbox"),
+            ("x", "Notional", "notion-notional"),
+        ],
+    )
+    def test_a_further_accounts_prefix_does_not_repeat_the_service(self, name, label, expected):
+        account = _connection(name=name, label=label, catalog_key="notion")
+        assert mcp_connection_service._extra_prefix("notion", account) == expected
+
+    def test_a_label_with_nothing_a_tool_name_carries_falls_back_to_the_id(self):
+        account = _connection(name="notion", label="✉️", catalog_key="notion")
+        assert mcp_connection_service._extra_prefix("notion", account) == (
+            f"notion-{account.id.hex[:8]}"
+        )
+
+    @pytest.mark.anyio
+    async def test_one_account_needs_no_nomination(self, monkeypatch):
+        """An unmarked single account answers under the service's own prefix -
+        which is why no upgrade has to backfill a default."""
+        seen = self._capture(monkeypatch)
+        self._owns(
+            monkeypatch, [_connection(name="mine", url="https://mine/mcp", catalog_key="notion")]
+        )
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=uuid4()
+        )
+
+        assert seen[0][0].url == "https://mine/mcp"
+
+    @pytest.mark.anyio
+    async def test_a_connection_that_no_longer_authorizes_is_reported_not_sent_bare(
+        self, monkeypatch
+    ):
+        """An expired grant or an unreadable token must not become an anonymous
+        request to their workspace, and must not vanish either - the person can
+        authorize it again, if told."""
+        seen = self._capture(monkeypatch)
+        self._owns(
+            monkeypatch, [_connection(catalog_key="notion", auth_token="enc:not-valid-ciphertext")]
+        )
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(), organization_id=uuid4(), refs=[self._personal()], sender_user_id=uuid4()
+        )
+
+        assert seen[0] == []
+        assert resolved.unavailable == [UnavailablePersonalService("notion", "unauthorized")]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("on_binding", "on_their_own", "expected"),
+        [
+            (None, None, None),
+            (["read", "write"], None, ["read", "write"]),
+            (None, ["read"], ["read"]),
+            (["read", "write"], ["read", "delete"], ["read"]),
+        ],
+    )
+    async def test_the_bindings_ceiling_intersects_the_persons_own_allowlist(
+        self, monkeypatch, on_binding, on_their_own, expected
+    ):
+        """The spec's list is the administrator's ceiling - there is no
+        organization connection to read one from - and the person's own can
+        only take more away. Neither overrides the other."""
+        seen = self._capture(monkeypatch)
+        self._owns(monkeypatch, [_connection(catalog_key="notion", allowed_tools=on_their_own)])
+
+        await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[self._personal(allowed_tools=on_binding)],
+            sender_user_id=uuid4(),
+        )
+
+        assert seen[0][0].allowed_tools == expected
+
+    @pytest.mark.anyio
+    async def test_an_organization_binding_beside_it_is_untouched(self, monkeypatch):
+        """A personal binding nobody can speak through costs the agent that
+        server and nothing else."""
+        seen = self._capture(monkeypatch)
+        org = _connection(name="linear", url="https://mcp.linear.app/sse", scope="org")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_by_ids",
+            _batch(org),
+        )
+        self._owns(monkeypatch, [])
+
+        resolved = await mcp_connection_service.build_toolsets_for_agent(
+            AsyncMock(),
+            organization_id=uuid4(),
+            refs=[OrgMcpServerRef(connection_id=org.id), self._personal()],
+        )
+
+        assert [spec.name for spec in seen[0]] == ["linear"]
+        assert _attached(resolved) == ["linear"]
+        assert resolved.unavailable == [UnavailablePersonalService("notion", "nobody_to_speak_as")]
+
+
+class TestConnectingOneMidRun:
+    """`connect_personal_toolset`: the person's own connection, read again once
+    they said they made it, for `connect_account` to attach to the run waiting.
+
+    In a session of its own - the run's is busy with the run, and the row was
+    committed by another request after this run's transaction began.
+    """
+
+    @staticmethod
+    def _session(monkeypatch) -> MagicMock:
+        db = MagicMock()
+        context = MagicMock()
+        context.return_value.__aenter__ = AsyncMock(return_value=db)
+        context.return_value.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(mcp_connection_service, "get_db_context", context)
+        return db
+
+    @staticmethod
+    def _owns(monkeypatch, connections) -> AsyncMock:
+        lookup = AsyncMock(return_value=connections)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "list_user_scoped_by_catalog_key",
+            lookup,
+        )
+        return lookup
+
+    @staticmethod
+    def _probe(monkeypatch, answers: bool) -> list[McpServerSpec]:
+        seen: list[McpServerSpec] = []
+
+        async def fake_probe(specs: list[McpServerSpec]) -> list[tuple[McpServerSpec, str | None]]:
+            seen.extend(specs)
+            return [(spec, spec.name if answers else None) for spec in specs]
+
+        monkeypatch.setattr(mcp_connection_service, "probe_toolsets", fake_probe)
+        return seen
+
+    @pytest.mark.anyio
+    async def test_the_connection_just_made_comes_back_as_its_toolset(self, monkeypatch):
+        db = self._session(monkeypatch)
+        lookup = self._owns(
+            monkeypatch, [_connection(url="https://mine.example.com/mcp", catalog_key="notion")]
+        )
+        seen = self._probe(monkeypatch, answers=True)
+        person = uuid4()
+
+        outcome = await mcp_connection_service.connect_personal_toolset(
+            PersonalMcpServerRef(account="personal", catalog_key="notion"), user_id=person
+        )
+
+        assert outcome == "notion"
+        assert [(spec.name, spec.url) for spec in seen] == [
+            ("notion", "https://mine.example.com/mcp")
+        ]
+        lookup.assert_awaited_once_with(db, user_id=person, catalog_key="notion")
+
+    @pytest.mark.anyio
+    async def test_a_persons_own_account_brings_its_instructions_when_it_opted_in(
+        self, monkeypatch
+    ):
+        self._session(monkeypatch)
+        self._owns(monkeypatch, [_connection(catalog_key="notion", include_instructions=True)])
+        seen = self._probe(monkeypatch, answers=True)
+
+        await mcp_connection_service.connect_personal_toolset(
+            PersonalMcpServerRef(account="personal", catalog_key="notion"), user_id=uuid4()
+        )
+
+        assert [spec.include_instructions for spec in seen] == [True]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("connections", "gap"),
+        [
+            ([], "not_connected"),
+            (
+                [_connection(catalog_key="notion", auth_token="enc:not-valid-ciphertext")],
+                "unauthorized",
+            ),
+        ],
+    )
+    async def test_a_gap_that_still_stands_is_named_and_nothing_is_probed(
+        self, monkeypatch, connections, gap
+    ):
+        self._session(monkeypatch)
+        self._owns(monkeypatch, connections)
+        seen = self._probe(monkeypatch, answers=True)
+
+        outcome = await mcp_connection_service.connect_personal_toolset(
+            PersonalMcpServerRef(account="personal", catalog_key="notion"), user_id=uuid4()
+        )
+
+        assert outcome == gap
+        assert seen == []
+
+    @pytest.mark.anyio
+    async def test_with_several_accounts_their_default_answers_the_waiting_turn(self, monkeypatch):
+        self._session(monkeypatch)
+        self._owns(
+            monkeypatch,
+            [
+                _connection(name="side", url="https://side/mcp", catalog_key="notion"),
+                _connection(
+                    name="work", url="https://work/mcp", catalog_key="notion", is_default=True
+                ),
+            ],
+        )
+        seen = self._probe(monkeypatch, answers=True)
+
+        outcome = await mcp_connection_service.connect_personal_toolset(
+            PersonalMcpServerRef(account="personal", catalog_key="notion"), user_id=uuid4()
+        )
+
+        assert outcome == "notion"
+        assert [spec.url for spec in seen] == ["https://work/mcp"]
+
+    @pytest.mark.anyio
+    async def test_a_server_that_does_not_answer_is_unreachable(self, monkeypatch):
+        self._session(monkeypatch)
+        self._owns(monkeypatch, [_connection(catalog_key="notion")])
+        self._probe(monkeypatch, answers=False)
+
+        outcome = await mcp_connection_service.connect_personal_toolset(
+            PersonalMcpServerRef(account="personal", catalog_key="notion"), user_id=uuid4()
+        )
+
+        assert outcome == "unreachable"
+
+
+class TestAWatchedConnection:
+    """#2301: one of a person's own connections, as the server a watch reads."""
+
+    @pytest.mark.anyio
+    async def test_it_carries_the_persons_credential_and_their_narrowing(self):
+        conn = _connection(catalog_key="github", label="Work", allowed_tools=["list_prs"])
+        conn.auth_token = _seal_into(conn, "secret-token")
+
+        spec = await watched_connection_spec(conn)
+
+        assert spec is not None
+        assert spec.name == "github" and spec.account == "Work"
+        assert spec.headers == {"Authorization": "Bearer secret-token"}
+        assert spec.allowed_tools == ["list_prs"]
+
+    @pytest.mark.anyio
+    async def test_a_custom_server_goes_by_its_name_and_a_dead_credential_by_nothing(self):
+        assert (await watched_connection_spec(_connection())).name == "github"
+        dead = _connection(auth_token="enc:not-valid-ciphertext")
+        assert await watched_connection_spec(dead) is None
+
+
+class TestAuthHeaders:
+    @pytest.mark.anyio
+    async def test_no_token_no_headers(self):
+        assert await resolve_auth_headers(_connection()) == {}
+
+    @pytest.mark.anyio
+    async def test_token_is_decrypted_into_bearer_header(self):
+        conn = _connection()
+        conn.auth_token = _seal_into(conn, "secret-token")
+        assert await resolve_auth_headers(conn) == {"Authorization": "Bearer secret-token"}
+
+    @pytest.mark.anyio
+    async def test_another_members_envelope_does_not_open(self):
+        """A personal token is bound to its owner, not to the deployment.
+
+        This is the property the old global Fernet key could not give: a
+        ciphertext lifted out of one member's row and dropped into another's
+        decrypted happily, and it is somebody's live credential for a third-party
+        service.
+        """
+        mine = _connection()
+        stolen = _connection(auth_token=_seal_into(mine, "secret-token"))
+        assert await resolve_auth_headers(stolen) is None
+
+    @pytest.mark.anyio
+    async def test_a_personal_row_without_an_owner_is_refused_not_guessed(self):
+        """The mirror of the organization case, and equally unreachable by API."""
+        conn = _connection(user_id=None, auth_token="whatever")
+
+        with pytest.raises(BadRequestError, match="no owner"):
+            connection_scope(conn)
+
+    @pytest.mark.anyio
+    async def test_undecryptable_token_yields_none(self):
+        conn = _connection(auth_token="enc:not-valid-ciphertext")
+        assert await resolve_auth_headers(conn) is None
+
+    @pytest.mark.anyio
+    async def test_an_organization_token_is_opened_with_the_organizations_envelope(self):
+        organization_id = uuid4()
+        sealed = seal("org-token", scope=VaultScope.organization(organization_id))
+        conn = _connection(
+            scope="org",
+            user_id=None,
+            organization_id=organization_id,
+            auth_token=sealed.ciphertext,
+            secret_key_version=sealed.key_version,
+        )
+        assert await resolve_auth_headers(conn) == {"Authorization": "Bearer org-token"}
+
+    @pytest.mark.anyio
+    async def test_another_organizations_envelope_does_not_open(self):
+        """The vault binds a ciphertext to the organization it was sealed for.
+        A row copied between tenants - by a bad restore, or by hand - must be
+        unusable rather than silently working somewhere it does not belong."""
+        sealed = seal("org-token", scope=VaultScope.organization(uuid4()))
+        conn = _connection(
+            scope="org",
+            user_id=None,
+            organization_id=uuid4(),
+            auth_token=sealed.ciphertext,
+            secret_key_version=sealed.key_version,
+        )
+        assert await resolve_auth_headers(conn) is None
+
+    @pytest.mark.anyio
+    async def test_an_organization_row_without_an_organization_is_refused_not_guessed(self):
+        """A check constraint makes this unreachable through the API, so hitting
+        it means the data is corrupt. Falling through to the deployment key
+        would report "wrong master key" about a row never sealed with one."""
+        conn = _connection(scope="org", user_id=None, organization_id=None, auth_token="whatever")
+
+        with pytest.raises(BadRequestError, match="no organization"):
+            connection_scope(conn)
+
+
+class TestAccountAuthorized:
+    """`account_authorized` is the one place a connection's usability is decided,
+    so the rendered list and the run cannot drift (#1443)."""
+
+    def test_a_bearer_connection_with_no_token_is_usable(self):
+        assert _connection().account_authorized is True
+
+    def test_a_token_on_a_configured_key_is_authorized(self):
+        conn = _connection()
+        conn.auth_token = _seal_into(conn, "secret-token")
+        assert conn.account_authorized is True
+
+    def test_a_token_whose_sealing_key_is_gone_is_not_authorized(self):
+        # A SECRET_KEY rotation leaves the row naming a version nothing can unwrap;
+        # the client had no way to know, so it read connected.
+        assert _connection(auth_token="sealed", secret_key_version=999).account_authorized is False
+
+    def test_an_oauth_connection_is_authorized_once_its_payload_is_written(self):
+        assert _connection(auth_type="oauth", oauth_payload='{"t":1}').account_authorized is True
+        assert _connection(auth_type="oauth", oauth_payload=None).account_authorized is False
+
+    def test_an_oauth_payload_sealed_under_a_dropped_key_is_not_authorized(self):
+        # The payload is present but unopenable after a rotation, the same way a
+        # bearer token is - the run finds `_oauth_access_token` returns None.
+        gone = _connection(auth_type="oauth", oauth_payload='{"t":1}', secret_key_version=999)
+        assert gone.account_authorized is False
+
+    @pytest.mark.anyio
+    async def test_resolve_auth_headers_refuses_a_token_whose_key_is_gone(self):
+        conn = _connection(auth_token="sealed", secret_key_version=999)
+        assert await resolve_auth_headers(conn) is None
+
+    def test_the_read_carries_the_server_decided_authorized(self):
+        usable = _connection()
+        usable.auth_token = _seal_into(usable, "secret-token")
+        assert McpConnectionRead.from_model(usable).authorized is True
+        gone = _connection(auth_token="sealed", secret_key_version=999)
+        assert McpConnectionRead.from_model(gone).authorized is False
+
+    def test_a_grant_the_sweep_could_not_renew_reads_as_one_to_authorize_again(self):
+        """Not as a server that stopped answering: the person's next step is to
+        sign in again, which is what the list and the Builder offer (#2073)."""
+        expired = _connection(
+            auth_type="oauth",
+            oauth_payload='{"t":1}',
+            last_status="error",
+            last_error=AUTHORIZATION_EXPIRED,
+        )
+        down = _connection(
+            auth_type="oauth", oauth_payload='{"t":1}', last_status="error", last_error="timeout"
+        )
+
+        assert expired.authorization_expired is True
+        assert McpConnectionRead.from_model(expired).authorized is False
+        assert down.authorization_expired is False
+        assert McpConnectionRead.from_model(down).authorized is True
+
+    def test_the_read_says_whether_the_server_instructions_join(self):
+        assert McpConnectionRead.from_model(
+            _connection(include_instructions=True)
+        ).include_instructions
+
+
+@pytest.fixture(autouse=True)
+def refresh_transaction_context(monkeypatch):
+    @contextlib.asynccontextmanager
+    async def context():
+        db = MagicMock()
+        db.commit = AsyncMock()
+        db.rollback = AsyncMock()
+        try:
+            yield db
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+
+    monkeypatch.setattr(mcp_connection_service, "get_worker_db_context", context)
+
+
+def _oauth_connection(payload: McpOAuthPayload, **overrides) -> McpConnection:
+    """A connection carrying a sealed OAuth payload."""
+    conn = _connection(auth_type="oauth", **overrides)
+    conn.oauth_payload = _seal_into(conn, payload.model_dump_json())
+    return conn
+
+
+def _base_payload(**overrides) -> McpOAuthPayload:
+    data = {
+        "server_url": "https://srv/mcp",
+        "started_at": datetime.now(UTC).timestamp(),
+        "authorization_endpoint": "https://srv/authorize",
+        "token_endpoint": "https://srv/token",
+        "client_id": "cid",
+        "client_secret": "csecret",
+        "scope": "read",
+        "resource": "https://srv/mcp",
+        "redirect_uri": "https://app/api/me/mcp-connections/oauth/callback",
+    }
+    data.update(overrides)
+    return McpOAuthPayload(**data)
+
+
+class TestOAuthTokens:
+    def test_apply_token_folds_grant(self):
+        payload = _base_payload(code_verifier="verifier", refresh_token="old-refresh")
+        token = OAuthToken(access_token="AT", refresh_token="new-refresh", expires_in=3600)
+        result = _apply_token(payload, token)
+        assert result.access_token.get_secret_value() == "AT"
+        assert result.refresh_token.get_secret_value() == "new-refresh"
+        assert result.code_verifier is None  # cleared once tokens arrive
+        assert (
+            result.expires_at is not None and result.expires_at > mcp_oauth.TOKEN_EXPIRY_SKEW_SECS
+        )
+
+    def test_apply_token_keeps_refresh_when_omitted(self):
+        payload = _base_payload(refresh_token="keep-me")
+        token = OAuthToken(access_token="AT", expires_in=None)
+        result = _apply_token(payload, token)
+        assert result.refresh_token.get_secret_value() == "keep-me"
+        assert result.expires_at is None
+
+    def test_a_zero_lifetime_grant_is_not_treated_as_non_expiring(self, monkeypatch):
+        monkeypatch.setattr(mcp_connection_service, "_now_epoch", lambda: 1000.0)
+        payload = _apply_token(
+            _base_payload(refresh_token="rotate"),
+            OAuthToken(access_token="already-expired", expires_in=0),
+        )
+        assert payload.expires_at == 1000.0
+        assert not mcp_connection_service._token_is_fresh(payload)
+
+    def test_an_oauth_payload_does_not_print_its_tokens(self):
+        """The one reader that could log a payload whole catches `Exception` and
+        names only the connection; masking the credentials makes the guarantee
+        hold by construction rather than by that one clause."""
+        payload = _apply_token(
+            _base_payload(code_verifier="verifier"),
+            OAuthToken(access_token="at-do-not-print", refresh_token="rt-do-not-print"),
+        )
+        for shown in (repr(payload), str(payload), str(payload.model_dump())):
+            assert "csecret" not in shown
+            assert "at-do-not-print" not in shown
+            assert "rt-do-not-print" not in shown
+        # The vault is the one place that needs the real values - including after a
+        # `model_copy`, which skips validation and would otherwise hold a bare str.
+        sealed = payload.model_dump_json()
+        assert '"access_token":"at-do-not-print"' in sealed
+        assert '"refresh_token":"rt-do-not-print"' in sealed
+        assert '"client_secret":"csecret"' in sealed
+        assert McpOAuthPayload.model_validate_json(sealed) == payload
+
+    @pytest.mark.anyio
+    async def test_unauthorized_oauth_yields_none(self):
+        # No access_token yet (consent not completed).
+        conn = _oauth_connection(_base_payload(code_verifier="v"), oauth_state="state123")
+        assert await resolve_auth_headers(conn) is None
+
+    @pytest.mark.anyio
+    async def test_valid_oauth_token_becomes_bearer(self):
+        payload = _base_payload(access_token="live-token", expires_at=None)
+        conn = _oauth_connection(payload)
+        assert await resolve_auth_headers(conn) == {"Authorization": "Bearer live-token"}
+
+    @pytest.mark.anyio
+    async def test_expired_token_is_refreshed_and_persisted(self, monkeypatch):
+        payload = _base_payload(
+            access_token="stale", refresh_token="rt", expires_at=0.0
+        )  # long expired
+        conn = _oauth_connection(payload)
+        fresh = OAuthToken(access_token="fresh-token", refresh_token="rt2", expires_in=3600)
+        refresh_mock = AsyncMock(return_value=fresh)
+        monkeypatch.setattr(mcp_oauth, "refresh_tokens", refresh_mock)
+        lock_mock = AsyncMock(return_value=conn)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo, "get_for_token_refresh", lock_mock
+        )
+        update_mock = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "update", update_mock)
+
+        headers = await resolve_auth_headers(conn)
+        assert headers == {"Authorization": "Bearer fresh-token"}
+        refresh_mock.assert_awaited_once()
+        # The stored address, never the stored token endpoint, scopes the refresh.
+        assert refresh_mock.call_args.kwargs["server_url"] == payload.server_url
+        # The refresh token is only ever spent while holding the row lock.
+        lock_mock.assert_awaited_once()
+        # The refreshed token was persisted back (re-encrypted).
+        stored = update_mock.call_args.kwargs["update_data"]["oauth_payload"]
+        assert McpOAuthPayload.model_validate_json(
+            _open_from(conn, stored)
+        ).access_token.get_secret_value() == ("fresh-token")
+
+    @pytest.mark.anyio
+    async def test_concurrent_turn_reuses_the_token_the_winner_stored(self, monkeypatch):
+        """Two turns can hit an expired token at once. The one that loses the
+        row lock must re-read the row and use the fresh token, not spend the
+        refresh token a second time - providers that rotate it would invalidate
+        the winner's copy and quietly kill the connection."""
+        stale = _oauth_connection(
+            _base_payload(access_token="stale", refresh_token="rt", expires_at=0.0)
+        )
+        # What the winner committed while we waited on the lock.
+        refreshed = _oauth_connection(
+            _base_payload(
+                access_token="fresh-token",
+                refresh_token="rt2",
+                expires_at=datetime.now(UTC).timestamp() + 3600,
+            ),
+            id=stale.id,
+            user_id=stale.user_id,
+        )
+        refresh_mock = AsyncMock()
+        monkeypatch.setattr(mcp_oauth, "refresh_tokens", refresh_mock)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_for_token_refresh",
+            AsyncMock(return_value=refreshed),
+        )
+        update_mock = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "update", update_mock)
+
+        headers = await resolve_auth_headers(stale)
+
+        assert headers == {"Authorization": "Bearer fresh-token"}
+        refresh_mock.assert_not_awaited()
+        update_mock.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_expired_token_without_refresh_yields_none(self):
+        payload = _base_payload(access_token="stale", refresh_token=None, expires_at=0.0)
+        conn = _oauth_connection(payload)
+        assert await resolve_auth_headers(conn) is None
+
+    @pytest.mark.anyio
+    async def test_a_connection_awaiting_first_consent_has_no_payload_to_read(self):
+        """`oauth_start` writes the row before the user ever sees the consent
+        screen, so `oauth_payload` is NULL rather than unreadable. That is not
+        a licence to reach the server anonymously - the plugin is simply not
+        usable until the callback lands."""
+        conn = _connection(auth_type="oauth", oauth_payload=None, oauth_state="pending")
+        assert await resolve_auth_headers(conn) is None
+
+
+class TestRefreshUnderLock:
+    """What happens between finding an expired token and spending the refresh one.
+
+    Every case here ends in `None`, and the reason is the same each time: a
+    turn that loses one server is a worse answer, while a refresh token redeemed
+    against the wrong copy of the row is a connection the user has to notice is
+    broken and re-authorize by hand. When the locked row disagrees with the copy
+    read before the lock, the locked row is the one that is true.
+    """
+
+    _id = uuid4()
+    _user_id = uuid4()
+
+    @classmethod
+    def _expired(cls) -> McpConnection:
+        """The pre-lock copy: expired access token, refresh token still there."""
+        return _oauth_connection(
+            _base_payload(access_token="stale", refresh_token="rt", expires_at=0.0),
+            id=cls._id,
+            user_id=cls._user_id,
+        )
+
+    @staticmethod
+    def _locked(monkeypatch, row: McpConnection | None) -> AsyncMock:
+        """What `SELECT ... FOR UPDATE` finds once the lock is granted."""
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_for_token_refresh",
+            AsyncMock(return_value=row),
+        )
+        refresh = AsyncMock()
+        monkeypatch.setattr(mcp_oauth, "refresh_tokens", refresh)
+        return refresh
+
+    @pytest.mark.anyio
+    async def test_a_token_the_provider_rejected_is_refreshed_whatever_its_expiry_says(
+        self, monkeypatch
+    ):
+        """Codex on #2195: a 401 for a token whose recorded expiry is still ahead.
+        While the row holds that same token it is refreshed; one another caller
+        has already replaced is handed back without spending the refresh token."""
+        fresh = _oauth_connection(
+            _base_payload(access_token="held", refresh_token="rt", expires_at=9e12)
+        )
+        refresh = self._locked(monkeypatch, fresh)
+        refresh.return_value = OAuthToken(access_token="renewed", refresh_token="rt2")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo, "update", AsyncMock(return_value=fresh)
+        )
+
+        assert (
+            await mcp_connection_service._refresh_under_lock(fresh, rejected="someone-elses")
+            == "held"
+        )
+        refresh.assert_not_awaited()
+        assert await mcp_connection_service._refresh_under_lock(fresh, rejected="held") == "renewed"
+        refresh.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_a_revocation_committed_elsewhere_updates_the_callers_view_without_a_write(
+        self, monkeypatch
+    ):
+        from sqlalchemy import inspect
+
+        original = self._expired()
+        locked = self._expired()
+        refresh = self._locked(monkeypatch, locked)
+        refresh.side_effect = mcp_oauth.OAuthGrantRevoked("invalid_grant")
+
+        async def store(_db, *, db_connection, update_data):
+            db_connection.oauth_payload = update_data["oauth_payload"]
+            return db_connection
+
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "update", store)
+        assert await mcp_connection_service._refresh_under_lock(original) is None
+        assert mcp_connection_service.grant_needs_consent(original)
+        assert not inspect(original).attrs.oauth_payload.history.has_changes()
+
+    @pytest.mark.anyio
+    async def test_a_connection_deleted_while_the_turn_waited_is_not_refreshed(self, monkeypatch):
+        """Deleting a connection is how a user revokes it. If the lock is granted
+        only after the row is gone, spending its refresh token would hand the
+        provider a credential the user has just withdrawn."""
+        refresh = self._locked(monkeypatch, None)
+
+        assert await resolve_auth_headers(self._expired()) is None
+        refresh.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_payload_cleared_under_the_lock_is_not_refreshed_from_the_stale_copy(
+        self, monkeypatch
+    ):
+        """Moving a connection's URL wipes `oauth_payload`, because tokens
+        belong to the host that issued them. A turn holding the pre-lock copy
+        must not resurrect them against the new host."""
+        refresh = self._locked(
+            monkeypatch,
+            _connection(auth_type="oauth", oauth_payload=None, id=self._id, user_id=self._user_id),
+        )
+
+        assert await resolve_auth_headers(self._expired()) is None
+        refresh.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_refresh_token_the_locked_row_no_longer_has_is_not_spent(self, monkeypatch):
+        """The winner of the lock may have stored a grant that came back without
+        a refresh token. Falling back to the one in the stale copy would redeem
+        a token the provider already rotated away, and providers answer that by
+        invalidating the whole grant."""
+        refresh = self._locked(
+            monkeypatch,
+            _oauth_connection(
+                _base_payload(access_token="stale", refresh_token=None, expires_at=0.0),
+                id=self._id,
+                user_id=self._user_id,
+            ),
+        )
+
+        assert await resolve_auth_headers(self._expired()) is None
+        refresh.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_provider_refusing_the_refresh_drops_the_server_without_writing_anything(
+        self, monkeypatch
+    ):
+        """A revoked grant is fixed by re-authorizing, not by failing the chat
+        turn. Nothing is persisted either: overwriting the payload would destroy
+        the record of what the user needs to re-authorize."""
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_for_token_refresh",
+            AsyncMock(return_value=self._expired()),
+        )
+        monkeypatch.setattr(
+            mcp_oauth,
+            "refresh_tokens",
+            AsyncMock(side_effect=mcp_oauth.OAuthError("invalid_grant")),
+        )
+        update = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "update", update)
+
+        assert await resolve_auth_headers(self._expired()) is None
+        update.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_refresh_token_refused_as_invalid_grant_is_dropped(self, monkeypatch):
+        """Dead for good, so it is not spent again every minute - and without it
+        the row reads as needing a new consent, which is what it needs (#1984)."""
+        row = self._expired()
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_for_token_refresh",
+            AsyncMock(return_value=row),
+        )
+        monkeypatch.setattr(
+            mcp_oauth,
+            "refresh_tokens",
+            AsyncMock(side_effect=mcp_oauth.OAuthGrantRevoked("invalid_grant")),
+        )
+
+        async def store(_db, *, db_connection, update_data):
+            db_connection.oauth_payload = update_data["oauth_payload"]
+            return db_connection
+
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "update", store)
+
+        assert await resolve_auth_headers(row) is None
+        stored = McpOAuthPayload.model_validate_json(_open_from(row, row.oauth_payload))
+        assert stored.refresh_token is None
+        assert stored.access_token.get_secret_value() == "stale"
+        assert mcp_connection_service.grant_needs_consent(row)
+
+    @pytest.mark.anyio
+    async def test_a_microsoft_refresh_leaves_out_the_resource_it_refuses(self, monkeypatch):
+        """Microsoft's v2.0 token endpoint answers RFC 8707's `resource` with an
+        error, so an Outlook grant that carried it would never renew."""
+        row = _oauth_connection(
+            _base_payload(
+                provider="microsoft", access_token="stale", refresh_token="rt", expires_at=0.0
+            )
+        )
+        refresh = self._locked(monkeypatch, row)
+        refresh.return_value = OAuthToken(access_token="AT", expires_in=3600)
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "update", AsyncMock())
+
+        await resolve_auth_headers(row)
+
+        assert refresh.await_args.kwargs["resource"] is None
+
+
+class TestGrantNeedsConsent:
+    """Whether only a new consent can make a polled grant usable again (#1984)."""
+
+    def test_an_unreadable_or_empty_grant_does(self):
+        assert mcp_connection_service.grant_needs_consent(_connection(auth_type="oauth"))
+        assert mcp_connection_service.grant_needs_consent(
+            _oauth_connection(_base_payload(access_token=None))
+        )
+
+    def test_an_expired_token_with_nothing_to_renew_it_does(self):
+        assert mcp_connection_service.grant_needs_consent(
+            _oauth_connection(_base_payload(access_token="a", refresh_token=None, expires_at=0.0))
+        )
+
+    def test_a_fresh_token_or_a_renewable_one_does_not(self):
+        fresh = _base_payload(access_token="a", refresh_token=None, expires_at=None)
+        renewable = _base_payload(access_token="a", refresh_token="r", expires_at=0.0)
+        assert not mcp_connection_service.grant_needs_consent(_oauth_connection(fresh))
+        assert not mcp_connection_service.grant_needs_consent(_oauth_connection(renewable))
+
+
+class TestTheTokenEndpointsRefusals:
+    """`invalid_grant` told apart from every other refusal (#1984)."""
+
+    @staticmethod
+    def _answering(monkeypatch, response_kwargs):
+        async def fake_send(client, request):
+            return httpx2.Response(request=request, **response_kwargs)
+
+        monkeypatch.setattr(mcp_oauth, "_send", fake_send)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("code", ["invalid_grant", "interaction_required", "consent_required"])
+    async def test_an_answer_only_a_new_consent_fixes_is_a_revoked_grant(self, monkeypatch, code):
+        """Microsoft answers a refresh with `interaction_required` when a new MFA or
+        Conditional Access policy applies; retried every minute, it never heals."""
+        self._answering(monkeypatch, {"status_code": 400, "json": {"error": code}})
+        with pytest.raises(mcp_oauth.OAuthGrantRevoked):
+            await mcp_oauth._token_request("https://93.184.216.34/token", {"grant_type": "x"})
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "body", [{"error": "invalid_client"}, ["invalid_grant"], {"error": 400}]
+    )
+    async def test_any_other_refusal_is_not(self, monkeypatch, body):
+        self._answering(monkeypatch, {"status_code": 400, "json": body})
+        with pytest.raises(mcp_oauth.OAuthError) as raised:
+            await mcp_oauth._token_request("https://93.184.216.34/token", {"grant_type": "x"})
+        assert not isinstance(raised.value, mcp_oauth.OAuthGrantRevoked)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(("resource", "sent"), [("https://srv/mcp", True), (None, False)])
+    async def test_a_refresh_sends_a_resource_only_when_there_is_one(
+        self, monkeypatch, resource, sent
+    ):
+        request = AsyncMock(return_value=OAuthToken(access_token="AT"))
+        monkeypatch.setattr(mcp_oauth, "_token_request", request)
+
+        await mcp_oauth.refresh_tokens(
+            token_endpoint="https://srv/token",
+            client_id="cid",
+            client_secret=None,
+            refresh_token="rt",
+            resource=resource,
+            scope=None,
+            server_url="https://srv/mcp",
+        )
+
+        assert ("resource" in request.await_args.args[1]) is sent
+
+
+class TestOAuthSweep:
+    """The scheduled pass over every OAuth connection on the deployment.
+
+    It exists for one failure the lazy refresh cannot report: a refresh token
+    the provider has revoked is otherwise discovered by an agent, mid-run, in
+    front of whoever asked the question. So the two things worth guarding are
+    that a dead grant is written down *before* anybody's run hits it, and that
+    a healthy fleet is left alone - this runs on a schedule over rows belonging
+    to every tenant, and a write per connection per pass would be both noise
+    and a claim nobody checked.
+    """
+
+    @pytest.fixture
+    def repo(self, monkeypatch):
+        mock_repo = MagicMock()
+        mock_repo.list_oauth_connections = AsyncMock(return_value=[])
+        mock_repo.get_for_token_refresh = AsyncMock()
+        mock_repo.update = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service, "mcp_connection_repo", mock_repo)
+        return mock_repo
+
+    @staticmethod
+    def _written(repo) -> dict:
+        """The status the sweep recorded - the last write, after any re-seal."""
+        return repo.update.await_args.kwargs["update_data"]
+
+    @pytest.mark.anyio
+    async def test_a_connection_nobody_has_authorized_is_not_reported_as_expired(
+        self, repo, monkeypatch
+    ):
+        """Two rows reach here with nothing to refresh: one whose consent was
+        never completed, and one whose payload this deployment can no longer
+        decrypt. Marking either "Authorization expired" would send somebody to
+        reconnect a plugin over a fact the sweep did not establish."""
+        never_authorized = _oauth_connection(_base_payload(code_verifier="v"))
+        unreadable = _connection(auth_type="oauth", oauth_payload="enc:not-valid-ciphertext")
+        repo.list_oauth_connections.return_value = [never_authorized, unreadable]
+        monkeypatch.setattr(mcp_oauth, "refresh_tokens", AsyncMock())
+
+        counts = await mcp_connection_service.sweep_oauth_connections(AsyncMock())
+
+        assert counts == {"checked": 0, "refreshed": 0, "needs_authorization": 0, "skipped": 2}
+        repo.update.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_token_that_is_still_good_is_counted_and_left_alone(self, repo, monkeypatch):
+        """The lazy refresh renews a token at the moment it is needed, which no
+        schedule beats. A sweep that renewed early would spend a refresh token
+        for nothing, and one that wrote `last_checked_at` anyway would cost a
+        write per connection per pass to say what it already said."""
+        healthy = _oauth_connection(
+            _base_payload(access_token="live", expires_at=datetime.now(UTC).timestamp() + 3600)
+        )
+        repo.list_oauth_connections.return_value = [healthy]
+        refresh = AsyncMock()
+        monkeypatch.setattr(mcp_oauth, "refresh_tokens", refresh)
+
+        counts = await mcp_connection_service.sweep_oauth_connections(AsyncMock())
+
+        assert counts == {"checked": 1, "refreshed": 0, "needs_authorization": 0, "skipped": 1}
+        refresh.assert_not_awaited()
+        repo.update.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_token_about_to_expire_is_renewed_and_the_row_marked_healthy(
+        self, repo, monkeypatch
+    ):
+        expiring = _oauth_connection(
+            _base_payload(access_token="stale", refresh_token="rt", expires_at=0.0)
+        )
+        repo.list_oauth_connections.return_value = [expiring]
+        repo.get_for_token_refresh.return_value = expiring
+        monkeypatch.setattr(
+            mcp_oauth,
+            "refresh_tokens",
+            AsyncMock(return_value=OAuthToken(access_token="fresh", expires_in=3600)),
+        )
+
+        counts = await mcp_connection_service.sweep_oauth_connections(AsyncMock())
+
+        assert counts == {"checked": 1, "refreshed": 1, "needs_authorization": 0, "skipped": 0}
+        written = self._written(repo)
+        assert (written["last_status"], written["last_error"]) == ("ok", None)
+        assert written["last_checked_at"] is not None
+
+    @pytest.mark.anyio
+    async def test_a_grant_the_provider_has_revoked_is_written_down_before_a_run_finds_it(
+        self, repo, monkeypatch
+    ):
+        """The whole reason this flow exists. Withdrawing the grant in the
+        provider's console leaves a connection that still looks fine until an
+        agent reaches for it mid-conversation; the sweep is what puts "needs
+        authorization" in front of somebody who can act on it."""
+        revoked = _oauth_connection(
+            _base_payload(access_token="stale", refresh_token="rt", expires_at=0.0)
+        )
+        repo.list_oauth_connections.return_value = [revoked]
+        repo.get_for_token_refresh.return_value = revoked
+        monkeypatch.setattr(
+            mcp_oauth,
+            "refresh_tokens",
+            AsyncMock(side_effect=mcp_oauth.OAuthError("invalid_grant")),
+        )
+
+        counts = await mcp_connection_service.sweep_oauth_connections(AsyncMock())
+
+        assert counts == {"checked": 1, "refreshed": 0, "needs_authorization": 1, "skipped": 0}
+        written = self._written(repo)
+        assert written["last_status"] == "error"
+        assert "reconnect" in written["last_error"]
+
+    @pytest.mark.anyio
+    async def test_an_expired_token_with_no_refresh_path_is_marked_without_taking_a_lock(
+        self, repo, monkeypatch
+    ):
+        """A grant issued without a refresh token cannot be renewed by anybody.
+        Taking the row lock to discover that would make the sweep contend with
+        live chat turns for every one of them."""
+        stranded = _oauth_connection(
+            _base_payload(access_token="stale", refresh_token=None, expires_at=0.0)
+        )
+        repo.list_oauth_connections.return_value = [stranded]
+        refresh = AsyncMock()
+        monkeypatch.setattr(mcp_oauth, "refresh_tokens", refresh)
+
+        counts = await mcp_connection_service.sweep_oauth_connections(AsyncMock())
+
+        assert counts == {"checked": 1, "refreshed": 0, "needs_authorization": 1, "skipped": 0}
+        repo.get_for_token_refresh.assert_not_awaited()
+        refresh.assert_not_awaited()
+        assert self._written(repo)["last_status"] == "error"
+
+
+class TestMcpConnectionService:
+    @pytest.fixture
+    def service(self):
+        return McpConnectionService(db=AsyncMock())
+
+    @pytest.fixture(autouse=True)
+    def locks(self, monkeypatch):
+        """The advisory lock a nomination takes, which needs a real session."""
+        held = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service, "hold_name", held)
+        return held
+
+    @pytest.fixture
+    def repo(self, monkeypatch):
+        mock_repo = MagicMock()
+        mock_repo.get_by_id = AsyncMock()
+        # `update` reads through the locked variant; one mock serves both so a
+        # test can stage the row once, whichever path the service takes.
+        mock_repo.get_by_id_for_update = mock_repo.get_by_id
+        mock_repo.get_by_name = AsyncMock(return_value=None)
+        mock_repo.list_user_scoped_by_catalog_key = AsyncMock(return_value=[])
+        mock_repo.list_for_user = AsyncMock(return_value=([], 0))
+        mock_repo.create = AsyncMock()
+        mock_repo.update = AsyncMock()
+        mock_repo.delete = AsyncMock()
+        mock_repo.clear_default_for_catalog_key = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service, "mcp_connection_repo", mock_repo)
+        return mock_repo
+
+    @pytest.mark.anyio
+    async def test_settings_lists_a_connection_the_user_switched_off(self, service, repo):
+        """Only the chat turn wants the enabled ones. The Settings listing is
+        where a disabled connection gets switched back on, so hiding it there
+        would strand it."""
+        conn = _connection(is_enabled=False)
+        repo.list_for_user.return_value = ([conn], 1)
+
+        items, total = await service.list_for_user(user_id=conn.user_id)
+
+        assert (items, total) == ([conn], 1)
+        assert repo.list_for_user.call_args.kwargs == {"user_id": conn.user_id}
+
+    @pytest.mark.anyio
+    async def test_create_blocks_internal_urls(self, service, repo):
+        """As a refusal naming the field, not as the `ValueError` the guard
+        raises - which no handler maps, so it left as a 500 (#861)."""
+        data = McpConnectionCreate(name="internal", url="http://127.0.0.1:8000/mcp")
+        with pytest.raises(BadRequestError) as excinfo:
+            await service.create(user_id=uuid4(), data=data)
+        assert excinfo.value.details == {
+            "fields": [{"field": "url", "message": excinfo.value.message}]
+        }
+        assert excinfo.value.status_code == 400
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_every_check_of_a_connections_own_url_honours_the_list(self, monkeypatch):
+        """Saving it, probing it for sign-in and starting its OAuth flow all
+        check the URL a person typed, so a listed host passes each of them.
+        What a server names afterwards is `mcp_oauth`'s to scope."""
+        monkeypatch.setattr(settings, "MCP_ALLOWED_HOSTS", ["10.0.0.5"])
+        url = "http://10.0.0.5:8000/mcp"
+
+        assert await mcp_connection_service._checked_url(url) == url
+
+        with pytest.raises(BadRequestError):
+            await mcp_connection_service._checked_url("http://10.0.0.6:8000/mcp")
+
+    @pytest.mark.anyio
+    async def test_create_accepts_a_host_the_operator_listed(self, service, repo, monkeypatch):
+        """`MCP_ALLOWED_HOSTS` is how a server on the deployment's own network
+        gets connected at all. The real validator runs here, and the name is
+        resolved: the operator vouched for a private answer, nothing worse."""
+        monkeypatch.setattr(settings, "MCP_ALLOWED_HOSTS", ["postgres-mcp"])
+        asked = TestOAuthRequestSafety._resolves(monkeypatch, "10.0.0.9")
+
+        await service.create(
+            user_id=uuid4(),
+            data=McpConnectionCreate(name="postgres", url="http://postgres-mcp:8000/mcp"),
+        )
+
+        assert repo.create.call_args.kwargs["url"] == "http://postgres-mcp:8000/mcp"
+        assert asked == ["postgres-mcp"]
+
+    @pytest.mark.anyio
+    async def test_moving_the_url_to_a_listed_host_is_accepted(self, service, repo, monkeypatch):
+        """Editing a connection's address is saving it too, so it honours the
+        list the way creating one does."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id.return_value = conn
+        monkeypatch.setattr(settings, "MCP_ALLOWED_HOSTS", ["postgres-mcp"])
+        asked = TestOAuthRequestSafety._resolves(monkeypatch, "10.0.0.9")
+
+        await service.update(
+            user_id=user_id,
+            connection_id=conn.id,
+            data=McpConnectionUpdate(url="http://postgres-mcp:8000/mcp"),
+        )
+
+        assert repo.update.call_args.kwargs["update_data"]["url"] == "http://postgres-mcp:8000/mcp"
+        assert asked == ["postgres-mcp"]
+
+    @pytest.mark.anyio
+    async def test_create_seals_the_token_for_its_owner(self, service, repo, monkeypatch):
+        _allow_any_url(monkeypatch)
+        user_id = uuid4()
+        data = McpConnectionCreate(
+            name="github", url="https://example.com/mcp", auth_token="secret"
+        )
+        await service.create(user_id=user_id, data=data)
+
+        stored = repo.create.call_args.kwargs["auth_token"]
+        assert stored != "secret"
+        assert unseal(stored, scope=VaultScope.user(user_id)) == "secret"
+        # And nobody else's envelope opens it.
+        with pytest.raises(BadRequestError, match="Failed to decrypt"):
+            unseal(stored, scope=VaultScope.user(uuid4()))
+
+    @pytest.mark.anyio
+    async def test_create_without_token_stores_none(self, service, repo, monkeypatch):
+        _allow_any_url(monkeypatch)
+        data = McpConnectionCreate(name="github", url="https://example.com/mcp")
+        await service.create(user_id=uuid4(), data=data)
+        assert repo.create.call_args.kwargs["auth_token"] is None
+
+    @pytest.mark.anyio
+    async def test_create_refuses_a_name_this_user_already_has(self, service, repo, monkeypatch):
+        """The name becomes the tool prefix inside the agent. Two connections
+        sharing one means the second server's tools silently never appear."""
+        _allow_any_url(monkeypatch)
+        repo.get_by_name.return_value = _connection(name="github")
+
+        with pytest.raises(AlreadyExistsError):
+            await service.create(
+                user_id=uuid4(),
+                data=McpConnectionCreate(name="github", url="https://example.com/mcp"),
+            )
+
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_create_losing_the_race_on_a_name_is_a_conflict_not_a_crash(
+        self, service, repo, monkeypatch
+    ):
+        """Two requests can both pass the name check before either one inserts.
+        `uq_mcp_connections_user_name` is what actually decides, and the loser
+        must get the same 409 as if it had simply arrived second - not a 500."""
+        _allow_any_url(monkeypatch)
+        repo.create.side_effect = IntegrityError("INSERT", {}, Exception("duplicate key"))
+
+        with pytest.raises(AlreadyExistsError) as refused:
+            await service.create(
+                user_id=uuid4(),
+                data=McpConnectionCreate(name="github", url="https://example.com/mcp"),
+            )
+
+        assert refused.value.details == {"name": "github"}
+
+    @pytest.mark.anyio
+    async def test_renaming_onto_another_connections_name_is_refused(self, service, repo):
+        """Same collision as at create, and the same consequence: one of the two
+        servers stops being reachable from the agent."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, name="github")
+        repo.get_by_id.return_value = conn
+        repo.get_by_name.return_value = _connection(user_id=user_id, name="linear")
+
+        with pytest.raises(AlreadyExistsError):
+            await service.update(
+                user_id=user_id,
+                connection_id=conn.id,
+                data=McpConnectionUpdate(name="linear"),
+            )
+
+        repo.update.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_change_that_touches_neither_url_nor_token_keeps_the_last_check_result(
+        self, service, repo
+    ):
+        """The probe result describes a server and the credential used to reach
+        it. Renaming a connection or switching it off changes neither, and
+        blanking the result would show "never checked" for a working server."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, name="github", last_status="ok")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id,
+            connection_id=conn.id,
+            data=McpConnectionUpdate(name="linear", is_enabled=False),
+        )
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert update_data["name"] == "linear"
+        assert "last_status" not in update_data
+        assert "last_checked_at" not in update_data
+
+    @pytest.mark.anyio
+    async def test_clearing_the_allowlist_exposes_every_tool_again(self, service, repo):
+        """`allowed_tools: null` in a PATCH body cannot be told apart from "not
+        provided", so the reset needs its own flag. Without it a user could
+        narrow an allowlist and never widen it back."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, allowed_tools=["search_issues"])
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id,
+            connection_id=conn.id,
+            data=McpConnectionUpdate(clear_allowed_tools=True),
+        )
+
+        assert repo.update.call_args.kwargs["update_data"]["allowed_tools"] is None
+
+    @pytest.mark.anyio
+    async def test_an_update_that_asks_for_nothing_writes_nothing(self, service, repo):
+        """An empty PATCH body must not bump `updated_at` - a row that changes
+        for no reason is one that looks edited to whoever reads it next."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id.return_value = conn
+
+        result = await service.update(
+            user_id=user_id, connection_id=conn.id, data=McpConnectionUpdate()
+        )
+
+        assert result is conn
+        repo.update.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_deleting_a_connection_removes_the_row_holding_the_credential(
+        self, service, repo
+    ):
+        """Deleting is the only way a user revokes a token they pasted in, so it
+        has to reach the row - and the row it reaches is the one ownership was
+        checked against, never the id the request named."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id.return_value = conn
+
+        await service.delete(user_id=user_id, connection_id=conn.id)
+
+        assert repo.delete.call_args.kwargs["db_connection"] is conn
+
+    @pytest.mark.anyio
+    async def test_update_reseals_a_replacement_token_at_the_rows_version(
+        self, service, repo, monkeypatch
+    ):
+        """One version governs every secret in the row, so a replacement token is
+        sealed at the version the row already records - never at whatever is
+        current, which would leave the OAuth envelopes two lines over sealed
+        under a version the column no longer names (#552).
+        """
+        monkeypatch.setattr(
+            settings, "VAULT_MASTER_KEYS", {1: "k1" * 20, 2: "k2" * 20, 3: "k3" * 20}
+        )
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, secret_key_version=2)
+        conn.auth_token = _seal_into(conn, "old")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id,
+            connection_id=conn.id,
+            data=McpConnectionUpdate(auth_token="new-token"),
+        )
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert "secret_key_version" not in update_data
+        assert (
+            unseal(update_data["auth_token"], scope=VaultScope.user(user_id), key_version=2)
+            == "new-token"
+        )
+
+    @pytest.mark.anyio
+    async def test_update_reads_the_row_locked_before_resealing(self, service, repo):
+        """Sealing at the row's recorded version is only safe while the row is
+        held from the read - an unlocked read lets a rotation commit in between,
+        and the new envelope lands tagged with a version it was not sealed
+        under. If update read through the unlocked getter, the None staged on
+        it here would make it refuse."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id_for_update = AsyncMock(return_value=conn)
+        repo.get_by_id = AsyncMock(return_value=None)
+
+        await service.update(
+            user_id=user_id, connection_id=conn.id, data=McpConnectionUpdate(is_enabled=False)
+        )
+
+        assert repo.get_by_id_for_update.await_count == 1
+
+    @pytest.mark.anyio
+    async def test_update_empty_token_clears_it(self, service, repo):
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        conn.auth_token = _seal_into(conn, "old")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id,
+            connection_id=conn.id,
+            data=McpConnectionUpdate(auth_token=""),
+        )
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert update_data["auth_token"] is None
+        # Credentials changed → stale check result is reset.
+        assert update_data["last_status"] is None
+
+    @pytest.mark.anyio
+    async def test_a_label_is_stored_beside_the_slug_the_model_reads(self, service, repo):
+        """`name` is the tool prefix and is constrained to what a tool name can
+        carry, which makes it a poor label for two accounts on one service."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id,
+            connection_id=conn.id,
+            data=McpConnectionUpdate(label="  Kacper - workspace firmowy  "),
+        )
+
+        # Trimmed, and the name untouched: the two answer different questions.
+        assert repo.update.call_args.kwargs["update_data"] == {
+            "label": "Kacper - workspace firmowy"
+        }
+
+    @pytest.mark.anyio
+    async def test_an_empty_label_clears_it_rather_than_storing_a_blank(self, service, repo):
+        """`None` is "unchanged" everywhere in a PATCH body, so it cannot also
+        mean "remove". Storing `""` would render a blank line where the slug
+        used to be."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, label="Old name")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id, connection_id=conn.id, data=McpConnectionUpdate(label="")
+        )
+
+        assert repo.update.call_args.kwargs["update_data"]["label"] is None
+
+    @pytest.mark.anyio
+    async def test_a_label_nobody_sent_is_left_alone(self, service, repo):
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, label="Kept")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id, connection_id=conn.id, data=McpConnectionUpdate(is_enabled=False)
+        )
+
+        assert "label" not in repo.update.call_args.kwargs["update_data"]
+
+    @pytest.mark.anyio
+    async def test_nominating_an_account_clears_the_siblings_first(self, service, repo):
+        """The partial unique index is the constraint, so it is never asked to
+        hold two: the others are cleared before this row is written (#1342)."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, catalog_key="notion")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id, connection_id=conn.id, data=McpConnectionUpdate(is_default=True)
+        )
+
+        assert repo.clear_default_for_catalog_key.await_args.kwargs == {
+            "user_id": user_id,
+            "catalog_key": "notion",
+            "except_id": conn.id,
+        }
+        assert repo.update.call_args.kwargs["update_data"]["is_default"] is True
+
+    @pytest.mark.anyio
+    async def test_a_nomination_is_serialized_per_member_and_service(self, service, repo, locks):
+        """Two nominations racing on one service each locked only their own row,
+        each found no sibling still marked, and both wrote `is_default` - so one
+        hit the partial unique index and answered 500. Taken *before* the
+        clear, because the clear is what makes room for the set."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, catalog_key="notion")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id, connection_id=conn.id, data=McpConnectionUpdate(is_default=True)
+        )
+
+        assert locks.await_args.args[2] == f"{user_id}:notion"
+        assert locks.await_args.args[1] is mcp_connection_service.LockScope.MCP_DEFAULT_ACCOUNT
+
+    @pytest.mark.anyio
+    async def test_repointing_the_url_drops_the_cached_tool_list(
+        self, service, repo, locks, monkeypatch
+    ):
+        """The Builder reads that cache without probing, so leaving it presented
+        the previous host's tools as the new server's - and an allowlist saved
+        from that list hides every tool the replacement actually offers."""
+        _allow_any_url(monkeypatch)
+        conn = _connection(url="https://old.example/mcp")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=conn.user_id,
+            connection_id=conn.id,
+            data=McpConnectionUpdate(url="https://new.example/mcp"),
+        )
+
+        assert repo.update.call_args.kwargs["update_data"]["last_tools"] is None
+
+    @pytest.mark.anyio
+    async def test_a_change_that_leaves_the_url_alone_keeps_the_tool_list(self, service, repo):
+        """A relabelled connection is the same server; blanking the list would
+        leave an agent author with nothing to choose from."""
+        conn = _connection(url="https://same.example/mcp")
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=conn.user_id, connection_id=conn.id, data=McpConnectionUpdate(label="Work")
+        )
+
+        assert "last_tools" not in repo.update.call_args.kwargs["update_data"]
+
+    @pytest.mark.anyio
+    async def test_un_nominating_leaves_the_siblings_alone(self, service, repo):
+        """Turning one off says nothing about which should be on instead."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, catalog_key="notion", is_default=True)
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id, connection_id=conn.id, data=McpConnectionUpdate(is_default=False)
+        )
+
+        repo.clear_default_for_catalog_key.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_connection_with_no_catalog_entry_cannot_be_nominated(self, service, repo):
+        """The key is what says this account and the organization's are the same
+        service, so a default without one would never be read."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, catalog_key=None)
+        repo.get_by_id.return_value = conn
+
+        with pytest.raises(BadRequestError) as refused:
+            await service.update(
+                user_id=user_id, connection_id=conn.id, data=McpConnectionUpdate(is_default=True)
+            )
+
+        assert refused.value.details["fields"][0]["field"] == "is_default"
+        repo.update.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_update_url_revalidates_ssrf(self, service, repo):
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id.return_value = conn
+
+        with pytest.raises(BadRequestError) as excinfo:
+            await service.update(
+                user_id=user_id,
+                connection_id=conn.id,
+                data=McpConnectionUpdate(url="http://169.254.169.254/mcp"),
+            )
+
+        assert excinfo.value.details == {
+            "fields": [{"field": "url", "message": excinfo.value.message}]
+        }
+        repo.update.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_other_users_connection_is_not_found(self, service, repo):
+        repo.get_by_id.return_value = _connection(user_id=uuid4())
+        with pytest.raises(NotFoundError):
+            await service.delete(user_id=uuid4(), connection_id=uuid4())
+
+    @pytest.mark.anyio
+    async def test_test_records_failure(self, service, repo, monkeypatch):
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id.return_value = conn
+        repo.update.return_value = conn
+
+        async def failing_probe(url, headers=None, timeout=None):
+            raise TimeoutError
+
+        monkeypatch.setattr(mcp_connection_service, "probe_mcp_server", failing_probe)
+
+        _, tools, error = await service.test(user_id=user_id, connection_id=conn.id)
+
+        assert tools == []
+        assert error is not None and "timed out" in error
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert update_data["last_status"] == "error"
+
+    @pytest.mark.anyio
+    async def test_test_records_success_and_returns_tools(self, service, repo, monkeypatch):
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id.return_value = conn
+        repo.update.return_value = conn
+
+        async def ok_probe(url, headers=None, timeout=None):
+            return [McpToolInfo(name="search", description="Search things")]
+
+        monkeypatch.setattr(mcp_connection_service, "probe_mcp_server", ok_probe)
+
+        _, tools, error = await service.test(user_id=user_id, connection_id=conn.id)
+
+        assert error is None
+        assert [t.name for t in tools] == ["search"]
+        assert repo.update.call_args.kwargs["update_data"]["last_status"] == "ok"
+
+    @pytest.mark.anyio
+    async def test_test_on_an_unauthorized_connection_reports_that_and_does_not_dial_out(
+        self, service, repo, monkeypatch
+    ):
+        """Probing with no credentials would tell the user their server is
+        broken when what is missing is their consent - and would send an
+        anonymous request to a third party to find that out."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id, auth_type="oauth", oauth_payload=None)
+        repo.get_by_id.return_value = conn
+        repo.update.return_value = conn
+
+        async def never_probed(url, headers=None, timeout=None):
+            raise AssertionError("an unauthorized connection must not be probed")
+
+        monkeypatch.setattr(mcp_connection_service, "probe_mcp_server", never_probed)
+
+        _, tools, error = await service.test(user_id=user_id, connection_id=conn.id)
+
+        assert tools == []
+        assert error is not None and "authorized" in error
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert (update_data["last_status"], update_data["last_error"]) == ("error", error)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("registration", "expected"),
+        [("https://srv/register", (True, True)), (None, (True, False))],
+    )
+    async def test_a_server_added_by_address_says_whether_people_can_sign_in(
+        self, service, monkeypatch, registration, expected
+    ):
+        """The discovery a sign-in runs, registering nothing (#2073)."""
+        _allow_any_url(monkeypatch)
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint=registration,
+            resource="https://srv/mcp",
+            scope=None,
+            metadata=MagicMock(),
+        )
+        register = AsyncMock()
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+        monkeypatch.setattr(mcp_oauth, "register_client", register)
+
+        probed = await service.probe_sign_in("https://srv/mcp")
+
+        assert (probed.sign_in, probed.registers_clients) == expected
+        register.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_server_with_no_oauth_metadata_offers_no_sign_in(self, service, monkeypatch):
+        _allow_any_url(monkeypatch)
+        monkeypatch.setattr(
+            mcp_oauth, "discover", AsyncMock(side_effect=mcp_oauth.OAuthError("none"))
+        )
+
+        probed = await service.probe_sign_in("https://srv/mcp")
+
+        assert (probed.sign_in, probed.registers_clients) == (False, False)
+
+    @pytest.mark.anyio
+    async def test_oauth_start_will_not_take_over_a_token_based_connection(
+        self, service, repo, monkeypatch
+    ):
+        """Names are unique per user, so an OAuth flow started under an existing
+        bearer connection's name would have to overwrite it - discarding a token
+        the user pasted in once and cannot read back out."""
+        _allow_any_url(monkeypatch)
+        repo.get_by_name.return_value = _connection(name="github", auth_type="bearer")
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint=None,
+            resource="https://srv/mcp",
+            scope=None,
+            metadata=MagicMock(),
+        )
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+        monkeypatch.setattr(mcp_oauth, "register_client", AsyncMock(return_value=("cid", None)))
+
+        with pytest.raises(AlreadyExistsError):
+            await service.oauth_start(user_id=uuid4(), name="github", url="https://srv/mcp")
+
+        repo.update.assert_not_called()
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_oauth_start_refuses_a_catalog_key_no_catalog_knows(
+        self, service, repo, monkeypatch
+    ):
+        """A key nothing recognises would be stored and then never match.
+
+        The whole point of the key is that a personal connection can stand in for
+        the organization's; one naming a server neither the curated catalog nor
+        the registry mirror holds can never be substituted for anything, so it is
+        refused at the door rather than written and left inert.
+        """
+        _allow_any_url(monkeypatch)
+        repo.get_by_name.return_value = None
+        monkeypatch.setattr(service, "_known_catalog_key", AsyncMock(return_value=False))
+
+        with pytest.raises(BadRequestError) as refusal:
+            await service.oauth_start(
+                user_id=uuid4(), name="whatever", url="https://srv/mcp", catalog_key="no-such"
+            )
+
+        assert refusal.value.details == {"catalog_key": "no-such"}
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_oauth_start_is_refused_under_an_impersonation(self, service, repo):
+        """An administrator acting as B must not fasten their own OAuth grant to
+        B's account. Refused before any registration, so no pending row (#1438)."""
+        with _impersonating(), pytest.raises(AuthorizationError):
+            await service.oauth_start(user_id=uuid4(), name="linear", url="https://srv/mcp")
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_org_oauth_start_is_refused_under_an_impersonation(self, service, repo):
+        """The organization start binds a grant the same way, so it takes the same
+        refusal - before any discovery or row - the org half of #1438 (#1490)."""
+        ctx = AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+        with _impersonating(), pytest.raises(AuthorizationError):
+            await service.oauth_start_for_org(ctx, name="shared", url="https://srv/mcp")
+        repo.create_org_scoped.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_org_github_oauth_start_is_refused_under_an_impersonation(self, service, repo):
+        """The GitHub org start skips `_oauth_start`, so it carries its own guard -
+        refused before the org's OAuth-app credentials are even read (#1490)."""
+        ctx = AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+        with _impersonating(), pytest.raises(AuthorizationError):
+            await service.oauth_start_for_org_github(ctx, portal_key="any-portal")
+        repo.create_org_scoped.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_polled_portal_oauth_start_is_refused_under_an_impersonation(self, service, repo):
+        """The polled-portal start skips `_oauth_start` too, so it carries its own
+        guard - the third org route #1438's single guard would have missed (#1490)."""
+        ctx = AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+        with _impersonating(), pytest.raises(AuthorizationError):
+            await service.oauth_start_for_polled_portal(ctx, portal_key="any-portal")
+        repo.create_org_scoped.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_create_with_a_token_is_refused_under_an_impersonation(
+        self, service, repo, monkeypatch
+    ):
+        """An administrator acting as B must not store their own bearer token as
+        B's personal connection - B's agents would then call the server as the
+        administrator's account after the hour-bounded impersonation ends, and
+        the credential would stand recorded against B (#1492)."""
+        _allow_any_url(monkeypatch)
+        with _impersonating(), pytest.raises(AuthorizationError):
+            await service.create(
+                user_id=uuid4(),
+                data=McpConnectionCreate(
+                    name="linear", url="https://srv/mcp", auth_token="admin-token"
+                ),
+            )
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_create_without_a_token_is_allowed_under_an_impersonation(
+        self, service, repo, monkeypatch
+    ):
+        """Only a manually entered credential is refused - a tokenless connection
+        captures no identity, and configuring one as B is much of what
+        impersonation is for (#1492)."""
+        _allow_any_url(monkeypatch)
+        with _impersonating():
+            await service.create(
+                user_id=uuid4(),
+                data=McpConnectionCreate(name="linear", url="https://srv/mcp"),
+            )
+        repo.create.assert_called_once()
+
+    @pytest.mark.anyio
+    async def test_update_with_a_replacement_token_is_refused_under_an_impersonation(
+        self, service, repo
+    ):
+        """The same refusal as create, for a token pasted over an existing
+        connection. Refused before the write, so nothing is resealed (#1492)."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        repo.get_by_id.return_value = conn
+        with _impersonating(), pytest.raises(AuthorizationError):
+            await service.update(
+                user_id=user_id,
+                connection_id=conn.id,
+                data=McpConnectionUpdate(auth_token="admin-token"),
+            )
+        repo.update.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_update_clearing_the_token_is_allowed_under_an_impersonation(self, service, repo):
+        """Removing a token stores no credential, so it is left alone - only a
+        non-empty replacement is refused (#1492)."""
+        user_id = uuid4()
+        conn = _connection(user_id=user_id)
+        conn.auth_token = _seal_into(conn, "old")
+        repo.get_by_id.return_value = conn
+        with _impersonating():
+            await service.update(
+                user_id=user_id,
+                connection_id=conn.id,
+                data=McpConnectionUpdate(auth_token=""),
+            )
+        assert repo.update.call_args.kwargs["update_data"]["auth_token"] is None
+
+    @pytest.mark.anyio
+    async def test_oauth_start_asks_a_second_account_for_its_label_and_keeps_it(
+        self, service, repo, monkeypatch
+    ):
+        """The label typed in the dialog used to be dropped on the way to consent."""
+        _allow_any_url(monkeypatch)
+        monkeypatch.setattr(service, "_known_catalog_key", AsyncMock(return_value=True))
+        repo.list_user_scoped_by_catalog_key = AsyncMock(
+            return_value=[_connection(name="linear", catalog_key="linear")]
+        )
+        monkeypatch.setattr(
+            mcp_oauth,
+            "discover",
+            AsyncMock(
+                return_value=mcp_oauth.DiscoveredServer(
+                    authorization_endpoint="https://srv/authorize",
+                    token_endpoint="https://srv/token",
+                    registration_endpoint="https://srv/register",
+                    resource="https://srv/mcp",
+                    scope=None,
+                    metadata=MagicMock(),
+                )
+            ),
+        )
+        monkeypatch.setattr(mcp_oauth, "register_client", AsyncMock(return_value=("cid", None)))
+
+        with pytest.raises(BadRequestError):
+            await service.oauth_start(
+                user_id=uuid4(), name="linear-2", url="https://srv/mcp", catalog_key="linear"
+            )
+        await service.oauth_start(
+            user_id=uuid4(),
+            name="linear-2",
+            url="https://srv/mcp",
+            catalog_key="linear",
+            label="Ops",
+        )
+
+        assert repo.create.call_args.kwargs["label"] == "Ops"
+
+    @pytest.mark.anyio
+    async def test_authorizing_an_existing_second_account_again_needs_no_label(
+        self, service, repo, monkeypatch
+    ):
+        _allow_any_url(monkeypatch)
+        monkeypatch.setattr(service, "_known_catalog_key", AsyncMock(return_value=True))
+        existing = _connection(name="linear-2", catalog_key="linear", auth_type="oauth")
+        repo.get_by_name = AsyncMock(return_value=existing)
+        repo.list_user_scoped_by_catalog_key = AsyncMock(
+            return_value=[_connection(name="linear", catalog_key="linear"), existing]
+        )
+        monkeypatch.setattr(
+            service, "_oauth_start", AsyncMock(return_value="https://srv/authorize?x")
+        )
+
+        assert (
+            await service.oauth_start(
+                user_id=uuid4(), name="linear-2", url="https://srv/mcp", catalog_key="linear"
+            )
+            == "https://srv/authorize?x"
+        )
+        repo.list_user_scoped_by_catalog_key.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_oauth_start_registers_and_persists_pending(self, service, repo, monkeypatch):
+        _allow_any_url(monkeypatch)
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint="https://srv/register",
+            resource="https://srv/mcp",
+            scope="read write",
+            metadata=MagicMock(),
+        )
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+        monkeypatch.setattr(mcp_oauth, "register_client", AsyncMock(return_value=("cid", "csec")))
+
+        user_id = uuid4()
+        url = await service.oauth_start(user_id=user_id, name="linear", url="https://srv/mcp")
+
+        assert url.startswith("https://srv/authorize?")
+        assert "code_challenge=" in url and "state=" in url
+        kwargs = repo.create.call_args.kwargs
+        assert kwargs["auth_type"] == "oauth"
+        assert kwargs["oauth_state"] and kwargs["oauth_pending_payload"]
+        # Nothing lands in the live payload until the callback succeeds.
+        assert kwargs.get("oauth_payload") is None
+        # The persisted payload holds the PKCE verifier but no tokens yet.
+        payload = McpOAuthPayload.model_validate_json(
+            unseal(kwargs["oauth_pending_payload"], scope=VaultScope.user(user_id))
+        )
+        assert payload.code_verifier and payload.access_token is None
+        assert payload.client_id == "cid"
+        # Stamped so the callback can refuse a flow the user never finished.
+        assert datetime.now(UTC).timestamp() - payload.started_at < mcp_oauth.FLOW_TTL_SECS
+
+    @pytest.mark.anyio
+    async def test_oauth_start_keeps_working_tokens_until_consent(self, service, repo, monkeypatch):
+        """Re-authorizing must not break the connection if the user closes the
+        consent tab - the live tokens (and the URL) stay put until it lands."""
+        _allow_any_url(monkeypatch)
+        live = _oauth_connection(
+            _base_payload(access_token="live-token"), name="linear", url="https://srv/mcp"
+        )
+        repo.get_by_name.return_value = live
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint=None,
+            resource="https://other/mcp",
+            scope=None,
+            metadata=MagicMock(),
+        )
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+        monkeypatch.setattr(mcp_oauth, "register_client", AsyncMock(return_value=("cid", None)))
+
+        await service.oauth_start(user_id=uuid4(), name="linear", url="https://other/mcp")
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert update_data["oauth_pending_payload"]
+        assert "oauth_payload" not in update_data  # the working tokens survive
+        assert "url" not in update_data  # and so does the URL they belong to
+
+    @pytest.mark.anyio
+    async def test_oauth_start_uses_a_pre_registered_client_instead_of_registering(
+        self, service, repo, monkeypatch
+    ):
+        """HubSpot publishes no registration endpoint, so the operator brings the
+        client. Registration must not run, and the staged payload must hold the
+        credentials that were handed in rather than any of its own."""
+        _allow_any_url(monkeypatch)
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint=None,
+            resource="https://srv/mcp",
+            scope=None,
+            metadata=OAuthMetadata(
+                issuer=AnyUrl("https://srv"),
+                authorization_endpoint=AnyUrl("https://srv/authorize"),
+                token_endpoint=AnyUrl("https://srv/token"),
+                token_endpoint_auth_methods_supported=["client_secret_post"],
+            ),
+        )
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+        register = AsyncMock(return_value=("registered", "registered-secret"))
+        monkeypatch.setattr(mcp_oauth, "register_client", register)
+
+        user_id = uuid4()
+        await service.oauth_start(
+            user_id=user_id,
+            name="hubspot",
+            url="https://srv/mcp",
+            client_id="operators-client",
+            client_secret=SecretStr("operators-secret"),
+        )
+
+        register.assert_not_awaited()
+        payload = McpOAuthPayload.model_validate_json(
+            unseal(
+                repo.create.call_args.kwargs["oauth_pending_payload"],
+                scope=VaultScope.user(user_id),
+            )
+        )
+        assert payload.client_id == "operators-client"
+        assert payload.client_secret is not None
+        assert payload.client_secret.get_secret_value() == "operators-secret"
+
+    @pytest.mark.anyio
+    async def test_a_pre_registered_public_client_needs_no_secret(self, service, repo, monkeypatch):
+        """A static client id with PKCE and no secret is a public client, which is
+        a legitimate registration - there is no secret for a server to refuse, so
+        the auth-method check does not apply."""
+        _allow_any_url(monkeypatch)
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint=None,
+            resource="https://srv/mcp",
+            scope=None,
+            metadata=OAuthMetadata(
+                issuer=AnyUrl("https://srv"),
+                authorization_endpoint=AnyUrl("https://srv/authorize"),
+                token_endpoint=AnyUrl("https://srv/token"),
+                token_endpoint_auth_methods_supported=["client_secret_basic"],
+            ),
+        )
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+        register = AsyncMock()
+        monkeypatch.setattr(mcp_oauth, "register_client", register)
+
+        user_id = uuid4()
+        url = await service.oauth_start(
+            user_id=user_id, name="hubspot", url="https://srv/mcp", client_id="public-client"
+        )
+
+        register.assert_not_awaited()
+        assert "client_id=public-client" in url
+        payload = McpOAuthPayload.model_validate_json(
+            unseal(
+                repo.create.call_args.kwargs["oauth_pending_payload"],
+                scope=VaultScope.user(user_id),
+            )
+        )
+        assert payload.client_secret is None
+
+    @pytest.mark.anyio
+    async def test_oauth_start_refuses_a_client_the_server_will_not_authenticate(
+        self, service, monkeypatch
+    ):
+        """`exchange_code` and `refresh_tokens` only put the secret in the form
+        body. A server that does not allow that is refused at start, not after
+        the user has already consented."""
+        _allow_any_url(monkeypatch)
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint=None,
+            resource="https://srv/mcp",
+            scope=None,
+            metadata=OAuthMetadata(
+                issuer=AnyUrl("https://srv"),
+                authorization_endpoint=AnyUrl("https://srv/authorize"),
+                token_endpoint=AnyUrl("https://srv/token"),
+                token_endpoint_auth_methods_supported=["client_secret_basic"],
+            ),
+        )
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+
+        with pytest.raises(mcp_oauth.OAuthError) as excinfo:
+            await service.oauth_start(
+                user_id=uuid4(),
+                name="hubspot",
+                url="https://srv/mcp",
+                client_id="operators-client",
+                client_secret=SecretStr("operators-secret"),
+            )
+        assert "client_secret_basic" in str(excinfo.value)
+
+    @pytest.mark.anyio
+    async def test_a_server_that_names_no_auth_method_takes_the_static_client(
+        self, service, repo, monkeypatch
+    ):
+        """RFC 8414 makes the list optional. Servers that omit it accept the body
+        form in practice, and refusing them would refuse the case this exists
+        for - so silence is consent."""
+        _allow_any_url(monkeypatch)
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint=None,
+            resource="https://srv/mcp",
+            scope=None,
+            metadata=OAuthMetadata(
+                issuer=AnyUrl("https://srv"),
+                authorization_endpoint=AnyUrl("https://srv/authorize"),
+                token_endpoint=AnyUrl("https://srv/token"),
+            ),
+        )
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+
+        url = await service.oauth_start(
+            user_id=uuid4(),
+            name="hubspot",
+            url="https://srv/mcp",
+            client_id="operators-client",
+            client_secret=SecretStr("operators-secret"),
+        )
+        assert "client_id=operators-client" in url
+
+    @pytest.mark.anyio
+    async def test_oauth_start_rejects_internal_urls(self, service, repo):
+        with pytest.raises(BadRequestError) as excinfo:
+            await service.oauth_start(
+                user_id=uuid4(), name="evil", url="http://169.254.169.254/mcp"
+            )
+        assert excinfo.value.details == {
+            "fields": [{"field": "url", "message": excinfo.value.message}]
+        }
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_google_grant_is_completed_through_googles_own_flow(
+        self, service, repo, monkeypatch
+    ):
+        """One callback route, three providers. The payload says which, so a grant
+        staged by the polled-portal start is exchanged with Google rather than
+        being sent through the MCP discovery flow that would refuse it."""
+        from app.services.portals import google_oauth
+
+        pending = _connection(
+            auth_type="oauth", url="https://gmail.googleapis.com", oauth_state="state-google"
+        )
+        pending.oauth_pending_payload = _seal_into(
+            pending,
+            _base_payload(
+                provider="google", server_url="https://gmail.googleapis.com"
+            ).model_dump_json(),
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="AT",
+                    refresh_token="RT",
+                    expires_in=3600,
+                    granted_scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+                )
+            ),
+        )
+
+        monkeypatch.setattr(mcp_connection_service, "_reach", AsyncMock(return_value=([], None)))
+        await service.oauth_callback(state="state-google", code="the-code")
+
+        update_data = repo.update.call_args_list[0].kwargs["update_data"]
+        assert update_data["granted_scopes"] == ["https://www.googleapis.com/auth/gmail.readonly"]
+        assert update_data["oauth_state"] is None
+        assert update_data["last_status"] == "ok"
+
+    @pytest.mark.anyio
+    async def test_a_microsoft_grant_is_completed_through_microsofts_own_flow(
+        self, service, repo, monkeypatch
+    ):
+        """The Outlook portal's grant (#1984), exchanged at the tenant's token
+        endpoint the start fixed - with the scopes it asked for, which Microsoft
+        wants repeated on the exchange."""
+        from app.services.portals import microsoft_oauth
+
+        pending = _connection(
+            auth_type="oauth", url="https://graph.microsoft.com", oauth_state="state-microsoft"
+        )
+        pending.oauth_pending_payload = _seal_into(
+            pending,
+            _base_payload(
+                provider="microsoft",
+                server_url="https://graph.microsoft.com",
+                token_endpoint="https://login.microsoftonline.com/contoso/oauth2/v2.0/token",
+                scope="https://graph.microsoft.com/Mail.Read offline_access",
+                code_verifier="the-verifier",
+            ).model_dump_json(),
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        exchange = AsyncMock(
+            return_value=microsoft_oauth.MicrosoftToken(
+                access_token="AT",
+                refresh_token="RT",
+                expires_in=3600,
+                granted_scopes=["https://graph.microsoft.com/Mail.Read"],
+            )
+        )
+        monkeypatch.setattr(microsoft_oauth, "exchange_code", exchange)
+        monkeypatch.setattr(mcp_connection_service, "_reach", AsyncMock(return_value=([], None)))
+
+        await service.oauth_callback(state="state-microsoft", code="the-code")
+
+        assert exchange.await_args.kwargs["token_endpoint"].startswith(
+            "https://login.microsoftonline.com/contoso/"
+        )
+        assert exchange.await_args.kwargs["scopes"] == [
+            "https://graph.microsoft.com/Mail.Read",
+            "offline_access",
+        ]
+        assert exchange.await_args.kwargs["code_verifier"] == "the-verifier"
+        update_data = repo.update.call_args_list[0].kwargs["update_data"]
+        stored = McpOAuthPayload.model_validate_json(
+            _open_from(pending, update_data["oauth_payload"])
+        )
+        assert stored.refresh_token.get_secret_value() == "RT"
+        assert stored.expires_at is not None
+        assert update_data["granted_scopes"] == ["https://graph.microsoft.com/Mail.Read"]
+
+    @pytest.mark.anyio
+    async def test_a_reconsent_that_omits_the_refresh_token_keeps_the_live_one(
+        self, service, repo, monkeypatch
+    ):
+        """Google withholds the refresh token on a re-consent for a grant it
+        already holds - the previous one stays valid. Overwriting it with None
+        stopped the mailbox's polling an hour later with nothing to say why."""
+        from app.services.portals import google_oauth
+
+        pending = _connection(
+            auth_type="oauth", url="https://gmail.googleapis.com", oauth_state="state-google"
+        )
+        pending.oauth_payload = _seal_into(
+            pending,
+            _base_payload(
+                provider="google", access_token="OLD-AT", refresh_token="OLD-RT"
+            ).model_dump_json(),
+        )
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(provider="google").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="NEW-AT", refresh_token=None, expires_in=3600, granted_scopes=[]
+                )
+            ),
+        )
+
+        monkeypatch.setattr(mcp_connection_service, "_reach", AsyncMock(return_value=([], None)))
+        await service.oauth_callback(state="state-google", code="the-code")
+
+        update_data = repo.update.call_args_list[0].kwargs["update_data"]
+        stored = McpOAuthPayload.model_validate_json(
+            _open_from(pending, update_data["oauth_payload"])
+        )
+        assert stored.access_token.get_secret_value() == "NEW-AT"
+        assert stored.refresh_token.get_secret_value() == "OLD-RT"
+
+    @pytest.mark.anyio
+    async def test_a_live_payload_with_no_refresh_token_has_nothing_to_carry(
+        self, service, repo, monkeypatch
+    ):
+        """A grant that never held a refresh token stays honestly without one -
+        inventing nothing is what keeps the hour-later failure attributable to
+        the consent that lacked `access_type=offline`, not to this carry."""
+        from app.services.portals import google_oauth
+
+        pending = _connection(
+            auth_type="oauth", url="https://gmail.googleapis.com", oauth_state="state-google"
+        )
+        pending.oauth_payload = _seal_into(
+            pending,
+            _base_payload(
+                provider="google", access_token="OLD-AT", refresh_token=None
+            ).model_dump_json(),
+        )
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(provider="google").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="NEW-AT", refresh_token=None, expires_in=3600, granted_scopes=[]
+                )
+            ),
+        )
+
+        monkeypatch.setattr(mcp_connection_service, "_reach", AsyncMock(return_value=([], None)))
+        await service.oauth_callback(state="state-google", code="the-code")
+
+        stored = McpOAuthPayload.model_validate_json(
+            _open_from(
+                pending, repo.update.call_args_list[0].kwargs["update_data"]["oauth_payload"]
+            )
+        )
+        assert stored.refresh_token is None
+
+    @pytest.mark.anyio
+    async def test_a_polled_grants_cursor_is_established_at_consent(
+        self, service, repo, monkeypatch
+    ):
+        """The first poll with no cursor snapshots the mailbox and emits nothing,
+        so mail landing between consent and the first heartbeat would be inside
+        the snapshot and permanently skipped. The callback takes the snapshot at
+        consent instead, so that mail lands after the boundary."""
+        from app.services.portals import google_oauth
+
+        pending = _connection(
+            auth_type="oauth", url="https://gmail.googleapis.com", oauth_state="state-google"
+        )
+        pending.purpose = "portal"
+        pending.portal_key = "google"
+        pending.poll_cursor = None
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(provider="google").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="AT", refresh_token="RT", expires_in=3600, granted_scopes=[]
+                )
+            ),
+        )
+        adapter = MagicMock(
+            poll=AsyncMock(return_value=SimpleNamespace(cursor={"history_id": "500"}))
+        )
+        monkeypatch.setattr(
+            mcp_connection_service.portals, "get_adapter", MagicMock(return_value=adapter)
+        )
+
+        await service.oauth_callback(state="state-google", code="the-code")
+
+        adapter.poll.assert_awaited_once_with(access_token="AT", cursor=None)
+        assert repo.update.call_args.kwargs["update_data"]["poll_cursor"] == {"history_id": "500"}
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("fresh_account", "kept"),
+        [("me@corp.test", True), ("someone-else@corp.test", False)],
+        ids=["same-account", "switched-account"],
+    )
+    async def test_a_reconsent_keeps_the_cursor_only_for_the_same_account(
+        self, service, repo, monkeypatch, fresh_account, kept
+    ):
+        """Re-authorizing a mailbox already being read must not move its position -
+        a snapshot would skip everything between the last poll and now. But the
+        consent screen asks which account to use, and another account's position
+        is polled against the new one and never advances (Codex on #2195)."""
+        from app.services.portals import google_oauth
+
+        pending = _connection(
+            auth_type="oauth", url="https://gmail.googleapis.com", oauth_state="state-google"
+        )
+        pending.purpose = "portal"
+        pending.portal_key = "google"
+        pending.poll_cursor = {"history_id": "400", "account": "me@corp.test"}
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(provider="google").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="AT", refresh_token="RT", expires_in=3600, granted_scopes=[]
+                )
+            ),
+        )
+        fresh = {"history_id": "900", "account": fresh_account}
+        adapter = MagicMock(poll=AsyncMock(return_value=MagicMock(cursor=fresh)))
+        monkeypatch.setattr(
+            mcp_connection_service.portals, "get_adapter", MagicMock(return_value=adapter)
+        )
+
+        await service.oauth_callback(state="state-google", code="the-code")
+
+        stored = repo.update.call_args.kwargs["update_data"]["poll_cursor"]
+        assert stored == (pending.poll_cursor if kept else fresh)
+
+    @pytest.mark.anyio
+    async def test_a_portal_with_no_adapter_establishes_no_cursor(self, service, repo, monkeypatch):
+        from app.services.portals import google_oauth
+
+        pending = _connection(
+            auth_type="oauth", url="https://gmail.googleapis.com", oauth_state="state-google"
+        )
+        pending.purpose = "portal"
+        pending.portal_key = "google"
+        pending.poll_cursor = None
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(provider="google").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="AT", refresh_token="RT", expires_in=3600, granted_scopes=[]
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            mcp_connection_service.portals, "get_adapter", MagicMock(return_value=None)
+        )
+
+        await service.oauth_callback(state="state-google", code="the-code")
+
+        assert repo.update.call_args.kwargs["update_data"]["poll_cursor"] is None
+
+    @pytest.mark.anyio
+    async def test_a_provider_that_cannot_snapshot_leaves_the_cursor_to_the_first_poll(
+        self, service, repo, monkeypatch
+    ):
+        """Best-effort: a Gmail that cannot answer right now must not fail the
+        consent that just succeeded - the first heartbeat takes the snapshot,
+        which is only the old, smaller window."""
+        from app.services.portals import google_oauth
+
+        pending = _connection(
+            auth_type="oauth", url="https://gmail.googleapis.com", oauth_state="state-google"
+        )
+        pending.purpose = "portal"
+        pending.portal_key = "google"
+        pending.poll_cursor = None
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(provider="google").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="AT", refresh_token="RT", expires_in=3600, granted_scopes=[]
+                )
+            ),
+        )
+        adapter = MagicMock(poll=AsyncMock(side_effect=portals_exceptions.PortalError("down")))
+        monkeypatch.setattr(
+            mcp_connection_service.portals, "get_adapter", MagicMock(return_value=adapter)
+        )
+
+        await service.oauth_callback(state="state-google", code="the-code")
+
+        assert repo.update.call_args.kwargs["update_data"]["poll_cursor"] is None
+
+    @pytest.mark.anyio
+    async def test_oauth_callback_exchanges_and_clears_state(self, service, repo, monkeypatch):
+        pending = _connection(auth_type="oauth", url="https://srv/mcp", oauth_state="state-xyz")
+        pending.oauth_pending_payload = _seal_into(
+            pending,
+            _base_payload(
+                code_verifier="verifier", server_url="https://moved/mcp"
+            ).model_dump_json(),
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        token = OAuthToken(access_token="AT", refresh_token="RT", expires_in=3600)
+        exchange = AsyncMock(return_value=token)
+        monkeypatch.setattr(mcp_oauth, "exchange_code", exchange)
+
+        monkeypatch.setattr(mcp_connection_service, "_reach", AsyncMock(return_value=([], None)))
+        await service.oauth_callback(state="state-xyz", code="the-code")
+
+        # The flow's own address decides which listed hosts the exchange may reach.
+        assert exchange.call_args.kwargs["server_url"] == "https://moved/mcp"
+        update_data = repo.update.call_args_list[0].kwargs["update_data"]
+        assert update_data["oauth_state"] is None  # no longer pending
+        assert update_data["oauth_pending_payload"] is None
+        assert update_data["last_status"] == "ok"
+        # The URL the tokens were issued for is applied together with them.
+        assert update_data["url"] == "https://moved/mcp"
+        payload = McpOAuthPayload.model_validate_json(
+            _open_from(pending, update_data["oauth_payload"])
+        )
+        assert (
+            payload.access_token.get_secret_value() == "AT"
+            and payload.refresh_token.get_secret_value() == "RT"
+        )
+        assert payload.code_verifier is None
+
+    @pytest.mark.anyio
+    async def test_oauth_callback_records_the_granted_scopes(self, service, repo, monkeypatch):
+        """The scopes the provider granted are mirrored to a plain column so the
+        trigger-portal webhook path can read them without unwrapping the token."""
+        pending = _connection(auth_type="oauth", url="https://srv/mcp", oauth_state="state-scoped")
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(code_verifier="verifier").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+        repo.update.return_value = pending
+        token = OAuthToken(
+            access_token="AT", refresh_token="RT", expires_in=3600, scope="repo admin:repo_hook"
+        )
+        monkeypatch.setattr(mcp_oauth, "exchange_code", AsyncMock(return_value=token))
+
+        monkeypatch.setattr(mcp_connection_service, "_reach", AsyncMock(return_value=([], None)))
+        await service.oauth_callback(state="state-scoped", code="the-code")
+
+        update_data = repo.update.call_args_list[0].kwargs["update_data"]
+        assert update_data["granted_scopes"] == ["repo", "admin:repo_hook"]
+
+    @pytest.mark.anyio
+    async def test_oauth_callback_lists_the_servers_tools_at_once(self, service, repo, monkeypatch):
+        """A server connected from the Builder or a chat has its tools to pick
+        from when the person is back, not after somebody clicks Check."""
+        pending = _connection(auth_type="oauth", url="https://srv/mcp", oauth_state="state-tools")
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(code_verifier="verifier").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+
+        async def applied(_db, *, db_connection, update_data):
+            for field, value in update_data.items():
+                setattr(db_connection, field, value)
+            return db_connection
+
+        repo.update = AsyncMock(side_effect=applied)
+        token = OAuthToken(access_token="AT", refresh_token="RT", expires_in=3600)
+        monkeypatch.setattr(mcp_oauth, "exchange_code", AsyncMock(return_value=token))
+        reach = AsyncMock(return_value=([McpToolInfo(name="search", description="")], None))
+        monkeypatch.setattr(mcp_connection_service, "_reach", reach)
+
+        await service.oauth_callback(state="state-tools", code="the-code")
+
+        assert reach.await_args.args[1] == {"Authorization": "Bearer AT"}
+        recorded = repo.update.call_args_list[-1].kwargs["update_data"]
+        assert recorded["last_status"] == "ok"
+        assert [tool["name"] for tool in recorded["last_tools"]] == ["search"]
+
+    @pytest.mark.anyio
+    async def test_oauth_callback_records_a_server_that_will_not_list(
+        self, service, repo, monkeypatch
+    ):
+        pending = _connection(auth_type="oauth", url="https://srv/mcp", oauth_state="state-down")
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(code_verifier="verifier").model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=pending)
+
+        async def applied(_db, *, db_connection, update_data):
+            for field, value in update_data.items():
+                setattr(db_connection, field, value)
+            return db_connection
+
+        repo.update = AsyncMock(side_effect=applied)
+        token = OAuthToken(access_token="AT", refresh_token="RT", expires_in=3600)
+        monkeypatch.setattr(mcp_oauth, "exchange_code", AsyncMock(return_value=token))
+        monkeypatch.setattr(
+            mcp_connection_service, "_reach", AsyncMock(return_value=([], "Timed out"))
+        )
+
+        await service.oauth_callback(state="state-down", code="the-code")
+
+        recorded = repo.update.call_args_list[-1].kwargs["update_data"]
+        assert recorded["last_status"] == "error"
+        assert recorded["last_error"] == "Timed out"
+        assert "last_tools" not in recorded
+
+    @pytest.mark.anyio
+    async def test_oauth_callback_unknown_state_is_not_found(self, service, repo):
+        repo.get_by_oauth_state = AsyncMock(return_value=None)
+        with pytest.raises(NotFoundError):
+            await service.oauth_callback(state="nope", code="x")
+
+    @pytest.mark.anyio
+    async def test_oauth_callback_rejects_an_expired_flow(self, service, repo, monkeypatch):
+        """The state token is the only thing authenticating this endpoint, and
+        it travels through the provider and the browser's history - a consent
+        redirect the user never finished must stop being redeemable."""
+        started = datetime.now(UTC).timestamp() - mcp_oauth.FLOW_TTL_SECS - 1
+        stale = _connection(auth_type="oauth", oauth_state="state-old")
+        stale.oauth_pending_payload = _seal_into(
+            stale,
+            _base_payload(code_verifier="verifier", started_at=started).model_dump_json(),
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=stale)
+        exchange_mock = AsyncMock()
+        monkeypatch.setattr(mcp_oauth, "exchange_code", exchange_mock)
+
+        with pytest.raises(mcp_oauth.OAuthError, match="expired"):
+            await service.oauth_callback(state="state-old", code="the-code")
+
+        exchange_mock.assert_not_awaited()
+        repo.update.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_oauth_callback_on_unreadable_payload_asks_to_start_again(self, service, repo):
+        """A rotated SECRET_KEY makes the pending payload undecryptable. That's
+        a dead flow the user restarts, not a 500."""
+        stale = _connection(
+            auth_type="oauth",
+            oauth_state="state-broken",
+            oauth_pending_payload="enc:not-valid-ciphertext",
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=stale)
+
+        with pytest.raises(mcp_oauth.OAuthError, match="no longer valid"):
+            await service.oauth_callback(state="state-broken", code="the-code")
+
+    @pytest.mark.anyio
+    async def test_oauth_callback_on_a_discovery_flow_missing_its_verifier_restarts(
+        self, service, repo
+    ):
+        """A discovery payload that decrypts but has lost its PKCE verifier - a
+        rotated master key left it unreadable - is a dead flow the user restarts,
+        not a 500 mid-exchange. Distinct from the undecryptable-payload case above:
+        here the payload reads fine and only the verifier is gone."""
+        dead = _connection(auth_type="oauth", oauth_state="state-noverifier")
+        dead.oauth_pending_payload = _seal_into(
+            dead, _base_payload(code_verifier=None).model_dump_json()
+        )
+        repo.get_by_oauth_state = AsyncMock(return_value=dead)
+
+        with pytest.raises(mcp_oauth.OAuthError, match="no longer valid"):
+            await service.oauth_callback(state="state-noverifier", code="the-code")
+
+    @pytest.mark.anyio
+    async def test_update_url_drops_oauth_tokens(self, service, repo, monkeypatch):
+        """Tokens are bound to the host they were issued for - moving the URL
+        must not send a provider's access token to a different server."""
+        _allow_any_url(monkeypatch)
+        user_id = uuid4()
+        conn = _oauth_connection(
+            _base_payload(access_token="AT"), user_id=user_id, oauth_state=None
+        )
+        repo.get_by_id.return_value = conn
+
+        await service.update(
+            user_id=user_id,
+            connection_id=conn.id,
+            data=McpConnectionUpdate(url="https://elsewhere.example/mcp"),
+        )
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert update_data["oauth_payload"] is None
+        assert update_data["oauth_pending_payload"] is None
+        assert update_data["oauth_state"] is None
+
+
+class TestOrganizationConnections:
+    """The servers an agent can be built on, and the credential they carry.
+
+    Everything here turns on two things a personal connection does not have: a
+    credential sealed for the organization rather than for the deployment, and
+    no owner at all - which is what keeps the personal routes, that authorize on
+    `user_id` alone, from ever reaching one of these rows.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> AuthContext:
+        return AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+
+    @pytest.fixture
+    def service(self):
+        return McpConnectionService(db=AsyncMock())
+
+    @pytest.fixture
+    def repo(self, monkeypatch):
+        mock_repo = MagicMock()
+        mock_repo.list_org_scoped = AsyncMock(return_value=([], 0))
+        mock_repo.get_org_scoped_by_id = AsyncMock(return_value=None)
+        mock_repo.get_org_scoped_by_name = AsyncMock(return_value=None)
+        mock_repo.get_by_id = AsyncMock()
+        mock_repo.get_by_name = AsyncMock(return_value=None)
+        mock_repo.get_org_scoped_by_catalog_key = AsyncMock(return_value=None)
+        mock_repo.list_user_scoped_by_catalog_key = AsyncMock(return_value=[])
+        mock_repo.create = AsyncMock()
+        mock_repo.create_org_scoped = AsyncMock()
+        mock_repo.update = AsyncMock()
+        mock_repo.delete = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service, "mcp_connection_repo", mock_repo)
+        return mock_repo
+
+    @pytest.fixture(autouse=True)
+    def mirror(self, monkeypatch):
+        """The registry mirror, empty unless a test stages a row.
+
+        Autouse because `catalog_key` is now validated against two catalogs, and
+        a live repository call against a mocked session answers with a Mock -
+        which is truthy, so every unknown key would read as known.
+        """
+        mock_mirror = MagicMock()
+        mock_mirror.get = AsyncMock(return_value=None)
+        monkeypatch.setattr(mcp_connection_service, "mcp_registry_server_repo", mock_mirror)
+        return mock_mirror
+
+    @pytest.fixture
+    def audit(self, monkeypatch):
+        recorder = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service, "record_audit", recorder)
+        return recorder
+
+    def _org_connection(self, ctx: AuthContext, **overrides) -> McpConnection:
+        return _connection(
+            scope="org",
+            user_id=None,
+            created_by_user_id=ctx.user_id,
+            organization_id=ctx.organization_id,
+            **overrides,
+        )
+
+    # -- listing --------------------------------------------------------
+
+    @pytest.mark.anyio
+    async def test_listing_asks_only_for_this_organizations_servers(self, service, ctx, repo):
+        conn = self._org_connection(ctx)
+        repo.list_org_scoped.return_value = ([conn], 1)
+
+        items, total = await service.list_for_org(ctx)
+
+        assert (items, total) == ([conn], 1)
+        assert repo.list_org_scoped.call_args.kwargs == {"organization_id": ctx.organization_id}
+
+    @pytest.mark.anyio
+    async def test_usable_servers_are_the_organization_s_own(self, service, ctx, repo):
+        conn = self._org_connection(ctx)
+        repo.list_org_scoped.return_value = ([conn], 1)
+
+        assert await service.list_usable(ctx) == [conn]
+        assert repo.list_org_scoped.call_args.kwargs == {"organization_id": ctx.organization_id}
+
+    # -- creating -------------------------------------------------------
+
+    @pytest.mark.anyio
+    async def test_the_credential_is_sealed_for_this_organization(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        """Not the deployment key. A shared credential sealed globally would
+        survive being lifted into another tenant's row, which is the one thing
+        the vault exists to prevent."""
+        _allow_any_url(monkeypatch)
+
+        await service.create_for_org(
+            ctx,
+            OrgMcpConnectionCreate(
+                name="github", url="https://example.com/mcp", auth_token="ghp-secret-9876"
+            ),
+        )
+
+        stored = repo.create_org_scoped.call_args.kwargs
+        assert stored["sealed_token"] != "ghp-secret-9876"
+        assert "ghp-secret-9876" not in stored["sealed_token"]
+        assert (
+            unseal(
+                stored["sealed_token"],
+                scope=VaultScope.organization(ctx.organization_id),
+                key_version=stored["secret_key_version"],
+            )
+            == "ghp-secret-9876"
+        )
+
+    @pytest.mark.anyio
+    async def test_a_server_needing_no_credential_stores_none(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        """An empty secret is refused by the vault, so a tokenless server has to
+        skip sealing rather than seal `""` and fail at the provider later."""
+        _allow_any_url(monkeypatch)
+
+        await service.create_for_org(
+            ctx, OrgMcpConnectionCreate(name="docs", url="https://example.com/mcp")
+        )
+
+        stored = repo.create_org_scoped.call_args.kwargs
+        assert (stored["sealed_token"], stored["secret_key_version"]) == (None, 1)
+
+    @pytest.mark.anyio
+    async def test_the_row_records_who_added_it_and_belongs_to_nobody(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        _allow_any_url(monkeypatch)
+
+        await service.create_for_org(
+            ctx,
+            OrgMcpConnectionCreate(
+                name="linear", url="https://example.com/mcp", catalog_key="linear"
+            ),
+        )
+
+        stored = repo.create_org_scoped.call_args.kwargs
+        assert stored["organization_id"] == ctx.organization_id
+        assert stored["created_by_user_id"] == ctx.user_id
+        assert stored["catalog_key"] == "linear"
+
+    @pytest.mark.anyio
+    async def test_an_unknown_catalog_key_is_refused_before_anything_is_written(
+        self, service, ctx, repo, audit
+    ):
+        """A key nothing recognises renders in the Builder as a server with no
+        name and no logo, which reads as a broken row rather than as a typo."""
+        with pytest.raises(BadRequestError, match="Unknown catalog server"):
+            await service.create_for_org(
+                ctx,
+                OrgMcpConnectionCreate(
+                    name="github", url="https://example.com/mcp", catalog_key="githbu"
+                ),
+            )
+        repo.create_org_scoped.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_personal_connection_keeps_the_catalog_key_it_was_created_with(
+        self, service, ctx, repo, mirror
+    ):
+        """Without it the substitution join matches nothing, so
+        `use_personal_when_available` was a switch that could never fire: every
+        personal row carried `catalog_key = NULL`."""
+        await service.create(
+            user_id=ctx.user_id,
+            data=McpConnectionCreate(
+                name="mine", url="https://example.com/mcp", catalog_key="notion"
+            ),
+        )
+
+        assert repo.create.call_args.kwargs["catalog_key"] == "notion"
+
+    @pytest.mark.anyio
+    async def test_a_second_account_on_a_service_needs_a_label(self, service, ctx, repo, mirror):
+        """Two Outlook accounts read as "Outlook" twice in every picker and approval
+        without one."""
+        repo.list_user_scoped_by_catalog_key = AsyncMock(
+            return_value=[_connection(name="notion", catalog_key="notion")]
+        )
+
+        with pytest.raises(BadRequestError) as refused:
+            await service.create(
+                user_id=ctx.user_id,
+                data=McpConnectionCreate(
+                    name="notion-2", url="https://example.com/mcp", catalog_key="notion"
+                ),
+            )
+
+        assert refused.value.details["fields"][0]["field"] == "label"
+        repo.create.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_labelled_second_account_or_a_first_one_is_stored(
+        self, service, ctx, repo, mirror
+    ):
+        await service.create(
+            user_id=ctx.user_id,
+            data=McpConnectionCreate(
+                name="notion", url="https://example.com/mcp", catalog_key="notion"
+            ),
+        )
+        repo.list_user_scoped_by_catalog_key = AsyncMock(
+            return_value=[_connection(name="notion", catalog_key="notion")]
+        )
+        await service.create(
+            user_id=ctx.user_id,
+            data=McpConnectionCreate(
+                name="notion-2", url="https://example.com/mcp", catalog_key="notion", label="Work"
+            ),
+        )
+
+        assert repo.create.await_count == 2
+        assert repo.create.await_args.kwargs["label"] == "Work"
+
+    @pytest.mark.anyio
+    async def test_authorizing_the_organizations_second_account_again_needs_no_label(
+        self, service, ctx, repo, monkeypatch
+    ):
+        existing = _connection(name="github-oss", catalog_key="github", scope="org")
+        repo.get_org_scoped_by_name = AsyncMock(return_value=existing)
+        repo.get_org_scoped_by_catalog_key = AsyncMock(
+            return_value=_connection(name="github", catalog_key="github", scope="org")
+        )
+        monkeypatch.setattr(
+            service, "_oauth_start", AsyncMock(return_value="https://srv/authorize?x")
+        )
+
+        await service.oauth_start_for_org(
+            ctx, name="github-oss", url="https://srv/mcp", catalog_key="github"
+        )
+
+        repo.get_org_scoped_by_catalog_key.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_second_organization_account_needs_a_label(self, service, ctx, repo, mirror):
+        repo.get_org_scoped_by_catalog_key = AsyncMock(
+            return_value=_connection(name="github", catalog_key="github", scope="org")
+        )
+
+        with pytest.raises(BadRequestError) as refused:
+            await service.create_for_org(
+                ctx,
+                OrgMcpConnectionCreate(
+                    name="github-oss", url="https://example.com/mcp", catalog_key="github"
+                ),
+            )
+
+        assert refused.value.details["fields"][0]["field"] == "label"
+
+    @pytest.mark.anyio
+    async def test_a_personal_connection_with_an_unknown_key_is_refused(
+        self, service, ctx, repo, mirror
+    ):
+        with pytest.raises(BadRequestError, match="Unknown catalog server"):
+            await service.create(
+                user_id=ctx.user_id,
+                data=McpConnectionCreate(
+                    name="mine", url="https://example.com/mcp", catalog_key="notoin"
+                ),
+            )
+        repo.create.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_mirrored_registry_key_is_accepted_for_an_organization(
+        self, service, ctx, repo, audit, mirror
+    ):
+        """The listing serves 5,703 mirrored servers beside the 99 curated ones
+        and hands back the registry row's own id as the key. Validating against
+        the curated catalog alone refused every one of them, so the mirror was
+        searchable, connectable personally, and unusable for the organization
+        connections agents actually bind to."""
+        mirror.get = AsyncMock(return_value=object())
+
+        await service.create_for_org(
+            ctx,
+            OrgMcpConnectionCreate(
+                name="obscure",
+                url="https://example.com/mcp",
+                catalog_key="io.github.someone/obscure-server",
+            ),
+        )
+
+        assert (
+            repo.create_org_scoped.call_args.kwargs["catalog_key"]
+            == "io.github.someone/obscure-server"
+        )
+
+    @pytest.mark.anyio
+    async def test_creating_blocks_internal_urls(self, service, ctx, repo, audit):
+        with pytest.raises(BadRequestError) as excinfo:
+            await service.create_for_org(
+                ctx, OrgMcpConnectionCreate(name="internal", url="http://127.0.0.1:8000/mcp")
+            )
+        assert excinfo.value.details == {
+            "fields": [{"field": "url", "message": excinfo.value.message}]
+        }
+        repo.create_org_scoped.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_creating_accepts_a_host_the_operator_listed(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        """The same exemption as a personal connection's. The audit entry
+        carrying the URL is what records that an internal host was connected."""
+        monkeypatch.setattr(settings, "MCP_ALLOWED_HOSTS", ["postgres-mcp"])
+        asked = TestOAuthRequestSafety._resolves(monkeypatch, "10.0.0.9")
+        repo.create_org_scoped.return_value = self._org_connection(ctx)
+
+        await service.create_for_org(
+            ctx, OrgMcpConnectionCreate(name="postgres", url="http://postgres-mcp:8000/mcp")
+        )
+
+        assert repo.create_org_scoped.call_args.kwargs["url"] == "http://postgres-mcp:8000/mcp"
+        assert audit.call_args.kwargs["details"]["url"] == "http://postgres-mcp:8000/mcp"
+        assert asked == ["postgres-mcp"]
+
+    @pytest.mark.anyio
+    async def test_a_name_already_taken_in_this_organization_is_refused(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        """The name becomes the agent's tool prefix, so two servers sharing one
+        are two sets of tools nobody can tell apart in a spec."""
+        _allow_any_url(monkeypatch)
+        repo.get_org_scoped_by_name.return_value = self._org_connection(ctx)
+
+        with pytest.raises(AlreadyExistsError):
+            await service.create_for_org(
+                ctx, OrgMcpConnectionCreate(name="github", url="https://example.com/mcp")
+            )
+        repo.create_org_scoped.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_a_name_that_collided_in_the_database_is_reported_as_a_collision(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        """Two admins adding the same server at once both pass the lookup; the
+        partial unique index catches the loser, who deserves the same message
+        as the one who lost the race by a second."""
+        _allow_any_url(monkeypatch)
+        repo.create_org_scoped.side_effect = IntegrityError("insert", {}, Exception("dup"))
+
+        with pytest.raises(AlreadyExistsError):
+            await service.create_for_org(
+                ctx, OrgMcpConnectionCreate(name="github", url="https://example.com/mcp")
+            )
+
+    @pytest.mark.anyio
+    async def test_the_audit_entry_names_the_server_and_never_the_token(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        _allow_any_url(monkeypatch)
+        repo.create_org_scoped.return_value = self._org_connection(ctx)
+
+        await service.create_for_org(
+            ctx,
+            OrgMcpConnectionCreate(
+                name="github", url="https://example.com/mcp", auth_token="ghp-secret-9876"
+            ),
+        )
+
+        recorded = audit.call_args.kwargs
+        assert recorded["action"] == "mcp_connection.created"
+        assert recorded["organization_id"] == ctx.organization_id
+        assert recorded["details"] == {
+            "name": "github",
+            "url": "https://example.com/mcp",
+            "catalog_key": None,
+        }
+        assert "ghp-secret-9876" not in str(recorded)
+
+    @pytest.mark.anyio
+    async def test_creating_with_a_token_is_refused_under_an_impersonation(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        """An administrator acting as an org owner must not store their own bearer
+        token as the organization's shared credential: every org agent would then
+        call the server as the administrator's account after the hour-bounded
+        impersonation ends, and the token was entered by nobody the org can see
+        (#1521). Refused before the write, so nothing is sealed."""
+        _allow_any_url(monkeypatch)
+        with _impersonating(), pytest.raises(AuthorizationError):
+            await service.create_for_org(
+                ctx,
+                OrgMcpConnectionCreate(
+                    name="github", url="https://example.com/mcp", auth_token="admin-token"
+                ),
+            )
+        repo.create_org_scoped.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_creating_without_a_token_is_allowed_under_an_impersonation(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        """Only a manually entered credential is refused - a tokenless org server
+        captures no identity, and configuring one while acting as an owner is
+        ordinary administration (#1521)."""
+        _allow_any_url(monkeypatch)
+        with _impersonating():
+            await service.create_for_org(
+                ctx, OrgMcpConnectionCreate(name="docs", url="https://example.com/mcp")
+            )
+        repo.create_org_scoped.assert_called_once()
+
+    # -- updating -------------------------------------------------------
+
+    @pytest.mark.anyio
+    async def test_an_organizations_connection_takes_a_label_too(self, service, ctx, repo):
+        """The same two names as a personal one: a slug the model reads, and
+        prose a person does. An organization holding two Notion accounts is the
+        case the field exists for (#1341)."""
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx,
+            connection_id=conn.id,
+            data=OrgMcpConnectionUpdate(label="  Marketing workspace  "),
+        )
+
+        assert repo.update.call_args.kwargs["update_data"] == {"label": "Marketing workspace"}
+
+    @pytest.mark.anyio
+    async def test_clearing_an_organizations_label_stores_no_blank(self, service, ctx, repo):
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(label="")
+        )
+
+        assert repo.update.call_args.kwargs["update_data"]["label"] is None
+
+    @pytest.mark.anyio
+    async def test_a_replacement_credential_is_resealed_for_this_organization(
+        self, service, ctx, repo, monkeypatch
+    ):
+        """Sealed at the row's recorded version, and the version column is left
+        alone - one version governs every envelope in the row (#552)."""
+        _allow_any_url(monkeypatch)
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(auth_token="ghp-rotated-4321")
+        )
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert "ghp-rotated-4321" not in update_data["auth_token"]
+        assert "secret_key_version" not in update_data
+        # Sealing at the row's version is only safe while the row is held from
+        # the read - the same race the channel-bot update locks against.
+        assert repo.get_org_scoped_by_id.await_args.kwargs["for_update"] is True
+        assert (
+            unseal(
+                update_data["auth_token"],
+                scope=VaultScope.organization(ctx.organization_id),
+                key_version=conn.secret_key_version,
+            )
+            == "ghp-rotated-4321"
+        )
+
+    @pytest.mark.anyio
+    async def test_an_empty_credential_clears_the_stored_one(self, service, ctx, repo):
+        conn = self._org_connection(ctx, auth_token="envelope")
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(auth_token="")
+        )
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert update_data["auth_token"] is None
+        # No new envelope, so the version that sealed the old one is left alone
+        # rather than rewritten to describe a token that no longer exists.
+        assert "secret_key_version" not in update_data
+
+    @pytest.mark.anyio
+    async def test_updating_with_a_replacement_token_is_refused_under_an_impersonation(
+        self, service, ctx, repo, audit
+    ):
+        """The same refusal as creating, for a token pasted over an existing org
+        connection. Refused before the write, so nothing is resealed (#1521)."""
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+        with _impersonating(), pytest.raises(AuthorizationError):
+            await service.update_for_org(
+                ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(auth_token="admin-token")
+            )
+        repo.update.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_updating_clearing_the_token_is_allowed_under_an_impersonation(
+        self, service, ctx, repo, audit
+    ):
+        """Removing a token stores no credential, so it is left alone - only a
+        non-empty replacement is refused (#1521)."""
+        conn = self._org_connection(ctx, auth_token="envelope")
+        repo.get_org_scoped_by_id.return_value = conn
+        repo.update.return_value = conn
+        with _impersonating():
+            await service.update_for_org(
+                ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(auth_token="")
+            )
+        assert repo.update.call_args.kwargs["update_data"]["auth_token"] is None
+
+    @pytest.mark.anyio
+    async def test_an_update_records_who_changed_the_shared_credential(
+        self, service, ctx, repo, audit, monkeypatch
+    ):
+        """`create_for_org` records who added a shared credential; an update that
+        rotated or repointed one left no trail at all. It now records the change -
+        the fields, never their values or the staleness resets - so a token set
+        under an impersonation is attributable to the administrator behind it,
+        which `record_audit` stamps from the audit context (#1521)."""
+        _allow_any_url(monkeypatch)
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+        repo.update.return_value = conn
+
+        await service.update_for_org(
+            ctx,
+            connection_id=conn.id,
+            data=OrgMcpConnectionUpdate(auth_token="ghp-rotated-4321"),
+        )
+
+        recorded = audit.call_args.kwargs
+        assert recorded["action"] == "mcp_connection.updated"
+        assert recorded["organization_id"] == ctx.organization_id
+        assert recorded["target_id"] == str(conn.id)
+        assert recorded["details"] == {"fields": ["auth_token"]}
+        assert "ghp-rotated-4321" not in str(recorded)
+
+    @pytest.mark.anyio
+    async def test_a_no_op_update_writes_no_audit(self, service, ctx, repo, audit):
+        """An update that changes nothing returns early, so it neither writes the
+        row nor records an entry that says a shared credential changed when it
+        did not (#1521)."""
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate())
+
+        repo.update.assert_not_called()
+        audit.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_moving_the_url_somewhere_internal_is_refused_by_field(self, service, ctx, repo):
+        """The other half of #861: a connection may not be *edited* into the
+        deployment's own network either, and that refusal is a 400 too."""
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+
+        with pytest.raises(BadRequestError) as excinfo:
+            await service.update_for_org(
+                ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(url="http://[::1]/mcp")
+            )
+
+        assert excinfo.value.details == {
+            "fields": [{"field": "url", "message": excinfo.value.message}]
+        }
+        repo.update.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_moving_the_url_to_a_listed_ipv6_host_is_accepted(
+        self, service, ctx, repo, monkeypatch
+    ):
+        """The edit path honours the list as the create path does, here for a
+        private IPv6 literal the guard would refuse."""
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+        monkeypatch.setattr(settings, "MCP_ALLOWED_HOSTS", ["fd00::1"])
+
+        await service.update_for_org(
+            ctx,
+            connection_id=conn.id,
+            data=OrgMcpConnectionUpdate(url="http://[fd00::1]:8000/mcp"),
+        )
+
+        assert repo.update.call_args.kwargs["update_data"]["url"] == "http://[fd00::1]:8000/mcp"
+
+    @pytest.mark.anyio
+    async def test_moving_the_url_discards_the_previous_check_result(
+        self, service, ctx, repo, monkeypatch
+    ):
+        """A green tick next to a server nobody has reached since it moved is
+        worse than no tick: it is the reason somebody publishes a broken agent."""
+        _allow_any_url(monkeypatch)
+        conn = self._org_connection(ctx, last_status="ok", last_error=None)
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx,
+            connection_id=conn.id,
+            data=OrgMcpConnectionUpdate(url="https://elsewhere.example/mcp"),
+        )
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert update_data["last_status"] is None
+        assert update_data["last_checked_at"] is None
+
+    @pytest.mark.anyio
+    async def test_moving_an_oauth_connections_url_drops_its_tokens_and_scopes(
+        self, service, ctx, repo, monkeypatch
+    ):
+        """The same safeguard the personal path has, and here it is a boundary
+        between administrators: without it, any `mcp:manage` holder could repoint
+        an org connection another admin authorized at a host of their choosing and
+        have the platform send that GitHub token there on the next Test or run.
+        The mirrored scopes describe the dropped token, so they go with it."""
+        _allow_any_url(monkeypatch)
+        conn = self._org_connection(ctx, auth_type="oauth", granted_scopes=["repo"])
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx,
+            connection_id=conn.id,
+            data=OrgMcpConnectionUpdate(url="https://elsewhere.example/mcp"),
+        )
+
+        update_data = repo.update.call_args.kwargs["update_data"]
+        assert update_data["oauth_payload"] is None
+        assert update_data["oauth_pending_payload"] is None
+        assert update_data["oauth_state"] is None
+        assert update_data["granted_scopes"] is None
+
+    @pytest.mark.anyio
+    async def test_renaming_onto_another_servers_name_is_refused(self, service, ctx, repo):
+        conn = self._org_connection(ctx, name="github")
+        repo.get_org_scoped_by_id.return_value = conn
+        repo.get_org_scoped_by_name.return_value = self._org_connection(ctx, name="linear")
+
+        with pytest.raises(AlreadyExistsError):
+            await service.update_for_org(
+                ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(name="linear")
+            )
+        repo.update.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_renaming_onto_a_free_name_goes_through(self, service, ctx, repo):
+        conn = self._org_connection(ctx, name="github")
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(name="linear")
+        )
+
+        assert repo.update.call_args.kwargs["update_data"] == {"name": "linear"}
+
+    @pytest.mark.anyio
+    async def test_renaming_a_server_to_the_name_it_already_has_is_not_a_collision(
+        self, service, ctx, repo
+    ):
+        conn = self._org_connection(ctx, name="github")
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(name="github")
+        )
+
+        repo.get_org_scoped_by_name.assert_not_called()
+        assert repo.update.call_args.kwargs["update_data"] == {"name": "github"}
+
+    @pytest.mark.anyio
+    async def test_clearing_the_allowlist_exposes_every_tool_again(self, service, ctx, repo):
+        conn = self._org_connection(ctx, allowed_tools=["search"])
+        repo.get_org_scoped_by_id.return_value = conn
+
+        await service.update_for_org(
+            ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate(clear_allowed_tools=True)
+        )
+
+        assert repo.update.call_args.kwargs["update_data"]["allowed_tools"] is None
+
+    @pytest.mark.anyio
+    async def test_an_update_that_asks_for_nothing_writes_nothing(self, service, ctx, repo):
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+
+        result = await service.update_for_org(
+            ctx, connection_id=conn.id, data=OrgMcpConnectionUpdate()
+        )
+
+        assert result is conn
+        repo.update.assert_not_called()
+
+    # -- authorizing ----------------------------------------------------
+
+    @pytest.mark.anyio
+    async def test_authorizing_a_shared_server_stages_the_flow_on_the_organizations_row(
+        self, service, ctx, repo, monkeypatch
+    ):
+        """The consent is one person's; the connection is not. A pending flow
+        sealed with that member's envelope would leave a row the organization
+        owns and only its author could ever open - and a name checked in their
+        personal namespace would miss the collision that matters here."""
+        _allow_any_url(monkeypatch)
+        discovered = mcp_oauth.DiscoveredServer(
+            authorization_endpoint="https://srv/authorize",
+            token_endpoint="https://srv/token",
+            registration_endpoint=None,
+            resource="https://srv/mcp",
+            scope=None,
+            metadata=MagicMock(),
+        )
+        monkeypatch.setattr(mcp_oauth, "discover", AsyncMock(return_value=discovered))
+        monkeypatch.setattr(mcp_oauth, "register_client", AsyncMock(return_value=("cid", None)))
+
+        url = await service.oauth_start_for_org(
+            ctx, name="linear", url="https://srv/mcp", catalog_key="linear", label="Product"
+        )
+
+        assert url.startswith("https://srv/authorize?")
+        assert repo.create_org_scoped.await_args.kwargs["label"] == "Product"
+        assert repo.get_org_scoped_by_name.await_args.kwargs == {
+            "organization_id": ctx.organization_id,
+            "name": "linear",
+        }
+        stored = repo.create_org_scoped.await_args.kwargs
+        assert stored["organization_id"] == ctx.organization_id
+        assert stored["created_by_user_id"] == ctx.subject_id
+        assert (stored["auth_type"], stored["sealed_token"]) == ("oauth", None)
+        # Provenance the row keeps: the Builder groups it under its entry by this.
+        assert stored["catalog_key"] == "linear"
+        payload = McpOAuthPayload.model_validate_json(
+            unseal(
+                stored["oauth_pending_payload"],
+                scope=VaultScope.organization(ctx.organization_id),
+            )
+        )
+        # Staged only: the verifier the callback needs, and no tokens yet.
+        assert payload.code_verifier and payload.access_token is None
+
+    # -- deleting and probing -------------------------------------------
+
+    @pytest.mark.anyio
+    async def test_deleting_removes_the_row_and_leaves_a_trail(self, service, ctx, repo, audit):
+        conn = self._org_connection(ctx, name="github")
+        repo.get_org_scoped_by_id.return_value = conn
+
+        with patch("app.services.agent_trigger.AgentTriggerService") as triggers_cls:
+            triggers = triggers_cls.return_value
+            triggers.release_connection = AsyncMock()
+            await service.delete_for_org(ctx, connection_id=conn.id)
+
+        # The triggers this account registered hooks for shed them first - while
+        # the token still exists - or the FK's SET NULL trips the shape CHECK.
+        triggers.release_connection.assert_awaited_once_with(ctx, conn.id)
+        assert repo.delete.call_args.kwargs == {"db_connection": conn}
+        recorded = audit.call_args.kwargs
+        assert recorded["action"] == "mcp_connection.deleted"
+        assert recorded["details"] == {"name": "github"}
+
+    @pytest.mark.anyio
+    async def test_a_probe_records_what_it_found(self, service, ctx, repo, monkeypatch):
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+        tools = [McpToolInfo(name="search", description="Search")]
+        monkeypatch.setattr(
+            mcp_connection_service, "probe_mcp_server", AsyncMock(return_value=tools)
+        )
+
+        _connection_out, found, error = await service.test_for_org(ctx, connection_id=conn.id)
+
+        assert (found, error) == (tools, None)
+        assert repo.update.call_args.kwargs["update_data"]["last_status"] == "ok"
+
+    # -- the tenant boundary --------------------------------------------
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(
+                lambda service, ctx, connection_id: service.update_for_org(
+                    ctx, connection_id=connection_id, data=OrgMcpConnectionUpdate(name="taken")
+                ),
+                id="update",
+            ),
+            pytest.param(
+                lambda service, ctx, connection_id: service.delete_for_org(
+                    ctx, connection_id=connection_id
+                ),
+                id="delete",
+            ),
+            pytest.param(
+                lambda service, ctx, connection_id: service.test_for_org(
+                    ctx, connection_id=connection_id
+                ),
+                id="test",
+            ),
+            pytest.param(
+                lambda service, ctx, connection_id: service.get_org_connection(ctx, connection_id),
+                id="get_org_connection",
+            ),
+        ],
+    )
+    async def test_a_server_this_organization_does_not_own_is_not_found(
+        self, service, ctx, repo, audit, call
+    ):
+        """Every write goes through the same scoped lookup, and a refusal reads
+        as "not found" so an id cannot be used to probe what another tenant has."""
+        connection_id = uuid4()
+
+        with pytest.raises(NotFoundError):
+            await call(service, ctx, connection_id)
+
+        kwargs = repo.get_org_scoped_by_id.call_args.kwargs
+        assert kwargs["connection_id"] == connection_id
+        assert kwargs["organization_id"] == ctx.organization_id
+
+    @pytest.mark.anyio
+    async def test_get_org_connection_returns_the_row_it_finds(self, service, ctx, repo):
+        """The public lookup a caller uses to prove a `connection_id` is its own
+        before storing it - the trigger service, before persisting the account its
+        webhook registers through."""
+        conn = self._org_connection(ctx)
+        repo.get_org_scoped_by_id.return_value = conn
+
+        assert await service.get_org_connection(ctx, conn.id) is conn
+
+    @pytest.mark.anyio
+    async def test_the_personal_routes_cannot_reach_an_organization_server(self, service, repo):
+        """`/me/mcp-connections` authorizes on `user_id` and asks for no
+        organization permission. Without the scope check, whoever created a
+        shared server could repoint a published agent at a host of their own."""
+        user_id = uuid4()
+        conn = _connection(scope="org", user_id=user_id, organization_id=uuid4())
+        repo.get_by_id.return_value = conn
+
+        with pytest.raises(NotFoundError):
+            await service.delete(user_id=user_id, connection_id=conn.id)
+        repo.delete.assert_not_called()
+
+
+class TestOrgReadSchema:
+    def test_the_sealed_credential_never_leaves_the_backend(self):
+        """A response says a credential exists, never what it is - the same
+        contract as a provider key, and the reason there is no read endpoint."""
+        organization_id = uuid4()
+        sealed = seal("ghp-secret-9876", scope=VaultScope.organization(organization_id))
+        conn = _connection(
+            scope="org",
+            user_id=None,
+            organization_id=organization_id,
+            catalog_key="github",
+            auth_token=sealed.ciphertext,
+            secret_key_version=sealed.key_version,
+        )
+
+        read = McpConnectionRead.from_model(conn)
+
+        assert (read.has_auth_token, read.catalog_key) == (True, "github")
+        rendered = read.model_dump_json()
+        assert "ghp-secret-9876" not in rendered
+        assert sealed.ciphertext not in rendered
+
+
+class TestAPreRegisteredClientIsRefusedBeforeItIsStaged:
+    """The two ways a hand-registered client arrives malformed, both refused by
+    the schema so the caller hears about it on submit rather than at consent."""
+
+    @pytest.mark.security
+    def test_a_secret_with_no_client_id_is_refused(self):
+        """`_oauth_start` would register dynamically and overwrite the secret, so
+        the caller would consent against a client they never named."""
+        with pytest.raises(ValidationError) as excinfo:
+            McpOAuthStart(name="hubspot", url="https://srv/mcp", client_secret="operators-secret")
+        assert "client_id" in str(excinfo.value)
+
+    @pytest.mark.security
+    def test_a_truncated_secret_is_refused_at_submission(self):
+        """The repository-wide credential floor: the secret is not used until the
+        callback, so without this a bad paste passes start, takes the operator
+        through consent, and fails the token exchange."""
+        with pytest.raises(ValidationError) as excinfo:
+            McpOAuthStart(
+                name="hubspot", url="https://srv/mcp", client_id="cid", client_secret="short"
+            )
+        assert "at least 8 characters" in str(excinfo.value)
+
+    def test_a_client_id_alone_is_a_public_client_and_is_accepted(self):
+        """PKCE without a secret is a legitimate static client."""
+        start = McpOAuthStart(name="hubspot", url="https://srv/mcp", client_id="cid")
+        assert (start.client_id, start.client_secret) == ("cid", None)
+
+
+class TestOAuthRequestSafety:
+    """Discovery lets the remote server choose most of the URLs we call, so
+    every hop - redirects included - is checked and then dialled at the address
+    that passed (#860).
+
+    IP literals are used except where a hostname is the point: the validator
+    short-circuits on a literal, so those tests never touch DNS.
+    """
+
+    @staticmethod
+    def _client(handler) -> PinnedAsyncClient:
+        return mcp_oauth._client(httpx2.MockTransport(handler))
+
+    @staticmethod
+    def _resolves(monkeypatch, *rounds: str) -> list[str]:
+        """One DNS answer per call, the last one repeating; records the names."""
+        asked: list[str] = []
+        remaining = iter(rounds)
+
+        def fake_getaddrinfo(host: str, port: int, **_kwargs: object) -> list[tuple]:
+            asked.append(host)
+            return [(2, 1, 6, "", (next(remaining, rounds[-1]), port))]
+
+        monkeypatch.setattr("app.core.sanitize.socket.getaddrinfo", fake_getaddrinfo)
+        return asked
+
+    @pytest.mark.anyio
+    async def test_a_discovery_document_naming_a_private_address_is_refused(self, monkeypatch):
+        """The authorization server comes out of the server's own metadata, so
+        this is the first hop an attacker controls outright."""
+        self._resolves(monkeypatch, "169.254.169.254")
+        seen: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(str(request.url))
+            return httpx2.Response(200, json={})
+
+        async with self._client(handler) as client:
+            request = client.build_request("GET", "https://auth.attacker.test/.well-known/oauth")
+            with pytest.raises(mcp_oauth.OAuthError, match="blocked address"):
+                await mcp_oauth._send(client, request)
+
+        assert seen == []
+
+    @pytest.mark.anyio
+    async def test_a_refused_hop_is_reported_without_the_url_it_refused(self, monkeypatch):
+        """The refusal crosses `httpx2` out of the transport and reaches a
+        browser as a toast, so what it may say is the same question #861
+        answered for the connection dialog. The endpoint this flow POSTs to is
+        reached with credentials, and its query string is the server's to
+        write."""
+        self._resolves(monkeypatch, "10.0.0.9")
+
+        async with self._client(lambda request: httpx2.Response(200, json={})) as client:
+            request = client.build_request(
+                "POST", "https://auth.attacker.test/token?client_secret=sh-secret-value"
+            )
+            with pytest.raises(mcp_oauth.OAuthError) as excinfo:
+                await mcp_oauth._send(client, request)
+
+        shown = str(excinfo.value)
+        assert "sh-secret-value" not in shown
+        assert "auth.attacker.test" not in shown
+        assert "10.0.0.9" not in shown
+
+    @pytest.mark.anyio
+    async def test_a_name_that_turns_private_is_dialled_at_the_address_that_passed(
+        self, monkeypatch
+    ):
+        """The rebinding case: public to the check, the metadata service to
+        whatever resolves next. There is no next - the request goes to the
+        address the check approved, naming the host only in `Host` and SNI."""
+        asked = self._resolves(monkeypatch, "93.184.216.34", "169.254.169.254")
+        seen: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            return httpx2.Response(200, json={})
+
+        async with self._client(handler) as client:
+            request = client.build_request("POST", "https://token.attacker.test/token")
+            response = await mcp_oauth._send(client, request)
+
+        assert response.status_code == 200
+        assert asked == ["token.attacker.test"]
+        assert seen[0].url.host == "93.184.216.34"
+        assert seen[0].headers["Host"] == "token.attacker.test"
+
+    @pytest.mark.anyio
+    async def test_redirect_to_internal_host_is_blocked(self):
+        seen: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(str(request.url))
+            return httpx2.Response(
+                302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}
+            )
+
+        async with self._client(handler) as client:
+            request = client.build_request("GET", "https://93.184.216.34/.well-known/x")
+            with pytest.raises(mcp_oauth.OAuthError):
+                await mcp_oauth._send(client, request)
+
+        # The first hop was allowed; the metadata address was never requested.
+        assert seen == ["https://93.184.216.34/.well-known/x"]
+
+    @pytest.mark.anyio
+    async def test_a_redirect_to_a_new_host_is_re_checked_not_trusted(self, monkeypatch):
+        """A second hop gets its own resolution, and its own refusal."""
+        asked = self._resolves(monkeypatch, "93.184.216.34", "10.0.0.7")
+        seen: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(str(request.url))
+            return httpx2.Response(302, headers={"Location": "https://intranet.attacker.test/x"})
+
+        async with self._client(handler) as client:
+            request = client.build_request("GET", "https://auth.attacker.test/start")
+            with pytest.raises(mcp_oauth.OAuthError, match="blocked address"):
+                await mcp_oauth._send(client, request)
+
+        assert asked == ["auth.attacker.test", "intranet.attacker.test"]
+        assert len(seen) == 1
+
+    @pytest.mark.anyio
+    async def test_a_relative_redirect_follows_the_host_not_the_pinned_address(self, monkeypatch):
+        """`next_request` is built from the URL we asked for. Were it built from
+        the dialled one, `/moved` would resolve against the IP and the hop after
+        it would be checked - and cached, and TLS-verified - as a bare address."""
+        self._resolves(monkeypatch, "93.184.216.34")
+        seen: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            if request.url.path == "/start":
+                return httpx2.Response(302, headers={"Location": "/moved"})
+            return httpx2.Response(200, text="ok")
+
+        async with self._client(handler) as client:
+            request = client.build_request("GET", "https://auth.example.test/start")
+            response = await mcp_oauth._send(client, request)
+
+        assert response.status_code == 200
+        assert [r.headers["Host"] for r in seen] == ["auth.example.test"] * 2
+        assert [r.url.host for r in seen] == ["93.184.216.34"] * 2
+
+    @pytest.mark.anyio
+    async def test_redirect_to_public_host_is_followed(self):
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.host == "93.184.216.34":
+                return httpx2.Response(302, headers={"Location": "https://93.184.216.35/moved"})
+            return httpx2.Response(200, text="ok")
+
+        async with self._client(handler) as client:
+            request = client.build_request("GET", "https://93.184.216.34/start")
+            response = await mcp_oauth._send(client, request)
+
+        assert response.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_redirect_loop_gives_up(self):
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(302, headers={"Location": "https://93.184.216.34/loop"})
+
+        async with self._client(handler) as client:
+            request = client.build_request("GET", "https://93.184.216.34/loop")
+            with pytest.raises(mcp_oauth.OAuthError, match="redirects"):
+                await mcp_oauth._send(client, request)
+
+    @pytest.mark.anyio
+    async def test_token_endpoint_body_is_not_surfaced(self, monkeypatch):
+        """The OAuth error text reaches the user's browser - an internal
+        service's reply must not ride along with it."""
+
+        async def fake_send(client, request):
+            return httpx2.Response(
+                500, text="redis: NOAUTH Authentication required", request=request
+            )
+
+        monkeypatch.setattr(mcp_oauth, "_send", fake_send)
+        with pytest.raises(mcp_oauth.OAuthError) as exc_info:
+            await mcp_oauth._token_request("https://93.184.216.34/token", {"grant_type": "x"})
+
+        assert "redis" not in str(exc_info.value)
+        assert "500" in str(exc_info.value)
+
+
+class TestOAuthRefusalsDoNotQuoteTheServer:
+    """An OAuth refusal reaches the browser - as a toast since #657 - so what it
+    may say is written here rather than by whatever raised.
+
+    `httpx2` puts the failing request in its message, and the two requests this
+    flow makes are a token grant and a client registration: a URL in that
+    message is an endpoint reached with credentials. The vendor's text is not
+    deleted, it moves to the log beside the raise (#686).
+    """
+
+    _LEAKY_URL = "https://auth.example.com/token?client_secret=shh-9f2c"
+
+    @staticmethod
+    def _discovered() -> mcp_oauth.DiscoveredServer:
+        metadata = OAuthMetadata(
+            issuer=AnyUrl("https://auth.example.com"),
+            authorization_endpoint=AnyUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyUrl("https://auth.example.com/token"),
+            registration_endpoint=AnyUrl("https://auth.example.com/register"),
+            response_types_supported=["code"],
+        )
+        return mcp_oauth.DiscoveredServer(
+            authorization_endpoint=str(metadata.authorization_endpoint),
+            token_endpoint=str(metadata.token_endpoint),
+            registration_endpoint=str(metadata.registration_endpoint),
+            resource="https://mcp.example.com/",
+            scope=None,
+            metadata=metadata,
+        )
+
+    @pytest.mark.anyio
+    async def test_an_unreachable_token_endpoint_is_named_by_its_class(self, monkeypatch, caplog):
+        vendor_text = f"[Errno 61] Connection refused for {self._LEAKY_URL}"
+
+        async def fake_send(client, request):
+            raise httpx2.ConnectError(vendor_text)
+
+        monkeypatch.setattr(mcp_oauth, "_send", fake_send)
+        with (
+            caplog.at_level(logging.ERROR, logger="app.agents.mcp_oauth"),
+            pytest.raises(mcp_oauth.OAuthError) as exc_info,
+        ):
+            await mcp_oauth._token_request(
+                "https://auth.example.com/token", {"grant_type": "refresh_token"}
+            )
+
+        shown = str(exc_info.value)
+        assert "client_secret" not in shown
+        assert self._LEAKY_URL not in shown
+        assert "ConnectError" in shown
+        assert vendor_text in caplog.text
+
+    @pytest.mark.anyio
+    async def test_a_failed_registration_is_named_by_its_class(self, monkeypatch, caplog):
+        vendor_text = f"Server disconnected without sending a response: {self._LEAKY_URL}"
+
+        async def fake_send(client, request):
+            raise httpx2.ReadError(vendor_text)
+
+        monkeypatch.setattr(mcp_oauth, "_send", fake_send)
+        with (
+            caplog.at_level(logging.ERROR, logger="app.agents.mcp_oauth"),
+            pytest.raises(mcp_oauth.OAuthError) as exc_info,
+        ):
+            await mcp_oauth.register_client(
+                self._discovered(), "https://app.example.com/oauth/callback"
+            )
+
+        shown = str(exc_info.value)
+        assert "client_secret" not in shown
+        assert self._LEAKY_URL not in shown
+        assert "ReadError" in shown
+        assert vendor_text in caplog.text
+
+    @pytest.mark.security
+    @pytest.mark.anyio
+    async def test_an_unreadable_token_response_does_not_echo_its_input(self, monkeypatch, caplog):
+        """A pydantic `ValidationError` echoes the input it rejected, and here
+        that input is the token payload - so it reaches neither the browser nor
+        the log. The refusal names the class; the log names the failing field and
+        its error type, never the value (#1626)."""
+
+        async def fake_send(client, request):
+            return httpx2.Response(200, json={"token": "at-secret-9f2c"}, request=request)
+
+        monkeypatch.setattr(mcp_oauth, "_send", fake_send)
+        with (
+            caplog.at_level(logging.ERROR, logger="app.agents.mcp_oauth"),
+            pytest.raises(mcp_oauth.OAuthError) as exc_info,
+        ):
+            await mcp_oauth._token_request(
+                "https://auth.example.com/token", {"grant_type": "authorization_code"}
+            )
+
+        shown = str(exc_info.value)
+        assert "at-secret-9f2c" not in shown
+        assert "ValidationError" in shown
+        # The token must not reach the log, but the failure is still described.
+        assert "at-secret-9f2c" not in caplog.text
+        assert "unreadable token response" in caplog.text
+
+    def test_validation_detail_names_the_field_not_the_value(self):
+        """The sanitized detail says which field failed and how, not what was in it."""
+        with pytest.raises(ValidationError) as exc_info:
+            mcp_oauth.OAuthToken.model_validate_json('{"token": "at-secret-9f2c"}')
+        detail = mcp_oauth._validation_detail(exc_info.value)
+        assert "at-secret-9f2c" not in detail
+        assert "access_token" in detail
+        assert "missing" in detail
+
+    def test_validation_detail_falls_back_to_the_class_for_a_plain_value_error(self):
+        """The caller catches the wider `ValueError`; a non-validation one names its class."""
+        assert mcp_oauth._validation_detail(ValueError("boom")) == "ValueError"
+
+
+class TestAUrlNoRequestCanBeBuiltFor:
+    """A discovery document may name a URL `httpx2` will not parse at all, and
+    that is the third-party server being malformed rather than this platform
+    being broken - so it answers the 400 every other bad document answers.
+
+    `httpx2.InvalidURL` derives from `Exception` rather than from
+    `httpx2.HTTPError`, so it escaped all three of this module's catches and
+    reached the unhandled-exception handler as a 500 with an empty body (#889).
+    Neither `app.core.sanitize` nor `PinnedAsyncClient` could have stopped it:
+    both need a request, and this is the failure to build one.
+
+    Two shapes reach here, and both are the remote server's text. A bad port
+    survives `urlparse` and is quoted back by `InvalidURL` - `Invalid port:
+    'client_secret=…'` - which is what decides the wording. An endpoint over
+    64 KiB survives `AnyHttpUrl` too, so it is the shape that reaches a stored
+    `token_endpoint` and a `registration_endpoint` after discovery has already
+    accepted the document.
+    """
+
+    _SERVER = "https://93.184.216.34/mcp"
+    _BAD_PORT = (
+        "https://auth.example.com:client_secret=sh-9f2c/.well-known/oauth-protected-resource"
+    )
+    _TOO_LONG = "https://93.184.216.35/token?p=" + "p" * 70_000
+
+    @staticmethod
+    def _serving(monkeypatch, handler) -> None:
+        """Point every client `discover` opens at *handler* instead of a network."""
+        real = mcp_oauth._client
+        monkeypatch.setattr(
+            mcp_oauth, "_client", lambda **kw: real(httpx2.MockTransport(handler), **kw)
+        )
+
+    @classmethod
+    def _hinting_at_the_bad_port(cls, request: httpx2.Request) -> httpx2.Response:
+        if request.method == "POST":
+            return httpx2.Response(
+                401,
+                headers={"WWW-Authenticate": f'Bearer resource_metadata="{cls._BAD_PORT}"'},
+                json={},
+            )
+        return httpx2.Response(404, json={})
+
+    @staticmethod
+    def _metadata(token_endpoint: str) -> dict[str, object]:
+        return {
+            "issuer": "https://93.184.216.35",
+            "authorization_endpoint": "https://93.184.216.35/authorize",
+            "token_endpoint": token_endpoint,
+            "response_types_supported": ["code"],
+        }
+
+    @pytest.mark.anyio
+    async def test_a_www_authenticate_hint_with_an_unusable_port_does_not_crash_discovery(
+        self, monkeypatch
+    ):
+        """The header is remote-controlled text that reaches `httpx2.Request`
+        before anything here sees it. It used to raise `InvalidURL` out of
+        `discover`; now the candidate is skipped and the flow gives the answer
+        it gives for a server with no metadata."""
+        seen: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(str(request.url))
+            return self._hinting_at_the_bad_port(request)
+
+        self._serving(monkeypatch, handler)
+        with pytest.raises(mcp_oauth.OAuthError) as exc_info:
+            await mcp_oauth.discover(self._SERVER)
+
+        assert "did not advertise OAuth metadata" in str(exc_info.value)
+        assert "sh-9f2c" not in str(exc_info.value)
+        # The hint was never requested; the well-known URIs after it still were.
+        assert seen == [
+            self._SERVER,
+            "https://93.184.216.34/.well-known/oauth-protected-resource/mcp",
+            "https://93.184.216.34/.well-known/oauth-protected-resource",
+            "https://93.184.216.34/.well-known/oauth-authorization-server",
+        ]
+
+    @pytest.mark.anyio
+    async def test_an_unusable_hint_ends_that_candidate_and_not_the_flow(self, monkeypatch):
+        """The hint is the first of three candidates and the other two are
+        derived from the URL an operator typed, so a server that writes its
+        `WWW-Authenticate` header badly and its well-known documents correctly
+        still connects."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.path == "/.well-known/oauth-protected-resource":
+                return httpx2.Response(
+                    200,
+                    json={
+                        "resource": "https://93.184.216.34/mcp",
+                        "authorization_servers": ["https://93.184.216.35"],
+                    },
+                )
+            if request.url.path == "/.well-known/oauth-authorization-server":
+                return httpx2.Response(200, json=self._metadata("https://93.184.216.35/token"))
+            return self._hinting_at_the_bad_port(request)
+
+        self._serving(monkeypatch, handler)
+        server = await mcp_oauth.discover(self._SERVER)
+
+        assert server.token_endpoint == "https://93.184.216.35/token"
+        assert server.authorization_endpoint == "https://93.184.216.35/authorize"
+
+    @pytest.mark.anyio
+    async def test_every_discovery_request_names_its_client(self, monkeypatch):
+        """The SDK builds these requests bare. Facebook answers a request with no
+        User-Agent by redirecting to an "unsupported browser" page, which made
+        Meta Ads read as a server with no OAuth metadata (#2103)."""
+        agents: list[str | None] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            agents.append(request.headers.get("user-agent"))
+            if request.url.path == "/.well-known/oauth-protected-resource":
+                return httpx2.Response(
+                    200,
+                    json={
+                        "resource": "https://93.184.216.34/mcp",
+                        "authorization_servers": ["https://93.184.216.35"],
+                    },
+                )
+            if request.url.path == "/.well-known/oauth-authorization-server":
+                return httpx2.Response(200, json=self._metadata("https://93.184.216.35/token"))
+            return self._hinting_at_the_bad_port(request)
+
+        self._serving(monkeypatch, handler)
+        await mcp_oauth.discover(self._SERVER)
+
+        assert agents and all(agents), "a request went out with no User-Agent"
+        assert "agenticos MCP client" in agents[1:], "the SDK's bare requests carry ours"
+
+    @pytest.mark.anyio
+    async def test_a_token_endpoint_discovery_accepted_but_httpx2_will_not_build(
+        self, monkeypatch, caplog
+    ):
+        """`AnyHttpUrl` has no length limit and `httpx2` stops at 64 KiB, which
+        is how an endpoint the metadata document was validated with reaches the
+        vault and comes back at every refresh. The refresh path answers `None`
+        on an `OAuthError` and a 500 on anything else."""
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.path == "/.well-known/oauth-protected-resource":
+                return httpx2.Response(
+                    200,
+                    json={
+                        "resource": "https://93.184.216.34/mcp",
+                        "authorization_servers": ["https://93.184.216.35"],
+                    },
+                )
+            if request.url.path == "/.well-known/oauth-authorization-server":
+                return httpx2.Response(200, json=self._metadata(self._TOO_LONG))
+            return httpx2.Response(404, json={})
+
+        self._serving(monkeypatch, handler)
+        server = await mcp_oauth.discover(self._SERVER)
+        assert server.token_endpoint == self._TOO_LONG
+
+        with (
+            caplog.at_level(logging.WARNING, logger="app.agents.mcp_oauth"),
+            pytest.raises(mcp_oauth.OAuthError) as exc_info,
+        ):
+            await mcp_oauth._token_request(server.token_endpoint, {"grant_type": "refresh_token"})
+
+        assert "a token endpoint" in str(exc_info.value)
+        assert "URL too long" in caplog.text
+
+    @pytest.mark.anyio
+    async def test_a_registration_endpoint_no_request_can_be_built_for_is_refused(self):
+        """`create_client_registration_request` sits above the client, so this
+        one raised before the flow's `except httpx2.HTTPError` was even entered."""
+        metadata = OAuthMetadata(
+            issuer=AnyUrl("https://auth.example.com"),
+            authorization_endpoint=AnyUrl("https://auth.example.com/authorize"),
+            token_endpoint=AnyUrl("https://auth.example.com/token"),
+            registration_endpoint=AnyUrl(self._TOO_LONG),
+            response_types_supported=["code"],
+        )
+        server = mcp_oauth.DiscoveredServer(
+            authorization_endpoint=str(metadata.authorization_endpoint),
+            token_endpoint=str(metadata.token_endpoint),
+            registration_endpoint=str(metadata.registration_endpoint),
+            resource="https://mcp.example.com/",
+            scope=None,
+            metadata=metadata,
+        )
+        with pytest.raises(mcp_oauth.OAuthError) as exc_info:
+            await mcp_oauth.register_client(server, "https://app.example.com/oauth/callback")
+
+        assert "a registration endpoint" in str(exc_info.value)
+
+    @pytest.mark.anyio
+    async def test_the_refusal_does_not_quote_the_port_it_could_not_parse(self, caplog):
+        """`InvalidURL` says `Invalid port: 'client_secret=sh-9f2c'`, and on this
+        flow that string was written by the server being refused. It stays in
+        the log; the browser is told which endpoint was unusable and no more."""
+        endpoint = "https://auth.example.com:client_secret=sh-9f2c/token"
+        with (
+            caplog.at_level(logging.WARNING, logger="app.agents.mcp_oauth"),
+            pytest.raises(mcp_oauth.OAuthError) as exc_info,
+        ):
+            await mcp_oauth._token_request(endpoint, {"grant_type": "authorization_code"})
+
+        shown = str(exc_info.value)
+        assert "sh-9f2c" not in shown
+        assert "auth.example.com" not in shown
+        assert "sh-9f2c" in caplog.text
+
+
+class TestReadSchema:
+    def test_token_never_leaves_backend(self):
+        conn = _connection()
+        conn.auth_token = _seal_into(conn, "secret")
+        read = McpConnectionRead.from_model(conn)
+        assert read.has_auth_token is True
+        assert "secret" not in read.model_dump_json()
+
+    def test_oauth_authorized_reflects_tokens_and_pending_state(self):
+        # First-time consent not completed: only a pending flow → not authorized.
+        pending = _connection(auth_type="oauth", oauth_state="s")
+        pending.oauth_pending_payload = _seal_into(
+            pending, _base_payload(code_verifier="v").model_dump_json()
+        )
+        assert McpConnectionRead.from_model(pending).oauth_authorized is False
+        # Completed: tokens present → authorized.
+        done = _oauth_connection(_base_payload(access_token="AT"), oauth_state=None)
+        read = McpConnectionRead.from_model(done)
+        assert read.oauth_authorized is True
+        assert read.auth_type == "oauth"
+        # The encrypted payload (with tokens) never appears in the response.
+        assert "AT" not in read.model_dump_json()
+
+    def test_reauthorizing_a_live_connection_still_reads_as_connected(self):
+        """A re-authorization in flight must not flash "not connected" in the UI
+        for a connection whose tokens still work."""
+        conn = _oauth_connection(_base_payload(access_token="AT"), oauth_state="new-flow")
+        conn.oauth_pending_payload = _seal_into(
+            conn, _base_payload(code_verifier="v").model_dump_json()
+        )
+        assert McpConnectionRead.from_model(conn).oauth_authorized is True
+
+
+class TestWebhookAccessToken:
+    """The token the trigger portals use to register a webhook - handed back only
+    when the account was re-authorized for the scope, so a plain tool connection
+    falls back to manual rather than registering with a scope it never had."""
+
+    @staticmethod
+    def _ctx() -> AuthContext:
+        return AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+
+    @pytest.mark.anyio
+    async def test_a_connection_without_the_scope_yields_no_token(self, monkeypatch):
+        service = McpConnectionService(AsyncMock())
+        conn = _connection(scope="org", granted_scopes=["repo"])
+        monkeypatch.setattr(McpConnectionService, "_get_org", AsyncMock(return_value=conn))
+        token = await service.webhook_access_token(
+            self._ctx(), uuid4(), required_scopes=["admin:repo_hook"]
+        )
+        assert token is None
+
+    @pytest.mark.anyio
+    async def test_a_scoped_connection_yields_its_live_token(self, monkeypatch):
+        service = McpConnectionService(AsyncMock())
+        conn = _connection(scope="org", granted_scopes=["repo", "admin:repo_hook"])
+        monkeypatch.setattr(McpConnectionService, "_get_org", AsyncMock(return_value=conn))
+        monkeypatch.setattr(
+            mcp_connection_service, "_oauth_access_token", AsyncMock(return_value="live-token")
+        )
+        token = await service.webhook_access_token(
+            self._ctx(), uuid4(), required_scopes=["admin:repo_hook"]
+        )
+        assert token == "live-token"
+
+    @pytest.mark.anyio
+    async def test_a_disabled_connection_yields_no_token_whatever_it_consented_to(
+        self, monkeypatch
+    ):
+        """Disabled means disabled everywhere: the agent tool path already skips a
+        disabled row, and a caller who kept a trigger's connection_id must not
+        keep enumerating repositories or registering hooks with a credential an
+        administrator switched off."""
+        service = McpConnectionService(AsyncMock())
+        conn = _connection(
+            scope="org", granted_scopes=["repo", "admin:repo_hook"], is_enabled=False
+        )
+        monkeypatch.setattr(McpConnectionService, "_get_org", AsyncMock(return_value=conn))
+        token = await service.webhook_access_token(
+            self._ctx(), uuid4(), required_scopes=["admin:repo_hook"]
+        )
+        assert token is None
+
+
+class TestPortalGrantLookup:
+    @pytest.mark.anyio
+    async def test_the_grant_is_read_for_the_callers_own_organization(self, monkeypatch):
+        """A Gmail grant is a `purpose='portal'` row the MCP lookups deliberately
+        cannot see, so the catalog resolves it here - always against the
+        caller's tenant, never a raw key alone."""
+        service = McpConnectionService(AsyncMock())
+        ctx = AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+        grant = _connection(scope="org")
+        lookup = AsyncMock(return_value=grant)
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "get_portal_grant", lookup)
+
+        found = await service.get_org_portal_grant(ctx, "google")
+
+        assert found is grant
+        assert lookup.await_args.kwargs == {
+            "organization_id": ctx.organization_id,
+            "portal_key": "google",
+        }
+
+
+class TestPortalGrantById:
+    @pytest.mark.anyio
+    async def test_the_orgs_own_grant_is_returned(self, monkeypatch):
+        service = McpConnectionService(AsyncMock())
+        ctx = AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+        grant = _connection(scope="org")
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_portal_by_id",
+            AsyncMock(return_value=grant),
+        )
+        assert await service.get_org_portal_connection(ctx, uuid4()) is grant
+
+    @pytest.mark.anyio
+    async def test_a_foreign_or_bogus_grant_id_is_not_found(self, monkeypatch):
+        """The same unprobeable refusal every org-scoped lookup gives: a trigger
+        created against another tenant's mailbox grant reads as missing."""
+        service = McpConnectionService(AsyncMock())
+        ctx = AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+        monkeypatch.setattr(
+            mcp_connection_service.mcp_connection_repo,
+            "get_org_scoped_portal_by_id",
+            AsyncMock(return_value=None),
+        )
+        with pytest.raises(NotFoundError):
+            await service.get_org_portal_connection(ctx, uuid4())
+
+
+class TestGithubPortalOAuth:
+    """The GitHub OAuth App connect flow: the org's stored creds, fixed endpoints.
+
+    Unlike the discovery flow, nothing here is registered or discovered - the
+    endpoints are GitHub's, the client is the organization's stored
+    `github_oauth_app`, and the resulting connection is keyed to the `github` MCP
+    catalog entry so the trigger portal and the agent's tools share one account.
+    """
+
+    pytestmark = pytest.mark.anyio
+
+    @pytest.fixture
+    def ctx(self) -> AuthContext:
+        return AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+
+    @pytest.fixture
+    def service(self):
+        return McpConnectionService(db=AsyncMock())
+
+    @pytest.fixture
+    def repo(self, monkeypatch):
+        mock_repo = MagicMock()
+        mock_repo.get_org_scoped_by_name = AsyncMock(return_value=None)
+        mock_repo.get_org_scoped_by_catalog_key = AsyncMock(return_value=None)
+        mock_repo.create_org_scoped = AsyncMock()
+        mock_repo.update = AsyncMock()
+        mock_repo.get_by_oauth_state = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service, "mcp_connection_repo", mock_repo)
+        return mock_repo
+
+    @pytest.fixture
+    def creds(self, monkeypatch):
+        """The organization's stored GitHub OAuth App, as the vault reader returns it."""
+        value = GithubOAuthAppSecret(client_id="Iv1.0123456789ab", client_secret="ghsec-42")
+        monkeypatch.setattr(OrganizationSecretService, "oauth_app", AsyncMock(return_value=value))
+        return value
+
+    async def test_a_start_without_a_stored_secret_is_a_clean_4xx_not_a_500(
+        self, service, ctx, repo, monkeypatch
+    ):
+        """A missing prerequisite is the operator's to fix, not a bug - and the row
+        is never created, so a retry after adding the secret is not a name clash."""
+        monkeypatch.setattr(
+            OrganizationSecretService,
+            "oauth_app",
+            AsyncMock(side_effect=NotFoundError(message="add a secret first")),
+        )
+        with pytest.raises(NotFoundError):
+            await service.oauth_start_for_org_github(ctx, portal_key="github")
+        repo.create_org_scoped.assert_not_called()
+
+    async def test_a_start_for_an_unknown_portal_is_refused(self, service, ctx, repo, creds):
+        with pytest.raises(BadRequestError):
+            await service.oauth_start_for_org_github(ctx, portal_key="no-such-portal")
+        repo.create_org_scoped.assert_not_called()
+
+    async def test_a_start_whose_catalog_entry_is_missing_is_refused(
+        self, service, ctx, repo, monkeypatch
+    ):
+        """A portal that names an MCP catalog key the catalog no longer holds is a
+        misconfiguration - a 4xx before any consent URL or secret read, not a 500."""
+        monkeypatch.setattr("app.services.mcp_connection.get_entry", lambda _key: None)
+        with pytest.raises(BadRequestError):
+            await service.oauth_start_for_org_github(ctx, portal_key="github")
+        repo.create_org_scoped.assert_not_called()
+
+    async def test_a_start_stages_the_flow_with_githubs_endpoints_and_the_org_creds(
+        self, service, ctx, repo, creds
+    ):
+        url = await service.oauth_start_for_org_github(ctx, portal_key="github")
+
+        # The consent URL is GitHub's own, carrying the org's client id and the
+        # portal's scopes - and never the client secret.
+        assert url.startswith("https://github.com/login/oauth/authorize?")
+        assert "client_id=Iv1.0123456789ab" in url
+        assert "scope=repo+admin%3Arepo_hook" in url
+        assert "ghsec-42" not in url
+
+        stored = repo.create_org_scoped.await_args.kwargs
+        assert stored["organization_id"] == ctx.organization_id
+        assert stored["created_by_user_id"] == ctx.subject_id
+        # Keyed to the MCP catalog entry so the portal join finds this connection.
+        assert stored["catalog_key"] == "github"
+        assert (stored["auth_type"], stored["sealed_token"]) == ("oauth", None)
+        assert stored["oauth_state"] and stored["oauth_pending_payload"]
+
+        payload = McpOAuthPayload.model_validate_json(
+            unseal(
+                stored["oauth_pending_payload"],
+                scope=VaultScope.organization(ctx.organization_id),
+            )
+        )
+        assert payload.provider == "github"
+        assert payload.token_endpoint == github_oauth.TOKEN_ENDPOINT
+        assert payload.authorization_endpoint == github_oauth.AUTHORIZE_ENDPOINT
+        assert payload.scope == "repo admin:repo_hook"
+        # The secret is sealed in the pending payload, never in a plain column.
+        assert payload.client_secret.get_secret_value() == "ghsec-42"
+        assert payload.access_token is None
+        assert payload.code_verifier is None  # no PKCE on this flow
+
+    async def test_reauthorizing_keeps_the_live_token_until_consent_lands(
+        self, service, ctx, repo, creds
+    ):
+        """Re-running the flow on a connected account must not break it if the user
+        abandons the consent tab - the live token survives until the callback."""
+        live = _connection(
+            scope="org",
+            user_id=None,
+            organization_id=ctx.organization_id,
+            catalog_key="github",
+            auth_type="oauth",
+            name="github",
+        )
+        live.oauth_payload = _seal_into(
+            live, _base_payload(access_token="live-token").model_dump_json()
+        )
+        repo.get_org_scoped_by_catalog_key.return_value = live
+
+        await service.oauth_start_for_org_github(ctx, portal_key="github")
+
+        update_data = repo.update.await_args.kwargs["update_data"]
+        assert update_data["oauth_pending_payload"]
+        assert "oauth_payload" not in update_data  # the working token survives
+        repo.create_org_scoped.assert_not_called()
+
+    async def test_a_pre_oauth_bearer_catalog_connection_is_upgraded_not_refused(
+        self, service, ctx, repo, creds
+    ):
+        """An organization that connected the GitHub catalog entry before the OAuth
+        flow existed holds a bearer row agents may already be bound to. The start
+        stages onto that row - found by its catalog key, whatever it is named - so
+        the portal is never wedged on Re-authorize behind an AlreadyExists, and no
+        duplicate row appears for the frontend's catalog-key join to miss."""
+        bearer = _connection(
+            scope="org",
+            user_id=None,
+            organization_id=ctx.organization_id,
+            catalog_key="github",
+            auth_type="bearer",
+            name="My GitHub",
+        )
+        repo.get_org_scoped_by_catalog_key.return_value = bearer
+
+        await service.oauth_start_for_org_github(ctx, portal_key="github")
+
+        # Staged on the existing row: no new row, and the bearer token survives
+        # untouched until the callback promotes the connection to OAuth.
+        repo.create_org_scoped.assert_not_called()
+        assert repo.update.await_args.kwargs["db_connection"] is bearer
+        update_data = repo.update.await_args.kwargs["update_data"]
+        assert update_data["oauth_pending_payload"]
+        assert "auth_type" not in update_data
+        assert "auth_token" not in update_data
+
+    async def test_a_like_named_bearer_row_outside_the_catalog_is_still_refused(
+        self, service, ctx, repo, creds
+    ):
+        """A bearer connection that merely *shares the name* `github` is not the
+        catalog row - staging onto it would hijack an unrelated connection into a
+        GitHub one at the callback, so the name collision keeps its refusal."""
+        unrelated = _connection(
+            scope="org",
+            user_id=None,
+            organization_id=ctx.organization_id,
+            catalog_key=None,
+            auth_type="bearer",
+            name="github",
+        )
+        repo.get_org_scoped_by_name.return_value = unrelated
+
+        with pytest.raises(AlreadyExistsError):
+            await service.oauth_start_for_org_github(ctx, portal_key="github")
+
+    async def test_the_callback_exchanges_the_code_and_persists_the_granted_scopes(
+        self, service, repo, monkeypatch
+    ):
+        organization_id = uuid4()
+        pending = _connection(
+            scope="org",
+            user_id=None,
+            organization_id=organization_id,
+            catalog_key="github",
+            auth_type="oauth",
+            name="github",
+            url="https://api.githubcopilot.com/mcp/",
+            oauth_state="gh-state",
+        )
+        pending.oauth_pending_payload = _seal_into(
+            pending,
+            _base_payload(
+                provider="github",
+                client_secret="ghsec-42",
+                code_verifier=None,
+                token_endpoint=github_oauth.TOKEN_ENDPOINT,
+                scope="repo admin:repo_hook",
+            ).model_dump_json(),
+        )
+        repo.get_by_oauth_state.return_value = pending
+        repo.update.return_value = pending
+        monkeypatch.setattr(
+            github_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=github_oauth.GithubToken(
+                    access_token="gho_live", granted_scopes=["repo", "admin:repo_hook"]
+                )
+            ),
+        )
+
+        monkeypatch.setattr(mcp_connection_service, "_reach", AsyncMock(return_value=([], None)))
+        await service.oauth_callback(state="gh-state", code="the-code")
+
+        update_data = repo.update.await_args_list[0].kwargs["update_data"]
+        # The scopes GitHub actually granted, mirrored to the plain column the
+        # webhook path reads.
+        assert update_data["granted_scopes"] == ["repo", "admin:repo_hook"]
+        assert update_data["oauth_pending_payload"] is None
+        assert update_data["oauth_state"] is None
+        assert update_data["last_status"] == "ok"
+        # A row staged as an upgrade of a pre-OAuth bearer connection is promoted
+        # only now, with the consent in hand: OAuth takes over, the static token
+        # goes. On an already-OAuth row both are no-ops.
+        assert update_data["auth_type"] == "oauth"
+        assert update_data["auth_token"] is None
+        payload = McpOAuthPayload.model_validate_json(
+            _open_from(pending, update_data["oauth_payload"])
+        )
+        assert payload.access_token.get_secret_value() == "gho_live"
+        # A classic OAuth App token neither refreshes nor expires.
+        assert payload.refresh_token is None
+        assert payload.expires_at is None
+
+    async def test_a_github_exchange_failure_surfaces_as_an_oauth_error(
+        self, service, repo, monkeypatch
+    ):
+        pending = _connection(
+            scope="org",
+            user_id=None,
+            organization_id=uuid4(),
+            catalog_key="github",
+            auth_type="oauth",
+            name="github",
+            oauth_state="gh-state",
+        )
+        pending.oauth_pending_payload = _seal_into(
+            pending,
+            _base_payload(provider="github", code_verifier=None).model_dump_json(),
+        )
+        repo.get_by_oauth_state.return_value = pending
+        monkeypatch.setattr(
+            github_oauth,
+            "exchange_code",
+            AsyncMock(side_effect=github_oauth.GithubOAuthError("GitHub said no")),
+        )
+
+        with pytest.raises(mcp_oauth.OAuthError):
+            await service.oauth_callback(state="gh-state", code="the-code")
+        repo.update.assert_not_called()
+
+
+class TestPolledPortalOAuth:
+    """Connecting a portal the platform reads rather than is posted to.
+
+    Gmail's case, and the same shape as GitHub's in the decision that matters: the
+    client is the organization's own, from the vault. It read the deployment's
+    `GOOGLE_CLIENT_ID` for one commit, which was a second mechanism for a
+    credential at rest - and left the card telling whoever wanted a mailbox
+    trigger to go and set an environment variable.
+    """
+
+    pytestmark = pytest.mark.anyio
+
+    @pytest.fixture
+    def ctx(self) -> AuthContext:
+        return AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+
+    @pytest.fixture
+    def service(self):
+        return McpConnectionService(db=AsyncMock())
+
+    @pytest.fixture
+    def repo(self, monkeypatch):
+        mock_repo = MagicMock()
+        mock_repo.get_portal_grant = AsyncMock(return_value=None)
+        mock_repo.create_org_scoped = AsyncMock()
+        mock_repo.update = AsyncMock()
+        monkeypatch.setattr(mcp_connection_service, "mcp_connection_repo", mock_repo)
+        return mock_repo
+
+    @pytest.fixture
+    def client(self, monkeypatch):
+        """The organization's stored Google client, as the vault reader answers it."""
+        from app.core.secret_kinds import GoogleOAuthAppSecret
+        from app.services import mcp_connection as service_module
+
+        creds = GoogleOAuthAppSecret(client_id="org-client", client_secret="org-secret")
+        monkeypatch.setattr(
+            service_module.OrganizationSecretService, "oauth_app", AsyncMock(return_value=creds)
+        )
+        return creds
+
+    async def test_an_organization_with_no_stored_client_is_a_clean_4xx(
+        self, service, ctx, repo, monkeypatch
+    ):
+        """A missing prerequisite the card shows, never a 500 - and no row written,
+        so storing the client and retrying is not a name clash."""
+        from app.services import mcp_connection as service_module
+
+        monkeypatch.setattr(
+            service_module.OrganizationSecretService,
+            "oauth_app",
+            AsyncMock(side_effect=NotFoundError(message="Add an org-visible secret")),
+        )
+        with pytest.raises(NotFoundError):
+            await service.oauth_start_for_polled_portal(ctx, portal_key="google")
+        repo.create_org_scoped.assert_not_called()
+
+    async def test_it_spends_the_organizations_own_client_not_the_deployments(
+        self, service, ctx, repo, client, monkeypatch
+    ):
+        """The regression that matters: a client read from the environment is a
+        second mechanism for a credential at rest, and this repository has one."""
+        from app.core.secret_kinds import SecretKind
+        from app.services import mcp_connection as service_module
+
+        monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "deployment-client")
+
+        url = await service.oauth_start_for_polled_portal(ctx, portal_key="google")
+
+        assert "client_id=org-client" in url
+        assert "deployment-client" not in url
+        asked = service_module.OrganizationSecretService.oauth_app.await_args
+        assert asked.kwargs["kind"] is SecretKind.GOOGLE_OAUTH_APP
+
+    async def test_a_portal_that_is_not_polled_is_refused(self, service, ctx, repo, client):
+        """GitHub connects through its own flow; sending it here would stage a grant
+        with no webhook scopes on it."""
+        with pytest.raises(BadRequestError):
+            await service.oauth_start_for_polled_portal(ctx, portal_key="github")
+        repo.create_org_scoped.assert_not_called()
+
+    async def test_an_unknown_portal_is_refused(self, service, ctx, repo, client):
+        with pytest.raises(BadRequestError):
+            await service.oauth_start_for_polled_portal(ctx, portal_key="no-such-portal")
+        repo.create_org_scoped.assert_not_called()
+
+    async def test_the_consent_url_is_googles_and_asks_for_offline_access(
+        self, service, ctx, repo, client
+    ):
+        url = await service.oauth_start_for_polled_portal(ctx, portal_key="google")
+
+        assert url.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+        assert "client_id=org-client" in url
+        assert "gmail.readonly" in url
+        # Without these Google returns a refresh token only on the very first
+        # consent for a client, so a mailbox would work for an hour and then stop.
+        assert "access_type=offline" in url
+        assert "prompt=consent" in url
+        # The secret never rides in a URL the browser is sent to.
+        assert "org-secret" not in url
+
+    async def test_the_grant_is_staged_as_a_portal_row_not_a_server(
+        self, service, ctx, repo, client
+    ):
+        """A grant must never appear among the organization's MCP servers: it has no
+        tools and nobody should be offered it to bind an agent to."""
+        await service.oauth_start_for_polled_portal(ctx, portal_key="google")
+
+        written = repo.create_org_scoped.await_args.kwargs
+        assert written["purpose"] == "portal"
+        assert written["portal_key"] == "google"
+        assert written["catalog_key"] is None
+
+    async def test_re_consenting_stages_onto_the_existing_grant(self, service, ctx, repo, client):
+        """One grant per portal per organization: a second row would be two mailboxes
+        with nothing to choose between them."""
+        repo.get_portal_grant = AsyncMock(
+            return_value=MagicMock(auth_type="oauth", id=uuid4(), secret_key_version=1)
+        )
+
+        await service.oauth_start_for_polled_portal(ctx, portal_key="google")
+
+        repo.create_org_scoped.assert_not_called()
+        assert repo.update.await_count == 1
+
+
+class TestCompletingGooglesFlow:
+    """The exchange, and the two fields GitHub's flow does not carry."""
+
+    pytestmark = pytest.mark.anyio
+
+    async def test_the_refresh_token_and_expiry_are_kept(self, monkeypatch):
+        """A Google access token expires in an hour, so both are needed - and this
+        is the whole reason a grant lives in a table that refreshes under a lock."""
+        from app.services.mcp_connection import _complete_google_flow
+        from app.services.portals import google_oauth
+
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="at",
+                    refresh_token="rt",
+                    expires_in=3600,
+                    granted_scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+                )
+            ),
+        )
+        payload = _base_payload(provider="google")
+
+        completed, granted = await _complete_google_flow(payload, "code")
+
+        assert completed.access_token.get_secret_value() == "at"
+        assert completed.refresh_token.get_secret_value() == "rt"
+        assert completed.expires_at is not None
+        assert granted == ["https://www.googleapis.com/auth/gmail.readonly"]
+
+    async def test_a_grant_with_no_refresh_token_is_stored_as_it_came(self, monkeypatch):
+        """Google withholds one when the account has consented before without
+        `access_type=offline`. Recorded as absent rather than invented."""
+        from app.services.mcp_connection import _complete_google_flow
+        from app.services.portals import google_oauth
+
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=google_oauth.GoogleToken(
+                    access_token="at", refresh_token=None, expires_in=None, granted_scopes=[]
+                )
+            ),
+        )
+
+        completed, granted = await _complete_google_flow(_base_payload(provider="google"), "code")
+
+        assert completed.refresh_token is None
+        assert completed.expires_at is None
+        assert granted is None
+
+    async def test_a_refused_exchange_becomes_the_shared_oauth_error(self, monkeypatch):
+        """So the one callback route reports it the way it reports every other
+        flow's failure."""
+        from app.services.mcp_connection import _complete_google_flow
+        from app.services.portals import google_oauth
+
+        monkeypatch.setattr(
+            google_oauth,
+            "exchange_code",
+            AsyncMock(side_effect=google_oauth.GoogleOAuthError("Google refused")),
+        )
+
+        with pytest.raises(mcp_oauth.OAuthError):
+            await _complete_google_flow(_base_payload(provider="google"), "code")
+
+
+class TestStartingOutlooksConsent:
+    """The Outlook portal's consent (#1984): the organization's app registration,
+    at its own tenant's endpoints, for delegated mail scopes only."""
+
+    pytestmark = pytest.mark.anyio
+
+    @pytest.fixture
+    def ctx(self) -> AuthContext:
+        return AuthContext(user_id=uuid4(), organization_id=uuid4(), role=OrgRoleName.OWNER.value)
+
+    @pytest.fixture
+    def service(self, monkeypatch):
+        from app.core.secret_kinds import MicrosoftOAuthAppSecret
+        from app.services import mcp_connection as service_module
+
+        creds = MicrosoftOAuthAppSecret(
+            tenant_id="contoso.onmicrosoft.com",
+            client_id="11111111-2222-3333-4444-555555555555",
+            client_secret="org-secret",
+        )
+        monkeypatch.setattr(
+            service_module.OrganizationSecretService, "oauth_app", AsyncMock(return_value=creds)
+        )
+        repo = MagicMock()
+        repo.get_portal_grant = AsyncMock(return_value=None)
+        monkeypatch.setattr(service_module, "mcp_connection_repo", repo)
+        service = McpConnectionService(db=AsyncMock())
+        service._stage_pending_oauth = AsyncMock()  # type: ignore[method-assign]
+        return service
+
+    async def test_the_consent_url_is_the_tenants_and_asks_for_mail_only(self, service, ctx):
+        from app.core.secret_kinds import SecretKind
+        from app.services import mcp_connection as service_module
+
+        url = await service.oauth_start_for_polled_portal(ctx, portal_key="microsoft")
+
+        assert url.startswith(
+            "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/authorize?"
+        )
+        assert "Mail.Read" in url
+        assert "offline_access" in url
+        assert "org-secret" not in url
+        asked = service_module.OrganizationSecretService.oauth_app.await_args
+        assert asked.kwargs["kind"] is SecretKind.MICROSOFT_OAUTH_APP
+
+    async def test_the_staged_grant_carries_the_tenants_token_endpoint(self, service, ctx):
+        """The callback has no secret to read the tenant from again; the payload
+        it completes is all it has."""
+        await service.oauth_start_for_polled_portal(ctx, portal_key="microsoft")
+
+        staged = service._stage_pending_oauth.await_args.kwargs
+        assert staged["payload"].provider == "microsoft"
+        assert staged["payload"].token_endpoint == (
+            "https://login.microsoftonline.com/contoso.onmicrosoft.com/oauth2/v2.0/token"
+        )
+        assert staged["url"] == "https://graph.microsoft.com"
+
+    async def test_the_consent_is_bound_to_its_flow_with_pkce(self, service, ctx):
+        """The challenge in the URL is the verifier staged for the callback, hashed."""
+        import base64
+        import hashlib
+
+        url = await service.oauth_start_for_polled_portal(ctx, portal_key="microsoft")
+
+        verifier = service._stage_pending_oauth.await_args.kwargs["payload"].code_verifier
+        challenge = httpx2.URL(url).params["code_challenge"]
+        assert httpx2.URL(url).params["code_challenge_method"] == "S256"
+        expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        assert challenge == expected.decode().rstrip("=")
+
+    async def test_a_polled_portal_with_no_client_kind_is_refused(self, service, ctx, monkeypatch):
+        from dataclasses import replace
+
+        from app.services import portal_catalog
+
+        bare = replace(portal_catalog.get_portal("microsoft"), oauth_app_kind=None)
+        monkeypatch.setattr(portal_catalog, "get_portal", lambda _key: bare)
+
+        with pytest.raises(BadRequestError):
+            await service.oauth_start_for_polled_portal(ctx, portal_key="microsoft")
+
+
+class TestCompletingMicrosoftsFlow:
+    pytestmark = pytest.mark.anyio
+
+    async def test_a_grant_with_no_refresh_token_is_stored_as_it_came(self, monkeypatch):
+        from app.services.mcp_connection import _complete_microsoft_flow
+        from app.services.portals import microsoft_oauth
+
+        monkeypatch.setattr(
+            microsoft_oauth,
+            "exchange_code",
+            AsyncMock(
+                return_value=microsoft_oauth.MicrosoftToken(
+                    access_token="at", refresh_token=None, expires_in=None, granted_scopes=[]
+                )
+            ),
+        )
+
+        completed, granted = await _complete_microsoft_flow(
+            _base_payload(provider="microsoft", scope=None, code_verifier="v"), "code"
+        )
+
+        assert completed.access_token.get_secret_value() == "at"
+        assert completed.refresh_token is None
+        assert completed.expires_at is None
+        assert granted is None
+
+    async def test_a_session_without_its_verifier_is_started_again(self):
+        """A pending payload from before PKCE, or one whose verifier could not be
+        read back, cannot complete; it is refused before anything reaches Microsoft."""
+        from app.services.mcp_connection import _complete_microsoft_flow
+
+        with pytest.raises(mcp_oauth.OAuthError, match="start again"):
+            await _complete_microsoft_flow(_base_payload(provider="microsoft"), "code")
+
+    async def test_a_refused_exchange_becomes_the_shared_oauth_error(self, monkeypatch):
+        from app.services.mcp_connection import _complete_microsoft_flow
+        from app.services.portals import microsoft_oauth
+
+        monkeypatch.setattr(
+            microsoft_oauth,
+            "exchange_code",
+            AsyncMock(side_effect=microsoft_oauth.MicrosoftOAuthError("Microsoft refused")),
+        )
+
+        with pytest.raises(mcp_oauth.OAuthError, match="Microsoft refused"):
+            await _complete_microsoft_flow(
+                _base_payload(provider="microsoft", code_verifier="v"), "code"
+            )
+
+
+class TestDiscoveredScopes:
+    """The consent asks for the scopes the MCP server names for itself.
+
+    Shaped on Microsoft Work IQ: its protected-resource metadata names one
+    scope on its own API, and its issuer, Entra, lists the OpenID scopes of
+    Graph. Asking for those beside a `resource` naming Work IQ is what Entra
+    refused with AADSTS9010010 at the token endpoint, after the person had
+    already consented.
+    """
+
+    _SERVER = "https://93.184.216.34/mcp"
+    _WORK_IQ_SCOPE = "fdcc1f02-fc51-4226-8753-f668596af7f7/WorkIQAgent.Ask"
+
+    @classmethod
+    def _serving(
+        cls,
+        monkeypatch,
+        *,
+        resource_scopes: list[str] | None,
+        issuer_scopes: list[str] | None,
+        challenge_scope: str | None = None,
+    ) -> None:
+        resource: dict[str, object] = {
+            "resource": cls._SERVER,
+            "authorization_servers": ["https://93.184.216.35"],
+        }
+        if resource_scopes is not None:
+            resource["scopes_supported"] = resource_scopes
+        issuer: dict[str, object] = {
+            "issuer": "https://93.184.216.35",
+            "authorization_endpoint": "https://93.184.216.35/authorize",
+            "token_endpoint": "https://93.184.216.35/token",
+            "response_types_supported": ["code"],
+        }
+        if issuer_scopes is not None:
+            issuer["scopes_supported"] = issuer_scopes
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.path == "/mcp" and challenge_scope is not None:
+                return httpx2.Response(
+                    401, headers={"WWW-Authenticate": f'Bearer scope="{challenge_scope}"'}
+                )
+            if request.url.path == "/.well-known/oauth-protected-resource/mcp":
+                return httpx2.Response(200, json=resource)
+            if request.url.path == "/.well-known/oauth-authorization-server":
+                return httpx2.Response(200, json=issuer)
+            return httpx2.Response(404, json={})
+
+        real = mcp_oauth._client
+        monkeypatch.setattr(
+            mcp_oauth, "_client", lambda **kw: real(httpx2.MockTransport(handler), **kw)
+        )
+
+    @pytest.mark.anyio
+    async def test_the_servers_own_scope_wins_over_the_issuers_and_keeps_refresh(self, monkeypatch):
+        self._serving(
+            monkeypatch,
+            resource_scopes=[self._WORK_IQ_SCOPE],
+            issuer_scopes=["openid", "profile", "email", "offline_access"],
+        )
+
+        server = await mcp_oauth.discover(self._SERVER)
+
+        assert server.scope == f"{self._WORK_IQ_SCOPE} offline_access"
+
+    @pytest.mark.anyio
+    async def test_offline_access_is_not_added_when_the_issuer_does_not_offer_it(self, monkeypatch):
+        self._serving(monkeypatch, resource_scopes=["read", "write"], issuer_scopes=["admin"])
+
+        server = await mcp_oauth.discover(self._SERVER)
+
+        assert server.scope == "read write"
+
+    @pytest.mark.anyio
+    async def test_offline_access_named_by_the_server_is_not_asked_for_twice(self, monkeypatch):
+        self._serving(
+            monkeypatch,
+            resource_scopes=["read", "offline_access"],
+            issuer_scopes=["offline_access"],
+        )
+
+        server = await mcp_oauth.discover(self._SERVER)
+
+        assert server.scope == "read offline_access"
+
+    @pytest.mark.anyio
+    async def test_the_issuers_scopes_stand_in_when_the_server_names_none(self, monkeypatch):
+        self._serving(monkeypatch, resource_scopes=None, issuer_scopes=["read", "write"])
+
+        server = await mcp_oauth.discover(self._SERVER)
+
+        assert server.scope == "read write"
+
+    @pytest.mark.anyio
+    async def test_no_scope_is_asked_for_when_neither_names_one(self, monkeypatch):
+        self._serving(monkeypatch, resource_scopes=None, issuer_scopes=None)
+
+        server = await mcp_oauth.discover(self._SERVER)
+
+        assert server.scope is None
+
+    @pytest.mark.anyio
+    async def test_the_scope_the_401_names_wins_over_the_metadata(self, monkeypatch):
+        self._serving(
+            monkeypatch,
+            resource_scopes=["read", "write"],
+            issuer_scopes=["read", "write", "offline_access"],
+            challenge_scope="read",
+        )
+
+        server = await mcp_oauth.discover(self._SERVER)
+
+        assert server.scope == "read offline_access"
+
+    @pytest.mark.anyio
+    async def test_asking_for_offline_access_prompts_for_consent(self, monkeypatch):
+        self._serving(
+            monkeypatch,
+            resource_scopes=[self._WORK_IQ_SCOPE],
+            issuer_scopes=["openid", "offline_access"],
+        )
+        server = await mcp_oauth.discover(self._SERVER)
+
+        url = mcp_oauth.authorization_url(
+            server, client_id="c", redirect_uri="https://x/cb", state="s", code_challenge="cc"
+        )
+
+        assert httpx2.URL(url).params["prompt"] == "consent"
+
+    @pytest.mark.anyio
+    async def test_no_consent_prompt_without_offline_access(self, monkeypatch):
+        self._serving(monkeypatch, resource_scopes=["read"], issuer_scopes=["read"])
+        server = await mcp_oauth.discover(self._SERVER)
+
+        url = mcp_oauth.authorization_url(
+            server, client_id="c", redirect_uri="https://x/cb", state="s", code_challenge="cc"
+        )
+
+        assert "prompt" not in httpx2.URL(url).params
+
+
+class TestPortalReadToken:
+    """The worker's way to a mailbox token: by organization, never by a member's request."""
+
+    @staticmethod
+    def _grant_lookup(monkeypatch, grant):
+        lookup = AsyncMock(return_value=grant)
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "get_portal_grant", lookup)
+        return lookup
+
+    @pytest.mark.anyio
+    async def test_a_portal_read_token_is_none_without_a_grant(self, monkeypatch):
+        self._grant_lookup(monkeypatch, None)
+        service = McpConnectionService(AsyncMock())
+        assert await service.portal_read_token(organization_id=uuid4(), portal_key="google") is None
+
+    @pytest.mark.anyio
+    async def test_a_portal_read_token_is_none_for_a_switched_off_grant(self, monkeypatch):
+        self._grant_lookup(monkeypatch, _connection(is_enabled=False))
+        renew = AsyncMock(return_value="live-token")
+        monkeypatch.setattr(mcp_connection_service, "_oauth_access_token", renew)
+        service = McpConnectionService(AsyncMock())
+        assert await service.portal_read_token(organization_id=uuid4(), portal_key="google") is None
+        renew.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_a_portal_read_token_is_the_renewed_token_otherwise(self, monkeypatch):
+        grant = _connection(scope="org")
+        lookup = self._grant_lookup(monkeypatch, grant)
+        renew = AsyncMock(return_value="live-token")
+        monkeypatch.setattr(mcp_connection_service, "_oauth_access_token", renew)
+        org = uuid4()
+        service = McpConnectionService(AsyncMock())
+        assert await service.portal_read_token(organization_id=org, portal_key="google") == (
+            "live-token"
+        )
+        renew.assert_awaited_once_with(grant)
+        assert lookup.await_args.kwargs == {"organization_id": org, "portal_key": "google"}
+
+    @pytest.mark.anyio
+    async def test_a_grant_that_cannot_be_renewed_gives_no_token(self, monkeypatch):
+        self._grant_lookup(monkeypatch, _connection(scope="org"))
+        monkeypatch.setattr(
+            mcp_connection_service, "_oauth_access_token", AsyncMock(return_value=None)
+        )
+        service = McpConnectionService(AsyncMock())
+        assert await service.portal_read_token(organization_id=uuid4(), portal_key="google") is None
+
+    @pytest.mark.anyio
+    async def test_another_organizations_grant_is_never_read(self, monkeypatch):
+        """The lookup is by the caller's organization, so a grant held by organization B
+        is not found when A asks - whatever the repository would otherwise return."""
+        org_a, org_b = uuid4(), uuid4()
+        grants = {org_b: _connection(scope="org", organization_id=org_b)}
+
+        async def lookup(db, *, organization_id, portal_key):
+            return grants.get(organization_id)
+
+        monkeypatch.setattr(mcp_connection_service.mcp_connection_repo, "get_portal_grant", lookup)
+        renew = AsyncMock(return_value="b-token")
+        monkeypatch.setattr(mcp_connection_service, "_oauth_access_token", renew)
+        service = McpConnectionService(AsyncMock())
+        assert await service.portal_read_token(organization_id=org_a, portal_key="google") is None
+        renew.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "content", ["vendor error with secret", "{}", "[]", '{"error":"wrong shape"}']
+)
+async def test_platform_adapter_does_not_reclassify_unexpected_failures(content):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from pydantic_ai.exceptions import ToolFailed
+
+    from app.agents.mcp import _platform_domain_result
+
+    error = ToolFailed(content)
+    call = AsyncMock(side_effect=error)
+    with pytest.raises(ToolFailed):
+        await _platform_domain_result(MagicMock(), call, "test", {})
+
+
+@pytest.mark.anyio
+async def test_platform_adapter_keeps_successful_answers_unchanged():
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.agents.mcp import _platform_domain_result
+
+    result = {"items": []}
+    assert (
+        await _platform_domain_result(MagicMock(), AsyncMock(return_value=result), "list", {})
+        == result
+    )

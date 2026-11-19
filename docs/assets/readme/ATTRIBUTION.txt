@@ -1,0 +1,20 @@
+Graphics in docs/assets/readme/, shown by README.md and its translations
+
+The figures are rendered from figures.html beside this file (render.mjs); the
+product screens inside the annotated ones are captured from a test deployment
+by capture.mjs. Figures are test records, not benchmarks.
+
+Agent faces in every figure:
+  Drawn by blobatar (https://www.npmjs.com/package/blobatar), the library the
+  console draws agent avatars with; MIT. Illustrations, not real people.
+
+Icons:
+  Lucide (https://lucide.dev), ISC.
+
+Type, rendered into the images:
+  Instrument Serif, Inter and Geist Mono, from Google Fonts; SIL Open Font License 1.1.
+
+Brand marks in figures.webp, eight-surfaces.webp, model-providers.webp and integrations-hub.webp:
+  Reused from frontend/src/lib/brand-glyphs.generated.ts (Simple Icons CC0 1.0,
+  Font Awesome Free CC BY 4.0, @lobehub/icons MIT). The marks belong to their owners
+  and identify connection options; they do not imply a partnership or endorsement.

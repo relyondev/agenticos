@@ -1,0 +1,146 @@
+"""A ceiling on how large a request body this API will accept at all.
+
+Every size limit in this codebase is checked on bytes that have already arrived:
+`FileUploadService.upload` measures `len(data)`, and `AgentEmbedService.accept_upload`
+narrows that further for a stranger's upload to a hosted page. Those bound what gets
+*stored*, and until this existed nothing bounded what a caller could make the process
+receive - Starlette's multipart parser resolves an `UploadFile` parameter before the
+handler runs, so by the time any of those checks executes the whole body has been
+spooled to a temporary file and `await file.read()` has copied it into memory.
+
+That is not much of a risk behind a session. It is one on
+`POST /api/v1/embed/{key}/files` (#517), which is the first route on a public
+surface that writes bytes: five uploads a minute per address, each of them
+arbitrarily large, with no account behind any of them.
+
+So the declared length is read before the body is, which is early enough to be worth
+doing and not a complete answer:
+
+*It trusts `Content-Length`, which a caller sets.* Lying downwards does not help
+them - the per-route caps still measure the bytes - and a chunked request declares no
+length at all, so this refuses the easy version and the per-route checks remain the
+ones that hold. A deployment that wants the guarantee rather than the courtesy sets
+`client_max_body_size` on the proxy in front of it, which is what
+`docs/configuration.md` says.
+
+*The cap is derived, not configured.* It is the largest upload the API accepts on
+any surface plus the slack a multipart envelope needs, so raising any upload ceiling
+raises this with it. A second number to keep in step with the first is a number that
+ends up below it - and this middleware is global while the ceilings are per surface,
+so it has to follow the largest of them or the highest one becomes unreachable.
+"""
+
+import logging
+
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# What a multipart envelope costs on top of the file inside it: the boundaries, the
+# per-part headers, and any other fields the form carries. Generous, because the
+# failure of being too tight is refusing a legitimate upload at its documented size.
+_ENVELOPE_ALLOWANCE = 5 * 1024 * 1024
+
+
+def max_body_bytes() -> int:
+    """The largest request body this API will accept.
+
+    Derived from the upload ceilings rather than set beside them, so they cannot
+    disagree: a deployment that raises one has raised this.
+
+    The *largest* of them, because this middleware is global and they are not.
+    It followed `MAX_UPLOAD_SIZE_MB` alone, which was the only one until chat
+    got a ceiling of its own - and a chat limit configured above the knowledge
+    base's would then have been unreachable, refused with a 413 before the route
+    that enforces it ever ran (#498).
+    """
+    largest_mb = max(
+        settings.MAX_UPLOAD_SIZE_MB,
+        settings.CHAT_MAX_UPLOAD_SIZE_MB,
+        settings.EMBED_MAX_UPLOAD_SIZE_MB,
+        settings.ML_MAX_UPLOAD_SIZE_MB,
+    )
+    return largest_mb * 1024 * 1024 + _ENVELOPE_ALLOWANCE
+
+
+class BodySizeLimitMiddleware:
+    """Refuse an over-large request before its body is read.
+
+    Pure ASGI rather than `BaseHTTPMiddleware`: that one wraps the receive channel in
+    a task and reads the request to hand it on, which is the buffering this exists to
+    avoid.
+
+    A refusal is the API's own error envelope, because a client parsing our errors
+    should not need to know which layer produced one. It is built here rather than
+    raised, since a middleware sits above the exception handlers.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared = _declared_length(scope)
+        limit = max_body_bytes()
+        if declared is not None and declared > limit:
+            path = str(scope.get("path", ""))
+            logger.warning(
+                "request_body_too_large",
+                extra={"declared_bytes": declared, "limit_bytes": limit, "path": path},
+            )
+            response = JSONResponse(
+                status_code=413,
+                content={
+                    "error": {
+                        "code": "REQUEST_TOO_LARGE",
+                        "message": "That request is too large.",
+                        "details": {"limit_mb": settings.MAX_UPLOAD_SIZE_MB},
+                    }
+                },
+                headers=_widget_cors(scope, path),
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+def _widget_cors(scope: Scope, path: str) -> dict[str, str] | None:
+    """The CORS header for a widget's dictation, so its 413 reaches it as one (#1797).
+
+    A widget posts from somebody else's origin, and a refusal it cannot read
+    reaches its `fetch` as a network error - "offline" for a recording that was
+    too large. The origin is echoed without being checked, because this runs
+    before anything has read the embed and the answer is the same for every
+    origin: there is nothing about the embed in it to learn.
+    """
+    if not (path.startswith("/api/v1/embed/") and path.endswith("/dictation")):
+        return None
+    for name, value in scope.get("headers", []):
+        if name == b"origin":
+            return {"Access-Control-Allow-Origin": value.decode("latin-1"), "Vary": "Origin"}
+    return None
+
+
+def _declared_length(scope: Scope) -> int | None:
+    """What this request says its body weighs, or `None` if it does not say.
+
+    `None` covers a chunked request and a malformed header alike, and both are let
+    through: this is the cheap half of the answer, and refusing a request for having
+    an unparsable `Content-Length` would be a new way to fail on a header the route
+    does not otherwise read.
+    """
+    for name, value in scope.get("headers", []):
+        if name != b"content-length":
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None

@@ -1,0 +1,124 @@
+---
+source_sha: "2f33faf1a39b"
+---
+
+# Archivos de contexto { #context-files }
+
+Un **archivo de contexto** es un trozo de conocimiento permanente escrito una vez
+y vinculado a muchos agents: un glosario, una voz de marca, una matriz de
+escalado, la lista de los productos que realmente vendes.
+
+Si alguna vez habéis escrito un `AGENTS.md` para un agent de código, esta es la
+misma idea con la misma forma — un archivo Markdown que dice cómo se hacen las
+cosas aquí, guardado junto al trabajo en lugar de dentro de un solo prompt. La
+diferencia está en quién lo lee: un `AGENTS.md` en un repositorio lo lee la
+herramienta que lo abra; un archivo de contexto aquí está vinculado a los agents
+que elijáis, se versiona con ellos y lo puede editar la persona que de verdad
+conoce la respuesta.
+
+Es la respuesta a un problema con el que toda empresa se topa en su tercer agent
+— los mismos tres párrafos pegados en tres juegos de instrucciones, y luego
+editados en uno solo de ellos.
+
+En Agent Builder, **Context → New context file** crea un archivo directamente en el panel de capacidades, lo vincula al borrador actual y activa Context. Después puedes elegir cómo lo usa ese agente. La publicación sigue siendo un paso separado. La creación requiere permisos para editar el agente y los archivos de contexto.
+
+## Dónde queda, entre los skills y el conocimiento { #where-it-sits-between-skills-and-knowledge }
+
+Tres cosas ponen texto delante de un modelo, y elegir mal es la causa habitual de
+un agent que o ignora lo que se le dijo o no lee nada en absoluto.
+
+| | Contiene | El modelo lo ve |
+|---|---|---|
+| **Archivo de contexto** | Hechos permanentes, pequeños y estables — un glosario, una guía de tono, un organigrama | Siempre, o bajo demanda — tú eliges |
+| **[Skill](skills.md)** | Un procedimiento para un tipo de tarea — cómo tratar una petición de reembolso | Cuando el modelo decide que esa tarea es lo que está ocurriendo |
+| **[Colección de conocimiento](file-processing.md)** | Un corpus demasiado grande para leerlo — cada documento de política, cada ticket | Solo los fragmentos que devuelve una búsqueda |
+
+La regla práctica: **si es corto y siempre relevante, es un archivo de contexto.
+Si es largo, es conocimiento. Si es un procedimiento, es un skill.**
+
+La página **Context** muestra en cada tarjeta el comienzo del archivo. `GET
+/api/v1/context` lo devuelve como `excerpt`: unas pocas líneas acotadas, nunca
+el cuerpo entero.
+
+## Dos modos, y la diferencia es el coste { #two-modes-and-the-difference-is-cost }
+
+Cada archivo adjunto tiene un modo en los ajustes de **Context** del agent. El mismo archivo compartido puede inyectarse en un agent, enlazarse en otro y desactivarse en un tercero.
+
+=== "`inject` — siempre presente"
+
+    El cuerpo se empalma literalmente en las instrucciones del agent. El modelo
+    siempre lo conoce, sin decidir mirarlo y sin ninguna llamada a herramienta.
+
+    Úsalo para lo que el agent nunca debe equivocarse: cómo se llaman tus
+    productos, a quién escalar, cómo referirse a la empresa.
+
+    **Se lee en absolutamente todos los turnos**, así que forma parte del coste
+    de cada mensaje. Mantén cortos los archivos inyectados.
+
+=== "`link` — leído bajo demanda"
+
+    El cuerpo se queda fuera del prompt y se expone a través de una herramienta. El
+    modelo lo lee solo cuando decide que el archivo es relevante, eligiendo a
+    partir del nombre y de una descripción de una línea que escribes tú.
+
+    Úsalo para material de consulta que importa a veces: una política que se
+    necesita rara vez, una variación regional, una lista larga.
+
+    No cuesta nada en los turnos que no lo necesitan, y nada en absoluto si el
+    modelo nunca lo mira — que es también el riesgo.
+
+!!! tip "Escribe la descripción para un modelo, no para una persona"
+
+    Un archivo vinculado se elige únicamente a partir de su nombre y su
+    descripción. «Política de devoluciones» le dice menos a un modelo que «cuándo
+    un cliente puede devolver un artículo, los plazos y las tres excepciones» — y
+    la diferencia está en si el archivo llega a abrirse alguna vez.
+
+## Vincularlos a un agent { #attaching-them-to-an-agent }
+
+Los archivos de contexto son de una organización, no de un agent. Escribes uno, y
+se vincula a él cualquier número de agents.
+
+Activa la capability **Context** en el agent y luego vincula los archivos que
+debería tener. Editar el archivo después cambia lo que sabe cada agent vinculado
+**en su siguiente run** — sin republicar, en ninguno de ellos.
+
+Esa es toda la idea, y también aquello con lo que hay que tener cuidado: un
+cambio en un archivo inyectado es un cambio en cada agent que lo lleva. Trátalo
+como el texto compartido y portante que es.
+
+En el Builder, cada archivo seleccionado tiene un interruptor **Usar en este agent** y un selector de modo. Estos ajustes pertenecen al borrador del agent y se aplican al publicarlo. El editor de la biblioteca cambia solo el contenido compartido y la descripción; el formato se deduce del nombre del archivo. Las versiones existentes sin ajustes individuales conservan su modo y disponibilidad anteriores.
+
+La capability también controla la herramienta de lectura. **Desactivar** la herramienta de
+lectura significa que solo los archivos inyectados llegan al modelo y que no se
+lee nada bajo demanda — una elección razonable cuando quieres que las entradas de
+un agent sean del todo predecibles.
+
+También se puede empezar por el archivo: **Add to an agent** en su tarjeta lo
+añade al borrador del agent con la capability Context activada, y la tarjeta dice
+qué agents lo llevan ya. Una base de conocimiento tiene la misma acción en su
+propia página.
+
+## Acceso { #access }
+
+Un archivo de contexto tiene un propietario y una visibilidad, como cualquier otro
+recurso de aquí, y `context:view` regula la lectura del catálogo. Un archivo que a
+alguien no se le ha concedido es un archivo que no puede vincular, y eso lo
+deciden [las mismas tres capas](permissions.md) que en todo lo demás.
+
+Lo que sea de verdad secreto no va en uno — un archivo de contexto es texto que un
+agent lee en voz alta cuando se le hace la pregunta adecuada. Las credenciales van
+en [el vault](secrets.md).
+
+## Resumen { #recap }
+
+- Un archivo de contexto es **conocimiento permanente escrito una vez y vinculado
+  a muchos agents**.
+- **`inject`** está siempre en el prompt y cuesta en cada turno; **`link`** se lee
+  bajo demanda y no cuesta nada hasta que ocurre.
+- Un archivo vinculado se elige por su **descripción**, así que escríbela para el
+  modelo.
+- Editar un archivo actualiza **cada agent vinculado en su siguiente run**, sin
+  republicar nada.
+- Corto y siempre relevante → contexto. Largo → [conocimiento](file-processing.md).
+  Un procedimiento → [un skill](skills.md).

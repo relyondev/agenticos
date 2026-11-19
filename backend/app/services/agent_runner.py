@@ -1,0 +1,7227 @@
+"""Running a published agent, and recording what it cost.
+
+Every surface - the playground, a Slack mention, the public API - goes through
+here. That is deliberate: if each surface assembled its own agent, budgets and
+run history would hold whatever each one remembered to record, and the first
+surface someone added in a hurry would be the one with no limits.
+
+The service owns the run lifecycle:
+
+    resolve version -> resolve model -> build -> execute -> record cost
+
+The cost row is written in a `finally` block. A run that crashed still spent
+money, and a budget that only counts successful runs is not a budget.
+
+The same reasoning is why the *limits* are resolved here too, not handed in.
+A run is under exactly two caps - the agent's own monthly limit and the
+organization's - and each is a
+:class:`~app.agents.capabilities.budget.SpendLimit` carrying the lookup that
+meters *its* spend: `agent.id` for the agent, `ctx.organization_id` for the
+organization. Neither is collapsed into the other, because the tighter of two
+numbers means nothing when the numbers count different things; whichever binds
+first stops the run and names itself.
+
+A run can also stop without an answer. When the approval gate parks a
+side-effecting tool call, the run is recorded as `awaiting_approval` with
+everything it needs to continue stored on the row, and :meth:`~AgentRunnerService.resume`
+picks it up once a person has decided - in another process, possibly the next
+day. Holding the coroutine open instead would cost a task and a connection per
+pending decision, for however long the approver takes to look.
+
+That stored position is a **tree**, because a delegate that stops for a person
+stops the whole run: the delegate suspends on its gated tool, the parent suspends
+on the `task` call that delegated to it, and so on up to the run somebody
+started. Each level keeps its own conversation and its own parked calls
+(:class:`PausedRunState`), and the resume walks it - continuing the delegate where
+it stopped instead of delegating again. That is not an optimisation. The approval
+a person granted names the *delegate's* tool call while the replayed parent
+presents its own, so a re-run delegation is handed a verdict it never asks about
+and the model is free to call something else: what a reviewer approved would not
+be what executes, with nothing raising.
+
+A run may also delegate, and that is the third thing this module owns. A
+delegate is a row, its pinned version is a row, and its collections, skills and
+secrets are rows - so the whole delegation tree is resolved *here*, before the
+run starts, and handed to the delegation capability as
+:class:`~app.agents.subagent_runtime.SubagentRuntime`. The capability holds no
+session and the request's `AsyncSession` is not concurrency-safe, so a
+delegation that had to fetch anything would be a query on a shared session in
+the middle of a tool call. What is left at run time is a closure that builds an
+agent already resolved, and a recorder that writes one row.
+"""
+
+import asyncio
+import logging
+from collections import Counter
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from functools import partial
+from typing import TYPE_CHECKING, Any, cast
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic_ai import Agent as PydanticAgent
+from pydantic_ai.agent import AgentRealtime
+from pydantic_ai.exceptions import ModelAPIError
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelResponse,
+    ToolCallPart,
+    UserContent,
+)
+from pydantic_ai.realtime import (
+    RealtimeModel,
+    RealtimeModelSettings,
+    RealtimeProviderSession,
+    RealtimeSession,
+    WebRTCAnswer,
+)
+from pydantic_ai.run import AgentRun as AgentIteration
+from pydantic_ai.run import AgentRunResult
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved
+from pydantic_ai.toolsets import AbstractToolset
+from pydantic_ai.usage import UsageLimits
+from pydantic_ai.workspaces import Workspace
+from pydantic_ai_harness.ask_user import DECLINED, AskUserRequest, ask_user_result
+from pydantic_ai_harness.ask_user import TOOL_NAME as ASK_USER_TOOL
+from pydantic_ai_harness.guardrails import GuardrailResult
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agents import prompt_variables
+from app.agents.a2a_delegate import a2a_delegate
+from app.agents.ask_user import (
+    QuestionItem,
+    answers_to_response,
+    park_the_question,
+    wire_questions,
+)
+from app.agents.audience import (
+    RunAudience,
+    acting_for_no_person,
+    acting_impersonated,
+    derive_audience,
+    run_person_for,
+)
+from app.agents.cache_watch import tally
+from app.agents.capabilities import get as capability_def
+from app.agents.capabilities.approval import (
+    ApprovalDecision,
+    ApprovalGranted,
+    ApprovalMode,
+    ApprovalPending,
+    ApprovalRejected,
+    ApprovalRequest,
+)
+from app.agents.capabilities.browser_use import (
+    BROWSER_CAPABILITY_ID,
+    BROWSER_STEP_MODEL_RESOURCE,
+    WebBrowserConfig,
+)
+from app.agents.capabilities.budget import (
+    BudgetExceeded,
+    BudgetGuard,
+    BudgetScope,
+    PeriodSpendLookup,
+    SpendEntry,
+    SpendLimit,
+    guarded_by,
+    metered_by,
+)
+from app.agents.capabilities.channel_tools import (
+    CHANNEL_DIRECTORY_RESOURCE,
+    CHANNEL_TOOLS_CAPABILITY_ID,
+    ChannelDestination,
+    ChannelDirectory,
+)
+from app.agents.capabilities.coding_agent import CODING_AGENT_ID
+from app.agents.capabilities.context import CONTEXT_FILES_RESOURCE, context_config
+from app.agents.capabilities.guardrails import (
+    GuardrailBlocked,
+    GuardrailsConfig,
+    ScreenedStream,
+    input_screen,
+    output_screen,
+)
+from app.agents.capabilities.media import offloaded_history
+from app.agents.capabilities.planning import (
+    PLANNING_STORE_RESOURCE,
+    dump_plan,
+    new_plan_store,
+    open_plan_store,
+    put_down,
+    still_open,
+)
+from app.agents.capabilities.sandbox import (
+    SHARED_SCOPES,
+    WORKSPACE_RESOURCE,
+    WORKSPACE_SHARED_RESOURCE,
+    WorkspaceIdentity,
+)
+from app.agents.capabilities.sandbox._identity import SessionScope
+from app.agents.capabilities.sandbox._recording import RecordingWorkspace
+from app.agents.capabilities.subagents import SubagentsConfig, acting_delegate
+from app.agents.capabilities.tool_output_limits import SPILL_LOG_RESOURCE
+from app.agents.connect_on_use import (
+    ConnectionCallback,
+    ConnectionRequest,
+    ConnectOnUse,
+    PendingService,
+)
+from app.agents.deps import AgentDeps, CompactionSink
+from app.agents.ephemeral_media import dump_messages
+from app.agents.factory import AgentOutput, BuiltAgent, answer_text, build_agent
+from app.agents.failures import run_failure_summary
+from app.agents.hand_off import CallWorker, HandOffSpend
+from app.agents.loop_guard import ToolLoopStopped
+from app.agents.manifest import RunRecorder, as_payload, carried_over, fit
+from app.agents.mcp import PLATFORM_MCP_PREFIX, unreachable_briefing
+from app.agents.model_resolver import ModelRequestSpec
+from app.agents.observability import current_trace_id
+from app.agents.person_briefing import Person, with_person
+from app.agents.spec import (
+    AgentSpec,
+    CapabilityBindingSpec,
+    ExternalAgentRef,
+    McpServerRef,
+    ObservabilitySpec,
+    PersonalMcpServerRef,
+    PlatformMcpServerRef,
+    SpecialistSpec,
+    SubagentRef,
+    TraceContent,
+    trace_content_block,
+)
+from app.agents.steering import SteeringInbox
+from app.agents.subagent_runtime import (
+    SUBAGENT_RUNTIME_RESOURCE,
+    DelegateWorkspace,
+    DelegationOutcome,
+    DelegationRecorder,
+    DelegationSpend,
+    DelegationStash,
+    DelegationStatus,
+    DynamicSpecialistBuilder,
+    DynamicSpecialists,
+    ParkedDelegation,
+    RegisteredSpecialist,
+    ResolvedSubagent,
+    ResumedDelegation,
+    SubagentRuntime,
+)
+from app.agents.voice import VoiceOptions, handed_off, without_voice_unavailable
+from app.core.audit import current_impersonator, record_audit
+from app.core.config import settings
+from app.core.exceptions import (
+    AppException,
+    AuthorizationError,
+    BadRequestError,
+    ModelCallFailedError,
+    NotFoundError,
+    RunExecutionError,
+    RunFailedError,
+)
+from app.core.permissions import AuthContext, Perm
+from app.core.secret_kinds import ApiKeySecret, StorableSecret
+from app.core.update_gate import require_admission
+from app.db.models.agent import Agent, AgentStatus
+from app.db.models.agent_exposure import AgentExposure
+from app.db.models.agent_run import AgentRun, ApprovalStatus, RunOrder, RunStatus, RunSurface
+from app.db.models.chat_file import ChatFile
+from app.db.models.conversation import Message
+from app.db.models.credential import ModelProfile
+from app.db.models.project import Project
+from app.db.models.run_manifest import RunManifest
+from app.db.models.skill import Skill
+from app.db.session import get_db_context, get_worker_db_context
+from app.db.vector_tables import VectorScope
+from app.repositories import (
+    agent_environment_repo,
+    agent_exposure_repo,
+    agent_repo,
+    agent_run_repo,
+    chat_file_repo,
+    conversation_repo,
+    conversation_share_repo,
+    external_agent_repo,
+    group_repo,
+    knowledge_base_repo,
+    member_repo,
+    message_rating_repo,
+    organization_repo,
+    run_manifest_repo,
+    user_repo,
+    voice_call_repo,
+)
+from app.repositories.agent_run import AgentSpendRow, RunFilters
+from app.repositories.voice_call import VoiceChain
+from app.schemas.agent import ParkedCall, ParkedQuestion
+from app.schemas.user import WorkingHours
+from app.services import change_feed
+from app.services.agent_registry import (
+    DEFAULT_GRANTED_SCOPES,
+    DELEGATION_CAPABILITY_ID,
+    AgentRegistryService,
+    delegation_binding,
+    models_a_run_reaches,
+)
+from app.services.api_key import mint_for_run
+from app.services.approvals import ApprovalService
+from app.services.attachments import (
+    UPLOAD_DIR,
+    AttachmentRouter,
+    EarlierAttachments,
+    find_earlier_attachments,
+    restore_earlier_attachments,
+)
+from app.services.channel_link import mcp_servers_link
+from app.services.channels.attachments import (
+    ChannelFileBudget,
+    channel_file_sender,
+    files_written,
+    workspace_snapshot,
+)
+from app.services.channels.base import OutgoingAttachment, channel_key
+from app.services.channels.directory import restore_directory
+from app.services.channels.formatting import (
+    CHANNEL_BEHAVIOR,
+    LINK_ACCOUNT_INSTRUCTION,
+    ChannelReference,
+    channel_author_references,
+    house_style,
+    runtime_context,
+)
+from app.services.channels.prompt_variables import CHANNEL_CONTEXT
+from app.services.channels.prompt_variables import resolve as resolve_prompt_variables
+from app.services.context import ContextService
+from app.services.conversation import ConversationService
+from app.services.device_hub import LocalTarget
+from app.services.mcp_catalog import get_entry as mcp_catalog_entry
+from app.services.mcp_connection import (
+    AccountNote,
+    PersonalServiceGapKind,
+    UnavailableBinding,
+    UnavailablePersonalService,
+    UnavailablePlatformServer,
+    UnavailablePrefixCollision,
+    UnavailableUnreachableServer,
+    build_toolsets_for_agent,
+    connect_personal_toolset,
+)
+from app.services.model_outputs import model_outputs, not_chat_refusal
+from app.services.model_profile import ModelProfileService, reaches_a_sign_in
+from app.services.notifications import NotificationService
+from app.services.organization import OrganizationService
+from app.services.organization_secret import OrganizationSecretService
+from app.services.project import ProjectService
+from app.services.run_heartbeat import run_heartbeat
+from app.services.sandbox_workspace import (
+    SANDBOX_CAPABILITY_ID,
+    OpenWorkspace,
+    SandboxWaitSink,
+    SandboxWorkspaceService,
+    WorkspaceFlushFailure,
+    project_sandbox,
+)
+from app.services.skill_proposal import SkillProposalService
+from app.services.skill_workspace import SKILLS_ROOT, MaterialisedSkills, collect_changes
+from app.services.skill_workspace import materialise as materialise_skills
+from app.services.skills import SkillService
+from app.services.spend import month_start, organization_monthly_spend
+from app.services.transcript import (
+    STOPPED_TOOL_RESULT,
+    RecordedToolCall,
+    TranscriptService,
+    settled_calls_in,
+    tool_calls_in,
+)
+
+if TYPE_CHECKING:
+    from pydantic_ai_harness.planning import PlanStore
+
+logger = logging.getLogger(__name__)
+
+_DELEGATION_RUN_STATUS: Mapping[DelegationStatus, RunStatus] = {
+    "completed": RunStatus.COMPLETED,
+    "failed": RunStatus.FAILED,
+    "cancelled": RunStatus.CANCELLED,
+}
+"""How a delegation's outcome is recorded as a run status.
+
+Three of the six, and no fourth added for delegation: a delegated run ends the
+same three ways any run ends, and a `delegated` status would answer "how did it
+end" with "it was delegated". `parent_run_id` answers that.
+"""
+
+
+def _delegation_config(spec: AgentSpec) -> SubagentsConfig | None:
+    """This spec's delegation policy, or `None` if the agent does not delegate.
+
+    The binding comes from `delegation_binding`, which publish validation reads
+    too - including its rule that a *disabled* binding is not delegation. One
+    reader, so the specialists, the depth cap and the shared capabilities cannot
+    be found by publish and missed by the run. This adds only the validation,
+    because the runner needs the fields and the validator needs the binding.
+
+    An agent whose spec does not bind the capability is assembled exactly as it
+    was before delegation existed: nothing new reaches `resources`.
+    """
+    binding = delegation_binding(spec)
+    return None if binding is None else SubagentsConfig.model_validate(binding.config)
+
+
+def input_screen_for(spec: AgentSpec) -> Callable[[str], GuardrailResult] | None:
+    """The input guardrail this spec's steers are screened with, or `None` without one."""
+    for binding in spec.capabilities:
+        if binding.id == "guardrails" and binding.enabled:
+            return input_screen(GuardrailsConfig.model_validate(binding.config))
+    return None
+
+
+def _output_screen(spec: AgentSpec) -> ScreenedStream | None:
+    """The stream screen this spec's output check runs, or `None` without one.
+
+    Built from the spec's own guardrails binding - switched on, as the capability
+    is built only then - so its delegates' streamed text is held to the rule its
+    answer is (agenticos#2000).
+    """
+    for binding in spec.capabilities:
+        if binding.id == "guardrails" and binding.enabled:
+            return output_screen(GuardrailsConfig.model_validate(binding.config))
+    return None
+
+
+def _secret_ids(spec: AgentSpec) -> list[UUID]:
+    """Every secret this spec's build has to unseal.
+
+    The capability bindings' credentials plus the observability token, which
+    rides along because it is the same kind of reference resolved at the same
+    moment - a second unsealing pass would be a second place for a tenant check
+    to be missed.
+    """
+    ids = [binding.secret_id for binding in spec.capabilities if binding.secret_id]
+    if spec.observability and spec.observability.token_secret_id:
+        ids.append(spec.observability.token_secret_id)
+    return ids
+
+
+def _delegate_workspace(spec: AgentSpec, shared: list[CapabilityBindingSpec]) -> DelegateWorkspace:
+    """Which workspace a delegate with this effective spec runs in.
+
+    The parent's only when `sandbox` was shared - `_with_shared` has put the
+    parent's binding on `spec` then too, so the share list is what tells the two
+    apart. A delegate binding `sandbox` of its own works in a fresh one, and one
+    binding none in none.
+    """
+    if any(binding.id == SANDBOX_CAPABILITY_ID for binding in shared):
+        return "parent"
+    if any(
+        binding.id == SANDBOX_CAPABILITY_ID and binding.enabled for binding in spec.capabilities
+    ):
+        return "own"
+    return "none"
+
+
+def _with_shared(spec: AgentSpec, shared: list[CapabilityBindingSpec]) -> AgentSpec:
+    """The delegate's spec, plus the capabilities its caller shares with it.
+
+    Sharing is by binding, so the delegate gets the parent's configuration of
+    that capability verbatim - the same connection, the same secret reference,
+    the same tool overrides. Nothing is reconfigured. In practice this exists for
+    `sandbox`: the parent's workspace backend travels with it (see
+    :meth:`AgentRunnerService._delegate_resources`), so a researcher writes
+    `/workspace/notes.md` and a writer reads it instead of opening a session of
+    its own and finding it empty.
+
+    A capability the delegate already binds itself is left alone. Its own
+    configuration is the more specific statement of intent, and a spec carrying
+    the same id twice would build one of the two with no indication which.
+    """
+    own = {binding.id for binding in spec.capabilities}
+    inherited = [binding for binding in shared if binding.id not in own]
+    return spec.model_copy(update={"capabilities": [*spec.capabilities, *inherited]})
+
+
+def _without_delegation(spec: AgentSpec) -> AgentSpec:
+    """The spec with delegation removed, for an agent at the end of the chain.
+
+    Used where nesting stops - the depth bound, and every inline specialist,
+    which does not delegate by construction. The capability is *removed* rather
+    than left in place with nothing to delegate to: a tool that always answers
+    "no delegates available" is a tool description the model reads and pays for
+    on every turn of every run, and the first thing it does with one is try it.
+    """
+    return spec.model_copy(
+        update={
+            "capabilities": [
+                binding for binding in spec.capabilities if binding.id != DELEGATION_CAPABILITY_ID
+            ],
+            "subagents": [],
+        }
+    )
+
+
+def _refuse_duplicate_names(resolved: list[ResolvedSubagent]) -> None:
+    """Refuse a tree where two delegates answer to one name.
+
+    The name is what the parent's model addresses, and
+    :meth:`~app.agents.subagent_runtime.SubagentRuntime.named` answers with the
+    first match - so a specialist called `researcher` beside a delegate whose
+    slug is `researcher` would silently run one where the author meant the other.
+    Two *delegates* cannot collide: `AgentSpec` refuses two pins of one agent and
+    `uq_agent_org_slug` refuses two agents with one slug. A specialist and a
+    delegate can, because a specialist's name is free text in the parent's own
+    config and nothing outside this run has ever seen it.
+
+    Raises:
+        BadRequestError: Naming the collision, before any tokens are spent.
+    """
+    counts = Counter(entry.name for entry in resolved)
+    duplicates = sorted(name for name, count in counts.items() if count > 1)
+    if duplicates:
+        raise BadRequestError(
+            message="Two of this agent's delegates answer to the same name",
+            details={"names": duplicates},
+        )
+
+
+class DynamicSpecialistFrame(BaseModel):
+    """One specialist a level of the tree kept with `create_agent`, stored across a park.
+
+    The library holds a `create_agent` registration in a registry it builds per
+    *built* agent, and a resume is a fresh build - so without this a specialist kept
+    before an approval park was gone after it, while the replayed transcript still
+    said it had been created and `task` answered "unknown subagent" (agenticos#175).
+    The four fields are the whole of what `create_agent` was given, which is exactly
+    what a resume needs to build the specialist again on the run's shared budget.
+
+    Where one of these is stored says which level kept it: the run's own agent's sit
+    flat on `PausedRunState.dynamic_specialists`, and a nested delegate's hang off
+    that delegate's :class:`DelegationFrame` the way its conversation does - which is
+    what carries a nested delegate's specialist across a park too (agenticos#254). See
+    :class:`app.agents.subagent_runtime.RegisteredSpecialist`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="How the model addresses it in `task`")
+    description: str = Field(description="What it is for, one line")
+    instructions: str = Field(description="Its system prompt - the whole of its behaviour")
+    model: str = Field(description="The organization model profile label it runs on")
+
+
+class DelegationFrame(BaseModel):
+    """A delegation the run parked inside, and where its delegate stopped.
+
+    A parked run is a *tree*, because a delegate that stopped for a person stopped
+    the whole run: the parent's `task` call parks too, and so does its parent's, up
+    to the run somebody started. Storing only the top of that - which is what
+    `paused_state` used to hold - makes the resume delegate again from nothing,
+    with the granted approval keyed on a tool call the replayed run never asks
+    about. The model is then free to call something else, so **what a reviewer
+    approved is not what executes**, and nothing raises.
+
+    `messages` empty means the delegate's place could not be kept - the library's
+    message history is best-effort telemetry - and then this delegation is re-run
+    from the start. The frame is still recorded, because the `task` call has to be
+    answered on the replay whatever happens to the delegate: Pydantic AI refuses a
+    resume that leaves a parked call without a result.
+
+    The spend is carried whether the place was kept or not, and for a different
+    reason: it is what the delegation has already cost, which is true of a
+    delegation re-run from the start exactly as it is of one continued. Left out,
+    the child run row written when the delegation ends holds only what the last
+    turn spent - see :class:`app.agents.subagent_runtime.DelegationSpend`.
+
+    `dynamic_specialists` is the same shape for `create_agent`: the specialists this
+    delegate kept, so a nested `create_agent` survives the park its own delegate
+    caused. It rides on the frame rather than on the flat run-level list because a
+    nested delegate has its own registry, and a resume seeds each level's from its own
+    key (agenticos#254).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_call_id: str = Field(
+        description=(
+            "The `task` call in the delegating agent's transcript. The replayed run "
+            "presents the same call, which is what identifies this delegation"
+        )
+    )
+    task_id: str = Field(description="The delegation library's own id for this delegation")
+    parent_task_id: str | None = Field(
+        default=None,
+        description=(
+            "The delegation this one was made inside, or null when the run's own "
+            "agent made it. What nests the tree without guessing"
+        ),
+    )
+    subagent: str = Field(description="The name the delegating agent's model addressed")
+    agent_id: UUID | None = Field(
+        default=None, description="The delegate's agent, or null for an inline specialist"
+    )
+    agent_version_id: UUID | None = Field(
+        default=None, description="The version it was pinned to, or null for an inline specialist"
+    )
+    child_run_id: str | None = Field(
+        default=None, description="Pydantic AI's run id for the suspended delegate run"
+    )
+    messages: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "The delegate's conversation as of the stop. Empty means its place "
+            "could not be kept, and the delegation is re-run rather than continued"
+        ),
+    )
+    cost_usd: Decimal = Field(
+        default=Decimal(0),
+        description=(
+            "What this delegation had cost by the moment it stopped, so the turn "
+            "that continues it records the whole of it and not only the tail"
+        ),
+    )
+    input_tokens: int = Field(default=0, description="The same, in input tokens")
+    output_tokens: int = Field(default=0, description="The same, in output tokens")
+    cost_is_partial: bool = Field(
+        default=False,
+        description=(
+            "Whether a request before the stop went unpriced, making `cost_usd` a "
+            "floor. Carried because `cost_is_partial` on the child's run row is read "
+            "per delegation now, so the turn that resumes cannot re-derive it"
+        ),
+    )
+    billed_cost_usd: Decimal = Field(
+        default=Decimal(0),
+        description=(
+            "What this delegation's row is owed by the stop - its own spend plus its "
+            "inline specialists', which `cost_usd` above leaves out because that is "
+            "the panel number. Equal to `cost_usd` for a delegate with no inline "
+            "specialist below it; carried so a published delegate that parked with "
+            "one resumes with its month intact (agenticos#228). Zero on an inline "
+            "specialist's own frame - it bills to its ancestor's row, not its own"
+        ),
+    )
+    billed_input_tokens: int = Field(default=0, description="The billed share, in input tokens")
+    billed_output_tokens: int = Field(default=0, description="The billed share, in output tokens")
+    billed_cache_read_tokens: int = Field(
+        default=0, description="Of the billed input tokens, those read from the provider's cache"
+    )
+    billed_cache_write_tokens: int = Field(
+        default=0, description="Of the billed input tokens, those written to the provider's cache"
+    )
+    billed_cost_is_partial: bool = Field(
+        default=False,
+        description="Whether the billed share went unpriced, making `billed_cost_usd` a floor",
+    )
+    started_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When this delegation's delegate first began, so the row written when it "
+            "ends begins at its first segment rather than at the resume. The earliest "
+            "start across every segment so far; null when none was ever stamped"
+        ),
+    )
+    delegations: list[DelegationFrame] = Field(
+        default_factory=list, description="Delegations this delegate had itself parked on"
+    )
+    dynamic_specialists: list[DynamicSpecialistFrame] = Field(
+        default_factory=list,
+        description=(
+            "The specialists this delegate kept with `create_agent`, re-registered "
+            "into its fresh registry on resume so a nested `create_agent` survives the "
+            "park too. Empty for a delegate that kept none, and for one parked before "
+            "this existed"
+        ),
+    )
+
+
+class AdmittedAs(BaseModel):
+    """The terms a run was admitted on, as the request stated them.
+
+    Every field is such a fact, and what they have in common is the whole reason
+    this is one model rather than loose fields: none is derivable from the run row,
+    all are decided by the request, and all are read again when a parked run
+    resumes. Another such fact belongs here rather than beside it.
+
+    Every field but one defaults to the safe answer, because this is read back out
+    of a JSONB column: a run parked before this existed loads as one that asked for
+    nothing unusual, which is what it was. `public_origin` is the exception - its
+    default `False` is not safe for a parked event-trigger run, whose input an
+    outsider wrote - so a resume reads a stored row without the key as public on
+    `RunSurface.SCHEDULE` (see `resume`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_the_flag_under_its_old_name(cls, data: Any) -> Any:
+        """Let a run parked as `private_to_user` resume as `acts_for_sender`.
+
+        The field was renamed when whose account a binding speaks through became
+        the binding's kind rather than a private-conversation substitution, and
+        `extra="forbid"` would otherwise refuse every approval parked before that
+        deploy - a run somebody is waiting on, failing to resume for a key
+        nobody can edit. The old flag meant "one identified person, nobody
+        else", which implies the new one; the new key wins where both appear.
+        """
+        if not isinstance(data, dict) or "private_to_user" not in data:
+            return data
+        migrated = {key: value for key, value in data.items() if key != "private_to_user"}
+        migrated.setdefault("acts_for_sender", data["private_to_user"])
+        return migrated
+
+    local: LocalTarget | None = Field(
+        default=None,
+        description=(
+            "Where on the person's own computer the chat asked this run to work "
+            "(#2305), so a run resumed after an approval keeps working there."
+        ),
+    )
+    approval_mode: ApprovalMode = Field(
+        default=ApprovalMode.FOLLOW_AGENT,
+        description=(
+            "How much the session asked to be told about, whatever the spec says. "
+            "`ASK_ALL` gates tools the spec leaves open, so a resume that took the "
+            "default rebuilt without the wrapper and ran a call a reviewer had "
+            "rejected (#1326)."
+        ),
+    )
+    acts_for_sender: bool = Field(
+        default=False,
+        description=(
+            "Whether an identified person wrote the message this run answers. What "
+            "decides if a personal MCP binding may speak through their own account, "
+            "and unrecoverable from the row: `agent_runs` records `user_id`, but on "
+            "a channel that is the binding's publisher when the sender is unlinked, "
+            "and on an API key it is the key's holder (#1343)."
+        ),
+    )
+    audience_user_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The person this run answers for, already resolved. Stored rather than "
+            "re-derived because re-deriving needs the request that is gone: whether "
+            "`user_id` was a real subject or a publisher standing in for an "
+            "unidentified visitor, and whether the chat account was linked. A "
+            "resume that re-derived it from the approver keyed the memory on their "
+            "identity and wrote one person's notes under another (#788)."
+        ),
+    )
+    audience_room_key: str | None = Field(
+        default=None,
+        description=(
+            "The group chat this run answers in, or `None` for a one-to-one "
+            "conversation. Unrecoverable from the row for the same reason: "
+            "`agent_runs` records no chat type, so a resumed run read a direct "
+            "message and a channel alike and would have lost the room's memory on "
+            "the way back (#788)."
+        ),
+    )
+    audience_writes_memory: bool = Field(
+        default=True,
+        description=(
+            "Whether the run may write the memory it reads - false for an event "
+            "trigger acting as its creator (#2027). Kept so a resume does not lift "
+            "the restriction the fire was admitted under; true for a run parked "
+            "before it existed, which is what every such run was."
+        ),
+    )
+    audience_searches_conversations: bool = Field(
+        default=True,
+        description=(
+            "Whether the run may search the person's past conversations - false for "
+            "a trigger acting as its creator (#2027). Kept for the same reason."
+        ),
+    )
+    audience_browses_signed_in: bool = Field(
+        default=False,
+        description=(
+            "Whether the run's web browser may start signed in with the person's "
+            "saved sign-ins (#2129). Kept so a resume released by an approver "
+            "does not re-derive it from them; false for a run parked before it "
+            "existed, which resumes signed out."
+        ),
+    )
+    subject_is_publisher_fallback: bool = Field(
+        default=False,
+        description=(
+            "Whether `user_id` is a publisher standing in for an unidentified "
+            "visitor rather than a real subject. Kept so a resume does not lend "
+            "the publisher's own MCP credentials to an anonymous guest, which the "
+            "approver's context cannot tell it (#1469): `agent_runs.user_id` is the "
+            "publisher either way. Defaults false, so a run parked before this was "
+            "recorded resumes as it always did."
+        ),
+    )
+    public_origin: bool = Field(
+        default=False,
+        description=(
+            "Whether an outsider supplied the input this run acts on - a webhook, a "
+            "form, a channel message, an email or a repository event reached it - "
+            "so that nobody answers for it even though it executes as a principal. "
+            "Unrecoverable from the row, which records the principal either way, so "
+            "a resume approved by a member would otherwise give the run a person. "
+            "Defaults false, which is not the safe answer for a row parked before "
+            "this existed: a resume treats a missing key on `RunSurface.SCHEDULE` as "
+            "true, so a legacy event-trigger run comes back with no person - and a "
+            "plain scheduled run parked across the deploy loses its creator as its "
+            "person too, until it is run again. A legacy workflow run is caught by "
+            "the dispatch it wakes inside, and a widget or embed run has no person "
+            "under its fallback rule either way."
+        ),
+    )
+    impersonated: bool = Field(
+        default=False,
+        description=(
+            "Whether an administrator was impersonating the run's person when it "
+            "started. Unrecoverable from the row, and the request that knew is gone "
+            "on a resume, so it is stored with the terms: a tool that must not act "
+            "under impersonation (automatic consent to a page's data) would "
+            "otherwise act after the approval. Defaults false, which is what a "
+            "run parked before this existed was."
+        ),
+    )
+
+
+class PausedRunState(BaseModel):
+    """What a parked run needs to pick up where it stopped.
+
+    Stored on the run rather than on the approval because it describes the
+    *run's* position, and a single step can park several calls at once.
+
+    Every field but `messages` and `tool_call_ids` is optional with a default, and
+    that is load-bearing rather than tidy: `extra="forbid"` is on this model, this
+    is read back out of a JSONB column, and a run parked before delegation existed
+    has to stay resumable. An older payload validates as a run that delegated
+    nothing, which is what it was.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[dict[str, Any]] = Field(
+        description="The conversation as of the parked call, in Pydantic AI's message format"
+    )
+    tool_call_ids: dict[str, str] = Field(
+        description="Approval id -> the tool call it parked, so a decision can be replayed"
+    )
+    channel_destination: ChannelDestination | None = None
+    channel_file_attempts: int = Field(default=0, ge=0, le=3)
+    channel_context: str = ""
+    channel_authors: dict[str, UUID] = Field(default_factory=dict)
+
+    questions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The run's own `ask_user_question` calls left unanswered, by tool call id "
+            "(#2064). Answered from the person's reply on resume - or as declined, "
+            "where the run parked on an approval in the same step"
+        ),
+    )
+    delegated_approvals: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Approval id -> the delegation whose delegate asked for it. Absent "
+            "means the run's own agent asked, which is every approval on a run "
+            "that did not delegate"
+        ),
+    )
+    delegations: list[DelegationFrame] = Field(
+        default_factory=list, description="The delegations this run parked inside"
+    )
+    dynamic_specialists: list[DynamicSpecialistFrame] = Field(
+        default_factory=list,
+        description=(
+            "The specialists the run's own agent kept with `create_agent`, so a "
+            "park does not lose them. Empty for a run that kept none, and for one "
+            "parked before this existed"
+        ),
+    )
+    admitted_as: AdmittedAs = Field(
+        default_factory=AdmittedAs,
+        description=(
+            "What the request that parked this run asked for, so the continuation "
+            "is the same run rather than a default-mode one wearing its id"
+        ),
+    )
+    run_limit_usd: Decimal | None = Field(
+        default=None,
+        description=(
+            "The most this run may spend, when its caller set a ceiling of its own - "
+            "an `agent.run` step's `max_cost_usd`. Restored on resume, so a run "
+            "continued after an approval stays under it"
+        ),
+    )
+    output_schema: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "The answer shape the run was asked for, when its caller replaced the "
+            "agent's own - an `agent.run` step's. Restored on resume, so the answer "
+            "that arrives after an approval has the shape the caller is waiting "
+            "for. Null keeps the version's own `output_schema`"
+        ),
+    )
+    plan: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "The planning capability's checklist as of the park, each entry a JSON "
+            "`PlanItem`. Re-seeded into a fresh store on resume so a run that parked "
+            "mid-plan does not resume with an empty checklist. Empty for a run "
+            "without the capability, and for one parked before this existed"
+        ),
+    )
+    generated_files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The generated files this run's own tools stored before it parked, by leaf "
+            "name. A file reaches `generate_video` as a starting image only if the run "
+            "made it, and a resume builds fresh deps - so without this a clip approved "
+            "after parking could not start from the picture drawn before it"
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class ParkedStop:
+    """A parked run a workflow's end stopped, whose audit entry is still to be written."""
+
+    run_id: UUID
+    organization_id: UUID
+    previous_status: str
+
+
+@dataclass(frozen=True)
+class ParkedApproval:
+    """One tool call waiting for a person, and everything its row will hold.
+
+    Carries the `approvals` row id rather than the model's `tool_call_id`: the
+    decision is recorded against that row, and it is the row the approvals queue
+    and the notification email point at. A surface that invented its own
+    identifier would be a second way to approve the same call.
+
+    The id is allocated when the call is parked rather than by the database,
+    because the row is not written until the run reaches its terminal write - see
+    :meth:`ApprovalChannel.__call__`. This is the same shape, and the same reason,
+    as :class:`RecordedDelegation`: a description the run collects while it runs
+    and :meth:`AgentRunnerService._write_approvals` turns into rows once, off the
+    shared session, when nothing is racing it.
+    """
+
+    approval_id: UUID
+    tool_call_id: str
+    """The model's own id for the call, so a surface can resolve the card it drew
+    for it. Carried beside the row id rather than instead of it: one addresses the
+    decision, the other addresses what is on screen."""
+
+    tool_name: str
+    tool_args: dict[str, Any]
+
+    capability_tool_id: str | None = None
+    """The stable id of the tool behind `tool_name`, which a binding may have
+    renamed - see :attr:`app.agents.approval.ApprovalRequest.capability_tool_id`."""
+
+    context: dict[str, str] | None = None
+    """The arguments' ids as names, from the tool's describer - see
+    :attr:`app.agents.approval.ApprovalRequest.describe`."""
+
+    subagent: str | None = None
+    """Which delegate asked, or `None` for the run's own agent."""
+
+    account: str | None = None
+    """Which account of an MCP service the call acts as, where its binding names one."""
+
+    standing: bool = False
+    """Whether this was granted by standing consent rather than parked.
+
+    `ApprovalMode.APPROVE_ALL` grants the call and records it anyway, so the row
+    exists and says who consented: skipping it would make a waived run
+    indistinguishable from an agent that was never gated, and the audit trail
+    `docs/governance.md` describes would quietly become untrue (#925). The row is
+    written `approved` rather than `pending`, and nothing about it is resumable -
+    the run never stopped."""
+
+    subagent_agent_id: UUID | None = None
+    """That delegate's own agent, or `None` for the run's own agent or an inline
+    specialist, which has no agent of its own. Read from the delegation in flight
+    when the call is parked and carried here, because the row that names it is
+    written after the run ends, when the contextvar is long gone."""
+
+    task_id: str | None = None
+    """The delegation the ask came from, or `None` for the run's own agent.
+
+    This is what splits one run's parked calls by the agent that made them, and it
+    has to be split: Pydantic AI refuses a resume whose results name a call the
+    replayed response does not contain, so a delegate's parked call handed to the
+    parent's replay fails the whole continuation.
+    """
+
+
+@dataclass
+class ApprovalChannel:
+    """A run's connection to the approval queue.
+
+    Handed to the agent as `AgentDeps.request_approval`: the gate asks, this
+    answers. A first ask parks the call and returns pending; a resumed run is
+    built with the recorded decisions already in hand.
+
+    Decisions are consumed on use. If the model calls the same tool a second
+    time after being approved once, that is a second act on the world and needs
+    its own approval - reusing the first would let one "yes" authorise a loop.
+
+    **Parking a call touches no database.** The row is *described* here and written
+    once by :meth:`AgentRunnerService._write_approvals` from the run's terminal
+    write. This is not tidiness - it is what makes the channel concurrency-safe.
+    Pydantic AI runs the tool calls from one model response concurrently, and
+    `parallel_tool_calls` is unset by default, so that is the provider's decision,
+    not the author's - a model that answers "email the customer and email the
+    account manager" in one step drives two gated calls into this channel at once.
+    Both would `await` a write on the request's `AsyncSession`, which the whole run
+    shares and which is not concurrency-safe; two inserts on it at once do not
+    produce a slow query, they corrupt the session and take the parent run row and
+    the conversation with it (agenticos#169). With the write deferred, `__call__`
+    never awaits the run's session, so the two calls cannot interleave on it. The
+    one thing it does await is the request's describer, which opens a session of
+    its own, and it awaits that before touching any of the state below.
+    """
+
+    organization_id: UUID
+    agent_id: UUID
+    run_id: UUID
+    decided: dict[str, ApprovalDecision] = field(default_factory=dict)
+    parked: dict[str, str] = field(default_factory=dict)
+
+    standing_consent_by: UUID | None = None
+    """Who granted every gated call on this run in advance, or `None`.
+
+    Set only for a web chat turn whose session asked for
+    `ApprovalMode.APPROVE_ALL`, and only after `prepare` has checked that this
+    caller may waive and that the organization allows it. A gated call then
+    resolves to a grant rather than a park - and still appends to `requested`, so
+    the row is written naming the consenting account (#925).
+
+    Never set anywhere unattended: `ApprovalGate` already refuses a run with no
+    approval channel, and standing consent must not become the way a schedule
+    approves itself."""
+
+    requested: list[ParkedApproval] = field(default_factory=list)
+    """What was parked, in enough detail for a surface to put it to somebody and
+    for :meth:`AgentRunnerService._write_approvals` to write the row.
+
+    Kept here rather than read back from the rows afterwards for two reasons: the
+    rows do not exist yet while the run is going, and re-reading them would be a
+    query per parked call to recover what this object already had in hand.
+    """
+
+    async def __call__(self, request: ApprovalRequest) -> ApprovalDecision:
+        decision = self.decided.pop(request.tool_call_id, None)
+        if decision is not None:
+            return decision
+        # Described only now that a row will be written - parked, or recorded under
+        # standing consent - and never for a call the resume already decided.
+        context = None if request.describe is None else await request.describe()
+
+        # Which delegate is asking, if the ask came from inside a delegation. Read
+        # from the delegation in flight rather than carried on the request, because
+        # the gate that builds the request belongs to whichever agent it was built
+        # for and has no way to know it is a delegate. Two things need it: the row,
+        # so a reviewer sees who is sending the email as well as that one is being
+        # sent, and the parked state, which has to know which agent's replay this
+        # call belongs to.
+        delegate = acting_delegate()
+        # Allocated here, not by the database, because the row is written after the
+        # run ends. Everything below is synchronous - a `uuid4`, a dict set and a
+        # list append, each atomic under the GIL - so with no `await` past the describer
+        # two concurrent gated calls cannot interleave and race the shared session.
+        approval_id = uuid4()
+        # Standing consent is recorded, not skipped: the row is the difference
+        # between a run somebody waived and an agent nobody ever gated. It is not
+        # added to `parked`, because nothing is waiting - `paused_state` names the
+        # calls a resume has to answer, and this one already ran (#925).
+        if self.standing_consent_by is None:
+            self.parked[str(approval_id)] = request.tool_call_id
+        self.requested.append(
+            ParkedApproval(
+                approval_id=approval_id,
+                tool_call_id=request.tool_call_id,
+                tool_name=request.tool_name,
+                tool_args=request.tool_args,
+                capability_tool_id=request.capability_tool_id,
+                context=context,
+                account=request.account,
+                standing=self.standing_consent_by is not None,
+                subagent=None if delegate is None else delegate.name,
+                # The delegate's own agent, which is *not* `self.agent_id`: that one
+                # is the agent whose run this is and what the row is scoped by. Null
+                # for an inline specialist, which has no agent of its own.
+                subagent_agent_id=None if delegate is None else delegate.agent_id,
+                task_id=None if delegate is None else delegate.task_id,
+            )
+        )
+        if self.standing_consent_by is not None:
+            return ApprovalGranted(request.tool_args)
+        return ApprovalPending()
+
+
+def _delegation_frames(
+    parked: Sequence[ParkedDelegation],
+    registered: Mapping[str | None, Sequence[RegisteredSpecialist]],
+) -> list[DelegationFrame]:
+    """One run's parked delegations, nested the way they were made.
+
+    Assembled from a flat list because that is what the capability can safely
+    produce: a fan-out runs several delegations in several asyncio tasks, and each
+    appends its own frame without knowing what any other did. The nesting is
+    recovered from `parent_task_id`, which each level read where its delegation
+    opened - so two concurrent chains cannot be threaded into one.
+
+    The recursion is bounded by `max_depth`, and by the fact that a delegation's
+    children all carry its task id as their parent while its own parent is
+    something else.
+
+    `registered` is what each level kept with `create_agent`, keyed by the `task`
+    call the level was delegated from - the same key the capability snapshotted it
+    under. A frame carries the specialists its own delegate kept, looked up by the
+    frame's `tool_call_id`, so a nested `create_agent` rides on the same frame its
+    conversation does and survives the park (agenticos#254). The run's own agent's
+    key (`None`) is not read here - `_parked_tree` puts it on the flat run-level list.
+    """
+    by_parent: dict[str | None, list[ParkedDelegation]] = {}
+    for entry in parked:
+        by_parent.setdefault(entry.parent_task_id, []).append(entry)
+
+    def specialists(tool_call_id: str) -> list[DynamicSpecialistFrame]:
+        return [
+            DynamicSpecialistFrame(
+                name=kept.name,
+                description=kept.description,
+                instructions=kept.instructions,
+                model=kept.model,
+            )
+            for kept in registered.get(tool_call_id, [])
+        ]
+
+    def frames(entries: list[ParkedDelegation]) -> list[DelegationFrame]:
+        return [
+            DelegationFrame(
+                tool_call_id=entry.tool_call_id,
+                task_id=entry.task_id,
+                parent_task_id=entry.parent_task_id,
+                subagent=entry.subagent,
+                agent_id=entry.agent_id,
+                agent_version_id=entry.agent_version_id,
+                child_run_id=entry.child_run_id,
+                messages=entry.messages,
+                cost_usd=entry.spent.cost_usd,
+                input_tokens=entry.spent.input_tokens,
+                output_tokens=entry.spent.output_tokens,
+                cost_is_partial=entry.spent.has_unpriced_models,
+                billed_cost_usd=entry.spent.billed_cost_usd,
+                billed_input_tokens=entry.spent.billed_input_tokens,
+                billed_output_tokens=entry.spent.billed_output_tokens,
+                billed_cache_read_tokens=entry.spent.billed_cache_read_tokens,
+                billed_cache_write_tokens=entry.spent.billed_cache_write_tokens,
+                billed_cost_is_partial=entry.spent.billed_has_unpriced_models,
+                started_at=entry.started_at,
+                delegations=frames(by_parent.get(entry.task_id, [])),
+                dynamic_specialists=specialists(entry.tool_call_id),
+            )
+            for entry in entries
+        ]
+
+    return frames(by_parent.get(None, []))
+
+
+@dataclass(frozen=True)
+class _RunRendering:
+    """What a run fills into instructions: its `{{variables}}`, and its person.
+
+    Two halves because they reach different agents. Every agent in the run reads
+    the same variables (#2065); only the run's own agent is talking to the
+    person (#2301) - a delegate answers that agent, and telling it "the person
+    you are talking to" would be untrue.
+    """
+
+    variables: Callable[[AgentSpec], AgentSpec]
+    person: Person | None
+
+    def for_the_run(self, spec: AgentSpec) -> AgentSpec:
+        """`spec` as the run's own agent reads it: variables filled, the person after."""
+        return with_person(self.variables(spec), self.person)
+
+
+@dataclass(frozen=True)
+class _ResumePlan:
+    """How a parked run and everything it parked inside are continued.
+
+    Two products of one walk, because they are two halves of one answer: the run's
+    own replay needs results for the calls *it* stopped on, and each delegation it
+    parked inside needs the same thing for its delegate, one level in.
+    """
+
+    results: DeferredToolResults
+    """For the run somebody started. Never a delegate's parked calls: Pydantic AI
+    refuses a resume whose results name a call the replayed response does not
+    contain, so one flat set for the whole tree fails the continuation outright -
+    which is what a run parked inside a delegate did before this existed."""
+
+    delegations: dict[str, ResumedDelegation]
+    """Keyed by the `task` call each delegation was made from, which is the only
+    thing the delegation capability knows about one before it starts it."""
+
+    spent: dict[str, DelegationSpend]
+    """What each delegation in the tree has already cost, on the same key.
+
+    Every frame, including one whose delegate is re-run rather than continued: what
+    it spent before the park is what it spent, and the row written when it ends is
+    the only place that money is attributed to the delegate's own agent.
+    """
+
+    started: dict[str, datetime | None]
+    """When each delegation in the tree first began, on the same key.
+
+    The clock's companion to :attr:`spent`, and filled for every frame the same
+    way: when the delegate first ran is a fact whether or not its place was kept,
+    and the row written when the delegation ends must begin there rather than at
+    the resume that settled it.
+    """
+
+    specialists: dict[str, list[RegisteredSpecialist]]
+    """The specialists each *continued* delegate kept, on the same `task`-call key.
+
+    Only for a frame whose place was kept: a delegate re-run from the start re-runs
+    its own `create_agent` and registers them again, so seeding those would be a
+    duplicate. A continued delegate does not re-run `create_agent` - the call is a
+    completed entry in its replayed history - so its registry starts empty and has to
+    be seeded, which is exactly the nested case agenticos#254 was losing. The run's
+    own agent's are not here; they come off `PausedRunState.dynamic_specialists`
+    under the `None` key.
+    """
+
+
+def _resume_plan(state: PausedRunState, decided_args: Mapping[str, dict[str, Any]]) -> _ResumePlan:
+    """Split a parked run's verdicts across the agents that were waiting on them.
+
+    `decided_args` is the arguments a person authorised, keyed by tool call. A call
+    with none is a `task` call: the delegation itself was never put to anybody, and
+    approving it here only means "let this call reach the tool pipeline again",
+    where the capability continues the delegate instead of starting one. The gate
+    remains the only thing allowed to decide whether a *gated* tool runs, which is
+    why every parked call is approved here and refusals are carried separately.
+    """
+    by_delegation: dict[str | None, list[str]] = {}
+    for approval_id, tool_call_id in state.tool_call_ids.items():
+        by_delegation.setdefault(state.delegated_approvals.get(approval_id), []).append(
+            tool_call_id
+        )
+
+    resuming: dict[str, ResumedDelegation] = {}
+    spent: dict[str, DelegationSpend] = {}
+    started: dict[str, datetime | None] = {}
+    specialists: dict[str, list[RegisteredSpecialist]] = {}
+
+    def level(frames: list[DelegationFrame], own: list[str]) -> DeferredToolResults:
+        results = DeferredToolResults()
+        for tool_call_id in own:
+            results.approvals[tool_call_id] = ToolApproved(
+                override_args=decided_args.get(tool_call_id)
+            )
+        for frame in frames:
+            results.approvals[frame.tool_call_id] = ToolApproved()
+            # Before the `continue` below, because neither what a delegation has
+            # spent nor when it first began is conditional on its place having been
+            # kept: a delegation re-run from the start still spent it and still
+            # began when it began, and the row written when it ends is where both
+            # reach the delegate's own agent.
+            spent[frame.tool_call_id] = DelegationSpend(
+                cost_usd=frame.cost_usd,
+                input_tokens=frame.input_tokens,
+                output_tokens=frame.output_tokens,
+                has_unpriced_models=frame.cost_is_partial,
+                # The row's share, carried alongside the panel's so a published
+                # delegate that parked with an inline specialist below it resumes
+                # with its month whole (agenticos#228). Zero on an inline
+                # specialist's frame, which bills to its ancestor, not itself.
+                billed_cost_usd=frame.billed_cost_usd,
+                billed_input_tokens=frame.billed_input_tokens,
+                billed_output_tokens=frame.billed_output_tokens,
+                billed_cache_read_tokens=frame.billed_cache_read_tokens,
+                billed_cache_write_tokens=frame.billed_cache_write_tokens,
+                billed_has_unpriced_models=frame.billed_cost_is_partial,
+            )
+            started[frame.tool_call_id] = frame.started_at
+            if not frame.messages:
+                # The delegate's place was not kept, so there is nothing to
+                # continue. The `task` call is still answered above - a parked call
+                # left without a result makes the whole run unresumable - and the
+                # delegation runs again from the start.
+                continue
+            resuming[frame.tool_call_id] = ResumedDelegation(
+                task_id=frame.task_id,
+                messages=ModelMessagesTypeAdapter.validate_python(frame.messages),
+                results=level(frame.delegations, by_delegation.get(frame.task_id, [])),
+            )
+            # Seeded only for a continued delegate, and keyed by the `task` call it
+            # was delegated from - which is what its own `build_delegation` reads back
+            # as `enclosing_tool_call_id()` to fill its fresh registry.
+            if frame.dynamic_specialists:
+                specialists[frame.tool_call_id] = [
+                    RegisteredSpecialist(
+                        name=kept.name,
+                        description=kept.description,
+                        instructions=kept.instructions,
+                        model=kept.model,
+                    )
+                    for kept in frame.dynamic_specialists
+                ]
+        return results
+
+    return _ResumePlan(
+        results=level(state.delegations, by_delegation.get(None, [])),
+        delegations=resuming,
+        spent=spent,
+        started=started,
+        specialists=specialists,
+    )
+
+
+@dataclass(frozen=True)
+class RecordedDelegation:
+    """One finished delegation, waiting for the run's terminal write.
+
+    Everything a row needs that only the delegation knows. What the *parent* knows
+    - the organization, the person, the conversation, the binding, the surface -
+    is read off the parent's row when the rows are written, so it cannot drift
+    from it.
+
+    `id` is allocated when the delegation is reported rather than by the database,
+    because the parent's model is told the id while the run is still going and the
+    row is written after it ends.
+
+    No `ModelRequestSpec` here, only the three fields a row records from it: the
+    resolved spec carries a live credential, and a list that outlives the tool call
+    is not a place to keep one.
+    """
+
+    id: UUID
+    agent_id: UUID
+    agent_version_id: UUID
+    task_id: str
+    status: RunStatus
+    model_label: str | None
+    provider: str | None
+    secret_id: UUID | None
+    input_tokens: int
+    output_tokens: int
+    cost_usd: Decimal
+    cost_is_partial: bool
+    started_at: datetime
+    ended_at: datetime
+    error: str | None = None
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class VoiceRun:
+    """What makes a prepared run a voice call (#54).
+
+    The run row records the realtime model, provider and key, not the chat
+    profile's: those are what the call spends. The chat profile is still
+    resolved - it prices nothing in a call, but it writes the long-history
+    summary a reconnect may need.
+    """
+
+    options: VoiceOptions
+    model_label: str
+    provider: str
+    secret_id: UUID
+
+
+@dataclass
+class PreparedRun:
+    """An agent ready to execute, with its run row already open.
+
+    Returned rather than executed inline because surfaces stream differently: a
+    WebSocket iterates events, a Slack handler awaits a final answer, the API
+    may do either. They share the setup and the accounting, not the loop.
+    """
+
+    run: AgentRun
+    agent: Agent
+    spec: AgentSpec
+    built: BuiltAgent
+    approvals: ApprovalChannel
+    workspace: OpenWorkspace | None = None
+    """The sandbox this run writes to, when its spec asks for one.
+
+    Carried on the prepared run rather than hidden in the agent because it has
+    to be *closed*: a `state` workspace is only stored by the flush in
+    :meth:`AgentRunnerService.finish`, and nothing else in the process knows the
+    run is over.
+    """
+
+    hand_off: CallWorker | None = None
+    """A call's text twin, when the call hands work off (#54): the session points
+    its steps at the call's event pump."""
+
+    earlier_attachments_checked: bool = False
+    """The workspace actually reached its attachment setup, persisted with the terminal run."""
+
+    materialised_skills: MaterialisedSkills | None = None
+    """The skill files written into that workspace, as they were written.
+
+    Kept so that `finish` can tell what the agent changed from what it was given.
+    Diffing against the database instead would re-propose every change a reviewer
+    already discarded, on every turn of a conversation whose workspace outlives
+    the run.
+    """
+
+    personal_service_gaps: list[PersonalServiceGap] = field(default_factory=list)
+    """The agent's personal MCP services this person cannot reach on this turn.
+
+    What the model was told in its instructions, in a form a surface can draw: a
+    chat renders a card with the button that connects the account, so the
+    person acts on the same sentence the agent is about to say. Empty for every
+    run whose bindings all resolved, and always empty for an organization
+    binding - those are skipped with a log line, not reported, because nobody at
+    the keyboard can fix them.
+    """
+
+    mcp_origins: Mapping[str, UUID] = field(default_factory=dict)
+    """Which organization MCP connection served each tool, by the name called.
+
+    Filled while the run lists its tools (`ResolvedMcpToolsets.origins`), and
+    read when its calls are written, so a server's call log lists its own calls
+    and not those of a member's connection that happens to share its name.
+    """
+
+    workspace_at_start: set[str] | None = None
+    """Every path the workspace held before the turn ran.
+
+    What the turn *added* is the difference against this. Compared against a
+    snapshot rather than modification times: a `state` workspace has none, and a
+    container's clock is not ours to trust.
+
+    `None` means there was no readable workspace to snapshot - no sandbox at all,
+    or a host that would not answer - and nothing is posted back. It is not an
+    empty set: the difference is computed against this, so an empty one would make
+    every file already in the workspace read as the turn's own output.
+    """
+
+    channel_destination: ChannelDestination | None = None
+    channel_context: str = ""
+    channel_author_context: str = ""
+    channel_authors: dict[str, UUID] = field(default_factory=dict)
+    channel_file_budget: ChannelFileBudget = field(default_factory=ChannelFileBudget)
+    automatic_outbound: bool = True
+    outbound: list[OutgoingAttachment] = field(default_factory=list)
+    """Files the turn produced, read in `finish` before the workspace closes.
+
+    Filled there rather than returned by the run, because a `run`-scoped workspace
+    is released by `close` and a caller reading it afterwards would find nothing.
+    """
+
+    outbound_refused: list[str] = field(default_factory=list)
+    """Produced files a reply cannot carry - too large, or past the per-reply cap.
+
+    Named rather than dropped: an agent told its file was delivered will tell the
+    user the same.
+    """
+
+    delegate_recorders: list[tuple[UUID, RunRecorder]] = field(default_factory=list)
+    """Each delegate's agent id and request recording, so `finish` can count the
+    cache busts it hit on the row that answers for that agent - a delegate's agent
+    is built and discarded inside a tool call, and its recorder with it."""
+
+    delegations: list[RecordedDelegation] = field(default_factory=list)
+    """What this run delegated, waiting to be written by `finish`.
+
+    Filled during the run by the recorder the delegation capability calls, and
+    written once at the end. Carried on the prepared run for the same reason the
+    workspace is: it is something `finish` has to act on, and nothing else in the
+    process knows the run is over.
+    """
+
+    stash: DelegationStash = field(default_factory=DelegationStash)
+    """Where a delegate that stopped for a person left its place.
+
+    Carried here so that :meth:`AgentRunnerService.finish` can fold it into the
+    parked state, rather than each streaming surface remembering to. That is the
+    same reasoning as the run's budget caps being resolved in this module: a thing
+    every surface has to remember is a thing the next surface will not, and this
+    one fails by silently answering a different question rather than by raising.
+    """
+
+    ctx: AuthContext | None = None
+    """Who ran it, for recording a proposal in `finish`.
+
+    A workspace flush needs no tenant - it writes a row it already holds - but a
+    proposal does: it is stored against an organization and read by a reviewer
+    there. Carried rather than re-derived, because `finish` is called from a
+    `finally` where the request may already be gone.
+    """
+
+    plan_store: PlanStore = field(default_factory=new_plan_store)
+    """The planning capability's store for this run, read by `finish` to snapshot
+    the checklist into the parked state.
+
+    Carried here for the same reason the delegation stash is: `finish` has to fold
+    it into `PausedRunState`, and a surface that had to remember it would resume the
+    next turn with a plan nobody continued. Defaulted to an empty store so a
+    `PreparedRun` built outside the runner (a test) still answers an empty plan
+    rather than `None`; `_assemble` replaces it with the run's seeded one.
+    """
+
+    finished_plan_withheld: bool = False
+    """Whether this run's store was opened empty over a *finished* stored plan.
+
+    A finished checklist is history and is not seeded (#1221), which leaves the
+    store empty - and `finish` writes the store back to the conversation, so the
+    next ordinary turn would dump `[]` over the row and delete the plan the fix
+    promises to keep. So the write is skipped while the store is still empty:
+    there is nothing this turn did to the checklist to record. An agent that
+    writes a new plan dumps a non-empty one and replaces the row as usual.
+
+    This tracks *what was seeded*, not whether the store was touched, and the
+    difference is one case: a turn that writes a plan and then empties it leaves
+    the withheld checklist in the row rather than clearing it. Nothing observes
+    that - `plan_items` has one reader, the seed, and the seed withholds a
+    finished plan either way - so the row differs only in holding a list nobody
+    will be seeded with. Tracking the store's dirtiness instead would need a
+    delegating `PlanStore`: `write_plan` goes through `set_items`, which the
+    library emits no event for.
+    """
+
+    run_limit_usd: Decimal | None = None
+    """The ceiling the caller set on this one run, if any - kept for a park to record."""
+
+    output_schema: dict[str, Any] | None = None
+    """The answer shape the caller asked for in place of the agent's own, if any.
+
+    Already applied to `spec`; kept apart so a park records it (the version's own
+    schema needs no recording - the resume rebuilds that version) and the
+    continuation is asked for the same shape the caller is waiting on.
+    """
+
+    admitted_as: AdmittedAs = field(default_factory=AdmittedAs)
+    """What the request that started this run said about it, for a resume to restore.
+
+    A resumed run is rebuilt from the row, and the row records the surface and
+    the caller and nothing else about the terms it was admitted on. Anything the
+    *request* decided has to travel with the parked state or it is re-derived
+    from a default - which is how the strictest approval mode became the one that
+    failed open on the path where somebody had said no (#1326).
+    """
+
+    @property
+    def deps(self) -> AgentDeps:
+        return self.built.deps
+
+    def _channel_references(
+        self, history: Sequence[ModelMessage] | None, *, has_current_prompt: bool
+    ) -> list[ChannelReference]:
+        # A restored map is authoritative: normalization can merge requests
+        # and replace their metadata while retaining the individual user parts.
+        if not self.channel_authors:
+            self.channel_authors.update(channel_author_references(list(history or [])))
+        if not (
+            self.channel_context
+            or self.channel_author_context
+            or self.run.channel_identity_id is not None
+            or self.channel_authors
+        ):
+            return []
+        return [
+            ChannelReference(
+                self.channel_context,
+                author_context=self.channel_author_context,
+                author_identity_id=self.run.channel_identity_id,
+                screen=input_screen_for(self.spec),
+                has_current_prompt=has_current_prompt,
+                authors_by_timestamp=self.channel_authors,
+            )
+        ]
+
+    async def execute(
+        self,
+        user_prompt: str | Sequence[UserContent] | None,
+        *,
+        message_history: Sequence[ModelMessage] | None,
+        deferred_tool_results: DeferredToolResults | None,
+    ) -> AgentRunResult[AgentOutput]:
+        """Run the agent to an answer, metered.
+
+        The non-streaming half of :meth:`iterate`, and it exists for the same
+        reason.
+        """
+        with (
+            guarded_by(self.built.budget),
+            metered_by(self.built.ledger),
+            acting_for_no_person(self.built.deps.run_person is None),
+            acting_impersonated(self.built.deps.impersonated),
+        ):
+            return await self.built.agent.run(
+                user_prompt,
+                deps=self.built.deps,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                usage_limits=self.built.usage_limits,
+                workspace=self._workspace(),
+                capabilities=self._channel_references(
+                    message_history, has_current_prompt=user_prompt is not None
+                ),
+            )
+
+    @asynccontextmanager
+    async def iterate(
+        self,
+        user_prompt: str | Sequence[UserContent] | None,
+        *,
+        message_history: Sequence[ModelMessage] | None,
+    ) -> AsyncGenerator[AgentIteration[AgentDeps, AgentOutput]]:
+        """Iterate the agent's graph, metered, for a surface that streams.
+
+        **The meter is here rather than at the call site because a surface that
+        forgets it bills nothing and says nothing.** `metered_by` is what books
+        the spend a request wrapper cannot see - the embedding call behind a
+        knowledge search - to this run's ledger. Miss it and
+        :func:`~app.agents.capabilities.budget.record_ambient_usage` finds no
+        active ledger and drops the cost silently: the run under-reports, the
+        organization's month never sees it, and nothing raises. The web chat ran
+        that way for its whole life (agenticos#16), which is the argument for the
+        agent being unreachable from a surface except through here.
+
+        `guarded_by` is opened alongside it, and for the same reason: an auxiliary
+        `Agent` a capability builds itself - a system reminder, a compaction
+        summary - re-checks the run's caps through
+        :func:`~app.agents.capabilities.budget.can_afford_ambient_call`, which reads
+        the guard set here. Miss it and such a call spends unrefused past a cap
+        (agenticos#1808).
+
+        `acting_for_no_person` is opened with them so that a record a tool writes
+        knows whether the run behind it has a person, without being handed the
+        deps - the same reason the other two are ambient.
+
+        Yields the library's run object, so the caller drives the graph and
+        decides what to forward. It stays readable after the block closes; the
+        outcome is taken from it there.
+        """
+        with (
+            guarded_by(self.built.budget),
+            metered_by(self.built.ledger),
+            acting_for_no_person(self.built.deps.run_person is None),
+            acting_impersonated(self.built.deps.impersonated),
+        ):
+            async with self.built.agent.iter(
+                user_prompt,
+                deps=self.built.deps,
+                message_history=message_history,
+                usage_limits=self.built.usage_limits,
+                workspace=self._workspace(),
+                capabilities=self._channel_references(
+                    message_history, has_current_prompt=user_prompt is not None
+                ),
+            ) as iteration:
+                yield iteration
+
+    def realtime(
+        self,
+        model: RealtimeModel,
+        *,
+        settings: RealtimeModelSettings,
+        message_history: Sequence[ModelMessage],
+        cost_limit: Decimal | None,
+    ) -> AgentRealtime[AgentDeps]:
+        """This run's agent as a realtime session factory (#54).
+
+        `request_limit=None`, never `built.usage_limits`: a session counts every
+        response, and a text run's 50-100 requests would end a call after a few
+        minutes of talking. The budget is the limit, as a cost.
+        """
+        return self.built.agent.realtime(
+            model,
+            deps=self.built.deps,
+            model_settings=settings,
+            usage_limits=UsageLimits(cost_limit=cost_limit, request_limit=None),
+            message_history=message_history,
+            run_id=str(self.run.id),
+            conversation_id=(
+                None if self.run.conversation_id is None else str(self.run.conversation_id)
+            ),
+        )
+
+    async def answer_offer(
+        self, realtime: AgentRealtime[AgentDeps], sdp_offer: str
+    ) -> WebRTCAnswer:
+        """Answer a browser's SDP offer, metered: it resolves the tools, MCP included, once."""
+        with guarded_by(self.built.budget), metered_by(self.built.ledger):
+            return await realtime.answer_webrtc_offer(sdp_offer)
+
+    @asynccontextmanager
+    async def realtime_session(
+        self,
+        realtime: AgentRealtime[AgentDeps],
+        *,
+        provider_session: RealtimeProviderSession | None,
+    ) -> AsyncGenerator[RealtimeSession]:
+        """The call's session, metered and guarded like `iterate` (#54).
+
+        `transcript_only`: no audio is kept, in memory or anywhere else.
+        """
+        with guarded_by(self.built.budget), metered_by(self.built.ledger):
+            async with realtime.session(
+                provider_session=provider_session, audio_retention="transcript_only"
+            ) as session:
+                yield session
+
+    def _workspace(self) -> Workspace | None:
+        """The workspace this run works in: the one the runner opened, if any.
+
+        Passed rather than left to a capability, so it also overrides the ref a
+        stored history names - the previous turn's, or one restored from another
+        environment. `None` leaves the agent's own, the in-memory fallback of a
+        spec run without the runner.
+        """
+        return None if self.workspace is None else self.workspace.workspace
+
+
+def _outcome(
+    agent_run: AgentIteration[AgentDeps, AgentOutput],
+) -> AgentRunResult[AgentOutput]:
+    """What the iterated run ended with.
+
+    Raises:
+        RuntimeError: If it ended without a result. That is not a state the
+            agent can reach on its own - it means whoever drove the loop stopped
+            early - so it fails loudly and is recorded as a failed run, rather
+            than being persisted as an empty answer.
+    """
+    if agent_run.result is None:
+        raise RuntimeError("The agent run ended without a result")
+    return agent_run.result
+
+
+def _question_calls(state: PausedRunState) -> dict[str, ToolCallPart]:
+    """The parked `ask_user_question` calls, as the model made them, by tool call id."""
+    wanted = set(state.questions)
+    return {
+        part.tool_call_id: part
+        for message in ModelMessagesTypeAdapter.validate_python(state.messages)
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ToolCallPart) and part.tool_call_id in wanted
+    }
+
+
+def _classify_output(
+    result: AgentRunResult[AgentOutput], *, parked: dict[str, str]
+) -> tuple[RunStatus, str, dict[str, Any] | None, PausedRunState | None]:
+    """The terminal status a finished run reaches, and what it carries there.
+
+    The success half of both run surfaces - the batch runner's `_run` and the
+    chat runner - which have to move in lockstep: a `DeferredToolRequests` output
+    is a run parked on an approval, and a new `PausedRunState` field or a change to
+    how a park is recorded belongs in one place rather than two copies. Anything
+    else is the completed answer: its text, and - for an agent that answers in
+    an `output_schema` - the object itself, which the text shows as JSON. The exception paths differ between the two (the
+    chat surface re-raises so the waiting caller is told why) and stay with each.
+    """
+    if isinstance(result.output, DeferredToolRequests):
+        questions = [
+            call.tool_call_id for call in result.output.calls if call.tool_name == ASK_USER_TOOL
+        ]
+        paused = PausedRunState(
+            messages=dump_messages(result.all_messages()),
+            tool_call_ids=parked,
+            questions=questions,
+        )
+        # Waiting on a decision outranks waiting on an answer: the approval queue
+        # is where somebody can release it, and a question in the same step is
+        # answered as declined when that happens.
+        status = (
+            RunStatus.AWAITING_ANSWER if questions and not parked else RunStatus.AWAITING_APPROVAL
+        )
+        return status, "", None, paused
+    if isinstance(result.output, dict):
+        return RunStatus.COMPLETED, answer_text(result.output), result.output, None
+    return RunStatus.COMPLETED, result.output, None, None
+
+
+type RunStream = Callable[[AgentIteration[AgentDeps, AgentOutput]], Awaitable[None]]
+"""How a surface that shows an answer arriving drives the run.
+
+Given to :meth:`AgentRunnerService.execute`, which iterates the graph instead of
+awaiting it and hands the run object over. The surface decides what to forward -
+the web chat forwards every event to a socket, a chat platform edits one post
+every second or so - and the settle path around it is unchanged, so a streamed
+run is metered exactly like one that was waited for.
+"""
+
+
+async def _with_exposure_prompt(spec: AgentSpec, exposure: AgentExposure | None) -> AgentSpec:
+    """Append current surface defaults and the binding's custom additions.
+
+    Surface defaults are deployment-owned; the database stores only additions.
+    The published agent spec remains unchanged.
+    """
+    if exposure is None:
+        return spec
+    added = "\n\n".join(
+        part for part in (house_style(exposure.surface), (exposure.prompt or "").strip()) if part
+    )
+    if not added:
+        return spec
+    return spec.model_copy(update={"instructions": f"{spec.instructions}\n\n{added}"})
+
+
+def _with_execution_environment(spec: AgentSpec, local: LocalTarget | None) -> AgentSpec:
+    """Describe the selected environment after its device and service grants resolve."""
+    from app.services.agent_templates import APP_ENVIRONMENT_GUIDANCE
+
+    briefing = APP_ENVIRONMENT_GUIDANCE
+    if local is not None:
+        selected = ["This run explicitly uses the initiating person's paired Desktop."]
+        if local.folder is not None:
+            selected.append(
+                f"Sandbox tools use their approved local folder in {local.mode} mode. "
+                "These files are personal, not the project's shared server files. "
+                "Do not describe local edits as uploaded or shared."
+            )
+        if local.browser:
+            selected.append("Browser tools use the approved local browser, not a cloud browser.")
+        if local.computer:
+            selected.append(
+                "Computer tools operate this person's own screen and input, not a cloud desktop."
+            )
+        if local.coding_agent is not None:
+            selected.append(
+                f"Coding tasks use {local.coding_agent} in the approved folder on this computer."
+            )
+        if local.model_service is not None:
+            selected.append(
+                "Inference uses the selected local model service; do not claim it runs in the cloud."
+            )
+        if local.mcp_services:
+            selected.append(
+                "The selected approved local MCP services are available through this run's tools."
+            )
+        briefing += "\n\n### Selected for this run\n" + "\n".join(selected)
+    if briefing in spec.instructions:
+        return spec
+    return spec.model_copy(update={"instructions": f"{spec.instructions}\n\n{briefing}"})
+
+
+def _with_local_capabilities(spec: AgentSpec, local: LocalTarget | None) -> AgentSpec:
+    """Opt-in tools for this run, retaining the author's limits and approval gates."""
+    if local is None:
+        return spec
+    requested: dict[str, dict[str, object]] = {}
+    if local.folder is not None:
+        requested[SANDBOX_CAPABILITY_ID] = {}
+    if local.browser:
+        requested[BROWSER_CAPABILITY_ID] = {"connection": "local"}
+    if local.computer:
+        requested["computer_use"] = {"desktop": "local"}
+    if local.coding_agent is not None:
+        requested[CODING_AGENT_ID] = {
+            "runs_on": "this_computer",
+            "harness": local.coding_agent,
+            "model": None,
+        }
+    bindings = list(spec.capabilities)
+    for capability_id, config in requested.items():
+        own = next((entry for entry in bindings if entry.id == capability_id), None)
+        binding = (
+            own.model_copy(update={"enabled": True, "config": {**own.config, **config}})
+            if own is not None
+            else CapabilityBindingSpec(id=capability_id, config=config)
+        )
+        if capability_id == CODING_AGENT_ID:
+            # Local harnesses use their own sign-in, never the sandbox credential.
+            binding = binding.model_copy(update={"secret_id": None})
+        bindings = [entry for entry in bindings if entry.id != capability_id] + [binding]
+    return spec.model_copy(update={"capabilities": bindings})
+
+
+def _in_project(spec: AgentSpec, project: Project) -> AgentSpec:
+    """The spec as it runs in a project: in the project's container, told about it.
+
+    The container replaces whatever workspace the agent keeps for itself, and is
+    given to an agent that keeps none - which agent answered a chat in a project
+    should not decide whether it can read the project's files. Its own sandbox
+    binding's approval settings carry over, so an author who gated the shell keeps
+    the gate. The project's instructions come after the agent's own: the agent is
+    still what it is, working on this.
+    """
+    config = project_sandbox(project).model_dump(mode="json")
+    own = next(
+        (binding for binding in spec.capabilities if binding.id == SANDBOX_CAPABILITY_ID), None
+    )
+    binding = (
+        own.model_copy(update={"config": config, "enabled": True})
+        if own is not None
+        else CapabilityBindingSpec(id=SANDBOX_CAPABILITY_ID, config=config)
+    )
+    briefing = (
+        f"## Project: {project.name}\n\n"
+        "This conversation is part of a project. By default, its shared server workspace "
+        "contains files shared with every chat in the project and every agent that answers "
+        "in it, whoever asked - so keep work there, and look there first for what the "
+        "person refers to. An explicitly selected local environment overrides the working "
+        "folder for this run; local files remain personal and are not synchronized to "
+        "this shared workspace.\n\n"
+        "Several people may write in this chat. Each person's message starts with their "
+        'name ("Anna: ..."): that is who is speaking, not part of what they said. Address '
+        "people by name, keep track of who asked for what, and when you answer one "
+        "person in a busy chat, say whom."
+    )
+    if project.description:
+        briefing += f"\n\n{project.description}"
+    if project.instructions.strip():
+        briefing += f"\n\n### The project's instructions\n\n{project.instructions.strip()}"
+    # A project the platform keeps files for has no container, and so no shell:
+    # a coding agent bound here would fail on every task. It is left out of the
+    # run, and the agent is told why rather than trying.
+    shell = project.backend == "service"
+    if not shell and any(entry.id == CODING_AGENT_ID for entry in spec.capabilities):
+        briefing += (
+            "\n\nThe coding agent is not available in this project: it keeps its files "
+            "without a container, so there is no shell to run Claude Code or Codex in. "
+            "If a task needs one, say so."
+        )
+    dropped = {SANDBOX_CAPABILITY_ID} | (set() if shell else {CODING_AGENT_ID})
+    return spec.model_copy(
+        update={
+            "capabilities": [
+                *(entry for entry in spec.capabilities if entry.id not in dropped),
+                binding,
+            ],
+            "instructions": f"{spec.instructions}\n\n{briefing}",
+        }
+    )
+
+
+def _with_workspace_briefing(spec: AgentSpec, workspace: OpenWorkspace) -> AgentSpec:
+    """The spec told what is installed in the container this run opened.
+
+    Appended for the same reason a binding's prompt is, and with the same
+    `model_copy`: it is true of this run rather than of the published version, and
+    which runtime a run gets is resolved from the spec, the connection and the host
+    at the moment it starts.
+
+    The alternative was an agent discovering its own machine by failing on it -
+    writing a PDF extractor beside a `lit` that would have read it, or installing
+    a package that was already there. `runtime_briefing` says `None` for a
+    workspace this deployment cannot honestly describe, and then nothing is added.
+    """
+    if workspace.briefing is None:
+        return spec
+    return spec.model_copy(update={"instructions": f"{spec.instructions}\n\n{workspace.briefing}"})
+
+
+_CHANNEL_SURFACES = frozenset(
+    {
+        RunSurface.SLACK,
+        RunSurface.TELEGRAM,
+        RunSurface.MATTERMOST,
+        RunSurface.TEAMS,
+        RunSurface.DISCORD,
+    }
+)
+
+_INTERRUPTED = frozenset(
+    {
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.BUDGET_EXCEEDED,
+        RunStatus.GUARDRAIL_BLOCKED,
+        RunStatus.LOOP_STOPPED,
+    }
+)
+"""The endings that leave the plan with nobody working it - see `put_down`. A
+completed turn and a parked one keep their step in progress: one chose to stop
+there, the other resumes on it."""
+
+
+_SKILLS_BRIEFING = (
+    f"Your skills are also files, under `{SKILLS_ROOT}/<name>/` - `SKILL.md` and each "
+    "of the skill's resources beside it. Read and run them there. A skill whose own "
+    "text names a different directory is out of date; this is where the files are."
+)
+
+_DEFERRED_SKILLS_BRIEFING = (
+    f"Your skills are also written as files, under `{SKILLS_ROOT}/<name>/` - `SKILL.md` "
+    "and each of the skill's resources beside it - the first time you use the "
+    "workspace. Read and run them there. A skill whose own text names a different "
+    "directory is out of date. A file that is not there was refused by the workspace, "
+    "usually because it is full; the skill's own text is still yours to load."
+)
+"""What a sandbox's run is told, whose skills are written on its first use there.
+
+Said before the writes can have succeeded, so it does not claim they did."""
+
+
+def _start_turn_on_first_use(
+    workspace: RecordingWorkspace,
+    prepared: PreparedRun,
+    skills: list[Skill],
+    *,
+    earlier: EarlierAttachments | None = None,
+    can_parse: bool = False,
+    checked_earlier: bool = False,
+) -> None:
+    """Write the run's skills, put back the thread's attachments and take the
+    run's snapshot when the sandbox is first used.
+
+    The same steps, in the same order, that a `state` workspace takes while the
+    run is prepared - deferred because on a sandbox they are what opens the
+    session. None of them raises, so the operation waiting behind them is never
+    failed by them; a snapshot that could not be taken stays `None`, which posts
+    nothing back.
+    """
+
+    async def start() -> None:
+        prepared.materialised_skills = await materialise_skills(workspace, skills)
+        if earlier is not None:
+            await restore_earlier_attachments(workspace, earlier, can_parse=can_parse)
+        prepared.earlier_attachments_checked = checked_earlier
+        prepared.workspace_at_start = await workspace_snapshot(workspace)
+
+    workspace.prepare_on_first_use(start)
+
+
+def _untouched(workspace: OpenWorkspace) -> bool:
+    """Whether the run never used its sandbox, so there is nothing in it to collect.
+
+    Listing it to find out would open the session the turn managed without.
+    """
+    recorder = workspace.workspace
+    return isinstance(recorder, RecordingWorkspace) and not recorder.touched
+
+
+_EARLIER_ATTACHMENTS_BRIEFING = (
+    "An earlier turn of this conversation stopped before it finished. Files attached "
+    f"to it that are missing from `{UPLOAD_DIR}/` are put back there before your first "
+    "use of the workspace this turn, where the workspace takes them - so one may be "
+    "there even where an earlier message says it could not be written or processed. "
+    f"List `{UPLOAD_DIR}/` before saying a file is missing, and if it is still not "
+    "there, say it could not be put back."
+)
+"""What a run is told when an interrupted turn of its thread left attachments behind (#2481).
+
+The earlier message's own note is history and cannot be rewritten, and it says
+there is no file to open; this is what tells the model to look again. Said before
+the writes can have happened - on a sandbox they wait for its first use - so it
+does not claim they succeeded: a write can still be refused, and is only logged."""
+
+
+def _with_earlier_attachments_briefing(spec: AgentSpec) -> AgentSpec:
+    """The spec told that the thread's attachments are put back - see `_EARLIER_ATTACHMENTS_BRIEFING`."""
+    return spec.model_copy(
+        update={"instructions": f"{spec.instructions}\n\n{_EARLIER_ATTACHMENTS_BRIEFING}"}
+    )
+
+
+def _with_skills_briefing(spec: AgentSpec, *, deferred: bool = False) -> AgentSpec:
+    """The spec told where this run's skills were written.
+
+    Nothing else tells it. The path was only ever discoverable from a skill's own
+    body, which made every skill authored against the old root the model's sole
+    authority for a location the platform had since changed - and a body that
+    still names it sends the model to a directory that is not there. Said once,
+    by the side that chooses the path, that text is merely stale.
+
+    Appended like the workspace briefing, and only when something was actually
+    materialised: a run whose every write was refused has no files to point at.
+    A sandbox's skills are written later, on its first use, so `deferred` says
+    where they will be without claiming they are there.
+    """
+    briefing = _DEFERRED_SKILLS_BRIEFING if deferred else _SKILLS_BRIEFING
+    return spec.model_copy(update={"instructions": f"{spec.instructions}\n\n{briefing}"})
+
+
+class PersonalServiceGap(BaseModel):
+    """One personal MCP service a turn cannot reach, as a surface draws it.
+
+    The same fact the model is briefed with, carried to the person: which
+    service, and why. The catalog key rather than a built URL, because the surface
+    owns where the remedy lives - the chat resolves the catalog entry and
+    navigates in the app, and a channel builds the absolute link beside its other
+    URLs. A runner that built `{FRONTEND_URL}/mcp-servers` quoted a path the
+    console no longer serves under a locale prefix (#1444).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    catalog_key: str
+    name: str = Field(
+        description="As the catalog names it; the key where the catalog no longer holds it"
+    )
+    gap: PersonalServiceGapKind
+
+
+def personal_service_gap(unavailable: UnavailablePersonalService) -> PersonalServiceGap:
+    """One gap as the model is briefed with it and the surface draws it.
+
+    Named after the catalog entry where there is one, so the person reads
+    "Notion" rather than the key. Where the remedy is reached from is the
+    surface's to decide, not this function's.
+    """
+    entry = mcp_catalog_entry(unavailable.catalog_key)
+    return PersonalServiceGap(
+        catalog_key=unavailable.catalog_key,
+        name=unavailable.catalog_key if entry is None else entry.name,
+        gap=unavailable.gap,
+    )
+
+
+def _with_personal_service_gaps(
+    spec: AgentSpec,
+    gaps: Sequence[UnavailableBinding],
+    surface: RunSurface,
+    *,
+    sender_present: bool = False,
+) -> AgentSpec:
+    """The spec told which of its bound servers this turn cannot reach, and why.
+
+    A binding with nothing to speak through, or one dropped for a prefix
+    collision, is skipped, and a skipped server is invisible to the model: it
+    answers as though the agent never had Notion, and the person asking concludes
+    the agent is broken. One paragraph per gap turns that into an answer they can
+    act on. Appended per run with `model_copy`, like a binding's prompt, because
+    it is true of this message and not of the published version.
+    """
+    if not gaps:
+        return spec
+    added = "\n\n".join(
+        _binding_gap_briefing(gap, surface, sender_present=sender_present) for gap in gaps
+    )
+    return spec.model_copy(update={"instructions": f"{spec.instructions}\n\n{added}"})
+
+
+def _with_account_notes(spec: AgentSpec, notes: Sequence[AccountNote]) -> AgentSpec:
+    """The spec told which account each prefix reaches, where a service has several.
+
+    Two Outlook accounts are `outlook_send` and `outlook_info_send` to the
+    model, and nothing in those names says which one is the company mailbox -
+    so the run names each account beside its prefix and asks the model to use
+    the one the person means (#2125). Per run, like the gaps: which accounts a
+    person holds is true of this message, not of the published version.
+    """
+    if not notes:
+        return spec
+    services: dict[str, list[AccountNote]] = {}
+    for note in notes:
+        services.setdefault(note.service, []).append(note)
+    lines = [
+        f"You reach {service} through {len(held)} accounts: "
+        + "; ".join(
+            f"tools starting `{note.prefix}_` act as "
+            + (
+                f"this person's own account {note.account!r}"
+                if note.whose == "personal"
+                else f"the organization's account {note.account!r}"
+            )
+            for note in held
+        )
+        + ". Use the account the person means; if it is unclear which, ask before acting."
+        for service, held in services.items()
+    ]
+    added = "\n\n".join(lines)
+    return spec.model_copy(update={"instructions": f"{spec.instructions}\n\n{added}"})
+
+
+def _connect_on_use(
+    unavailable: Sequence[UnavailableBinding],
+    *,
+    refs: Sequence[McpServerRef],
+    user_id: UUID | None,
+    request_connection: ConnectionCallback | None,
+) -> tuple[ConnectOnUse | None, list[UnavailableBinding]]:
+    """Split the gaps into those the run offers to connect on use and those it briefs.
+
+    Only a personal service the person talking could put right, and only where
+    a surface can hold the run while they do. Everything else - a prefix
+    collision, a turn with nobody to speak as, a surface that cannot wait - is
+    briefed exactly as before.
+    """
+    if request_connection is None or user_id is None:
+        return None, list(unavailable)
+    personal = {ref.catalog_key: ref for ref in refs if isinstance(ref, PersonalMcpServerRef)}
+    pending: list[PendingService] = []
+    briefed: list[UnavailableBinding] = []
+    for gap in unavailable:
+        if not isinstance(gap, UnavailablePersonalService) or gap.gap == "nobody_to_speak_as":
+            briefed.append(gap)
+            continue
+        request = ConnectionRequest(
+            catalog_key=gap.catalog_key, name=personal_service_gap(gap).name, gap=gap.gap
+        )
+        resolve = partial(connect_personal_toolset, personal[gap.catalog_key], user_id=user_id)
+        pending.append(PendingService(request=request, resolve=resolve))
+    if not pending:
+        return None, briefed
+    return ConnectOnUse(services=pending, request_connection=request_connection), briefed
+
+
+def _binding_gap_briefing(
+    gap: UnavailableBinding, surface: RunSurface, *, sender_present: bool
+) -> str:
+    """One paragraph for a binding this turn could not honour, model-facing."""
+    if isinstance(gap, UnavailablePlatformServer):
+        return (
+            f"This platform's own tools ({PLATFORM_MCP_PREFIX}_*) are not available this "
+            "turn: they act as the person you are talking to, and nobody signed in is "
+            "behind this message. If asked about the platform itself, say you cannot "
+            "look it up from here rather than guessing."
+        )
+    if isinstance(gap, UnavailablePrefixCollision):
+        if gap.server == gap.kept:
+            # Same name on both sides - an organization connection and a personal
+            # binding both called `notion` - so naming the server would tell the
+            # model that what it holds is both attached and unavailable.
+            return (
+                f"Two of this agent's bindings are both called {gap.server} - "
+                f"{gap.server_binding} and {gap.kept_binding} - and reduce to one tool prefix "
+                f"{gap.prefix!r}, which two servers cannot share, so only {gap.kept_binding} is "
+                f"attached this turn. The {gap.server} tools you have are that one's. If asked "
+                f"for something only the other could do, say that the agent's other {gap.server} "
+                "binding is not attached because two of its servers collide under one name, "
+                "which the agent's author resolves by renaming one connection."
+            )
+        return (
+            f"The {gap.server} server ({gap.server_binding}) is not available this turn: it and "
+            f"{gap.kept} ({gap.kept_binding}) both reduce to the tool prefix {gap.prefix!r}, and "
+            f"two servers cannot share one - so only {gap.kept} is attached. If asked for anything "
+            f"in {gap.server}, say it is not available because two of this agent's servers collide "
+            "under one name, which the agent's author resolves by renaming one connection."
+        )
+    if isinstance(gap, UnavailableUnreachableServer):
+        return unreachable_briefing(gap.server, binding=gap.binding, held_by=gap.held_by)
+    return _personal_gap_briefing(personal_service_gap(gap), surface, sender_present=sender_present)
+
+
+def _servers_pointer(surface: RunSurface, *, connect_key: str | None = None) -> str:
+    """Where to send the person to fix a personal-service gap, phrased for the surface.
+
+    A channel reader is in Slack with no session, so the pointer is the absolute
+    link, built beside the other channel URLs; a console reader is already in the
+    app, so the page is named in words. Only a service nobody has connected takes
+    `?connect=`, which opens the connect flow - the other gaps are about an account
+    already held, where it would mint a second one.
+    """
+    if surface in _CHANNEL_SURFACES:
+        return f"point them at {mcp_servers_link(connect_key)}"
+    return "send them to the MCP servers page"
+
+
+def _personal_gap_briefing(
+    gap: PersonalServiceGap, surface: RunSurface, *, sender_present: bool
+) -> str:
+    bound = f"{gap.name} is bound to the account of whoever is talking to you"
+    if gap.gap == "nobody_to_speak_as":
+        if surface in _CHANNEL_SURFACES:
+            return (
+                f"{bound}, and this message came from a chat account nobody has linked to a "
+                f"person here, so the {gap.name} tools are not available for it. If asked for "
+                f"anything in {gap.name}, explain: {LINK_ACCOUNT_INSTRUCTION}"
+            )
+        if sender_present:
+            return (
+                f"{bound}, and although they are signed in, this run does not act as their "
+                f"account, so the {gap.name} tools are not available here. If asked for anything "
+                f"in {gap.name}, say so plainly rather than attempting a workaround."
+            )
+        return (
+            f"{bound}, and nobody is signed in on this surface, so the {gap.name} tools are not "
+            f"available here. If asked for anything in {gap.name}, say so plainly rather than "
+            "attempting a workaround."
+        )
+    if gap.gap == "unauthorized":
+        return (
+            f"{bound}, and this person's own {gap.name} connection no longer authorizes, so its "
+            f"tools are not available for this message. If asked for anything in {gap.name}, say "
+            f"so and {_servers_pointer(surface)} to authorize their {gap.name} connection again, "
+            "under You."
+        )
+    return (
+        f"{bound}, and this person has not connected their own {gap.name} yet, so its tools are "
+        f"not available for this message. If asked for anything in {gap.name}, say so and "
+        f"{_servers_pointer(surface, connect_key=gap.catalog_key)} to connect it, then ask again."
+    )
+
+
+ASIDE_PREFIX = (
+    "A side question about this conversation, asked while you are still working on "
+    "the task. Answer it briefly from what has been said so far. Do not continue, "
+    "repeat or redo the task, and do not promise to."
+)
+"""How a question on the side of a running task is put to the model (#2087)."""
+
+
+def _answer_only(spec: AgentSpec) -> AgentSpec:
+    """The spec with everything that acts or looks things up taken away (#2087).
+
+    For a question asked on the side of a run still working: it is answered from
+    the conversation so far, and it must not touch the world the main run is in
+    the middle of changing - a second set of tool calls against the same
+    workspace or mailbox, racing the first, is exactly what "without derailing
+    it" rules out. What stays is what shapes the answer's voice: the
+    instructions, the context files and the model - and the guardrails, which
+    have no tools and screen what the question carries in and the answer out.
+    """
+    return spec.model_copy(
+        update={
+            "capabilities": [
+                binding for binding in spec.capabilities if binding.id == "guardrails"
+            ],
+            "mcp_servers": [],
+            "subagents": [],
+            "skill_ids": [],
+            "collection_ids": [],
+        }
+    )
+
+
+def _with_channel_mcp_approval(
+    spec: AgentSpec, surface: RunSurface, *, linked_sender: bool = False
+) -> AgentSpec:
+    """Require approval for channel writes, preserving an operator's stricter policy.
+
+    Linked senders use web chat's read-only classification. An unlinked room
+    participant still needs approval for every MCP call; no member vouched for
+    releasing organization data to them. An explicit `all` still includes reads.
+    This also applies to delegates and resumed runs through the shared factory.
+    """
+    if surface not in _CHANNEL_SURFACES:
+        return spec
+    return spec.model_copy(
+        update={
+            "mcp_servers": [
+                ref.model_copy(
+                    update={
+                        "approval": "all"
+                        if not linked_sender or ref.approval == "all"
+                        else "writes"
+                    }
+                )
+                for ref in spec.mcp_servers
+            ]
+        }
+    )
+
+
+def _with_channel_tools(spec: AgentSpec, exposure: AgentExposure | None) -> AgentSpec:
+    """The spec with the lookups *this* binding grants, if it grants any.
+
+    The one capability whose binding is not in the published spec, and the
+    reason is the same one that put `prompt` on the exposure: an agent can
+    answer on two Mattermost servers and three Slack workspaces, and "may it
+    read what was said in this channel" has a different answer on the internal
+    one and the customer one. A field on the spec has one answer for all five.
+
+    So it is assembled here, per run, from the row that admitted the message -
+    and it goes through `AgentSpec.capabilities` rather than straight into
+    `resources` on purpose. That is what keeps these tools ordinary: gateable by
+    the approval policy, renameable by a binding, and visible to
+    `approval_required_tools`, all of which read the spec. The copy is local to
+    this run; `model_copy` leaves the stored spec alone, and publishing refuses
+    a stored spec that tries to carry this capability itself.
+    """
+    granted = [] if exposure is None else list(exposure.tools or [])
+    if not granted:
+        return spec
+    binding = CapabilityBindingSpec(
+        id=CHANNEL_TOOLS_CAPABILITY_ID,
+        config={"tools": granted},
+        tool_approval={"send_channel_file": "required"} if "send_channel_file" in granted else {},
+    )
+    return spec.model_copy(update={"capabilities": [*spec.capabilities, binding]})
+
+
+@dataclass
+class _RunBudget:
+    """The run's budget guard, once the build has produced one.
+
+    A delegate is built with `shared_budget=` the parent's guard - that is what
+    puts a delegation's spend under the parent's caps and into the parent's
+    ledger. The guard is a product of `build_agent`, and the resolved delegates
+    have to be *inside* the `resources` that same call reads, so there is no
+    ordering in which a delegate's build closure could be handed the guard
+    directly. It reads this instead, at the moment the model actually delegates,
+    which is always after the assignment in `_assemble`.
+
+    The same shape, and the same reason, as
+    :attr:`~app.agents.subagent_runtime.SubagentRuntime.ledger`.
+    """
+
+    guard: BudgetGuard | None = None
+
+
+@dataclass
+class _ModelCatalog:
+    """The organization's models, listed once per run and resolved as needed.
+
+    Which of them a level offers depends on the spec delegating (a ChatGPT
+    sign-in only when that spec names it), so the rows are kept rather than one
+    finished answer, and each profile is resolved the first time a level offers
+    it.
+    """
+
+    rows: list[ModelProfile] | None = None
+    """Every profile in the organization, or `None` until first read."""
+
+    resolved: dict[UUID, ModelRequestSpec | None] = field(default_factory=dict)
+    """Each profile resolved so far, by id - `None` for one that did not resolve."""
+
+
+@dataclass(frozen=True)
+class _Delegation:
+    """What every level of one run's delegation tree is resolved against.
+
+    One object rather than ten parameters threaded through four methods: all of
+    it belongs to the *run* rather than to the delegate being resolved, and an
+    argument list that long is how a `run_id` ends up where a `conversation_id`
+    was meant to go.
+    """
+
+    ctx: AuthContext
+    models_ctx: AuthContext
+    """Who the tree's models are resolved for - whose ChatGPT sign-in they may spend.
+
+    `ctx` except on a resume, where `ctx` is the approver's and this is the run's
+    own person, as `_assemble` resolves the run's own model: releasing somebody's
+    run must neither lend its delegates the approver's subscription nor refuse
+    them the owner's."""
+
+    run: AgentRun
+    surface: RunSurface
+    """Where the run came from, for the briefing a delegate gets on a personal
+    service nobody can speak through - the remedy differs between a chat channel
+    and an API key."""
+
+    agent_id: UUID
+    """The agent that started the run. An inline specialist is built under it,
+    having no id of its own."""
+
+    user_id: str | None
+    user_name: str | None
+
+    personal_mcp_user_id: UUID | None
+    """Whose own MCP connections a personal binding speaks through.
+
+    The person who wrote the message, and `None` where nobody did. Here rather
+    than derived per delegate because it is a fact about the *run*: a delegate
+    answers the same person its parent does, at every level of the tree.
+    """
+
+    sender_present: bool
+    """Whether a signed-in person is behind the run though it may not act as them.
+
+    A fact about the run, like `personal_mcp_user_id`: it separates an API call a
+    person made with their own token from a surface with nobody on it, so a
+    delegate's gap briefing does not tell a signed-in caller that nobody is
+    signed in (#1445).
+    """
+
+    approvals: ApprovalChannel
+    budget: _RunBudget
+
+    render_variables: Callable[[AgentSpec], AgentSpec]
+    """Fills a delegate's `{{variables}}` with this run's facts, as the run's own
+    agent had its filled (#2065)."""
+
+    record: DelegationRecorder
+    """One recorder for the whole tree, because there is one run row to hang a
+    delegation off. A nested delegation's row points at the run somebody started
+    rather than at its immediate caller's - which does not exist yet while the
+    grandchild is running, and would never exist for an inline specialist."""
+
+    queued: list[RecordedDelegation]
+    """Where the recorder leaves a finished delegation for `finish` to write."""
+
+    recorders: list[tuple[UUID, RunRecorder]]
+    """Where each delegate built for this run leaves its agent id and request recording."""
+
+    attribution: dict[UUID, ModelRequestSpec]
+    """Which model each pinned delegate resolved to, keyed by version id.
+
+    Filled while the tree is resolved and read when a delegation is recorded, so
+    a child row names the model that actually answered instead of leaving the
+    cost dashboard to group it under "not recorded". Keyed by version rather than
+    by name, because a name is only unique within one level of the tree.
+    """
+
+    runtimes: list[SubagentRuntime]
+    """Every runtime the tree produced, for the one assignment they all need."""
+
+    stash: DelegationStash
+    """One stash for the whole tree, because a delegation three levels down parks
+    the run somebody started and is continued from that run's stored state."""
+
+    output_screen: ScreenedStream | None = None
+    """The run's own output check, for what every level of the tree streams."""
+
+    answering_call: VoiceOptions | None = None
+    """The call the tree works for, when a call's text twin delegates (#54).
+
+    A delegate in a call cannot park on an approval - nobody resumes a call - so
+    each one settles its own gated calls with the caller, as the twin does.
+    Parked instead, the delegate's approval would surface as one on the twin's
+    `task` call, which no approval row answers."""
+
+    catalog: _ModelCatalog = field(default_factory=_ModelCatalog)
+    """The organization's model catalog, read at most once and only if asked for.
+
+    What a specialist a model invented may run on comes out of it per level - see
+    :meth:`AgentRunnerService._model_catalog`, which is the only reader.
+
+    Shared across the tree because the rows are a fact about the organization,
+    not about a level, and resolving one costs a vault unseal. Two nested levels
+    that both allow dynamic specialists would otherwise pay for it twice.
+    """
+
+
+def _register_runtime(
+    delegation: _Delegation,
+    subagents: list[ResolvedSubagent],
+    *,
+    depth_remaining: int,
+    depth: int,
+    dynamic: DynamicSpecialists | None,
+) -> SubagentRuntime:
+    """One level of the tree, and a note that its ledger is still owed.
+
+    Collected rather than returned up the recursion because every level shares
+    the run's single ledger: that makes one assignment to make, in one place,
+    with nowhere for a nested level to be forgotten. The stash is shared for the
+    same reason and can be handed over here, because it is not a product of the
+    build.
+
+    `depth` is how many delegations deep the agent holding this runtime already is,
+    told rather than computed - see :attr:`SubagentRuntime.depth`.
+
+    `dynamic` is per level and not inherited: whether an agent may invent a
+    specialist is its own spec's `allow_dynamic`, so a delegate that switched it on
+    gets it whatever its caller said, and one that did not is not handed its
+    caller's permission.
+    """
+    runtime = SubagentRuntime(
+        subagents=tuple(subagents),
+        record=delegation.record,
+        depth_remaining=depth_remaining,
+        depth=depth,
+        dynamic=dynamic,
+        stash=delegation.stash,
+        output_screen=delegation.output_screen,
+    )
+    delegation.runtimes.append(runtime)
+    return runtime
+
+
+def _delegate_builder(
+    delegation: _Delegation,
+    *,
+    spec: AgentSpec,
+    model: ModelRequestSpec,
+    agent_id: UUID,
+    resources: dict[str, Any],
+    secrets: Mapping[UUID, StorableSecret],
+    extra_toolsets: list[AbstractToolset[Any]],
+    reviewer_models: Mapping[UUID, ModelRequestSpec] | None = None,
+) -> Callable[[], PydanticAgent[Any, Any]]:
+    """A closure that builds one delegate, with nothing left to look up.
+
+    Everything the database can answer has been answered by the time this
+    returns - the model profile, the collections, the skills, the secrets, the
+    MCP toolsets - so what the closure does is CPU work and Pydantic AI. That is
+    what makes it safe to call from inside a tool call, on a session the whole run
+    shares.
+
+    Lazy because a delegate the model never calls must cost nothing: building one
+    constructs every capability it has and instruments the agent. The capability
+    calls this at most once per run and caches the result, which a stateless
+    Pydantic AI agent makes correct for a fan-out of ten calls to one delegate.
+    """
+
+    def build() -> PydanticAgent[Any, Any]:
+        built = build_agent(
+            _with_execution_environment(delegation.render_variables(spec), None),
+            model,
+            organization_id=delegation.ctx.organization_id,
+            agent_id=agent_id,
+            run_id=delegation.run.id,
+            conversation_id=delegation.run.conversation_id,
+            user_id=delegation.user_id,
+            user_name=delegation.user_name,
+            granted_scopes=DEFAULT_GRANTED_SCOPES,
+            resources=resources,
+            secrets=secrets,
+            extra_toolsets=extra_toolsets,
+            # Its own reviewers, resolved with everything else: without their
+            # models `_reviewers` leaves each one out, and an agent reviewed when
+            # called directly would run unreviewed as a delegate.
+            reviewer_models=reviewer_models,
+            # The person waiting on the parent is the person a delegate has to
+            # ask, so the gate reaches the same queue rather than refusing
+            # because a delegation has no channel of its own.
+            request_approval=delegation.approvals,
+            # The run's guard, so this delegate checks and records against the
+            # one ledger the parent's caps are measured on. Without it a
+            # delegate meters nothing the parent can see, and the parent's cap
+            # stops binding at exactly the moment delegation multiplies spend.
+            shared_budget=delegation.budget.guard,
+            answering_call=delegation.answering_call,
+        )
+        # Kept so `finish` counts its cache busts on the row of the agent that hit them.
+        delegation.recorders.append((agent_id, built.recorder))
+        return built.agent
+
+    return build
+
+
+def _dynamic_builder(
+    delegation: _Delegation,
+    *,
+    profiles: Mapping[str, ModelRequestSpec],
+    trace_content: TraceContent,
+) -> DynamicSpecialistBuilder:
+    """How a specialist a run's model invents becomes an agent of this platform's.
+
+    Through :func:`_delegate_builder`, which is the point rather than a
+    convenience: a dynamic specialist arrives at `build_agent` with the run's
+    `shared_budget`, the run's approval channel and a `ModelRequestSpec` resolved
+    from one of the organization's own profiles, exactly as an inline specialist
+    does. That is what makes its model request metered, and it is the whole
+    difference between this and the delegation library building one itself from
+    its own default model string.
+
+    `profiles[model]` cannot raise: the library validates the model against
+    `DynamicSpecialists.allowed_models`, which is the keys of this same mapping,
+    before it calls the factory.
+
+    Called immediately rather than kept, unlike a resolved delegate's closure. A
+    delegate the model never addresses should cost nothing, but this specialist was
+    asked for by name a moment ago - and building here is what lets `create_agent`
+    report success only when there is genuinely an agent.
+
+    `agent_id` is the *run's* agent, as it is for an inline specialist: a specialist
+    has no agent row of its own, so nothing attributes a run row to it and its cost
+    is the parent's. It also keys the workspace session, which is why it must not
+    be invented.
+    """
+
+    def build(*, name: str, instructions: str, model: str) -> PydanticAgent[Any, Any]:
+        return _delegate_builder(
+            delegation,
+            # Instructions and a model, and deliberately nothing else: no
+            # capabilities, no collections, no skills, no MCP connections and no
+            # delegates - so a specialist a model wrote cannot reach anything the
+            # organization granted the agent that invented it, and cannot delegate
+            # a level further. The one thing it does inherit is what may be
+            # recorded about it: a specialist nobody reviewed is the last place a
+            # run's prompts should start leaving from.
+            spec=AgentSpec(
+                name=name,
+                instructions=instructions,
+                model_profile_id=profiles[model].profile_id,
+                observability=trace_content_block(trace_content),
+            ),
+            model=profiles[model],
+            agent_id=delegation.agent_id,
+            resources={
+                "kb_collection_names": [],
+                "kb_vector_scopes": {},
+                "skills": [],
+                CONTEXT_FILES_RESOURCE: [],
+            },
+            secrets={},
+            extra_toolsets=[],
+        )()
+
+    return build
+
+
+def _spend_already_booked(run: AgentRun) -> SpendEntry:
+    """A resumed run's opening balance, as one ledger entry.
+
+    A resumed run keeps its own row, so its ledger has to start with what the
+    run already spent. Otherwise finishing it would overwrite the cost with only
+    what the continuation cost, and the per-run budget would reset every time
+    somebody approved something - which is exactly the run a budget is for.
+    """
+    return SpendEntry(
+        model_name=run.model_label or "unknown",
+        input_tokens=run.input_tokens,
+        output_tokens=run.output_tokens,
+        cache_read_tokens=run.cache_read_tokens or 0,
+        cache_write_tokens=run.cache_write_tokens or 0,
+        cost_usd=run.cost_usd,
+        priced=not run.cost_is_partial,
+    )
+
+
+@dataclass(frozen=True)
+class _RecordedState:
+    """What an earlier turn of a conversation left for the next one to seed from.
+
+    Three fields off one row, named rather than positional: they were a tuple of
+    two, and a third would have made every call site count commas to find out
+    which value it was reading.
+    """
+
+    overhead: int | None
+    reminder_state: dict[str, Any] | None
+    plan: list[dict[str, Any]] | None
+
+
+def _observability_of(stored: dict[str, Any]) -> ObservabilitySpec | None:
+    """The observability block of a stored spec, without validating the rest of it.
+
+    One block out of the document rather than `AgentSpec.model_validate`, because
+    a spec that has stopped validating - a capability dropped in a deploy, a
+    narrowed rule - is exactly the agent somebody is trying to read a trace for.
+    Refusing them the link would make a debugging aid fail on the runs that need
+    debugging.
+    """
+    block = stored.get("observability")
+    if not isinstance(block, dict):
+        return None
+    try:
+        return ObservabilitySpec.model_validate(block)
+    except ValidationError:
+        logger.warning("run_trace_observability_unreadable")
+        return None
+
+
+@dataclass(frozen=True)
+class RunSegment:
+    """One execution of a run, and what it did while it lasted.
+
+    A run is executed once when it is started and once more every time somebody
+    approves what it parked on, so "the run" and "this execution of it" are
+    different things and only the second one knows what the model just called.
+
+    `tool_calls` is that difference made available to a caller. The resume
+    endpoint is why it exists: a continuation runs over HTTP rather than the
+    socket a conversation streams, so its `tool_call` frames reach nobody, and a
+    client that was handed only the answer had no way to draw the steps that
+    produced it. Approving a call showed nothing happening and then asked for a
+    second approval nothing on screen accounted for.
+
+    Attributes:
+        output: What the agent answered, empty when it parked again or stopped.
+        structured: The answer as an object, when the run answered in an
+            `output_schema`; its text is then that object shown as JSON.
+        run: The run row, as `finish` left it.
+        tool_calls: What this execution called, in order, each with what came
+            back - `None` on the call the run is now parked on.
+        settled: What the calls it *inherited* returned, by tool call id. A resume
+            runs the call somebody approved, and that call was made by the previous
+            execution - so its return arrives here without it, and it belongs to a
+            step already on screen rather than to a new one.
+    """
+
+    output: str
+    run: AgentRun
+    tool_calls: list[RecordedToolCall]
+    settled: dict[str, str]
+    structured: dict[str, Any] | None = None
+    generated_files: frozenset[str] = frozenset()
+    """Leaf names actually stored by this run, never inferred from tool result text."""
+
+
+def failed_run_error(run: AgentRun, exc: Exception) -> RunFailedError:
+    """The refusal naming a run that failed once it started (#2121).
+
+    `run.error` is our own sentence, written by `_run` from the exception; the
+    exception itself is not put on the wire. A fallback chain whose every model
+    failed arrives as a group of model errors, and is the model's failure too.
+    The conversation is named where there is one: a key's run opened it, and
+    without the id a retry could only open another.
+    """
+    kind = ModelCallFailedError if _only_model_errors(exc) else RunFailedError
+    details: dict[str, str] = {"run_id": str(run.id), "status": run.status}
+    if run.conversation_id is not None:
+        details["conversation_id"] = str(run.conversation_id)
+    return kind(
+        message=f"{kind.message}: {run.error}" if run.error else kind.message,
+        details=details,
+    )
+
+
+def _only_model_errors(exc: BaseException) -> bool:
+    """Whether `exc` is a model call's failure - on its own, or every one of a group."""
+    if isinstance(exc, BaseExceptionGroup):
+        failed, rest = exc.split(ModelAPIError)
+        return failed is not None and rest is None
+    return isinstance(exc, ModelAPIError)
+
+
+def _browser_step_profile(spec: AgentSpec) -> UUID | None:
+    """The model profile the agent named for `browse_web`'s steps, if it named one."""
+    for binding in spec.capabilities:
+        if binding.id == BROWSER_CAPABILITY_ID and binding.enabled:
+            config = WebBrowserConfig.model_validate(binding.config)
+            return config.step_model_profile_id
+    return None
+
+
+def _key_may_continue(ctx: AuthContext, run: AgentRun) -> bool:
+    """Whether an organization key may read and answer the questions of its issuer's run.
+
+    An owner check alone lets any of the issuer's keys through - a key holds its
+    issuer's identity - and answering resumes the run, spending the budget and
+    running tools in their name. So a key needs `agents:run`, as starting the run did,
+    and the run must be one a key started: see :func:`_started_by_a_person`.
+    """
+    return ctx.api_key_id is None or (ctx.has(Perm.AGENTS_RUN) and not _started_by_a_person(run))
+
+
+def _started_by_a_person(run: AgentRun) -> bool:
+    """Whether a session started this run rather than an API key.
+
+    Such a run acts as its person: their own accounts on a service, their kept
+    browser sign-ins. A key carries no person to act as - the MCP contract says
+    so - so a key does not continue one, or it would reach those accounts and
+    read what they returned. Every keyed run records its key's scopes.
+    """
+    return run.key_scopes is None
+
+
+class AgentRunnerService:
+    """Prepare, execute and account for agent runs."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+        self.registry = AgentRegistryService(db)
+        self.models = ModelProfileService(db)
+        self.skills = SkillService(db)
+        self.context = ContextService(db)
+        self.secrets = OrganizationSecretService(db)
+        self.approvals = ApprovalService(db)
+        self.organizations = OrganizationService(db)
+        self.workspaces = SandboxWorkspaceService(db)
+        self.proposals = SkillProposalService(db)
+        self.transcript = TranscriptService(db)
+
+    async def _variable_renderer(
+        self,
+        ctx: AuthContext,
+        *,
+        organization_name: str | None,
+        surface: RunSurface,
+        user_name: str | None,
+        person_time_zone: str | None,
+    ) -> _RunRendering:
+        """What fills `{{variables}}` for this run, the same for every agent in it (#2065),
+        and the person the run's own agent is told about (#2301).
+
+        The person is the run's real subject. A publisher standing in for an
+        unidentified asker is not named - their name and address are not the
+        visitor's - so the visitor is whoever the surface says (a channel's
+        display name) or "a visitor".
+        """
+        person = (
+            await user_repo.get_by_id(self.db, ctx.user_id)
+            if ctx.user_id is not None and not ctx.subject_is_publisher_fallback
+            else None
+        )
+        groups = (
+            await group_repo.names_for_member(
+                self.db, organization_id=ctx.organization_id, user_id=person.id
+            )
+            if person is not None
+            else []
+        )
+        facts = prompt_variables.RunFacts(
+            now=datetime.now(UTC),
+            user_name=user_name or (person.full_name or person.email if person else None),
+            user_email=person.email if person else None,
+            organization_name=organization_name,
+            surface=surface.value,
+            groups=tuple(groups),
+        )
+
+        # The account's own zone when the surface did not send one - a schedule, a
+        # channel - so "9:00" in a routine is still the person's 9:00 (#2301).
+        zone = person_time_zone or (person.time_zone if person is not None else None)
+        about = (
+            Person(
+                locale=person.locale,
+                time_zone=zone,
+                job_title=person.job_title,
+                about=person.about,
+                working_hours=(
+                    WorkingHours.model_validate(person.working_hours)
+                    if isinstance(person.working_hours, dict)
+                    else None
+                ),
+            )
+            if person is not None
+            else None
+        )
+
+        def render(spec: AgentSpec) -> AgentSpec:
+            return prompt_variables.render(spec, facts, person_zone=zone)
+
+        return _RunRendering(variables=render, person=about)
+
+    async def _run_owner_context(
+        self, ctx: AuthContext, existing_run: AgentRun | None
+    ) -> AuthContext | None:
+        """Whose authority a run's platform credential carries: the run's own person.
+
+        A resumed run is continued by whoever answered its approval - an operator,
+        an administrator - and lending the run their authority would let it do
+        what the person who started it never could. So a run resumed by somebody
+        else is rebuilt on its owner's current membership, and on nobody's where
+        that membership is gone.
+
+        And under the key it started with, whoever resumes it: a run an
+        `agents:run` key started must not mint, on resume, a credential with the
+        owner's whole role. The key's scopes ride on the run (`key_scopes`) and
+        narrow the rebuilt context as they narrowed the original one.
+        """
+        if existing_run is None or existing_run.user_id is None:
+            return ctx
+        ceiling = (
+            None
+            if existing_run.key_scopes is None
+            else frozenset(Perm(scope) for scope in existing_run.key_scopes if scope in Perm)
+        )
+        if existing_run.user_id == ctx.user_id:
+            if ceiling is None:
+                return ctx
+            narrowed = ceiling if ctx.key_scopes is None else ceiling & ctx.key_scopes
+            return replace(ctx, key_scopes=narrowed)
+        membership = await member_repo.get_active(
+            self.db, organization_id=ctx.organization_id, user_id=existing_run.user_id
+        )
+        if membership is None:
+            return None
+        return AuthContext(
+            user_id=existing_run.user_id,
+            organization_id=ctx.organization_id,
+            role=membership.role,
+            subject_is_publisher_fallback=existing_run.initiated_by_publisher_fallback,
+            key_scopes=ceiling,
+        )
+
+    async def _platform_credential(
+        self,
+        spec: AgentSpec,
+        ctx: AuthContext,
+        existing_run: AgentRun | None = None,
+        *,
+        agent_id: UUID | None = None,
+    ) -> str | None:
+        """A credential for this platform's own MCP server, when the spec binds it.
+
+        Minted from the authority of the person the run is for, so the agent can do
+        what they can do - and an agent that does not bind the server mints
+        nothing. `None` where nobody is behind the run.
+        """
+        if not any(isinstance(ref, PlatformMcpServerRef) for ref in spec.mcp_servers):
+            return None
+        owner = await self._run_owner_context(ctx, existing_run)
+        return (
+            None
+            if owner is None
+            else await mint_for_run(
+                owner, agent_id=existing_run.agent_id if existing_run is not None else agent_id
+            )
+        )
+
+    async def _bound_collections(self, spec: AgentSpec, ctx: AuthContext) -> dict[str, Any]:
+        """The agent's bound collections, as the `resources` entries that carry them.
+
+        Resolved server-side and passed through deps: the model asks *what* to
+        search, never *where*. `kb_collection_names` are the vector-store names;
+        `kb_vector_scopes` the bound base behind each, because a name is not
+        unique and resolving it again would search whichever same-named base of
+        the organization comes first rather than the one bound here (#2537).
+        """
+        found = await knowledge_base_repo.get_by_ids(self.db, spec.collection_ids)
+        names: list[str] = []
+        scopes: dict[str, VectorScope] = {}
+        for collection_id in spec.collection_ids:
+            collection = found.get(collection_id)
+            if collection is None or collection.organization_id != ctx.organization_id:
+                # A collection deleted after publish degrades the agent's reach
+                # rather than failing the run - the answer is worse, not absent.
+                logger.warning(
+                    "Agent references collection %s which is gone from org %s",
+                    collection_id,
+                    ctx.organization_id,
+                )
+                continue
+            name = collection.collection_name
+            if previous := scopes.get(name):
+                # Both bases passed the organization check above, so they share
+                # a vector tenant. Read their union without widening to siblings.
+                scopes[name] = replace(
+                    previous,
+                    additional_knowledge_base_ids=(
+                        *previous.additional_knowledge_base_ids,
+                        collection.id,
+                    ),
+                )
+            else:
+                names.append(name)
+                scopes[name] = collection.vector_scope
+        return {"kb_collection_names": names, "kb_vector_scopes": scopes}
+
+    async def _recorded_conversation_state(self, conversation_id: UUID | None) -> _RecordedState:
+        """What an earlier turn of this thread recorded, in one read.
+
+        Three things the build seeds from the conversation - the request overhead
+        (instructions and tool schemas), how far the system-reminders cadence has
+        advanced, and the plan the agent is working to. All three are properties of
+        the agent rather than of the conversation, strictly, but the conversation is
+        where a run finds them without asking every surface to carry them, and an
+        agent answering one thread answers with the instructions and tools it has
+        now.
+
+        Read together because they are seeded together: without the overhead a
+        one-request turn cannot tell a window with no room for a summary from one
+        that works (#49); without the cadence a reminder set to fire every N
+        requests never reaches N in a chat of one-request turns; and without the
+        plan an agent denies a checklist it wrote in the previous message, because
+        a plan store is one run's and a chat message is a run (#1077). One row, so
+        one SELECT rather than one each.
+        """
+        if conversation_id is None:
+            return _RecordedState(None, None, None)
+        conversation = await conversation_repo.get_conversation_by_id(self.db, conversation_id)
+        if conversation is None:
+            return _RecordedState(None, None, None)
+        return _RecordedState(
+            conversation.overhead_tokens, conversation.reminder_state, conversation.plan_items
+        )
+
+    async def prepare(
+        self,
+        ctx: AuthContext,
+        agent_id: UUID,
+        *,
+        # The same default `execute` carries, so the two cannot disagree about
+        # what an unnamed surface is. Every production caller passes one.
+        surface: RunSurface = RunSurface.API,
+        conversation_id: UUID | None = None,
+        channel_key: str | None = None,
+        memory_room_key: str | None = None,
+        channel_directory: ChannelDirectory | None = None,
+        user_name: str | None = None,
+        acts_for_sender: bool = False,
+        extra_toolsets: list[AbstractToolset[Any]] | None = None,
+        exposure: AgentExposure | None = None,
+        model_profile_id: UUID | None = None,
+        environment_id: UUID | None = None,
+        version_id: UUID | None = None,
+        approval_mode: ApprovalMode = ApprovalMode.FOLLOW_AGENT,
+        local: LocalTarget | None = None,
+        on_compaction: CompactionSink | None = None,
+        output_schema: dict[str, Any] | None = None,
+        on_sandbox_wait: SandboxWaitSink | None = None,
+        request_connection: ConnectionCallback | None = None,
+        run_limit_usd: Decimal | None = None,
+        public_origin: bool = False,
+        voice: VoiceRun | None = None,
+        person_time_zone: str | None = None,
+        draft: bool = False,
+        test: bool = False,
+        aside: bool = False,
+        source_run: AgentRun | None = None,
+    ) -> PreparedRun:
+        """Assemble everything a run needs and open its row.
+
+        Args:
+            source_run: A run whose frozen spec an auxiliary call uses.
+                Current access is still checked; its original instructions, budgets
+                and tracing policy cannot drift to a newly published version.
+            aside: A question asked on the side of a run still working (#2087):
+                answered from the conversation alone, with the agent's tools,
+                knowledge, servers and delegates taken away - see `_answer_only`.
+            approval_mode: How much this session wants to be asked, whatever the
+                spec says (#925). `FOLLOW_AGENT` is every run that does not name
+                one and is exactly the behaviour that existed before. The other
+                two are checked here rather than at the surface: `prepare` is the
+                one funnel a fresh run and a resumed one share, so a check at the
+                socket would be a check one caller could forget.
+            channel_directory: The one channel this run is answering in, ready
+                to be asked about, or `None` on every surface that is not a
+                channel. Bound by the caller because binding one needs the bot
+                row and its unsealed token, and a capability may reach neither -
+                the same reason the workspace backend is opened here rather than
+                inside `sandbox`.
+            exposure: The binding that admitted this run, when one did. It
+                supplies the prompt appended to the spec, the channel tools it
+                grants, its environment and its session scope, and is stamped on
+                the run row - so a run that arrived through a place the agent was
+                published to is attributable to that place. It carries no cap of
+                its own: the two budgets are the agent's and the organization's
+                (`BudgetScope`), and `agent_exposures` has no cap column.
+            model_profile_id: Run on this model instead of the one the spec
+                names. What an agent *does* - its instructions, its tools, its
+                approval gates - is unchanged; only which model executes it is.
+                The run row records the model that actually ran, so a cheaper or
+                stronger model chosen for one conversation stays attributable
+                and stays inside the same budget.
+            on_compaction: Where to tell a live surface that a summary is
+                running. A compaction takes tens of seconds and says nothing, so
+                a surface that streams and does not attach this simply stops for
+                the length of it - which is the failure `CompactionSink`'s own
+                docstring was written for, and which the widget's socket had
+                because only the dashboard's chat passed one (#936).
+            on_sandbox_wait: Where to tell a live surface that the run's sandbox
+                is still opening, usually its image being built. Handed to the
+                workspace as it is opened, since preparing already opens the
+                session to snapshot it (#2222).
+            environment_id: Run the version this environment pins instead of
+                the default. Falls back to the exposure's environment - a bot
+                bound to `dev` serves dev without every caller re-deriving it -
+                and then to the default environment's version.
+            version_id: Run exactly this published version, whatever any
+                environment pins - a workflow step built against it. Takes
+                precedence over `environment_id`.
+            output_schema: The shape the answer must have, in place of the
+                version's own `output_schema` - a workflow step that needs an
+                object. Already checked by the caller.
+            request_connection: How to ask the person at the keyboard to connect
+                one of their own services while the run waits. Given, a personal
+                binding they have not connected is offered to the model as
+                `connect_account` rather than briefed as unavailable - so nobody
+                is asked to connect a service the agent never reaches for.
+            public_origin: An outsider supplied this run's input - a delivery
+                fired an event trigger, or a workflow admitted by an external door
+                runs the agent - so nobody is behind it, whoever `ctx` names.
+                Stored on the run's admitted terms, so a resume keeps it.
+            voice: A voice call (#54). The spec is stripped of what a call
+                cannot run *before* assembly, so no sandbox opens and no
+                delegate resolves; the row is stamped `modality='voice'` with
+                the realtime model and its key.
+            person_time_zone: The person's own IANA time zone, when the surface
+                knows it - what an agent whose `time_zone` is `user` tells the
+                time in (#2065).
+            draft: Run the unpublished draft instead of a version, for the
+                Builder's test panel (#2074). The caller must be able to edit the
+                agent, the draft must pass the checks a publish makes, and the
+                run keeps a frozen copy of it, so a parked call continues on
+                exactly what it was running. It names no environment.
+            test: Mark the run as a test - a draft always is - so Activity can
+                tell trying an agent from using it. Budgeted like any run.
+
+        Raises:
+            BadRequestError: If the agent is unpublished, archived, or its spec
+                no longer validates - surfaced before any tokens are spent.
+        """
+        require_admission()
+        if source_run is not None and (
+            source_run.organization_id != ctx.organization_id or source_run.agent_id != agent_id
+        ):
+            raise BadRequestError(
+                message="The source run does not belong to this agent and organization"
+            )
+        effective_environment_id = environment_id or (
+            exposure.environment_id if exposure is not None else None
+        )
+        test_spec: dict[str, Any] | None = None
+        if draft:
+            if effective_environment_id is not None:
+                raise BadRequestError(
+                    message="A draft has no environment - test it, or test an environment",
+                    details={"environment_id": str(effective_environment_id)},
+                )
+            agent, spec = await self.registry.get_draft_spec(ctx, agent_id)
+            version_id = None
+            test_spec = spec.model_dump(mode="json")
+        elif version_id is not None:
+            agent, spec, version_id = await self.registry.get_pinned_spec(ctx, agent_id, version_id)
+        else:
+            agent, spec, version_id = await self.registry.get_runnable_spec(
+                ctx, agent_id, environment_id=effective_environment_id
+            )
+        if source_run is not None:
+            _, spec = await self._parked_spec(ctx, source_run)
+            version_id = source_run.agent_version_id
+            test_spec = source_run.test_spec
+        spec = await self._with_environment_observability(
+            ctx, spec, environment_id=effective_environment_id
+        )
+        spec = await _with_exposure_prompt(spec, exposure)
+        spec = _with_channel_tools(spec, exposure)
+        if output_schema is not None:
+            spec = spec.model_copy(update={"output_schema": output_schema})
+        if voice is not None:
+            spec = without_voice_unavailable(spec)
+        if aside:
+            spec = _answer_only(spec)
+        prepared = await self._assemble(
+            ctx,
+            agent=agent,
+            spec=spec,
+            existing_run=None,
+            surface=surface,
+            conversation_id=conversation_id,
+            channel_key=channel_key,
+            memory_room_key=memory_room_key,
+            channel_directory=channel_directory,
+            model_profile_id=model_profile_id,
+            user_name=user_name,
+            acts_for_sender=acts_for_sender,
+            extra_toolsets=extra_toolsets,
+            exposure=exposure,
+            decided={},
+            resuming={},
+            already_spent={},
+            already_started={},
+            version_id=version_id,
+            environment_id=effective_environment_id,
+            approval_mode=await self._allowed_approval_mode(ctx, approval_mode, surface=surface),
+            local=local,
+            # Passed in rather than set on the built deps like `on_compaction`:
+            # whether a gap is briefed or offered as a tool decides what is built.
+            request_connection=request_connection,
+            run_limit_usd=run_limit_usd,
+            public_origin=public_origin,
+            voice=voice,
+            # And this one because preparing already opens the sandbox session.
+            on_sandbox_wait=on_sandbox_wait,
+            person_time_zone=person_time_zone,
+            is_test=test or draft,
+            test_spec=test_spec,
+        )
+        prepared.output_schema = output_schema
+        prepared.run_limit_usd = run_limit_usd
+        if on_compaction is not None:
+            # Set on the built deps rather than passed into `_assemble`: it is a
+            # property of the *surface*, not of the run, and `_assemble` already
+            # takes fourteen arguments about the run.
+            prepared.built.deps.on_compaction = on_compaction
+        return prepared
+
+    async def _reviewer_models(
+        self, ctx: AuthContext, spec: AgentSpec
+    ) -> dict[UUID, ModelRequestSpec]:
+        """Each run reviewer's model, by profile id - those that still resolve (#2106).
+
+        A reviewer is optional to the run it watches: one whose profile was deleted
+        since publish, or whose key no longer unseals, is left out with a warning
+        rather than taking the agent offline.
+        """
+        models: dict[UUID, ModelRequestSpec] = {}
+        for reviewer in spec.reviewers:
+            profile_id = reviewer.model_profile_id
+            if profile_id is None or profile_id in models:
+                continue
+            try:
+                models[profile_id] = await self.models.resolve(ctx, profile_id=profile_id)
+            except AppException:
+                logger.warning(
+                    "Run reviewer %s cannot resolve its model; the run goes on without it",
+                    reviewer.name,
+                    exc_info=True,
+                )
+        return models
+
+    async def _allowed_approval_mode(
+        self, ctx: AuthContext, requested: ApprovalMode, *, surface: RunSurface
+    ) -> ApprovalMode:
+        """The mode this caller may actually run, or a refusal.
+
+        **Refused, never downgraded.** Answering a request to waive approvals by
+        quietly following the spec instead would leave somebody believing they had
+        turned the questions off, and the next gated call parks a run they think
+        is running - so a mode this caller may not set is an error with a reason,
+        not a silent fallback (#925).
+
+        Three things have to hold for `APPROVE_ALL`, and each is a different
+        failure if it does not:
+
+        - the caller holds `approvals:decide`. A standing consent *is* the
+          decision the approval queue exists to record, and `member` and `builder`
+          hold `agents:run` without it - so without this gate the everyday chat
+          user grants themselves, in one click, the authority the API refuses them
+          one endpoint over;
+        - the organization allows waiving at all. Without a ceiling a Builder's
+          deliberate gate is one click from nothing in every conversation, which
+          makes the per-tool model advisory;
+        - the surface is the web chat. `ApprovalGate` already refuses a run with
+          no approval channel, and standing consent must not become the way a
+          schedule or a webhook approves itself.
+
+        `ASK_ALL` passes all three by construction: it only ever tightens, so it
+        needs no permission, no ceiling and no surface check.
+        """
+        if requested is not ApprovalMode.APPROVE_ALL:
+            return requested
+        if surface is not RunSurface.WEB:
+            raise AuthorizationError(
+                message="Approvals can only be waived from a chat session.",
+                details={"surface": surface.value},
+            )
+        if not ctx.has(Perm.APPROVALS_DECIDE):
+            raise AuthorizationError(
+                message="You may not waive approvals; ask somebody who can decide them.",
+                details={"permission": Perm.APPROVALS_DECIDE.value},
+            )
+        organization = await organization_repo.get_by_id(self.db, ctx.organization_id)
+        if organization is None or not organization.chat_may_waive_approvals:
+            raise AuthorizationError(
+                message="This organization does not allow conversations to waive approvals.",
+                details={"organization_id": ctx.organization_id},
+            )
+        return requested
+
+    @staticmethod
+    async def _browser_session(ctx: AuthContext, local: LocalTarget) -> UUID:
+        """Resolve only the initiating person's paired device, without opening a folder."""
+        from app.services import device_hub
+
+        if ctx.user_id is None or ctx.api_key_id is not None or ctx.subject_is_publisher_fallback:
+            raise BadRequestError(
+                message="Only your own chats can use your computer's browser or screen"
+            )
+        device = await device_hub.wait_for(ctx.user_id, local.device_id, timeout=0)
+        if device is None:
+            raise BadRequestError(
+                message="Your computer is not connected: open the AgenticOS app on it"
+            )
+        return device.session_id
+
+    async def _assemble(
+        self,
+        ctx: AuthContext,
+        *,
+        agent: Agent,
+        spec: AgentSpec,
+        existing_run: AgentRun | None,
+        surface: RunSurface,
+        conversation_id: UUID | None,
+        channel_key: str | None = None,
+        channel_directory: ChannelDirectory | None = None,
+        user_name: str | None,
+        acts_for_sender: bool = False,
+        owner_user_id: UUID | None = None,
+        memory_room_key: str | None = None,
+        restored_audience: RunAudience | None = None,
+        restored_publisher_fallback: bool | None = None,
+        extra_toolsets: list[AbstractToolset[Any]] | None,
+        exposure: AgentExposure | None,
+        decided: dict[str, ApprovalDecision],
+        resuming: dict[str, ResumedDelegation],
+        already_spent: dict[str, DelegationSpend],
+        already_started: dict[str, datetime | None],
+        approval_mode: ApprovalMode = ApprovalMode.FOLLOW_AGENT,
+        local: LocalTarget | None = None,
+        specialists: Mapping[str | None, Sequence[RegisteredSpecialist]] | None = None,
+        model_profile_id: UUID | None = None,
+        version_id: UUID | None = None,
+        environment_id: UUID | None = None,
+        plan_items: list[dict[str, Any]] | None = None,
+        request_connection: ConnectionCallback | None = None,
+        run_limit_usd: Decimal | None = None,
+        public_origin: bool = False,
+        impersonated: bool = False,
+        voice: VoiceRun | None = None,
+        person_time_zone: str | None = None,
+        is_test: bool = False,
+        test_spec: dict[str, Any] | None = None,
+        on_sandbox_wait: SandboxWaitSink | None = None,
+        channel_file_attempts: int = 0,
+        restored_channel_context: str = "",
+        restored_channel_authors: dict[str, UUID] | None = None,
+    ) -> PreparedRun:
+        """Build the agent for a run, opening its row unless one is being resumed.
+
+        The single funnel a fresh run and a resumed one share. Splitting them
+        would mean two places that decide what an agent may reach, and the
+        second one would eventually forget something.
+
+        `version_id` is the version the spec was resolved from - stamped on a
+        fresh run so history records what actually answered, which an
+        environment can make different from `current_version_id`. A resumed
+        run keeps the version it was parked on.
+
+        `decided` and `resuming` are the two halves of a continuation, and both go
+        into the assembly rather than into the run call: a verdict is answered by
+        the approval gate of whichever agent asked, and a stashed delegate is
+        continued by the delegation capability of whichever agent delegated - so
+        both have to be in place before anything is built. `already_spent` and
+        `already_started` travel with them because all three are read at the same
+        moment: the delegation is opened by the replayed `task` call, and what it
+        cost before the park - and when it first began - have to be in the stash by
+        then or the row it eventually writes holds only this turn's spend and begins
+        at the resume.
+
+        `specialists` is the same kind of thing for `create_agent`, keyed by the
+        `task` call each level was delegated from: `None` for the run's own agent, a
+        nested delegate's enclosing call otherwise. `None` on a fresh run and filled
+        from `PausedRunState` on a resume, re-registered by each level's delegation
+        capability before the replay so a kept specialist is reachable after the park
+        that created it - at the run's own agent (agenticos#175) and inside a nested
+        delegate (agenticos#254) alike.
+        """
+        spec = _with_local_capabilities(
+            await self.registry.with_assistant_guidance(agent, spec), local
+        )
+
+        # Whose ChatGPT sign-in the run's models may run on: the person the run
+        # is for. On a resume `ctx` is the approver's, and releasing somebody's
+        # run must neither lend it the approver's subscription nor refuse it the
+        # owner's. The restored audience already names nobody for a visitor or a
+        # key's holder.
+        models_ctx = (
+            ctx
+            if restored_audience is None
+            else replace(
+                ctx,
+                user_id=restored_audience.user_id,
+                subject_is_publisher_fallback=False,
+                api_key_id=None,
+            )
+        )
+        # A caller's override wins over the spec's choice. Only the model is
+        # replaced - instructions, tools, budgets and the approval gate are the
+        # agent's, so this cannot be used to run something the agent is not.
+        local_model_choice: tuple[str, UUID] | None = None
+        model_spec: ModelRequestSpec | None = None
+        if local is not None and local.model_service is not None:
+            if voice is not None:
+                raise BadRequestError(message="Local models are available for text conversations")
+            profile = await self.models.profile_for_organization(
+                models_ctx.organization_id, profile_id=model_profile_id or spec.model_profile_id
+            )
+            local_model_choice = (local.model_service, profile.id)
+        else:
+            model_spec = await self.models.resolve(
+                models_ctx, profile_id=model_profile_id or spec.model_profile_id
+            )
+            # The override arrives from a socket frame or an API body, past every
+            # picker and past publish, so the catalogs' answer is checked here too
+            # (#2487): a speech or embedding model refused by name, before a run row
+            # or a model call, rather than a provider error on the first turn.
+            outputs = model_outputs(
+                model_spec.provider, model_spec.model, base_url=model_spec.credential.base_url
+            )
+            if not outputs.chat:
+                raise BadRequestError(
+                    message=not_chat_refusal(model_spec.label, model_spec.model, outputs),
+                    details={"model_profile_id": str(model_spec.profile_id)},
+                )
+
+        # The organization's ceiling is read here rather than passed in by the
+        # surface, for the reason this module exists: a limit each caller has to
+        # remember is a limit the next surface will not have. It used to be a
+        # parameter with a default of "no cap" and no production caller, so
+        # twelve agents in one organization meant twelve independent caps and no
+        # ceiling. `ctx.organization_id` is also the only tenant in scope here,
+        # which is what keeps the cap and the spend it is measured against - the
+        # `period_spend` below - reading the same organization.
+        organization = await self.organizations.get_by_id(ctx.organization_id)
+
+        rendering = await self._variable_renderer(
+            # Who the run is about: on a resume `ctx` is the approver's, and the
+            # agent was told the person who started it - their name and address,
+            # or "a visitor" - before it parked.
+            ctx
+            if existing_run is None
+            else replace(
+                ctx,
+                user_id=existing_run.user_id,
+                subject_is_publisher_fallback=existing_run.initiated_by_publisher_fallback,
+            ),
+            organization_name=organization.name if organization is not None else None,
+            surface=surface,
+            user_name=user_name,
+            person_time_zone=person_time_zone,
+        )
+        spec = rendering.for_the_run(spec)
+
+        # Everything a capability needs but must not fetch itself. Resolved once,
+        # server-side, so the model cannot influence what an agent reaches.
+        resources: dict[str, Any] = {
+            **await self._bound_collections(spec, ctx),
+            "skills": await self.skills.resolve_for_agent(ctx, spec.skill_ids),
+            CONTEXT_FILES_RESOURCE: await self.context.resolve_for_agent(
+                ctx, spec.context_ids, config=context_config(spec.capabilities)
+            ),
+        }
+        # What an earlier turn of this thread wrote down. Read here rather than
+        # beside the build below, because one of the three is a resource.
+        recorded = await self._recorded_conversation_state(conversation_id)
+        # Always present, like the two above and unlike the conditional resources
+        # below: the planning capability reads it only when bound, but the runner
+        # owns the store either way so `finish` can snapshot the checklist into the
+        # parked state.
+        #
+        # Seeded from `PausedRunState.plan` on a resume and from the *conversation*
+        # on a fresh run. The park's copy wins because it is the newer one - it was
+        # itself seeded from the conversation when that run began, and then worked
+        # on. Without the conversation's copy the store is empty every turn, which
+        # is an agent denying the plan it wrote in the previous message (#1077).
+        #
+        # `still_open` on the conversation's copy only: a finished checklist is
+        # history, and seeding it would have the tail reminder call a task nobody
+        # is doing "your current plan" (#1221). A resume is mid-plan by
+        # construction and goes through untouched.
+        seeded_from = plan_items if plan_items is not None else still_open(recorded.plan)
+        finished_plan_withheld = seeded_from is None and bool(recorded.plan)
+        plan_store = await open_plan_store(seeded_from)
+        resources[PLANNING_STORE_RESOURCE] = plan_store
+        # Only on a channel run, and bound to the channel the message arrived in
+        # before it got here. Absent everywhere else, and `channel_tools` then
+        # builds nothing at all - an agent in the dashboard has no channel to
+        # ask about, and four tools that can only answer "there is no channel
+        # here" are worse than none, because the model keeps trying.
+        if channel_directory is not None:
+            resources[CHANNEL_DIRECTORY_RESOURCE] = channel_directory
+        # Resolved here for the reason the browser's step model is: the vault and
+        # the session are here, and the factory has neither. Handed to it apart
+        # from `resources`, which every capability reads and a log line may carry:
+        # a resolved model holds its unsealed credential.
+        reviewer_models = await self._reviewer_models(models_ctx, spec)
+        step_profile = _browser_step_profile(spec)
+        if step_profile is not None:
+            # Built here, where the vault and the session are: a fast model for
+            # `browse_web`'s steps, which are most of a browse's time.
+            resources[BROWSER_STEP_MODEL_RESOURCE] = (
+                await self.models.resolve(models_ctx, profile_id=step_profile)
+            ).build()
+        # Unsealed here and handed straight to the factory, which hands them to
+        # the capability instances that declared them. They are kept out of
+        # `resources` deliberately: a resource may end up in a log line and a
+        # secret may not.
+        secrets = await self.secrets.resolve_for_bindings(ctx, _secret_ids(spec))
+
+        # Whose own MCP connections a personal binding speaks through, and the
+        # only place the answer is assembled. Not `ctx.user_id` alone: on a
+        # channel an unlinked sender runs under the binding's publisher, and on
+        # an API key the context is the key holder's - neither of them is the
+        # person talking, so the caller says whether there is one.
+        #
+        # `owner_user_id` is who the run belongs to, and it is not always whoever
+        # is calling. A run that parked for approval is resumed by an approver,
+        # so deriving this from `ctx` alone read *their* personal account inside
+        # somebody else's conversation - the resume path passes the recorded
+        # owner and this falls back to the caller only for a run being started.
+        #
+        # But a publisher standing in for an unidentified visitor is not a person
+        # whose own account may be reached for, even though `acts_for_sender` is
+        # set on that surface too: resolving one here would speak to a third-party
+        # MCP server with the owner/publisher's own connected-account credentials
+        # on behalf of an anonymous guest (#1469). Read from the request on a fresh
+        # run and from the parked terms on a resume, where the approver's context
+        # is not the run's - the same reason `owner_user_id` is passed rather than
+        # taken from `ctx` (#788). It defaults false, so a run parked before this
+        # was recorded resolves as it always did rather than losing its tools.
+        subject_is_publisher_fallback = (
+            restored_publisher_fallback
+            if restored_publisher_fallback is not None
+            else ctx.subject_is_publisher_fallback
+        )
+        # Not the same question as `subject_is_publisher_fallback` above, even
+        # though a schedule or event trigger sets both from one call
+        # (`AgentTriggerService._creator_context`). That flag exists to keep an
+        # unattended fire from reaching a personal MCP connection or store on
+        # its creator's behalf (#1469) - it says nothing about whether
+        # `ctx.user_id` is a real, notifiable person. For `RunSurface.SCHEDULE`
+        # it is: the trigger's own creator, who wants to hear a run they set up
+        # finished or failed. Everywhere else `subject_is_publisher_fallback`
+        # is true, `ctx.user_id` is a publisher standing in for a visitor
+        # nobody can name (`app.services.access.publisher_context`) - not a
+        # person to notify. Conflating the two left every scheduled and
+        # event-triggered run silently unnotified regardless of who made it.
+        initiated_by_publisher_fallback = (
+            subject_is_publisher_fallback and surface is not RunSurface.SCHEDULE
+        )
+        personal_mcp_user_id = (
+            (owner_user_id or ctx.user_id)
+            if acts_for_sender and not subject_is_publisher_fallback
+            else None
+        )
+        spec = _with_channel_mcp_approval(
+            spec, surface, linked_sender=personal_mcp_user_id is not None
+        )
+        # Whether a signed-in person is behind this run even where a personal
+        # binding may not speak through their account - true on the API, where a
+        # bearer token identifies the caller but their own connections are
+        # deliberately out of reach, and false where nobody wrote the message at
+        # all. It is what tells the gap briefing to explain the refusal rather
+        # than tell a signed-in caller that nobody is signed in (#1445).
+        sender_present = (
+            owner_user_id or ctx.user_id
+        ) is not None and not subject_is_publisher_fallback
+
+        # The MCP servers the spec binds, resolved here rather than by each
+        # surface. A surface that forgot would produce an agent missing half its
+        # tools with nothing to show for it, and the answer would differ between
+        # the playground and Slack for no reason anybody could see.
+        resolved = await build_toolsets_for_agent(
+            self.db,
+            organization_id=ctx.organization_id,
+            refs=spec.mcp_servers,
+            sender_user_id=personal_mcp_user_id,
+            platform_credential=await self._platform_credential(
+                spec, ctx, existing_run, agent_id=agent.id
+            ),
+        )
+        spec_toolsets = resolved.toolsets
+        on_use, briefed = _connect_on_use(
+            resolved.unavailable,
+            refs=spec.mcp_servers,
+            user_id=personal_mcp_user_id,
+            request_connection=request_connection,
+        )
+        context = runtime_context(
+            surface.value,
+            console_url=settings.FRONTEND_URL,
+            linked_sender=personal_mcp_user_id is not None,
+        )
+        if context:
+            guidance = "" if CHANNEL_BEHAVIOR in spec.instructions else "\n\n" + CHANNEL_BEHAVIOR
+            spec = spec.model_copy(
+                update={"instructions": f"{spec.instructions}\n\n{context}{guidance}"}
+            )
+        spec = _with_personal_service_gaps(spec, briefed, surface, sender_present=sender_present)
+        spec = _with_account_notes(spec, resolved.accounts)
+
+        run = existing_run
+        if run is None:
+            require_admission()
+            run = await agent_run_repo.create_run(
+                self.db,
+                organization_id=ctx.organization_id,
+                agent_id=agent.id,
+                # A draft under test has no version; naming the current one
+                # would credit its answers to something it did not run.
+                agent_version_id=(
+                    None if test_spec is not None else version_id or agent.current_version_id
+                ),
+                user_id=ctx.user_id,
+                initiated_by_publisher_fallback=initiated_by_publisher_fallback,
+                key_scopes=(
+                    None
+                    if ctx.key_scopes is None
+                    else sorted(scope.value for scope in ctx.key_scopes)
+                ),
+                conversation_id=conversation_id,
+                environment_id=environment_id,
+                exposure_id=exposure.id if exposure else None,
+                channel_identity_id=ctx.channel_identity_id,
+                surface=surface.value,
+                # A call spends on its realtime model and key, not the chat profile's.
+                model_label=voice.model_label
+                if voice is not None
+                else model_spec.label
+                if model_spec is not None
+                else "Local model",
+                provider=voice.provider
+                if voice is not None
+                else model_spec.provider
+                if model_spec is not None
+                else "ollama",
+                secret_id=voice.secret_id
+                if voice is not None
+                else model_spec.secret_id
+                if model_spec is not None
+                else None,
+                modality="voice" if voice is not None else "text",
+                started_at=datetime.now(UTC),
+                is_test=is_test,
+                test_spec=test_spec,
+            )
+
+        # Two lookups, because the caps they feed meter two different things. The
+        # agent's own cap used to read the organization-wide number below, which
+        # made `AgentSpec.budget.monthly_usd` a second organization cap wearing
+        # an agent's name: an agent with a $10 limit was refused once its
+        # *neighbours* had spent $10, and nothing ever isolated its own spend.
+        # Each on a session of its own, never the run's. The budget capability
+        # reads its baseline once, immediately before the run's first model
+        # request - a read on the shared session there would open a transaction
+        # that then sits `idle in transaction` for the rest of the run, holding
+        # the very connection the opening commit in `_run` exists to hand back:
+        # measured under 18 concurrent runs, the three past the pool waited 26
+        # seconds at this read (#12). A session of its own from `get_db_context`:
+        # a pooled connection checked out for the read and handed straight back,
+        # on the loop that owns the pools, and a `NullPool` engine on any other -
+        # the case a trigger's run in the worker used to need this to be the
+        # worker context for. That was a new connection, a SCRAM handshake and
+        # four statements of dialect start-up, two or three times per run (#2248).
+        # Both leave this run's own row out. A baseline is what *other* runs have
+        # already spent; what this one spends is the ledger's, and on a resume
+        # the two are the same money. A run that spent $6 and parked has
+        # `cost_usd = 6.00` committed, and the ledger is re-seeded with that $6
+        # so finishing does not overwrite the cost with only the continuation's -
+        # summed as well, the first model request after an approval saw $12
+        # against a $10 cap and refused a run with $4 of headroom (#15). On a
+        # fresh run the row is there too, at zero, so this changes nothing and
+        # needs no branch.
+        # A call reads them again at every heartbeat (#54), so those re-reads take
+        # the pooled session rather than an engine and connection of their own
+        # each time - a call runs on the API worker's own loop, where that pool
+        # lives, and a heartbeat reads them holding no other connection. Each
+        # lookup's first read stays on the worker context: it is the call's start
+        # check, made while the starter's own transaction holds a pooled
+        # connection, and a second checkout from the same pool there waits on a
+        # pool the concurrent starts themselves have taken.
+        read_before: set[str] = set()
+
+        def spend_session(lookup: str) -> Callable[[], AbstractAsyncContextManager[AsyncSession]]:
+            if voice is None or lookup not in read_before:
+                read_before.add(lookup)
+                return get_worker_db_context
+            return get_db_context
+
+        async def agent_period_spend() -> Decimal:
+            async with spend_session("agent")() as db:
+                return await agent_run_repo.sum_cost_since(
+                    db,
+                    organization_id=ctx.organization_id,
+                    since=month_start(),
+                    agent_id=agent.id,
+                    include_delegations=True,
+                    exclude_run_id=run.id,
+                )
+
+        async def org_period_spend() -> Decimal:
+            async with spend_session("organization")() as db:
+                return await organization_monthly_spend(
+                    db, ctx.organization_id, exclude_run_id=run.id
+                )
+
+        group_limits = await self._group_limits(
+            self._department_context(ctx, existing_run), exclude_run_id=run.id
+        )
+
+        # A chat in a project works in the project's container and reads its
+        # instructions, whichever agent answers - see `_in_project`.
+        project = await ProjectService(self.db).for_run(ctx, conversation_id)
+        if project is not None:
+            spec = _in_project(spec, project)
+
+        # Opened after the run row, because a run-scoped workspace keys on it,
+        # and before the agent, because the capability reads the backend out of
+        # `resources`. Nothing starts here for a container-backed one: the
+        # client opens its session on the first tool call, so an agent granted a
+        # workspace it never touches costs nothing.
+        workspace_ctx = models_ctx if local is not None else ctx
+        workspace = await self.workspaces.open(
+            spec,
+            ctx=workspace_ctx,
+            identity=WorkspaceIdentity(
+                organization_id=ctx.organization_id,
+                agent_id=agent.id,
+                run_id=run.id,
+                conversation_id=conversation_id,
+                # A publisher standing in for a visitor, or a trigger's creator as
+                # an authority rather than a person, has no workspace of their own
+                # here - the rule memory and personal connections keep. Without it a
+                # `user`-scoped workspace opened the publisher's own for every
+                # stranger on their widget, and the creator's own for every fire
+                # that may not read their notes (#2027).
+                # And a key, which is not the person it was issued by.
+                user_id=(
+                    None
+                    if workspace_ctx.user_id is None
+                    or subject_is_publisher_fallback
+                    or workspace_ctx.api_key_id is not None
+                    else str(workspace_ctx.user_id)
+                ),
+                channel_key=channel_key,
+                project_id=project.id if project is not None else None,
+            ),
+            # What the binding that admitted this run says, if it says anything.
+            # The same agent in web chat and on a Slack bot is one agent in two
+            # situations, and one value for both was the wrong shape. A project's
+            # container is the project's, whatever either says.
+            scope_override=(
+                "project"
+                if project is not None
+                else cast("SessionScope | None", exposure.session_scope)
+                if exposure is not None and exposure.session_scope
+                else None
+            ),
+            on_wait=on_sandbox_wait,
+            local=local,
+        )
+        if local is not None and (local.browser or local.computer) and local.folder is None:
+            session_id = await self._browser_session(workspace_ctx, local)
+            if local.browser:
+                resources["local_browser_session"] = session_id
+            if local.computer:
+                resources["local_computer_session"] = session_id
+        if local is not None and (
+            local.model_service is not None
+            or local.mcp_services
+            or ((local.browser or local.computer) and local.folder is not None)
+        ):
+            # _open_local has authenticated the actual sender and resolved only
+            # their own paired session before any local service is contacted.
+            from app.services.device_hub import (
+                DeviceWorkspace,
+                describe_service,
+                local_mcp_toolset,
+                local_model_spec,
+            )
+
+            if workspace is None or not isinstance(workspace.workspace.backend, DeviceWorkspace):
+                raise BadRequestError(message="Local services require your own connected computer")
+            session_id = workspace.workspace.backend.session_id
+            if local.browser:
+                resources["local_browser_session"] = session_id
+            if local.computer:
+                resources["local_computer_session"] = session_id
+            if local_model_choice is not None:
+                service_id, profile_id = local_model_choice
+                service = await describe_service(session_id, service_id, "model")
+                model_spec = local_model_spec(profile_id, session_id, service)
+                run.model_label = model_spec.label
+                run.provider = model_spec.provider
+                run.secret_id = None
+            for service_id in dict.fromkeys(local.mcp_services):
+                service = await describe_service(session_id, service_id, "mcp")
+                spec_toolsets.append(local_mcp_toolset(session_id, service))
+
+        # Local inference was resolved only after the workspace authenticated its owner.
+        assert model_spec is not None
+
+        # What a call's realtime model is told: the briefings below describe a
+        # workspace and skill files only its text twin can reach.
+        spec = _with_execution_environment(spec, local)
+        spoken_spec = spec
+        materialised: MaterialisedSkills | None = None
+        started_with: set[str] | None = None
+        earlier: EarlierAttachments | None = None
+        checked_earlier = False
+        if workspace is not None:
+            resources[WORKSPACE_RESOURCE] = workspace.workspace
+            resources[WORKSPACE_SHARED_RESOURCE] = await self._workspace_shared(
+                ctx, workspace.scope, conversation_id
+            )
+            resources[SPILL_LOG_RESOURCE] = workspace.spills
+            spec = _with_workspace_briefing(spec, workspace)
+            # Skills as files, beside the shell that can run them. A skill whose
+            # resource is a script is otherwise text the model can quote and not
+            # execute, while the same agent has `execute` one tool call away - and
+            # `collect_changes` diffs these files to turn an agent's edit into a
+            # proposal a person accepts.
+            #
+            # They were removed for a turn because every workspace listing was
+            # mostly skill files an agent had not written, and that was the right
+            # complaint about the wrong thing: the files belong on disk, where the
+            # agent and the proposal flow use them, and not in a browser about what
+            # an agent is keeping *for a person*. `browsable` is where they are
+            # dropped instead (#1064).
+            #
+            # A sandbox's are written on its first use instead, by `_start_turn_on_first_use`
+            # once the prepared run exists: writing them here opened the session -
+            # a container start on a new conversation, a round trip per file on every
+            # turn - before the model saw a token, for a turn that may never touch
+            # the sandbox. The briefing cannot wait for the writes, so it is given
+            # whenever there are skills, worded so it does not claim they landed.
+            #
+            # And the files of this agent's turns that stopped before writing them,
+            # put back (#2481) - on the same first use, or here for a `state`
+            # workspace, and before the snapshot either way so a file put back is
+            # not read as this turn's output. Only on a run by a person, in a
+            # session: a publisher standing in for a visitor or a key's holder is
+            # not whoever attached the file - the same subjects the workspace
+            # identity above refuses. A resume looks again only when its own
+            # person continues it, since a sandbox may first be used after the
+            # park; one released by another approver opens the approver's
+            # workspace, and `chat_file_repo` does not let that run's finishing
+            # close the window.
+            if (
+                conversation_id is not None
+                and ctx.user_id is not None
+                and ctx.api_key_id is None
+                and not subject_is_publisher_fallback
+                and (
+                    existing_run is None
+                    or (existing_run.user_id == ctx.user_id and _started_by_a_person(existing_run))
+                )
+            ):
+                earlier = await find_earlier_attachments(
+                    self.db,
+                    conversation_id=conversation_id,
+                    organization_id=ctx.organization_id,
+                    user_id=ctx.user_id,
+                    agent_id=agent.id,
+                    can_parse=workspace.parses_documents,
+                    # A file the input edge would refuse is never put back
+                    # (#2481): its turn may have stopped before the edge ran.
+                    screen=input_screen_for(spec),
+                )
+                checked_earlier = True
+            if earlier is not None:
+                spec = _with_earlier_attachments_briefing(spec)
+            if isinstance(workspace.workspace, RecordingWorkspace):
+                if resources["skills"]:
+                    spec = _with_skills_briefing(spec, deferred=True)
+            else:
+                materialised = await materialise_skills(workspace.workspace, resources["skills"])
+                if materialised.written:
+                    spec = _with_skills_briefing(spec)
+                if earlier is not None:
+                    await restore_earlier_attachments(
+                        workspace.workspace, earlier, can_parse=workspace.parses_documents
+                    )
+                # After the skills are written, so materialising them does not read as
+                # the turn's own output.
+                started_with = await workspace_snapshot(workspace.workspace)
+
+        if local is not None and local.skills:
+            # Read on the person's own computer, in place, for a chat that chose its
+            # sources; the instruction files come last in what the model reads.
+            from app.services.device_hub import (
+                DeviceWorkspace,
+                local_skills_context,
+            )
+
+            backend = workspace.workspace.backend if workspace is not None else None
+            skills_session = (
+                backend.session_id
+                if isinstance(backend, DeviceWorkspace)
+                else await self._browser_session(workspace_ctx, local)
+            )
+            skills_context = await local_skills_context(
+                skills_session,
+                local.skills,
+                folder=local.folder,
+                computer_grant=local.computer_grant,
+                conversation_id=conversation_id,
+            )
+            spec_toolsets.append(skills_context.toolset)
+            spec = spec.model_copy(
+                update={"instructions": f"{spec.instructions}\n\n{skills_context.briefing}"}
+            )
+
+        channel = ApprovalChannel(
+            organization_id=ctx.organization_id,
+            agent_id=agent.id,
+            run_id=run.id,
+            decided=decided,
+            # Only ever set by a checked `APPROVE_ALL` - `_allowed_approval_mode`
+            # has already refused a caller who may not waive, an organization that
+            # does not allow it, and every surface but the web chat.
+            standing_consent_by=(
+                ctx.user_id if approval_mode is ApprovalMode.APPROVE_ALL else None
+            ),
+        )
+
+        # Everything a delegation needs, resolved while there is still a session
+        # and an auth context to resolve it with. `None` for an agent that does
+        # not delegate, and then nothing new reaches `resources` at all - the
+        # assembly below is what it was before delegation existed.
+        run_budget = _RunBudget()
+        runtimes: list[SubagentRuntime] = []
+        delegations: list[RecordedDelegation] = []
+        delegate_recorders: list[tuple[UUID, RunRecorder]] = []
+        stash = DelegationStash(
+            resuming=resuming,
+            spent=already_spent,
+            started=already_started,
+            to_register={} if specialists is None else {k: list(v) for k, v in specialists.items()},
+        )
+        runtime = await self._delegation_runtime(
+            ctx,
+            models_ctx=models_ctx,
+            spec=spec,
+            agent=agent,
+            run=run,
+            surface=surface,
+            user_name=user_name,
+            personal_mcp_user_id=personal_mcp_user_id,
+            sender_present=sender_present,
+            resources=resources,
+            approvals=channel,
+            budget=run_budget,
+            render_variables=rendering.variables,
+            runtimes=runtimes,
+            delegations=delegations,
+            delegate_recorders=delegate_recorders,
+            stash=stash,
+            answering_call=None if voice is None else voice.options,
+        )
+        if runtime is not None:
+            resources[SUBAGENT_RUNTIME_RESOURCE] = runtime
+
+        # The audience is the run's own, not the resuming caller's: an approver
+        # releasing somebody else's run must not become the person its memory is kept
+        # for or whose conversations it may search (#788). On a resume it is restored
+        # verbatim rather than re-derived, because the facts it was derived from -
+        # whether the subject was a publisher stand-in, whether the chat account was
+        # linked, whether the chat was a room - are all gone with the request that
+        # carried them.
+        audience_user_id = owner_user_id or ctx.user_id
+        audience = restored_audience or derive_audience(
+            user_id=audience_user_id,
+            subject_is_publisher_fallback=ctx.subject_is_publisher_fallback,
+            fired_as_creator=ctx.fired_as_creator,
+            room_key=memory_room_key,
+            via_api_key=ctx.api_key_id is not None,
+        )
+        # A workflow step runs as the workflow's principal, so only the dispatch
+        # knows whether an outsider supplied the run's input. Read here rather
+        # than trusted to every caller: a step parked before the flag existed
+        # wakes with it unset, and a step that forgets to pass it must not lend
+        # the run the principal as its person. With no dispatch at all a workflow
+        # run counts as public - both callers run inside one.
+        #
+        # Imported here: `workflow_execution` reaches the `agent.run` node, which
+        # imports this module at load.
+        from app.services.workflow_execution import context as workflow_context
+
+        dispatching = workflow_context.active()
+        public_origin = public_origin or (
+            surface is RunSurface.WORKFLOW and (dispatching is None or dispatching.public_origin)
+        )
+        # Whether an administrator started this run as its person: stated by a
+        # resume from the stored terms, otherwise read from the request that is
+        # starting it or the workflow dispatch it runs inside - the only places
+        # that still know. Carried on the deps and the admitted terms, because
+        # the ambient request state is gone in a spawned task, a worker and a
+        # run resumed after an approval.
+        impersonated = (
+            impersonated
+            or current_impersonator() is not None
+            or (dispatching is not None and dispatching.impersonated)
+        )
+        # The run's own person. On a resume that is `owner_user_id` alone, never
+        # the approver's `ctx.user_id`: a run whose member was deleted lost its
+        # owner to `SET NULL`, and the approver releasing it must not fill the gap.
+        run_person = run_person_for(
+            user_id=owner_user_id if existing_run is not None else audience_user_id,
+            subject_is_publisher_fallback=subject_is_publisher_fallback,
+            surface=surface,
+            public_origin=public_origin,
+        )
+        hand_off: CallWorker | None = None
+        handed = [] if voice is None else handed_off(spec)
+        if voice is not None and handed:
+            call = voice.options
+            twin_spec = spec
+
+            def build_twin() -> BuiltAgent:
+                # The agent's own text run in every respect but its approvals,
+                # which the call settles: built like a delegate, on the run's
+                # guard, so its spend is the call's and the call's caps bind it.
+                return build_agent(
+                    twin_spec,
+                    model_spec,
+                    organization_id=ctx.organization_id,
+                    agent_id=agent.id,
+                    run_id=run.id,
+                    conversation_id=run.conversation_id,
+                    user_id=None if audience_user_id is None else str(audience_user_id),
+                    user_name=user_name,
+                    audience=audience,
+                    run_person=run_person,
+                    impersonated=impersonated,
+                    granted_scopes=DEFAULT_GRANTED_SCOPES,
+                    resources=resources,
+                    secrets=secrets,
+                    reviewer_models=reviewer_models,
+                    extra_toolsets=[*(extra_toolsets or []), *spec_toolsets],
+                    request_approval=channel,
+                    gate_every_tool=approval_mode is ApprovalMode.ASK_ALL,
+                    shared_budget=run_budget.guard,
+                    answering_call=call,
+                )
+
+            def report_hand_off(spent: HandOffSpend) -> None:
+                # A row of its own, as a delegation's: the twin spends on the text
+                # model and key, which the call's row - the realtime key's - would
+                # otherwise carry on the Spend card (Codex on #2204). A call runs a
+                # published version; without one the money stays on the call's row.
+                version_id = run.agent_version_id
+                if version_id is None:
+                    return
+                delegations.append(
+                    RecordedDelegation(
+                        id=uuid4(),
+                        agent_id=agent.id,
+                        agent_version_id=version_id,
+                        task_id=spent.task_id,
+                        status=RunStatus.FAILED if spent.error else RunStatus.COMPLETED,
+                        model_label=model_spec.label,
+                        provider=model_spec.provider,
+                        secret_id=model_spec.secret_id,
+                        input_tokens=spent.share.input_tokens,
+                        output_tokens=spent.share.output_tokens,
+                        cache_read_tokens=spent.share.cache_read_tokens,
+                        cache_write_tokens=spent.share.cache_write_tokens,
+                        cost_usd=spent.share.cost_usd,
+                        cost_is_partial=spent.share.has_unpriced_models,
+                        started_at=spent.started_at,
+                        ended_at=spent.ended_at,
+                        error=spent.error,
+                    )
+                )
+
+            hand_off = CallWorker(
+                build_twin,
+                workspace=None if workspace is None else workspace.workspace,
+                capability_names=[capability_def(capability_id).name for capability_id in handed],
+                report=report_hand_off,
+            )
+        built = build_agent(
+            spoken_spec if voice is not None else spec,
+            model_spec,
+            organization_id=ctx.organization_id,
+            agent_id=agent.id,
+            run_id=run.id,
+            conversation_id=run.conversation_id,
+            # The guard keeps a subject-less context stringifying to None, never "None".
+            user_id=None if audience_user_id is None else str(audience_user_id),
+            user_name=user_name,
+            audience=audience,
+            run_person=run_person,
+            impersonated=impersonated,
+            granted_scopes=DEFAULT_GRANTED_SCOPES,
+            resources=resources,
+            secrets=secrets,
+            reviewer_models=reviewer_models,
+            extra_toolsets=[
+                *(extra_toolsets or []),
+                *spec_toolsets,
+                *(() if hand_off is None else (hand_off.toolset(),)),
+            ],
+            extra_capabilities=() if on_use is None else (on_use,),
+            agent_period_spend=agent_period_spend,
+            org_period_spend=org_period_spend,
+            org_monthly_budget_usd=organization.monthly_budget_usd,
+            run_limit_usd=run_limit_usd,
+            group_limits=group_limits,
+            request_approval=channel,
+            gate_every_tool=approval_mode is ApprovalMode.ASK_ALL,
+            # Both from one read of the conversation (see
+            # `_recorded_conversation_state`): the request overhead, without which
+            # a one-request turn cannot tell a window with no room for a summary
+            # from one that works (#49), and how far the reminder cadence has
+            # advanced, so it counts across turns rather than resetting each one.
+            recorded_overhead=recorded.overhead,
+            recorded_reminder_state=recorded.reminder_state,
+            voice=None if voice is None else voice.options,
+        )
+
+        # Both only assignable now, and both before the run starts. The guard and
+        # the ledger are products of the build, while the runtime had to be inside
+        # the `resources` that build read - so the ordering is the one thing that
+        # cannot be arranged in a constructor. Every level of the tree shares the
+        # run's single ledger, which is what makes a delegation's spend visible to
+        # the parent's cap before the next request.
+        run_budget.guard = built.budget
+        for entry in runtimes:
+            entry.ledger = built.ledger
+
+        prepared = PreparedRun(
+            run=run,
+            agent=agent,
+            spec=spec,
+            built=built,
+            approvals=channel,
+            workspace=workspace,
+            hand_off=hand_off,
+            earlier_attachments_checked=(
+                checked_earlier
+                and workspace is not None
+                and not isinstance(workspace.workspace, RecordingWorkspace)
+            ),
+            materialised_skills=materialised,
+            mcp_origins=resolved.origins,
+            workspace_at_start=started_with,
+            automatic_outbound=surface not in _CHANNEL_SURFACES and channel_directory is None,
+            channel_context=(
+                restored_channel_context
+                if existing_run is not None
+                else ""
+                if channel_directory is None
+                else await resolve_prompt_variables(CHANNEL_CONTEXT, channel_directory)
+            ),
+            channel_authors=dict(restored_channel_authors or {}),
+            channel_file_budget=ChannelFileBudget(channel_file_attempts),
+            channel_destination=None
+            if channel_directory is None
+            else channel_directory.destination,
+            # Only personal gaps reach the chat's connect card - a prefix collision
+            # is the agent author's to fix by renaming a connection, not something
+            # the person talking connects an account for (#1442). Nor does one the
+            # run offers to connect on use: that card appears when it is used.
+            personal_service_gaps=[
+                personal_service_gap(gap)
+                for gap in briefed
+                if isinstance(gap, UnavailablePersonalService)
+            ],
+            delegations=delegations,
+            delegate_recorders=delegate_recorders,
+            stash=stash,
+            ctx=ctx,
+            plan_store=plan_store,
+            finished_plan_withheld=finished_plan_withheld,
+            admitted_as=AdmittedAs(
+                approval_mode=approval_mode,
+                local=local,
+                acts_for_sender=acts_for_sender,
+                audience_user_id=audience.user_id,
+                audience_room_key=audience.room_key,
+                audience_writes_memory=audience.writes_memory,
+                audience_searches_conversations=audience.searches_conversations,
+                audience_browses_signed_in=audience.browses_signed_in,
+                subject_is_publisher_fallback=subject_is_publisher_fallback,
+                public_origin=public_origin,
+                impersonated=impersonated,
+            ),
+        )
+        if channel_directory is not None:
+            built.deps.send_channel_file = channel_file_sender(
+                None if workspace is None else workspace.workspace,
+                channel_directory,
+                prepared.channel_file_budget,
+            )
+        if workspace is not None and isinstance(workspace.workspace, RecordingWorkspace):
+            _start_turn_on_first_use(
+                workspace.workspace,
+                prepared,
+                resources["skills"],
+                earlier=earlier,
+                can_parse=workspace.parses_documents,
+                checked_earlier=checked_earlier,
+            )
+        return prepared
+
+    async def _delegation_runtime(
+        self,
+        ctx: AuthContext,
+        *,
+        models_ctx: AuthContext,
+        spec: AgentSpec,
+        agent: Agent,
+        run: AgentRun,
+        surface: RunSurface,
+        user_name: str | None,
+        personal_mcp_user_id: UUID | None,
+        sender_present: bool,
+        resources: dict[str, Any],
+        approvals: ApprovalChannel,
+        budget: _RunBudget,
+        render_variables: Callable[[AgentSpec], AgentSpec],
+        runtimes: list[SubagentRuntime],
+        delegations: list[RecordedDelegation],
+        delegate_recorders: list[tuple[UUID, RunRecorder]],
+        stash: DelegationStash,
+        answering_call: VoiceOptions | None = None,
+    ) -> SubagentRuntime | None:
+        """The delegation tree this run may reach, or `None` if it delegates to none.
+
+        Resolved here, in full, before the run starts: a delegate is a row, its
+        pinned version is a row, and so are its collections, skills and secrets.
+        The capability that will use this holds no session, and the one this
+        service holds is shared by everything in the run and is not
+        concurrency-safe - so a tree walked at run time would be a query per
+        delegation from inside a tool call.
+
+        Args:
+            models_ctx: Who every model in the tree is resolved for: see
+                `_Delegation.models_ctx`.
+            resources: The run's own resource dict, from which a shared
+                capability's instance state travels to the delegates. Read, never
+                handed on: see :meth:`_delegate_resources`.
+            budget: The holder the delegates' build closures read the run's guard
+                out of, filled by `_assemble` once the build has produced one.
+            runtimes: Collects every level's runtime, so `_assemble` can give them
+                all the run's ledger in one pass.
+            delegations: Where the recorder leaves what it recorded, for `finish`
+                to write. Nothing is written while the run is going: see
+                :meth:`_delegation_recorder`.
+            stash: The run's parked delegations, in both directions - where a
+                delegate that stops for a person leaves its place, and where a
+                continuation finds one. Given to every level of the tree, because
+                the run being continued is the one somebody started however deep
+                the delegation that parked it was.
+            answering_call: The call the tree works for, when it is a call's
+                text twin that delegates (#54): see `_Delegation.answering_call`.
+
+        Raises:
+            BadRequestError: If a pin names a version that is gone, if a delegate
+                is already running higher up the tree, or if two delegates answer
+                to one name. All three refuse the run rather than narrowing it: a
+                missing collection makes an answer worse, but a delegation nobody
+                can explain makes the run untrustworthy.
+        """
+        config = _delegation_config(spec)
+        if config is None:
+            return None
+
+        attribution: dict[UUID, ModelRequestSpec] = {}
+        delegation = _Delegation(
+            ctx=ctx,
+            models_ctx=models_ctx,
+            run=run,
+            surface=surface,
+            agent_id=agent.id,
+            # Not `str(ctx.user_id)`: a context with no subject would stringify to
+            # the literal "None" and hand it to every delegate's tools as the
+            # caller's id, for the reason `_assemble` says at greater length.
+            user_id=None if ctx.user_id is None else str(ctx.user_id),
+            user_name=user_name,
+            personal_mcp_user_id=personal_mcp_user_id,
+            sender_present=sender_present,
+            approvals=approvals,
+            budget=budget,
+            render_variables=render_variables,
+            record=self._delegation_recorder(run=run, attribution=attribution, queued=delegations),
+            queued=delegations,
+            recorders=delegate_recorders,
+            attribution=attribution,
+            runtimes=runtimes,
+            stash=stash,
+            output_screen=_output_screen(spec),
+            answering_call=answering_call,
+        )
+        # `max_depth` counts levels of delegation *including this agent's own*, so
+        # the budget left below this level is one less. The subtraction is the whole
+        # of the setting's meaning and reads like an off-by-one, so: at `max_depth=1`
+        # nothing is left, and every delegate is built without the capability - this
+        # agent delegates and its delegates do not, which is what the field says and
+        # what an author reads in the Builder. Without it, the documented behaviour
+        # of `1` was what `0` did, and the default shipped one nested level of
+        # delegation nobody asked for - which is the unbounded-cost path the whole
+        # ceiling exists to close.
+        depth_remaining = config.max_depth - 1
+        subagents = await self._resolve_delegates(
+            delegation,
+            spec=spec,
+            config=config,
+            resources=resources,
+            depth_remaining=depth_remaining,
+            depth=0,
+            ancestors=frozenset({agent.id}),
+        )
+        return _register_runtime(
+            delegation,
+            subagents,
+            depth_remaining=depth_remaining,
+            depth=0,
+            dynamic=await self._dynamic_specialists(
+                delegation,
+                config,
+                trace_content=spec.trace_content,
+                named=models_a_run_reaches(spec),
+            ),
+        )
+
+    async def _dynamic_specialists(
+        self,
+        delegation: _Delegation,
+        config: SubagentsConfig,
+        *,
+        trace_content: TraceContent,
+        named: frozenset[UUID],
+    ) -> DynamicSpecialists | None:
+        """Whether one agent in the tree may invent specialists, and how it builds one.
+
+        `None` for every agent whose author left `allow_dynamic` off, which is the
+        default and is most of them - and then the delegation capability offers
+        neither dynamic entry point at all, rather than two tools that can only
+        refuse.
+
+        This is where the setting is read, and the only place: the capability reads
+        the *result* off `SubagentRuntime.dynamic`. Two readers would be two
+        answers to "may this agent invent a specialist", and the one that mattered
+        would be whichever ran later.
+
+        `named` is the profiles this agent's own author chose (`_model_catalog`).
+        Also `None` when no model is left to invent one on - an override onto a
+        model elsewhere, with the one the spec names refused to this caller -
+        because the delegation library reads an empty list of allowed models as
+        "any model at all".
+        """
+        if not config.allow_dynamic:
+            return None
+        profiles = await self._model_catalog(delegation, named)
+        if not profiles:
+            return None
+        return DynamicSpecialists(
+            build=_dynamic_builder(delegation, profiles=profiles, trace_content=trace_content),
+            allowed_models=tuple(profiles),
+        )
+
+    async def _model_catalog(
+        self, delegation: _Delegation, named: frozenset[UUID]
+    ) -> Mapping[str, ModelRequestSpec]:
+        """Every model a dynamic specialist may run on, resolved and keyed by label.
+
+        Resolved rather than listed, because a specialist has to be *built* from
+        inside a tool call, on a session the whole run shares - so the credential
+        has to be out of the vault before the run starts, exactly as a pinned
+        delegate's is. That is a query and an unseal per profile, which is why it
+        happens only for an agent whose author asked for dynamic specialists, and
+        the listing only once per run.
+
+        The label is the handle, because it is what the Builder shows an author,
+        what an organization's models are unique by, and therefore the only name a
+        model can be given that a profile can be found from. A provider-qualified
+        model id would be a second namespace, and one the model would be guessing
+        at.
+
+        Two consequences worth naming rather than leaving to be discovered. Every
+        credential in the catalog is unsealed before the run starts, whether or not
+        a specialist is ever invented - the price of the model being able to choose
+        at all, and the reason this is not resolved for every agent. And it widens
+        what a reviewed agent may run a specialist on to the organization's models,
+        not only the one its author chose for itself; the run's own caps still
+        bind, so what varies is the price of a request rather than the ceiling on
+        the run. A model profile has no per-row grants to resolve - it is
+        organization-scoped configuration, and `list_profiles` is scoped to the
+        organization the run is in.
+
+        Except a ChatGPT sign-in, which is one person's subscription. A run spends
+        one for anybody who may see it in the vault - its owner, whoever it is
+        shared with, the organization's owners and admins - so offered here, a
+        specialist the model invents would spend that person's plan on an agent
+        nobody chose it for. A profile on a sign-in, or one whose fallbacks reach
+        one (`reaches_a_sign_in`, since `resolve` follows them), is offered only
+        when it is in `named`: the profiles the delegating agent's own published
+        spec names (`models_a_run_reaches`), without what its parent shares with
+        it. Its author chose those, and publish held them to being allowed to
+        (#2546).
+
+        A profile that does not resolve is left out with a warning rather than
+        failing the run - its key deleted (`BadRequestError`), the row itself gone
+        between this listing and this resolution (`NotFoundError`), or a sign-in
+        the person running the agent may not spend (`AuthorizationError`: an API
+        key's holder, a widget visitor, a member it is not shared with). The
+        alternative is one model in a catalog of ten stopping an agent that names
+        none of it, which is the same reasoning `resolve` already applies to a
+        fallback chain. The result can be empty - see `_dynamic_specialists`.
+
+        Every profile is resolved for `_Delegation.models_ctx`, the run's own
+        person, so a resume does not resolve it for the approver.
+        """
+        catalog = delegation.catalog
+        if catalog.rows is None:
+            catalog.rows = await self.models.list_profiles(delegation.ctx)
+        by_id = {profile.id: profile for profile in catalog.rows}
+        offered: dict[str, ModelRequestSpec] = {}
+        for profile in catalog.rows:
+            # A specialist on a speech or embedding model would fail on its
+            # first turn (#2487).
+            if not model_outputs(profile.provider, profile.model, base_url=profile.base_url).chat:
+                continue
+            if profile.id not in named and reaches_a_sign_in(profile, by_id):
+                continue
+            if profile.id not in catalog.resolved:
+                catalog.resolved[profile.id] = await self._catalog_entry(
+                    delegation.models_ctx, profile
+                )
+            if (resolved := catalog.resolved[profile.id]) is not None:
+                offered[profile.label] = resolved
+        return offered
+
+    async def _catalog_entry(
+        self, ctx: AuthContext, profile: ModelProfile
+    ) -> ModelRequestSpec | None:
+        """One profile of `_model_catalog`, resolved - or `None`, logged, if it does not."""
+        try:
+            return await self.models.resolve(ctx, profile_id=profile.id)
+        except BadRequestError, NotFoundError, AuthorizationError:
+            logger.warning(
+                "model_profile_not_usable_for_dynamic_specialists",
+                extra={"profile_id": str(profile.id), "label": profile.label},
+            )
+            return None
+
+    async def _resolve_delegates(
+        self,
+        delegation: _Delegation,
+        *,
+        spec: AgentSpec,
+        config: SubagentsConfig,
+        resources: dict[str, Any],
+        depth_remaining: int,
+        depth: int,
+        ancestors: frozenset[UUID],
+    ) -> list[ResolvedSubagent]:
+        """Every delegate one agent in the tree may address, resolved.
+
+        `spec` and `config` belong to the agent that is *delegating* - the run's
+        own at the top, a published delegate's one level down - which is what
+        makes this one walk rather than two that drift apart. `ancestors` carries
+        the agent ids already running above this point, `depth_remaining` how
+        much further the tree may go, and `depth` how far in it already is - which
+        is what a surface needs to nest a delegation panel under the right parent.
+
+        Inline specialists come first only so the order is stable; the model
+        addresses a delegate by name, and the name is refused if two share it.
+
+        Delegation is never shared, whatever the share list says. Publish
+        validation refuses the id (`_share_problems`), and this drops it again
+        because a spec published before that rule existed is still stored and
+        still runs: sharing it would copy this agent's binding onto a delegate
+        that binds none, and `_delegation_config` would then read the *parent's*
+        specialists, fan-out and `allow_dynamic` as if the delegate's author had
+        chosen them.
+        """
+        share = set(config.share_with_delegates) - {DELEGATION_CAPABILITY_ID}
+        shared = [
+            binding for binding in spec.capabilities if binding.enabled and binding.id in share
+        ]
+        resolved: list[ResolvedSubagent] = []
+        for specialist in config.inline:
+            resolved.append(
+                await self._resolve_specialist(
+                    delegation,
+                    specialist=specialist,
+                    parent=spec,
+                    shared=shared,
+                    resources=resources,
+                )
+            )
+        for ref in spec.subagents:
+            resolved.append(
+                await self._resolve_delegate(
+                    delegation,
+                    ref=ref,
+                    shared=shared,
+                    resources=resources,
+                    depth_remaining=depth_remaining,
+                    depth=depth,
+                    ancestors=ancestors,
+                )
+            )
+        if spec.external_agents:
+            resolved.extend(await self._resolve_external(delegation, spec.external_agents))
+        _refuse_duplicate_names(resolved)
+        return resolved
+
+    async def _resolve_external(
+        self, delegation: _Delegation, refs: Sequence[ExternalAgentRef]
+    ) -> list[ResolvedSubagent]:
+        """Remote A2A agents, each a delegate that sends its task over the wire (#2092).
+
+        A registration that was removed since publish fails the run, naming it, as
+        a pin to a vanished version does: delegating to "whatever is there now"
+        is not what was published. Its credential is unsealed now, like every
+        secret a run holds, and goes nowhere but its own endpoint.
+        """
+        ctx = delegation.ctx
+        rows = await external_agent_repo.get_many(
+            self.db, [ref.external_agent_id for ref in refs], organization_id=ctx.organization_id
+        )
+        missing = [str(ref.external_agent_id) for ref in refs if ref.external_agent_id not in rows]
+        if missing:
+            raise BadRequestError(
+                message="A remote agent this agent delegates to is no longer registered",
+                details={"external_agent_ids": missing},
+            )
+        secret_ids = [row.secret_id for row in rows.values() if row.secret_id is not None]
+        secrets = await self.secrets.resolve_for_bindings(ctx, secret_ids)
+        resolved: list[ResolvedSubagent] = []
+        for ref in refs:
+            row = rows[ref.external_agent_id]
+            secret = secrets.get(row.secret_id) if row.secret_id is not None else None
+            bearer = secret.api_key.get_secret_value() if isinstance(secret, ApiKeySecret) else None
+            resolved.append(
+                ResolvedSubagent(
+                    name=row.slug,
+                    description=row.description or row.name,
+                    build=a2a_delegate(
+                        handle=row.slug,
+                        endpoint=row.endpoint_url,
+                        card_url=row.card_url,
+                        bearer=bearer,
+                    ),
+                    preferred_mode=ref.preferred_mode,
+                )
+            )
+        return resolved
+
+    async def _resolve_specialist(
+        self,
+        delegation: _Delegation,
+        *,
+        specialist: SpecialistSpec,
+        parent: AgentSpec,
+        shared: list[CapabilityBindingSpec],
+        resources: dict[str, Any],
+    ) -> ResolvedSubagent:
+        """One inline specialist, built by the factory every agent goes through.
+
+        `to_agent_spec` is what keeps "one spec type, one builder" true rather
+        than aspirational: a specialist is a typed subset of `AgentSpec`, so the
+        way to build one is to say which agent it is. It runs on the delegating
+        agent's model profile when it names none, which is both the least
+        surprising answer and the only one that works when the parent's profile is
+        the only one the author chose.
+
+        It resolves its **own** collections, skills and secrets. Delegation is
+        stripped: a specialist does not delegate further - nesting is bounded for
+        published delegates, which are reviewable - and a spec that bound the
+        capability anyway would offer a tool with nothing behind it.
+
+        `agent_id` and `agent_version_id` are left unset, which is what tells the
+        recorder there is no agent to attribute a run row to. Its cost is the
+        parent's, and the tool call in the transcript is the record.
+
+        The parent's trace-content mode comes with it. A specialist has no Logfire
+        project of its own and gains none here, but `content="none"` is a promise
+        about the run rather than about one agent in it, and a specialist whose
+        spec carried no observability block at all was instrumented by the
+        deployment's global default with content on (#1699).
+        """
+        ctx = delegation.ctx
+        spec = _without_delegation(
+            _with_shared(
+                specialist.to_agent_spec(
+                    fallback_model_profile_id=parent.model_profile_id,
+                    trace_content=parent.trace_content,
+                ),
+                shared,
+            )
+        )
+        own_resources = await self._delegate_resources(
+            ctx, spec, shared=shared, parent_resources=resources
+        )
+        return ResolvedSubagent(
+            name=specialist.name,
+            description=specialist.description,
+            build=_delegate_builder(
+                delegation,
+                spec=spec,
+                model=await self.models.resolve(
+                    delegation.models_ctx, profile_id=spec.model_profile_id
+                ),
+                agent_id=delegation.agent_id,
+                resources=own_resources,
+                secrets=await self.secrets.resolve_for_bindings(ctx, _secret_ids(spec)),
+                # A specialist has no MCP connections. They are
+                # organization-scoped configuration, and reaching one through a
+                # specialist nobody published is the wrong door - bind it on the
+                # parent and share it.
+                extra_toolsets=[],
+            ),
+            max_steps=specialist.max_steps,
+            preferred_mode=specialist.preferred_mode,
+            workspace=_delegate_workspace(spec, shared),
+            collection_names=tuple(own_resources["kb_collection_names"]),
+            collection_scopes=tuple(own_resources["kb_vector_scopes"].items()),
+        )
+
+    async def _resolve_delegate(
+        self,
+        delegation: _Delegation,
+        *,
+        ref: SubagentRef,
+        shared: list[CapabilityBindingSpec],
+        resources: dict[str, Any],
+        depth_remaining: int,
+        depth: int,
+        ancestors: frozenset[UUID],
+    ) -> ResolvedSubagent:
+        """One published delegate, on the version it is pinned to.
+
+        The pin is loaded directly rather than through `get_runnable_spec`, and
+        that is what pinning means: `get_runnable_spec` resolves an
+        *environment*, so a delegate would otherwise follow the parent's, and the
+        same published parent would run a different delegate in `dev` than in
+        production with nothing recording that anything differed.
+
+        Its name is the delegate's `slug`, which is the agent's one public
+        handle: it is what a channel mention resolves, what the Builder shows the
+        author beside the pin, and it is unique per organization by database
+        constraint (`uq_agent_org_slug`). Slugifying the pinned spec's *name*
+        instead would be a second handle for one concept - stable, but neither
+        unique (two names can slugify alike, which the constraint would never
+        have allowed) nor the name the author was shown, so instructions saying
+        "delegate to research-bot" would address something the model was never
+        offered. The row owns the slug: `save_draft` updates `name` and never
+        `slug`, so it does not move when the agent is renamed either.
+
+        `AGENTS_RUN` on the delegate was checked when the parent was published; a
+        delegation is not a privilege boundary, and re-checking it per caller
+        would make the same published agent work for one person and not another -
+        so the row is read tenant-scoped rather than through the registry.
+
+        Its **status** is another matter, and is checked. Archiving is this
+        product's one take-out-of-service action: `get_runnable_spec` refuses a
+        direct run of an archived agent and `_resolve_pins` refuses a pin to one
+        at publish. An agent archived *after* a parent pinned it would otherwise
+        keep answering as that parent's delegate indefinitely - the caller hardest
+        to notice, and the one whose author has already been told the agent is
+        retired. This is a lifecycle check on the delegate, not the per-caller
+        permission re-check the paragraph above declines to do: it answers the
+        same way for everyone who runs the parent.
+
+        Raises:
+            BadRequestError: If the delegate or its pinned version is gone or
+                belongs to another organization, if the delegate has been
+                archived, if the pin names a version of a different agent, or if
+                this delegate is already running higher up the tree.
+        """
+        ctx = delegation.ctx
+        if ref.agent_id in ancestors:
+            # Pinning makes a cycle hard to reach by accident - a pin cannot name
+            # a version published after it - but not impossible, and a cycle at
+            # run time is a run that ends when the step limit does, having spent
+            # everything up to it.
+            raise BadRequestError(
+                message="An agent cannot delegate to one already running in this run",
+                details={"agent_id": str(ref.agent_id), "run_id": str(delegation.run.id)},
+            )
+        delegate = await agent_repo.get(self.db, ref.agent_id, organization_id=ctx.organization_id)
+        if delegate is None:
+            # Deleted since the parent was published, or never in this
+            # organization. Refused rather than run from the pinned spec alone:
+            # the row is where the handle the parent addresses it by lives, and a
+            # delegate nobody can name is a delegate nobody can call.
+            raise BadRequestError(
+                message="A delegate this agent is pinned to no longer exists",
+                details={"agent_id": str(ref.agent_id)},
+            )
+        if delegate.status == AgentStatus.ARCHIVED.value:
+            # Named, unlike the two refusals around it: the pin was valid when it
+            # was published and somebody has since retired the delegate, so the
+            # fix is to unarchive it or republish the parent without it.
+            raise BadRequestError(
+                message=f"A delegate this agent is pinned to, '{delegate.name}', is archived",
+                details={"agent_id": str(ref.agent_id), "slug": delegate.slug},
+            )
+        version = await agent_repo.get_version(
+            self.db, ref.agent_version_id, organization_id=ctx.organization_id
+        )
+        if version is None or version.agent_id != ref.agent_id:
+            # Never a fall back to the delegate's current version. The reason to
+            # pin is that nothing changes without somebody deciding, and a silent
+            # upgrade is worse than a refusal because nobody finds out.
+            raise BadRequestError(
+                message="The pinned version of one of this agent's delegates no longer exists",
+                details={
+                    "agent_id": str(ref.agent_id),
+                    "agent_version_id": str(ref.agent_version_id),
+                },
+            )
+
+        published = AgentSpec.model_validate(version.spec)
+        pinned = _with_shared(published, shared)
+        pinned = await self.registry.with_assistant_guidance(delegate, pinned)
+        delegate_resources = await self._delegate_resources(
+            ctx, pinned, shared=shared, parent_resources=resources
+        )
+        runnable = pinned
+        nested_config = _delegation_config(pinned)
+        if nested_config is not None:
+            if depth_remaining > 0:
+                # The more restrictive of the two ceilings, and the reason there are
+                # two: what the tree has left below this level, and what *this
+                # delegate's* author allowed. `depth_remaining - 1` alone took only
+                # the root's, so a caller with `max_depth=3` handed a delegate whose
+                # own spec says 1 enough budget for its delegates to delegate again
+                # - the delegate's reviewed ceiling exceeded by a caller it has
+                # never seen, and a ceiling a caller can widen is not a ceiling.
+                # `max_depth - 1` because that field counts the configured agent's
+                # own level, exactly as it does at the top of the tree in
+                # `_subagent_runtime`; both are at least 0, since the field is
+                # validated `ge=1`.
+                nested_remaining = min(depth_remaining - 1, nested_config.max_depth - 1)
+                delegate_resources[SUBAGENT_RUNTIME_RESOURCE] = _register_runtime(
+                    delegation,
+                    await self._resolve_delegates(
+                        delegation,
+                        spec=pinned,
+                        config=nested_config,
+                        resources=delegate_resources,
+                        depth_remaining=nested_remaining,
+                        depth=depth + 1,
+                        ancestors=ancestors | {ref.agent_id},
+                    ),
+                    depth_remaining=nested_remaining,
+                    depth=depth + 1,
+                    # This delegate's own setting, not its caller's. A published
+                    # delegate is reviewed on its own spec, so whether it may
+                    # invent specialists is a question its author answered - and
+                    # `nested_config` is that answer only because delegation is
+                    # the one capability `_resolve_delegates` will not share.
+                    # Shared, the parent's binding would land on a delegate that
+                    # binds none and be read here as the delegate's own.
+                    # And its own trace-content mode, for the same reason: a
+                    # published delegate carries an observability block of its
+                    # own, so what a specialist it invents may record is its
+                    # author's answer rather than its caller's. And the sign-ins
+                    # its own author named, not those a binding its caller shares
+                    # runs on: nobody publishing this delegate chose them (#2546).
+                    dynamic=await self._dynamic_specialists(
+                        delegation,
+                        nested_config,
+                        trace_content=pinned.trace_content,
+                        named=models_a_run_reaches(published),
+                    ),
+                )
+            else:
+                # The bound. Built without the capability rather than with one
+                # that refuses: see `_without_delegation`. Which also closes the
+                # dynamic entry points - a delegate at the bound may not invent a
+                # specialist either, because a specialist is a level like any
+                # other.
+                runnable = _without_delegation(pinned)
+
+        runnable = _with_channel_mcp_approval(
+            runnable, delegation.surface, linked_sender=delegation.personal_mcp_user_id is not None
+        )
+        model = await self.models.resolve(
+            delegation.models_ctx, profile_id=runnable.model_profile_id
+        )
+        # Recorded now so the child's run row can name the model that answered.
+        delegation.attribution[ref.agent_version_id] = model
+        resolved = await build_toolsets_for_agent(
+            self.db,
+            organization_id=ctx.organization_id,
+            refs=runnable.mcp_servers,
+            sender_user_id=delegation.personal_mcp_user_id,
+            # The run's own person, as for the parent: on a resume `ctx` is the
+            # approver's, and a delegate must not carry their authority either.
+            platform_credential=await self._platform_credential(runnable, ctx, delegation.run),
+        )
+        toolsets = resolved.toolsets
+        # Briefed like the parent: a delegate may bind a service the parent does
+        # not, and one that lost it silently would report failure where the
+        # parent could have relayed "connect your Notion" instead.
+        runnable = _with_personal_service_gaps(
+            runnable,
+            resolved.unavailable,
+            delegation.surface,
+            sender_present=delegation.sender_present,
+        )
+        runnable = _with_account_notes(runnable, resolved.accounts)
+        secrets = await self.secrets.resolve_for_bindings(ctx, _secret_ids(runnable))
+        return ResolvedSubagent(
+            name=delegate.slug,
+            # What the parent's model reads before deciding to delegate. The name
+            # is the fallback because a delegate with no description still has to
+            # be describable - "helper" gets ignored, but an empty string is not
+            # a choice the model can act on at all.
+            description=pinned.description or pinned.name,
+            build=_delegate_builder(
+                delegation,
+                spec=runnable,
+                model=model,
+                agent_id=ref.agent_id,
+                resources=delegate_resources,
+                secrets=secrets,
+                extra_toolsets=toolsets,
+                reviewer_models=await self._reviewer_models(ctx, runnable),
+            ),
+            max_steps=runnable.max_steps,
+            preferred_mode=ref.preferred_mode,
+            workspace=_delegate_workspace(runnable, shared),
+            agent_id=ref.agent_id,
+            agent_version_id=ref.agent_version_id,
+            # Beside the agent as well as inside its deps, because the library
+            # replaces those deps with a clone of the parent's - see
+            # `ResolvedSubagent.collection_names`.
+            collection_names=tuple(delegate_resources["kb_collection_names"]),
+            collection_scopes=tuple(delegate_resources["kb_vector_scopes"].items()),
+        )
+
+    async def _delegate_resources(
+        self,
+        ctx: AuthContext,
+        spec: AgentSpec,
+        *,
+        shared: list[CapabilityBindingSpec],
+        parent_resources: dict[str, Any],
+    ) -> dict[str, Any]:
+        """A resource dict of the delegate's own, resolved from the delegate's spec.
+
+        A fresh dict every time, and never the caller's. `build_agent` reads
+        `kb_collection_names` straight out of whatever it is given, and that dict
+        is mutable and shared for the length of the run - so handing a delegate
+        the parent's would silently grant it every collection the parent has, and
+        a specialist is a tempting place to reach a collection nobody granted
+        precisely because it does not look like an agent.
+
+        What does travel is the state a shared capability's instance depends on.
+        For `sandbox` that is the workspace and the spill log, for the one
+        capability built before the run starts - the spill store of
+        `tool_output_limits` - so a delegate's spills land in the files it shares.
+        The delegation runs in the parent's workspace itself because
+        `ResolvedSubagent.workspace` says `parent` (`_delegate_workspace`).
+
+        Two consequences worth stating, because both are silent. A delegate that
+        binds `sandbox` itself *and* is shared the parent's gets its own tool
+        configuration over the parent's session - sharing a workspace means
+        sharing the files, and a delegate reading a different filesystem is the
+        thing sharing exists to prevent. And a delegate that binds `sandbox`
+        without being shared one gets a fresh in-memory workspace, because no
+        workspace is opened per delegate: only the run has one. Sharing is how a
+        delegate reaches a durable workspace at all.
+        """
+        resources: dict[str, Any] = {
+            **await self._bound_collections(spec, ctx),
+            "skills": await self.skills.resolve_for_agent(ctx, spec.skill_ids),
+            CONTEXT_FILES_RESOURCE: await self.context.resolve_for_agent(
+                ctx, spec.context_ids, config=context_config(spec.capabilities)
+            ),
+        }
+        if any(binding.id == SANDBOX_CAPABILITY_ID for binding in shared):
+            resources[WORKSPACE_RESOURCE] = parent_resources.get(WORKSPACE_RESOURCE)
+            resources[WORKSPACE_SHARED_RESOURCE] = parent_resources.get(WORKSPACE_SHARED_RESOURCE)
+            # And the spill log with it: a delegate spilling to the shared
+            # filesystem must record its handles where the workspace's close can
+            # delete them (#803).
+            resources[SPILL_LOG_RESOURCE] = parent_resources.get(SPILL_LOG_RESOURCE)
+        return resources
+
+    async def _workspace_shared(
+        self, ctx: AuthContext, scope: str, conversation_id: UUID | None
+    ) -> bool:
+        """Whether other people's runs work in this run's workspace too.
+
+        Always for a project's, an agent's or a channel's. For a conversation's,
+        once somebody it is shared with to edit may write in it: their turns run
+        in the same container.
+        """
+        if scope in SHARED_SCOPES:
+            return True
+        if scope != "conversation" or conversation_id is None:
+            return False
+        shares = await conversation_share_repo.get_shares_for_conversation(
+            self.db, conversation_id, organization_id=ctx.organization_id
+        )
+        return any(share.shared_with is not None and share.permission == "edit" for share in shares)
+
+    @staticmethod
+    def _delegation_recorder(
+        *,
+        run: AgentRun,
+        attribution: Mapping[UUID, ModelRequestSpec],
+        queued: list[RecordedDelegation],
+    ) -> DelegationRecorder:
+        """How a finished delegation becomes a run row of its own - eventually.
+
+        **Nothing here touches the database, and that is the whole design.** The
+        request's `AsyncSession` is shared by everything in the run and is not
+        concurrency-safe, and two delegations can be in flight at once *in `sync`
+        mode*: a `sync` delegation holds its own tool call, but pydantic-ai runs
+        several tool calls from one model response concurrently, so a parent whose
+        model emits two `task` calls in one step overlaps two of them without
+        either being asynchronous - and `parallel_tool_calls` is unset by default,
+        so that is the provider's decision, not the author's. Two inserts on that
+        session at once do not produce a slow query; they corrupt the session and
+        take the parent's run row and the conversation with it. `max_fanout` bounds
+        how many delegations there are, not whether they overlap.
+
+        So the delegation is *described* here and written by
+        :meth:`_write_delegations` from the run's single terminal write. The id is
+        allocated here so the return value still answers the question the surface
+        asks it - which run history entry does this delegation panel link to - and
+        the row it names appears when the run ends.
+
+        Only a delegation to a *published* agent is recorded. An inline specialist
+        has no agent to attribute a row to - it is not versioned, nothing else can
+        reference it, and inventing an identity for it would create a second notion
+        of "agent" that the permission model cannot see. Its cost is the parent's,
+        and the tool call in the transcript is the record.
+
+        What the row is for: the delegate's own monthly total, which is otherwise
+        unanswerable, and the run history entry a delegation panel links to. It is
+        deliberately *not* part of the organization's monthly total - the parent's
+        row already contains these tokens, because a run has one ledger - and
+        `agent_run_repo.sum_cost_since` is where that division lives.
+
+        The span is the delegation's own, off the task handle: `started_at` when
+        the delegate started and `ended_at` when it reached a terminal status,
+        carried through :class:`DelegationOutcome`. Neither is the settlement
+        instant, which for a background delegation is the poll that collected it -
+        arbitrarily later than the delegate finished, and what once gave every
+        background row a duration of zero ordered after work that preceded it
+        (agenticos#191). A delegation that parked on an approval and resumed spans
+        both turns: `started_at` is the first segment's, carried across the park the
+        way its cost is, and `ended_at` the last (agenticos#245). A terminal handle
+        that ended without a start - a delegate cancelled or failed before executing
+        - falls back to that end, and a handle carrying neither falls back to `now`:
+        both columns are non-null and a delegation with no recorded span still has
+        to write one. (A refusal *before* a handle exists writes no row at all -
+        :meth:`DelegationJournal.settle` returns first.) The parent's row remains the
+        authority on the run's real span.
+        """
+
+        async def record(outcome: DelegationOutcome) -> UUID | None:
+            if outcome.agent_id is None or outcome.agent_version_id is None:
+                return None
+            model = attribution.get(outcome.agent_version_id)
+            if model is None:
+                # A delegation to something this run never resolved. Nothing here
+                # can say what it was or what it ran on, and a row attributed by
+                # guess is worse than no row: it would count towards a real
+                # agent's monthly total.
+                logger.warning(
+                    "delegation_outcome_for_unresolved_delegate",
+                    extra={"run_id": str(run.id), "subagent": outcome.subagent},
+                )
+                return None
+
+            # The delegation's own span, off the handle. `now` only when the handle
+            # carried none - a delegation the library refused before it started a
+            # task never ran, and both columns are non-null. `ended_at` falls back
+            # to the start rather than to `now`, so a handle missing its end reads
+            # as a zero-duration run at the right time, never a negative span.
+            now = datetime.now(UTC)
+            started_at = outcome.started_at or outcome.ended_at or now
+            ended_at = outcome.ended_at or started_at
+            delegated = RecordedDelegation(
+                id=uuid4(),
+                agent_id=outcome.agent_id,
+                agent_version_id=outcome.agent_version_id,
+                task_id=outcome.task_id,
+                status=(
+                    RunStatus.LOOP_STOPPED
+                    if outcome.loop_stopped
+                    else _DELEGATION_RUN_STATUS[outcome.status]
+                ),
+                model_label=model.label,
+                provider=model.provider,
+                secret_id=model.secret_id,
+                input_tokens=outcome.input_tokens,
+                output_tokens=outcome.output_tokens,
+                cache_read_tokens=outcome.cache_read_tokens,
+                cache_write_tokens=outcome.cache_write_tokens,
+                cost_usd=outcome.cost_usd,
+                # Whether *this delegation's* own requests were priced, not the
+                # run's. A parent on a model `genai-prices` does not know makes the
+                # parent's row a floor and says nothing about a delegate that ran
+                # on a priced one.
+                cost_is_partial=outcome.cost_is_partial,
+                started_at=started_at,
+                ended_at=ended_at,
+                error=outcome.error,
+            )
+            # `append` is atomic under the GIL and this coroutine never awaits, so
+            # two overlapping delegations cannot interleave inside it. That is the
+            # property the queue buys: no lock, and no database.
+            queued.append(delegated)
+            return delegated.id
+
+        return record
+
+    async def _write_delegations(self, prepared: PreparedRun) -> None:
+        """Write the rows the run's delegations left behind.
+
+        Called from the same place the parent's row is written, which is the run's
+        one terminal write and the only point at which the session is certainly
+        not being shared with a tool call.
+
+        Ordered after the parent's row on purpose: these rows carry
+        `parent_run_id`, so the row they point at has to exist. It does - `_assemble`
+        inserts it before the run starts - and the parent's own accounting is
+        written first regardless, because that row is the authority for what the run
+        cost while a child row is attribution.
+
+        Never raises. It shares a `finally` with the parent's cost row, and a
+        delegate deleted mid-run would otherwise turn a completed run into a
+        storage error; the money is on the parent's row either way. The same
+        reasoning, and the same guard, as :meth:`_propose_skill_changes`.
+
+        Catching the exception is not enough on its own, which is why each row
+        goes in inside its own savepoint. `agent_runs.agent_id` is a foreign key,
+        so a delegate deleted between resolution and here makes the insert fail
+        *in Postgres* - and an aborted transaction refuses every statement after
+        it, including the commit. Guarding the loop with one `try` therefore
+        destroyed exactly what it was written to protect: the parent's finished
+        row and its cost rolled back with the child row that could not be
+        written, and the delegations after it were never attempted. A savepoint
+        per delegation loses that one row and nothing else.
+        """
+        parent = prepared.run
+        # One delegate's agent is built once per run, however often it is called,
+        # so its busts are known per agent: they go on its first row, whose agent
+        # and model are what the Spend card groups by.
+        unclaimed: dict[UUID, list[RunRecorder]] = {}
+        for agent_id, recorder in prepared.delegate_recorders:
+            if agent_id != parent.agent_id:
+                unclaimed.setdefault(agent_id, []).append(recorder)
+        for delegation in prepared.delegations:
+            cache = tally(*unclaimed.pop(delegation.agent_id, []))
+            try:
+                async with self.db.begin_nested():
+                    await agent_run_repo.record_delegated_run(
+                        self.db,
+                        run_id=delegation.id,
+                        organization_id=parent.organization_id,
+                        agent_id=delegation.agent_id,
+                        agent_version_id=delegation.agent_version_id,
+                        parent_run_id=parent.id,
+                        subagent_task_id=delegation.task_id,
+                        # Read off the parent's row rather than kept on the queued
+                        # record: they describe the run, not the delegation, and two
+                        # copies of one fact drift.
+                        user_id=parent.user_id,
+                        # Whose turn it was: a delegation made for an unlinked
+                        # sender is theirs as much as the run that made it, and
+                        # without these it read as the publisher's own.
+                        initiated_by_publisher_fallback=parent.initiated_by_publisher_fallback,
+                        channel_identity_id=parent.channel_identity_id,
+                        conversation_id=parent.conversation_id,
+                        # The binding that admitted the run admitted this too, so "what
+                        # has this Slack app spent" keeps a delegated turn.
+                        exposure_id=parent.exposure_id,
+                        surface=parent.surface,
+                        model_label=delegation.model_label,
+                        provider=delegation.provider,
+                        secret_id=delegation.secret_id,
+                        status=delegation.status.value,
+                        input_tokens=delegation.input_tokens,
+                        output_tokens=delegation.output_tokens,
+                        cache_read_tokens=delegation.cache_read_tokens,
+                        cache_write_tokens=delegation.cache_write_tokens,
+                        cost_usd=delegation.cost_usd,
+                        cost_is_partial=delegation.cost_is_partial,
+                        started_at=delegation.started_at,
+                        ended_at=delegation.ended_at,
+                        error=delegation.error,
+                        cache_busts=cache.busts,
+                        cache_expiries=cache.expiries,
+                        cache_missed_tokens=cache.missed_tokens,
+                    )
+            except Exception:
+                logger.exception(
+                    "delegation_row_not_written",
+                    extra={"run_id": str(parent.id), "delegation_id": str(delegation.id)},
+                )
+
+    async def _write_approvals(self, prepared: PreparedRun, *, include_pending: bool) -> None:
+        """Write the approval rows the run parked, once, off the shared session.
+
+        The rows are *described* while the run runs and written here, from the
+        run's terminal write - the one point at which the session is certainly not
+        being shared with a concurrent tool call. Parking a call on the channel
+        touches no database precisely so that two gated calls in one model step
+        cannot race two inserts on the request's `AsyncSession` (agenticos#169);
+        this is where that deferral is paid back. The loop is sequential, so the
+        writes it makes do not race each other either.
+
+        Unlike :meth:`_write_delegations`, a failure here is not swallowed. A
+        delegation row is attribution - the money is on the parent's row whether or
+        not the child row lands - but an approval row is what a resume reads to
+        learn a call is waiting and what it was asked to approve. A parked run
+        missing one of its rows cannot be continued for that call, so a write that
+        fails has to fail the run rather than strand it awaiting a decision nothing
+        recorded.
+
+        The one failure that must *not* strand the run is a delegate deleted since
+        its call was parked. `subagent_agent_id` is a `SET NULL` foreign key -
+        deleting the delegate is meant to leave the record of what it was authorised
+        to do, not take it down - but that only fires for a delete that lands after
+        the row exists. Deferring the write widened the window to the whole run, so
+        a delete that lands *before* it would instead make the insert violate the
+        key and roll the parked run back. So the delegates still present are
+        resolved and locked first (:func:`agent_repo.existing_ids_locked`), and an
+        id whose agent is gone is written null - exactly what `SET NULL` would have
+        done - keeping the row, the delegate's name and the resumable run.
+
+        Each row is written with the id allocated when the call was parked, so it
+        matches the `paused_state` that names it and the :class:`ParkedApproval` a
+        surface already drew a card from. An unparked run leaves `requested` empty
+        and this does nothing.
+        """
+        channel = prepared.approvals
+        # A workspace failure can turn a parked run into a terminal failure.
+        # Keep standing-consent audit records, but never enqueue an impossible decision.
+        requested = [p for p in channel.requested if include_pending or p.standing]
+        named = {p.subagent_agent_id for p in requested if p.subagent_agent_id is not None}
+        present = await agent_repo.existing_ids_locked(
+            self.db, named, organization_id=channel.organization_id
+        )
+        for parked in requested:
+            await self.approvals.request(
+                approval_id=parked.approval_id,
+                organization_id=channel.organization_id,
+                run_id=channel.run_id,
+                agent_id=channel.agent_id,
+                # The tool the model called, not the capability that owns it: the
+                # approver is looking at "send_email", not at "email".
+                tool_id=parked.tool_name,
+                tool_args=parked.tool_args,
+                capability_tool_id=parked.capability_tool_id,
+                context=parked.context,
+                account=parked.account,
+                subagent_name=parked.subagent,
+                # Null when the delegate's agent was deleted after the call was
+                # parked: the record of what it was authorised to do outlives it.
+                subagent_agent_id=(
+                    parked.subagent_agent_id if parked.subagent_agent_id in present else None
+                ),
+                # Who consented in advance, for a call granted by standing consent
+                # rather than parked. `None` leaves the row pending, which is every
+                # other approval there has ever been.
+                standing_consent_by=(channel.standing_consent_by if parked.standing else None),
+            )
+
+    @staticmethod
+    async def _collect_outbound(prepared: PreparedRun) -> None:
+        """Collect files for surfaces with automatic delivery; channels use an explicit action."""
+        if not prepared.automatic_outbound:
+            return
+        if prepared.workspace is None or _untouched(prepared.workspace):
+            return
+        delivered = await files_written(prepared.workspace.workspace, prepared.workspace_at_start)
+        prepared.outbound.extend(delivered.attachments)
+        prepared.outbound_refused.extend(delivered.refused)
+
+    async def _propose_skill_changes(self, prepared: PreparedRun) -> None:
+        """Record what this run wrote to its skills, as something a person decides.
+
+        Never raises. It is called from the same `finally` that records what the
+        run cost, so a failure here - a name taken since, a workspace that cannot
+        be listed - must not replace whatever actually happened to the run.
+
+        The change is not applied. A skill is instructions every agent bound to it
+        follows on every run, so an agent that could edit one directly could
+        rewrite what another agent does, inside a conversation nobody is
+        reviewing. `app/db/models/skill_proposal.py` has the rest of the
+        reasoning.
+        """
+        workspace = prepared.workspace
+        state = prepared.materialised_skills
+        if workspace is None or state is None or prepared.ctx is None or _untouched(workspace):
+            return
+        run_id = str(prepared.run.id)
+        agent_id = prepared.agent.id
+        conversation_id = prepared.run.conversation_id
+        try:
+            changes = await collect_changes(workspace.workspace, state)
+            if changes:
+                # Optional proposals must not poison the transaction that still
+                # has to persist the run's terminal status and spend.
+                async with self.db.begin_nested():
+                    await self.proposals.record(
+                        prepared.ctx,
+                        changes,
+                        agent_id=agent_id,
+                        conversation_id=conversation_id,
+                    )
+        except Exception:
+            logger.exception("skill_proposal_record_failed", extra={"run_id": run_id})
+
+    async def keep_plan(self, prepared: PreparedRun, *, status: RunStatus) -> None:
+        """Store the checklist the turn ended on, so the next turn starts from it.
+
+        Every surface that runs a turn in a conversation calls this on its way
+        out - the web chat as much as `_run` (#1077, #2162). A run with no
+        conversation has nowhere to keep one and writes nothing.
+
+        `keep_plan` treats an empty list as no plan, so an agent that binds no
+        planning capability writes nothing, and a run that emptied a stored plan
+        records that it did. An interrupted run puts its step in progress down
+        (`put_down`). The one turn that writes nothing is the one whose store was
+        opened empty over a finished plan: it did nothing to the checklist, and
+        `[]` would delete the row #1221 keeps.
+        """
+        if prepared.run.conversation_id is None:
+            return
+        checklist = await dump_plan(prepared.plan_store)
+        if status in _INTERRUPTED:
+            checklist = put_down(checklist)
+        if checklist or not prepared.finished_plan_withheld:
+            await ConversationService(self.db).keep_plan(prepared.run.conversation_id, checklist)
+
+    async def finish(
+        self,
+        prepared: PreparedRun,
+        *,
+        status: RunStatus,
+        error: str | None = None,
+        paused_state: PausedRunState | None = None,
+        budget_scope: BudgetScope | None = None,
+    ) -> AgentRun:
+        """Record what the run consumed and how it ended.
+
+        Called from a `finally` block by every surface: a crashed run still
+        spent money, and a budget that ignores failures is not a budget. That is
+        also what makes this the right place to read the **trace id**: it is
+        reached however the run ended, and the run somebody most wants a trace for
+        is the one that failed.
+
+        The id is read here rather than accepted as a parameter, which is what it
+        used to be. No caller ever passed one, so the write was guarded by a
+        condition that was always false and `AgentRunRead.logfire_trace_id` -
+        documented as a deep link into the trace - was null on every row ever
+        written (#206).
+
+        `paused_state` is what a parked run is resumed from. Passing nothing
+        clears it, which is what makes a finished run un-resumable rather than
+        replayable. What each surface supplies is its own position - the messages
+        and the parked calls it can see; the delegation tree underneath is folded
+        in here, from the stash on the prepared run, because a surface cannot see
+        it and one that had to remember it would answer the next turn from a
+        delegation nobody continued.
+
+        `budget_scope` names which cap bound, for a `BUDGET_EXCEEDED` status. It
+        is carried from the `except` clause that caught the refusal rather than
+        re-derived here, because the alternative is matching a prefix on the
+        error message - and it decides who gets mailed: an agent's cap is its
+        author's to raise, the organization's is not.
+        """
+        # Both before the workspace closes, because a run-scoped one is released
+        # by `close` and its files are gone afterwards.
+        await self._collect_outbound(prepared)
+        await self._propose_skill_changes(prepared)
+
+        # Before the run row is written, so a workspace flush that fails cannot
+        # leave the run un-finished, and after the run has certainly stopped
+        # using it. `close` reports a typed failure without replacing accounting.
+        # A parked run keeps its spills: the history it resumes from names them -
+        # parked on an approval or on a question to the person alike.
+        workspace_result = await self.workspaces.close(
+            prepared.workspace,
+            keep_spills=status in (RunStatus.AWAITING_APPROVAL, RunStatus.AWAITING_ANSWER),
+        )
+
+        if isinstance(workspace_result, WorkspaceFlushFailure):
+            error = "; ".join(part for part in (error, workspace_result.error.message) if part)
+            if status in (
+                RunStatus.COMPLETED,
+                RunStatus.AWAITING_APPROVAL,
+                RunStatus.AWAITING_ANSWER,
+            ):
+                status = RunStatus.FAILED
+                paused_state = None
+
+        # The approval rows the run parked, written here rather than while it ran:
+        # parking on the channel is deferred off the shared session so two gated
+        # calls in one model step cannot race two inserts (agenticos#169), and this
+        # is where the deferral is paid back. Before the parent's terminal write,
+        # so the rows the `paused_state` names exist by the time it is stored.
+        await self._write_approvals(
+            prepared,
+            include_pending=status in (RunStatus.AWAITING_APPROVAL, RunStatus.AWAITING_ANSWER),
+        )
+
+        parked = (
+            None
+            if paused_state is None
+            else self._parked_tree(prepared, paused_state, await dump_plan(prepared.plan_store))
+        )
+        ledger = prepared.built.ledger
+        # This row's own requests, and an inline or invented specialist's, which
+        # has no row and is built as this agent; a published delegate's go on its
+        # own row in `_write_delegations`, so the Spend card names the agent and
+        # model that actually missed the cache.
+        cache = tally(
+            prepared.built.recorder,
+            *(
+                recorder
+                for agent_id, recorder in prepared.delegate_recorders
+                if agent_id == prepared.run.agent_id
+            ),
+        )
+        if prepared.earlier_attachments_checked:
+            await agent_run_repo.record_attachment_lookup(self.db, prepared.run)
+        finished = await agent_run_repo.finish_run(
+            self.db,
+            run=prepared.run,
+            status=status.value,
+            input_tokens=ledger.input_tokens,
+            output_tokens=ledger.output_tokens,
+            cache_read_tokens=ledger.cache_read_tokens,
+            cache_write_tokens=ledger.cache_write_tokens,
+            cost_usd=ledger.total_usd,
+            cost_is_partial=ledger.has_unpriced_models,
+            ended_at=datetime.now(UTC),
+            error=error,
+            logfire_trace_id=current_trace_id(),
+            paused_state=None if parked is None else parked.model_dump(mode="json"),
+            # Added to what the run's earlier segments counted: a resumed run is
+            # the same row, built again with a fresh tally.
+            tool_args_repaired=(prepared.run.tool_args_repaired or 0)
+            + prepared.built.repairs.count,
+            cache_busts=cache.busts,
+            cache_expiries=cache.expiries,
+            cache_missed_tokens=cache.missed_tokens,
+        )
+        # After the parent's row and on every path out of the run, for the reason
+        # the parent's row is written on every path: a delegation that spent money
+        # and recorded nothing is the hole a cancellation would otherwise open.
+        await self._write_delegations(prepared)
+        await self._record_manifest(prepared)
+        # Guarded, because `finish` is called from a `finally` block: an
+        # exception raised while telling somebody about a failed run would
+        # replace the failure itself, and the operator would debug the mail
+        # server instead of the run.
+        try:
+            await self._notify(
+                finished,
+                agent=prepared.agent,
+                spec=prepared.spec,
+                status=status,
+                error=error,
+                budget_scope=budget_scope,
+            )
+        except Exception:
+            logger.exception("run_notification_failed", extra={"run_id": str(finished.id)})
+        return finished
+
+    async def _record_manifest(self, prepared: PreparedRun) -> None:
+        """Store what this run handed its model.
+
+        On every path out of the run, like the row itself: the run somebody most
+        wants to see the prompt and the tools for is the one that failed, and a
+        record written only on success would be missing exactly then.
+
+        Guarded for the reason `_notify` is guarded - this is reached from a
+        `finally` block, and an exception raised while *recording* a failed run
+        would replace the failure with itself, sending an operator to debug the
+        observability write instead of the agent. A run with no manifest reads as
+        one that recorded nothing, which is what happened.
+
+        **In a SAVEPOINT, and that half is not optional.** Swallowing the
+        exception is not enough on its own: a failed flush leaves the session
+        unusable, so the next statement on it raises and the run's own terminal
+        write is lost to a record nobody asked for. `TranscriptService._attach`
+        makes the same trade for the same reason - a nested transaction is what
+        makes "this write may fail harmlessly" true rather than aspirational.
+
+        Nothing is written for a run that never reached a model. That is a fact
+        about the run - refused by a budget, blocked by a guardrail on the way in
+        - and an empty row would read as a record that failed to capture.
+        """
+        recorder = prepared.built.recorder
+        if not recorder.requests and recorder.instructions is None:
+            return
+        try:
+            payload = as_payload(recorder)
+            previous = await run_manifest_repo.get_by_run(
+                self.db, prepared.run.id, prepared.run.organization_id
+            )
+            if previous is not None:
+                payload = carried_over(previous.payload, payload)
+            payload, truncated = fit(payload)
+            async with self.db.begin_nested():
+                await run_manifest_repo.record(
+                    self.db,
+                    run_id=prepared.run.id,
+                    organization_id=prepared.run.organization_id,
+                    payload=payload,
+                    truncated=truncated,
+                )
+        except Exception:
+            logger.exception("run_manifest_write_failed", extra={"run_id": str(prepared.run.id)})
+
+    @staticmethod
+    def _parked_tree(
+        prepared: PreparedRun, paused_state: PausedRunState, plan: list[dict[str, Any]]
+    ) -> PausedRunState:
+        """The parked state a surface reported, plus the delegations underneath it.
+
+        A surface knows its own agent's position and nothing about the tree below
+        it: a delegation is a tool call named `task` that either answers or does
+        not. So the frames come from the run's stash, and which agent each parked
+        approval belongs to comes from the channel that wrote the rows - both of
+        which live on the prepared run, and neither of which any surface has to
+        remember.
+
+        The alternative was a second argument on every `finish` call, and the two
+        surfaces that park a run are the two that would have to agree about it
+        forever. One of them would eventually not, and the failure is a resumed run
+        that delegates again from nothing and answers a question nobody asked.
+
+        The kept specialists come from the same stash, snapshotted by the delegation
+        capability's `wrap_run` when the run ended and keyed by the `task` call each
+        level was delegated from. The run's own agent's (`None`) go flat on
+        `dynamic_specialists`; a nested delegate's ride on its own `DelegationFrame`,
+        which is what carries them across a park too (agenticos#254, agenticos#175).
+
+        `plan` is the planning checklist read from the run's store just before this,
+        so a run that parked mid-plan resumes with the steps it had rather than an
+        empty list. Empty for a run without the capability.
+        """
+        return paused_state.model_copy(
+            update={
+                # What the request asked for, recorded here for the same reason
+                # the delegation frames are: `finish` is the one place both
+                # surfaces pass through, and a surface that had to remember it
+                # would be the surface that forgot (#1326, #1343).
+                "admitted_as": prepared.admitted_as,
+                "output_schema": prepared.output_schema,
+                "run_limit_usd": prepared.run_limit_usd,
+                "delegated_approvals": {
+                    str(parked.approval_id): parked.task_id
+                    for parked in prepared.approvals.requested
+                    if parked.task_id is not None
+                },
+                "delegations": _delegation_frames(prepared.stash.parked, prepared.stash.registered),
+                "dynamic_specialists": [
+                    DynamicSpecialistFrame(
+                        name=specialist.name,
+                        description=specialist.description,
+                        instructions=specialist.instructions,
+                        model=specialist.model,
+                    )
+                    for specialist in prepared.stash.registered.get(None, [])
+                ],
+                "plan": plan,
+                "generated_files": sorted(prepared.built.deps.generated_files),
+                "channel_destination": prepared.channel_destination,
+                "channel_file_attempts": prepared.channel_file_budget.attempts,
+                "channel_context": prepared.channel_context,
+                "channel_authors": dict(prepared.channel_authors),
+            }
+        )
+
+    @staticmethod
+    def _department_context(ctx: AuthContext, existing_run: AgentRun | None) -> AuthContext | None:
+        """Whose departments cap this run: the person who started it, resumed or not.
+
+        A resume runs under whoever decided the approval, and their departments
+        are not the run's - its spend is the starter's, and the starter's caps
+        hold it. Departments are a person's, not a role's, so the run's own
+        person and flags are enough. `None` where no member started the run:
+        nobody's to begin with, or fired by a routine, which a fresh run tells
+        apart by its flags.
+        """
+        if existing_run is None:
+            return ctx
+        if existing_run.user_id is None or existing_run.trigger_id is not None:
+            return None
+        return replace(
+            ctx,
+            user_id=existing_run.user_id,
+            subject_is_publisher_fallback=existing_run.initiated_by_publisher_fallback,
+            fired_as_creator=None,
+        )
+
+    async def _group_limits(
+        self, ctx: AuthContext | None, *, exclude_run_id: UUID
+    ) -> list[SpendLimit]:
+        """The monthly caps of every department the person running this is in (#2072).
+
+        None for a run nobody in the organization started - a trigger, a
+        channel stranger: a department's month is what its members ran, and
+        that run is nobody's. Such a run still names somebody - the trigger's
+        creator, the publisher a visitor stands in for - as its authority, so it
+        is told apart by those flags rather than by a missing user. Each lookup
+        on a session of its own, for the same reason as the two above it.
+        """
+        if (
+            ctx is None
+            or ctx.user_id is None
+            or ctx.subject_is_publisher_fallback
+            or ctx.fired_as_creator is not None
+        ):
+            return []
+        groups = await group_repo.capped_groups_for_member(
+            self.db, organization_id=ctx.organization_id, user_id=ctx.user_id
+        )
+
+        def period_spend(group_id: UUID) -> PeriodSpendLookup:
+            async def lookup() -> Decimal:
+                async with get_db_context() as db:
+                    return await agent_run_repo.sum_cost_since(
+                        db,
+                        organization_id=ctx.organization_id,
+                        since=month_start(),
+                        group_id=group_id,
+                        exclude_run_id=exclude_run_id,
+                    )
+
+            return lookup
+
+        return [
+            SpendLimit(
+                scope=BudgetScope.GROUP,
+                limit_usd=group.monthly_budget_usd,
+                period_spend=period_spend(group.id),
+                subject_id=group.id,
+                subject_name=group.name,
+            )
+            for group in groups
+        ]
+
+    async def _notify(
+        self,
+        run: AgentRun,
+        *,
+        agent: Agent,
+        spec: AgentSpec,
+        status: RunStatus,
+        error: str | None,
+        budget_scope: BudgetScope | None,
+    ) -> None:
+        """Tell somebody, when the run ended in a way nobody is watching for.
+
+        Here rather than at the two places that raise, because this is where
+        every surface converges and where the fact is already durable: a person
+        told about a budget breach that the transaction then rolled back would
+        go looking for a run that does not exist.
+
+        A chat user watching the stream is told twice - once on screen, once by
+        email - and that is the right trade: the alternative is guessing from
+        the surface whether anybody was looking, and being wrong in the
+        direction of silence.
+        """
+        notifications = NotificationService(self.db)
+        if status is RunStatus.BUDGET_EXCEEDED:
+            await notifications.budget_exceeded(
+                run,
+                agent=agent,
+                spec=spec,
+                reason=error or "A spending limit was reached.",
+                # An agent's own cap unless the refusal said otherwise. A
+                # `BUDGET_EXCEEDED` row with no scope recorded predates this
+                # being carried, and the agent's audience is the narrower of the
+                # two - so an unknown scope tells fewer people rather than
+                # mailing the whole administration about somebody's draft.
+                scope=budget_scope or BudgetScope.AGENT,
+            )
+        elif status is RunStatus.AWAITING_APPROVAL:
+            approvals = await agent_run_repo.list_approvals_for_run(
+                self.db, run_id=run.id, organization_id=run.organization_id
+            )
+            pending = [a for a in approvals if a.status == ApprovalStatus.PENDING.value]
+            await notifications.approval_requested(run, agent=agent, spec=spec, approvals=pending)
+        elif RunSurface(run.surface) not in {RunSurface.WEB, RunSurface.FOLLOW_UPS}:
+            # A chat user watching `WEB` already sees a completion or a
+            # failure on screen; every other surface is exactly the "stops
+            # silently" gap this module's own docstring names.
+            # A routine's own finish is told by the routine, with its name and the
+            # start of its answer, which this point does not have (#2301).
+            if status is RunStatus.COMPLETED and RunSurface(run.surface) is not RunSurface.SCHEDULE:
+                await notifications.run_completed(run, agent=agent)
+            elif status in (RunStatus.FAILED, RunStatus.LOOP_STOPPED):
+                # A run stopped for looping produced nothing either, and says why.
+                await notifications.run_failed(run, agent=agent, error=error)
+        # Whatever the outcome: a failed run spent money too.
+        await notifications.department_budget_warnings(run)
+
+    async def execute(
+        self,
+        ctx: AuthContext,
+        agent_id: UUID,
+        prompt: str,
+        *,
+        said: str | None = None,
+        channel_author_context: str = "",
+        surface: RunSurface = RunSurface.API,
+        conversation_id: UUID | None = None,
+        channel_key: str | None = None,
+        memory_room_key: str | None = None,
+        channel_directory: ChannelDirectory | None = None,
+        acts_for_sender: bool = False,
+        local: LocalTarget | None = None,
+        message_history: Sequence[ModelMessage] | None = None,
+        exposure: AgentExposure | None = None,
+        environment_id: UUID | None = None,
+        version_id: UUID | None = None,
+        attachments: list[ChatFile] | None = None,
+        content: Sequence[UserContent] = (),
+        outbound: list[OutgoingAttachment] | None = None,
+        outbound_refused: list[str] | None = None,
+        tool_calls: list[RecordedToolCall] | None = None,
+        generated_files: set[str] | None = None,
+        stream: RunStream | None = None,
+        on_compaction: CompactionSink | None = None,
+        output_schema: dict[str, Any] | None = None,
+        structured: list[dict[str, Any]] | None = None,
+        run_limit_usd: Decimal | None = None,
+        public_origin: bool = False,
+        parks_questions: bool = False,
+        steering: SteeringInbox | None = None,
+        aside: bool = False,
+        reports_failure: bool = False,
+        draft: bool = False,
+    ) -> tuple[str, AgentRun]:
+        """Run an agent to completion and return its answer.
+
+        The non-streaming path, used by the API and chat channels. Surfaces that
+        stream call :meth:`prepare` and :meth:`finish` around their own loop.
+
+        `environment_id` runs the version that environment pins - the API's way
+        of exercising a dev environment before promoting it. `version_id` runs
+        one named version instead, as a workflow step does.
+
+        `attachments` are files that arrived with the message. They are routed
+        here rather than by the caller because where an attachment *goes* depends
+        on whether the agent has a workspace, and only `prepare` knows that - the
+        same reason the streaming path routes them after preparing rather than
+        before. They are also linked to the turn they arrived with, so a file
+        posted in a channel is a file in the transcript rather than a sentence
+        about one.
+
+        `content` is what the model sees beside the prompt that is not a chat
+        file - a workflow step's images, already loaded from the run's files and
+        checked there. Appended after the prompt and any attachments.
+
+        `said` is what the person actually wrote, when `prompt` is something this
+        caller assembled around it - a widget's placement note, a channel's
+        restored slash. It is what goes in the transcript; `prompt` is what goes
+        to the model. Defaults to `prompt`, which is right for every surface that
+        assembles nothing.
+
+        `outbound` and `outbound_refused` are filled with what the agent produced
+        and what a reply cannot carry. Lists the caller passes in rather than a
+        third return value: the workspace is closed before this returns - a
+        run-scoped one is released outright - so a caller cannot read it
+        afterwards, and every other caller of this method would have to unpack a
+        tuple it has no use for.
+
+        `run_limit_usd` is a ceiling on this one run, beside the agent's and the
+        organization's monthly ones - a workflow step's `max_cost_usd`.
+
+        `public_origin` says an outsider supplied the input, so no member is
+        behind the run - see :meth:`prepare`.
+
+        `output_schema` asks for an answer of that shape in place of the
+        version's own, and `structured` is filled with the answer as an object
+        when it is one - a list for the reason `outbound` is. The returned text
+        is then that object shown as JSON, for a surface that shows text.
+
+        An empty answer with the run in `awaiting_approval` means a tool call
+        is parked; the caller shows the queue rather than an answer.
+
+        `parks_questions` is for a surface that can put an `ask_user` question to
+        its person later - a chat, as buttons: the question parks the run in
+        `awaiting_answer` instead of being answered as declined (#2064).
+
+        `steering` is the inbox of a surface whose person may add to the task
+        while it runs, and `aside` answers a question on the side of one (#2087).
+
+        `draft` runs the unpublished draft as a test, as `prepare` documents - the
+        HTTP API's way of trying an agent before it is published (#2301).
+
+        `generated_files` receives only names recorded by this run's own media
+        storage, so a surface need not trust a filename in a tool result.
+
+        `reports_failure` is for the HTTP API: a run that fails once started raises
+        :class:`RunFailedError` naming it - :class:`ModelCallFailedError` when the
+        model provider was what failed - instead of the bare exception, so the
+        caller learns which run to read (#2121). The other surfaces answer a
+        failure their own way and keep the original exception.
+        """
+        if aside:
+            # Said as the person asked it; told to the model as a side question.
+            said = prompt if said is None else said
+            prompt = f"{ASIDE_PREFIX}\n\n{prompt}"
+        prepared = await self.prepare(
+            ctx,
+            agent_id,
+            surface=surface,
+            conversation_id=conversation_id,
+            channel_key=channel_key,
+            memory_room_key=memory_room_key,
+            channel_directory=channel_directory,
+            acts_for_sender=acts_for_sender,
+            local=local,
+            exposure=exposure,
+            environment_id=environment_id,
+            version_id=version_id,
+            on_compaction=on_compaction,
+            output_schema=output_schema,
+            run_limit_usd=run_limit_usd,
+            public_origin=public_origin,
+            aside=aside,
+            draft=draft,
+        )
+        prepared.channel_author_context = channel_author_context
+        prepared.built.deps.steering = steering
+        input_edge = input_screen_for(prepared.spec)
+        if steering is not None:
+            steering.screen = input_edge
+        if parks_questions:
+            prepared.built.deps.ask_questions = park_the_question
+            prepared.built.deps.parks_questions = True
+        # `str | list[Any]`, not `str`: an attached image is folded in as
+        # `BinaryContent` beside the text, and narrowing that back to a string
+        # would hand the model a path where it should have been handed a picture.
+        assembled: str | list[Any] = prompt
+        attachment_context: str | None = None
+        if attachments:
+            router = AttachmentRouter(
+                prepared.workspace.workspace if prepared.workspace is not None else None,
+                # Whether the workspace can read a PDF itself. Known, not inferred
+                # from the briefing: a briefing is a best effort and this decides
+                # whether the extracted text is written at all.
+                can_parse=prepared.workspace is not None and prepared.workspace.parses_documents,
+                # Screened before a file is written, not only once the run starts
+                # (#2559): a refused file must not outlive its turn.
+                screen=input_edge,
+            )
+            assembled = await router.build_prompt(prompt, attachments)
+            attachment_context = router.context or None
+        if content:
+            assembled = [
+                *(assembled if isinstance(assembled, list) else [assembled]),
+                *content,
+            ]
+        try:
+            segment = await self._run(
+                prepared,
+                user_prompt=assembled,
+                # The prompt as it was *given*, not as it was assembled: the files
+                # are recorded as rows below, and a surface that prepends its own
+                # note passes what the person typed.
+                said=prompt if said is None else said,
+                attachments=attachments or (),
+                attachment_context=attachment_context,
+                message_history=message_history,
+                deferred_tool_results=None,
+                stream=stream,
+            )
+        except Exception as exc:
+            # Failed SQL can expire the row and leave the transaction unusable.
+            # Preserve the database error (including pool exhaustion's 503)
+            # without loading attributes from that failed transaction.
+            if not reports_failure or isinstance(exc, (AppException, SQLAlchemyError)):
+                raise
+            raise failed_run_error(prepared.run, exc) from exc
+        if generated_files is not None:
+            generated_files.update(segment.generated_files)
+        if outbound is not None:
+            outbound.extend(prepared.outbound)
+        if outbound_refused is not None:
+            outbound_refused.extend(prepared.outbound_refused)
+        # Handed back the same way as the files: a surface that can draw a chart
+        # needs what the turn called, and reading it off the row afterwards is
+        # not open to a channel run, which writes no messages (#205).
+        if tool_calls is not None:
+            tool_calls.extend(segment.tool_calls)
+        if structured is not None and segment.structured is not None:
+            structured.append(segment.structured)
+        return segment.output, segment.run
+
+    async def parked_calls(self, ctx: AuthContext, run: AgentRun) -> list[ParkedCall]:
+        """What this run is waiting on a decision for, right now.
+
+        Read back off the row rather than returned from the run that parked it,
+        because the caller that needs it is the *resume*: a continuation runs the
+        agent, and the agent can reach a second gated call and park again. A client
+        told only `status` was handed "still awaiting approval" and nothing to
+        approve, so the run could not be finished from the surface that started it -
+        the continuation runs over HTTP rather than the socket a conversation
+        streams, so there is no frame carrying the new calls either.
+
+        `tool_call_id` comes from the run's own paused state, which maps approval id
+        to the call it parked; the approval row does not carry one. Null where a run
+        was parked before that map was stored, which is a step a surface cannot mark
+        rather than a call it cannot decide.
+        """
+        if run.status != RunStatus.AWAITING_APPROVAL.value:
+            return []
+        approvals = await agent_run_repo.list_approvals_for_run(
+            self.db, run_id=run.id, organization_id=ctx.organization_id
+        )
+        state = run.paused_state or {}
+        by_approval = state.get("tool_call_ids", {}) if isinstance(state, dict) else {}
+        return [
+            ParkedCall(
+                id=approval.id,
+                tool_call_id=by_approval.get(str(approval.id)),
+                tool_name=approval.tool_id,
+                tool_args=approval.tool_args or {},
+                capability_tool_id=approval.capability_tool_id,
+                context=approval.context,
+                account=approval.account,
+            )
+            for approval in approvals
+            if approval.status == ApprovalStatus.PENDING.value
+        ]
+
+    async def resume(
+        self,
+        ctx: AuthContext,
+        run_id: UUID,
+        *,
+        answers: Mapping[str, object] | None = None,
+        run_limit_usd: Decimal | None = None,
+    ) -> RunSegment:
+        """Continue a parked run now that its tool calls have been decided.
+
+        `run_limit_usd` can only tighten the parked lifetime ceiling. A workflow
+        continuation passes the agent's prior spend plus its new remaining allowance.
+
+        `answers` is what a run parked on `ask_user` questions continues with: each
+        parked question's tool result, keyed by its call (#2064). A run waiting on
+        an answer is refused without one for every question; a run that parked on
+        an approval in the same step answers its questions as declined.
+
+        Runs the *version the run was parked on*, not whatever is published now:
+        the stored conversation was produced by that spec, and continuing it
+        under a different one would answer a question nobody asked.
+
+        A run parked *inside a delegation* is continued the same way one level
+        further in: the delegate's own conversation and the verdicts on the calls it
+        stopped on go into the stash, the replayed `task` call finds them there, and
+        the delegate carries on from where it was rather than starting again. That
+        is the only shape in which the person's decision applies to the call they
+        were shown - the parent parks on `task`, so a re-run delegation would be
+        handed an approval naming a tool call it never asks about, and the model
+        would be free to call something else.
+
+        A continuation that cannot be built leaves the run parked. The version's
+        spec is fetched and assembled *before* the row leaves the queue, so a
+        secret deleted since the park, a removed model profile or a capability
+        dropped in a deploy refuses this attempt rather than the run: the
+        decision stands, and resuming works again once the spec does.
+
+        Returns:
+            The continuation as a :class:`RunSegment` - what it answered, the row,
+            and **what it called on the way there**. The last of those is the only
+            record a caller gets: the continuation runs over HTTP rather than the
+            socket a conversation streams, so nothing announces its tool calls, and
+            a surface handed just the answer drew a turn in which approving a call
+            was followed by a second approval request for work it could not show.
+
+        Raises:
+            NotFoundError: If the run is not in this organization.
+            BadRequestError: If the run is not parked, has no stored state, or
+                still has a decision outstanding. All three mean the caller is
+                about to replay something it should not. Also if the spec it was
+                parked on can no longer be built - see above.
+        """
+        run = await agent_run_repo.claim_parked_run(
+            self.db, run_id, organization_id=ctx.organization_id
+        )
+        if run is None:
+            raise NotFoundError(message="Run not found", details={"run_id": str(run_id)})
+        if run.status not in (RunStatus.AWAITING_APPROVAL.value, RunStatus.AWAITING_ANSWER.value):
+            raise BadRequestError(
+                message="This run is not waiting for approval",
+                details={"run_id": str(run_id), "status": run.status},
+            )
+        if run.paused_state is None:
+            raise BadRequestError(
+                message="This run was parked without the state needed to continue it",
+                details={"run_id": str(run_id)},
+            )
+        if ctx.api_key_id is not None and _started_by_a_person(run):
+            raise AuthorizationError(
+                message="A run a person started is continued from a session, not with an API key",
+                details={"run_id": str(run_id)},
+            )
+        state = PausedRunState.model_validate(run.paused_state)
+        ceiling = state.run_limit_usd
+        if run_limit_usd is not None:
+            ceiling = run_limit_usd if ceiling is None else min(ceiling, run_limit_usd)
+
+        given = answers or {}
+        if run.status == RunStatus.AWAITING_ANSWER.value and any(
+            question not in given for question in state.questions
+        ):
+            raise BadRequestError(
+                message="This run is waiting for an answer from the person it asked",
+                details={"run_id": str(run_id)},
+            )
+
+        decided, plan = await self._decisions(ctx, run=run, state=state)
+        for question in state.questions:
+            plan.results.calls[question] = given.get(question, DECLINED)
+
+        agent, spec = await self._parked_spec(ctx, run)
+        # The continuation traces where the original did: the environment that
+        # routed the run still owns its observability.
+        spec = await self._with_environment_observability(
+            ctx, spec, environment_id=run.environment_id
+        )
+        # The binding that admitted the run enriches its spec two ways `prepare`
+        # does: the platform's own formatting prompt and the `channel_tools`
+        # capability. A continuation that skipped them would answer a channel
+        # approval without channel tools and formatted for the wrong platform
+        # (#513 was S14 - "an approval is answered in the thread that asked for
+        # it"). The exposure id is stamped on the row, so it can be reloaded and
+        # the same helpers run. The destination was captured server-side when
+        # parked; restore its directory without storing a bot credential.
+        exposure = (
+            await agent_exposure_repo.get(
+                self.db, run.exposure_id, organization_id=ctx.organization_id
+            )
+            if run.exposure_id is not None
+            else None
+        )
+        directory = await restore_directory(
+            self.db,
+            organization_id=ctx.organization_id,
+            surface=run.surface,
+            exposure=exposure,
+            destination=state.channel_destination,
+        )
+        spec = await _with_exposure_prompt(spec, exposure)
+        spec = _with_channel_tools(spec, exposure)
+        if state.output_schema is not None:
+            spec = spec.model_copy(update={"output_schema": state.output_schema})
+        prepared = await self._assemble(
+            ctx,
+            agent=agent,
+            spec=spec,
+            existing_run=run,
+            surface=RunSurface(run.surface),
+            conversation_id=run.conversation_id,
+            user_name=None,
+            # The terms the run was admitted on, restored rather than re-derived.
+            # `agent_runs` records the surface and the caller, so a resume that
+            # inferred these got the strictest approval mode wrong on the one
+            # path where somebody had said no (#1326), and read a direct message
+            # as a channel (#1343).
+            approval_mode=state.admitted_as.approval_mode,
+            local=state.admitted_as.local,
+            acts_for_sender=state.admitted_as.acts_for_sender and run.user_id is not None,
+            # Whose run this is, not who is resuming it. An approver is allowed
+            # to release somebody else's parked run; they are not the account it
+            # speaks through - for personal MCP or for the run's audience.
+            owner_user_id=run.user_id,
+            restored_audience=RunAudience(
+                user_id=state.admitted_as.audience_user_id,
+                room_key=state.admitted_as.audience_room_key,
+                writes_memory=state.admitted_as.audience_writes_memory,
+                searches_conversations=state.admitted_as.audience_searches_conversations,
+                browses_signed_in=state.admitted_as.audience_browses_signed_in,
+            ),
+            # The run's own terms, not the approver's context: whether user_id was
+            # a publisher stand-in is gone with the request that carried it, so a
+            # resume would otherwise lend the publisher's MCP to a guest (#1469).
+            restored_publisher_fallback=state.admitted_as.subject_is_publisher_fallback,
+            # Who supplied the input is gone with the request too; without it a
+            # member approving an outsider's parked run would become its person.
+            # A schedule-surface row parked before the key existed cannot say
+            # whether a delivery fired it, so it fails closed: public, no person.
+            public_origin=state.admitted_as.public_origin
+            or (
+                "public_origin" not in state.admitted_as.model_fields_set
+                and RunSurface(run.surface) is RunSurface.SCHEDULE
+            ),
+            impersonated=state.admitted_as.impersonated,
+            extra_toolsets=None,
+            exposure=exposure,
+            channel_file_attempts=state.channel_file_attempts,
+            restored_channel_context=state.channel_context,
+            restored_channel_authors=state.channel_authors,
+            channel_directory=directory,
+            channel_key=(
+                None
+                if state.channel_destination is None
+                else channel_key(state.channel_destination.platform_chat_id)
+            ),
+            decided=decided,
+            resuming=plan.delegations,
+            already_spent=plan.spent,
+            already_started=plan.started,
+            # The specialists each level kept before it parked, rebuilt into that
+            # level's fresh registry before the replay so `task` reaches them again.
+            # `None` is the run's own agent, off the flat state list; a nested
+            # delegate's come from its `DelegationFrame`, keyed by its `task` call
+            # (agenticos#254). One map, so `_assemble` seeds every level in one pass.
+            specialists={
+                None: [
+                    RegisteredSpecialist(
+                        name=frame.name,
+                        description=frame.description,
+                        instructions=frame.instructions,
+                        model=frame.model,
+                    )
+                    for frame in state.dynamic_specialists
+                ],
+                **plan.specialists,
+            },
+            # The planning checklist the run parked with, re-seeded into a fresh
+            # store so the resumed turn sees the steps it left rather than starting
+            # the plan over. `plan` here is the delegation resume plan; this is the
+            # planning capability's, off `PausedRunState.plan`.
+            plan_items=state.plan,
+            run_limit_usd=ceiling,
+        )
+        prepared.output_schema = state.output_schema
+        prepared.run_limit_usd = ceiling
+        prepared.built.ledger.book(_spend_already_booked(run))
+        # What the run made before parking is still its own: the starting image a
+        # parked `generate_video` names was drawn earlier in this same run.
+        prepared.built.deps.generated_files.update(state.generated_files)
+
+        # Out of the queue once the build has succeeded, and before anything is
+        # replayed. Two different things keep two different resumes out, which is
+        # why this line sits between the build and the run rather than at either
+        # end:
+        #
+        # A resume arriving *while this one is still building* waits at
+        # `claim_parked_run` - the row lock is held until `_run` commits, which
+        # it does before anything is replayed - and then reads the status
+        # written here, so building first widens no window. A resume arriving
+        # *after that commit* has no lock to wait on, and what refuses it is
+        # finding the run no longer parked; so the status has to change before
+        # the tool call is replayed, not after.
+        #
+        # It is written last because a build refuses for reasons that have
+        # nothing to do with this run: a secret a binding names deleted since the
+        # park, a model profile removed, a capability dropped in a deploy, an
+        # MCP connection unshared. Flipping the row first left every one of those
+        # with a run stuck in `running`, which `claim_parked_run` never hands out
+        # again - a decision a person made, recorded against work that cannot
+        # continue. Nothing above has touched the row, so the run is still parked
+        # and still resumable, and no failure path can commit a status that was
+        # never written.
+        await agent_run_repo.mark_running(self.db, run=run)
+
+        try:
+            return await self._run(
+                prepared,
+                # No new prompt: the conversation resumes at the tool call it stopped
+                # on, and inventing a user turn here would put words in their mouth.
+                user_prompt=None,
+                said=None,
+                message_history=ModelMessagesTypeAdapter.validate_python(state.messages),
+                deferred_tool_results=plan.results,
+            )
+        except Exception as exc:
+            # The continuation raised. `_run` has recorded the run terminal and
+            # committed before re-raising, so this re-raise carries the failure to
+            # the caller rather than swallowing it - but it also carries the
+            # recorded status, which the raising path used to throw away. The resume
+            # answer is where a web-chat surface learns a delegate's outcome (the
+            # continuation ran over HTTP, not the socket the conversation streams);
+            # without the status the surface leaves an `awaiting_approval` panel
+            # waiting on a decision already spent, and the run cannot be resumed
+            # again because it is now terminal (agenticos#262). A build refusal
+            # raised *before* `_run` leaves the run parked and is retryable, so it
+            # is deliberately outside this `try` - it must keep surfacing as itself.
+            # `CancelledError` is a `BaseException` and not caught: over HTTP it
+            # means the request itself went away, so there is nobody to hand a
+            # status to, and catching it would break the cancellation it signals.
+            # The reason too, where the run recorded one: it is our own sentence
+            # (`run_failure_summary`), and without it the chat said the run had
+            # failed and nothing about why - a provider out of credit read the
+            # same as a crash.
+            raise RunExecutionError(
+                message=(
+                    f"{RunExecutionError.message}: {run.error}"
+                    if run.error
+                    else RunExecutionError.message
+                ),
+                details={"run_id": str(run.id), "status": run.status},
+            ) from exc
+
+    async def can_stop_parked(self, ctx: AuthContext, run_id: UUID) -> bool:
+        """Whether this session may stop a parked run, without exposing its data."""
+        if ctx.api_key_id is not None:
+            return False
+        run = await agent_run_repo.get_run(self.db, run_id, organization_id=ctx.organization_id)
+        return (
+            run is not None
+            and run.status in (RunStatus.AWAITING_ANSWER.value, RunStatus.AWAITING_APPROVAL.value)
+            and (
+                run.user_id == ctx.user_id
+                or (
+                    run.status == RunStatus.AWAITING_APPROVAL.value
+                    and ctx.has(Perm.APPROVALS_DECIDE)
+                )
+            )
+        )
+
+    async def cancel_parked(self, ctx: AuthContext, run_id: UUID) -> str | None:
+        """Stop a parked run without executing its continuation or losing its spend.
+
+        The person who started it may stop it. An approval decider may also stop
+        a run waiting on approval. Keys cannot use this console operation.
+        The same row lock as resume serializes stopping against a continuation;
+        a second stop is idempotent, while a run already resumed is refused.
+        """
+        if ctx.api_key_id is not None:
+            raise AuthorizationError(
+                message="Stop this run from a signed-in session", details={"run_id": run_id}
+            )
+        run = await agent_run_repo.claim_parked_run(
+            self.db, run_id, organization_id=ctx.organization_id
+        )
+        if run is None:
+            raise NotFoundError(message="Run not found", details={"run_id": run_id})
+        decider = ctx.has(Perm.APPROVALS_DECIDE) and run.status in (
+            RunStatus.AWAITING_APPROVAL.value,
+            RunStatus.CANCELLED.value,
+        )
+        if run.user_id != ctx.user_id and not decider:
+            raise AuthorizationError(
+                message="Only the person who started this run may stop it",
+                details={"run_id": run_id},
+            )
+        if run.status == RunStatus.CANCELLED.value:
+            return None
+        if run.status not in (RunStatus.AWAITING_ANSWER.value, RunStatus.AWAITING_APPROVAL.value):
+            raise BadRequestError(
+                message="This run is not waiting for a response",
+                details={"run_id": run_id, "status": run.status},
+            )
+        return await self._stop_parked(run, actor_user_id=ctx.subject_id)
+
+    async def stop_parked_for_workflow(
+        self, run_ids: Sequence[UUID], *, organization_id: UUID
+    ) -> list[ParkedStop]:
+        """Stop the parked runs workflow steps wait on, because that workflow run ended.
+
+        No person and no permission check: the workflow run's own end is the reason.
+        A run that is not parked any more - resumed, ended, or gone - is left alone.
+
+        Row work only: the runs are claimed in id order, so two workflow runs ending
+        together lock the same rows in the same order, and nothing here takes the
+        audit chain lock, which must come after every row lock
+        (`app.core.audit.record_audit`). The caller finishes its own row work, then
+        passes what this returns to `record_parked_stops`.
+        """
+        stops: list[ParkedStop] = []
+        for run_id in sorted(set(run_ids)):
+            run = await agent_run_repo.claim_parked_run(
+                self.db, run_id, organization_id=organization_id
+            )
+            if run is None or run.status not in (
+                RunStatus.AWAITING_ANSWER.value,
+                RunStatus.AWAITING_APPROVAL.value,
+            ):
+                continue
+            previous_status = await self._close_parked(run, actor_user_id=None)
+            stops.append(ParkedStop(run.id, run.organization_id, previous_status))
+        return stops
+
+    async def record_parked_stops(self, stops: Sequence[ParkedStop]) -> None:
+        """Audit the runs `stop_parked_for_workflow` stopped, after every row lock."""
+        for stop in stops:
+            await record_audit(
+                self.db,
+                actor_user_id=None,
+                organization_id=stop.organization_id,
+                action="run.cancelled",
+                target_type="agent_run",
+                target_id=str(stop.run_id),
+                details={"previous_status": stop.previous_status, "by": "workflow_run"},
+            )
+
+    async def _stop_parked(self, run: AgentRun, *, actor_user_id: UUID) -> str:
+        """Stop a parked run on a person's request: close it, then audit who did it."""
+        previous_status = await self._close_parked(run, actor_user_id=actor_user_id)
+        await record_audit(
+            self.db,
+            actor_user_id=actor_user_id,
+            organization_id=run.organization_id,
+            action="run.cancelled",
+            target_type="agent_run",
+            target_id=str(run.id),
+            details={"previous_status": previous_status},
+        )
+        return STOPPED_TOOL_RESULT
+
+    async def _close_parked(self, run: AgentRun, *, actor_user_id: UUID | None) -> str:
+        """Close a parked run the caller has locked and checked, keeping its spend.
+
+        Returns the status it was parked in. Writes no audit entry: see
+        `stop_parked_for_workflow`.
+        """
+        previous_status = run.status
+        state = (
+            PausedRunState.model_validate(run.paused_state)
+            if run.paused_state is not None
+            else None
+        )
+        at = datetime.now(UTC)
+        frames = [] if state is None else list(state.delegations)
+        for frame in frames:
+            frames.extend(frame.delegations)
+        calls = [] if state is None else [*state.questions, *state.tool_call_ids.values()]
+        calls.extend(frame.tool_call_id for frame in frames)
+        await self._cancel_delegations(run, frames, at=at)
+        if state is not None and state.plan and run.conversation_id is not None:
+            await ConversationService(self.db).keep_plan(run.conversation_id, put_down(state.plan))
+        await self.transcript.record(
+            run,
+            prompt=None,
+            answer="",
+            settled=dict.fromkeys(calls, STOPPED_TOOL_RESULT),
+        )
+        await agent_run_repo.expire_pending_approvals(self.db, run_id=run.id, decided_at=at)
+        await agent_run_repo.finish_run(
+            self.db,
+            run=run,
+            status=RunStatus.CANCELLED.value,
+            input_tokens=run.input_tokens,
+            output_tokens=run.output_tokens,
+            cost_usd=run.cost_usd,
+            cost_is_partial=run.cost_is_partial,
+            ended_at=at,
+            error="Stopped by user"
+            if actor_user_id is not None
+            else "Stopped: its workflow run ended",
+            paused_state=None,
+        )
+        return previous_status
+
+    async def _cancel_delegations(
+        self, run: AgentRun, frames: Sequence[DelegationFrame], *, at: datetime
+    ) -> None:
+        """Attribute the spend already incurred by suspended published delegates.
+
+        Inline specialists bill to their published ancestor. Deleted delegates
+        retain their cost on the parent, as in the ordinary terminal write.
+        No model is built: provider attribution was not kept in a parked frame.
+        """
+        named = {frame.agent_id for frame in frames if frame.agent_id is not None}
+        if not named:
+            return
+        present = await agent_repo.existing_ids_locked(
+            self.db, named, organization_id=run.organization_id
+        )
+        for frame in frames:
+            if (
+                frame.agent_id is None
+                or frame.agent_id not in present
+                or frame.agent_version_id is None
+            ):
+                continue
+            legacy = "billed_cost_usd" not in frame.model_fields_set
+            await agent_run_repo.record_delegated_run(
+                self.db,
+                run_id=uuid4(),
+                organization_id=run.organization_id,
+                agent_id=frame.agent_id,
+                agent_version_id=frame.agent_version_id,
+                parent_run_id=run.id,
+                subagent_task_id=frame.task_id,
+                user_id=run.user_id,
+                initiated_by_publisher_fallback=run.initiated_by_publisher_fallback,
+                channel_identity_id=run.channel_identity_id,
+                conversation_id=run.conversation_id,
+                exposure_id=run.exposure_id,
+                surface=run.surface,
+                model_label=None,
+                provider=None,
+                secret_id=None,
+                status=RunStatus.CANCELLED.value,
+                input_tokens=frame.input_tokens if legacy else frame.billed_input_tokens,
+                output_tokens=frame.output_tokens if legacy else frame.billed_output_tokens,
+                cache_read_tokens=frame.billed_cache_read_tokens,
+                cache_write_tokens=frame.billed_cache_write_tokens,
+                cost_usd=frame.cost_usd if legacy else frame.billed_cost_usd,
+                cost_is_partial=frame.cost_is_partial if legacy else frame.billed_cost_is_partial,
+                started_at=frame.started_at or at,
+                ended_at=at,
+                error="Stopped by user",
+            )
+
+    async def answer(
+        self, ctx: AuthContext, run_id: UUID, responses: Mapping[str, list[Any]]
+    ) -> RunSegment:
+        """Answer the questions a run parked on, and continue it (#2064).
+
+        `responses` holds, per parked call, the answers the question card sends - a
+        list parallel to the questions, read as leniently as a live card's answers
+        are. Only the person the run ran as may answer: the questions were put to
+        them, and an answer is words in their mouth. A question left out is
+        answered as declined, which the model is told and carries on from.
+
+        Raises:
+            NotFoundError: If the run is not in this organization.
+            AuthorizationError: If the caller is not the person it asked, or is
+                their organization key without `agents:run`.
+            BadRequestError: If the run is not waiting for an answer, or an
+                answer names a question it did not ask.
+        """
+        run = await self.get_run(ctx, run_id)
+        if run.status != RunStatus.AWAITING_ANSWER.value or run.paused_state is None:
+            raise BadRequestError(
+                message="This run is not waiting for an answer",
+                details={"run_id": str(run_id), "status": run.status},
+            )
+        if run.user_id != ctx.user_id:
+            raise AuthorizationError(message="Only the person it asked can answer this question")
+        if ctx.api_key_id is not None and _started_by_a_person(run):
+            raise AuthorizationError(
+                message="A run a person started is answered from a session, not with an API key",
+                details={"run_id": str(run_id)},
+            )
+        if not _key_may_continue(ctx, run):
+            raise AuthorizationError(
+                message="Answering a run continues it, and this key may not run agents",
+                details={"scope": Perm.AGENTS_RUN.value},
+            )
+        state = PausedRunState.model_validate(run.paused_state)
+        unknown = sorted(set(responses) - set(state.questions))
+        if unknown:
+            raise BadRequestError(
+                message="An answer names a question this run did not ask",
+                details={"tool_call_ids": unknown},
+            )
+        asked = {
+            tool_call_id: AskUserRequest.from_tool_call(call)
+            for tool_call_id, call in _question_calls(state).items()
+        }
+        results: dict[str, object] = {
+            tool_call_id: ask_user_result(
+                asked[tool_call_id],
+                answers_to_response(asked[tool_call_id], responses[tool_call_id]),
+            )
+            if tool_call_id in responses
+            else DECLINED
+            for tool_call_id in state.questions
+        }
+        return await self.resume(ctx, run_id, answers=results)
+
+    async def parked_questions(self, ctx: AuthContext, run: AgentRun) -> list[ParkedQuestion]:
+        """The questions this run is waiting on the caller to answer, right now.
+
+        Only for the person it asked - to anybody else a run waiting on somebody's
+        answer has nothing to offer them - and empty for a run not waiting at all.
+        """
+        if (
+            run.status != RunStatus.AWAITING_ANSWER.value
+            or run.paused_state is None
+            or run.user_id != ctx.user_id
+            or not _key_may_continue(ctx, run)
+        ):
+            return []
+        state = PausedRunState.model_validate(run.paused_state)
+        return [
+            ParkedQuestion(
+                tool_call_id=tool_call_id,
+                questions=[
+                    QuestionItem.model_validate(item)
+                    for item in wire_questions(AskUserRequest.from_tool_call(call))
+                ],
+            )
+            for tool_call_id, call in _question_calls(state).items()
+        ]
+
+    async def _decisions(
+        self, ctx: AuthContext, *, run: AgentRun, state: PausedRunState
+    ) -> tuple[dict[str, ApprovalDecision], _ResumePlan]:
+        """The verdicts on this run's parked calls, and where each one has to arrive.
+
+        Two products, because a run's parked calls do not all belong to the same
+        agent. The verdicts are flat and keyed by tool call - every approval gate in
+        the tree reads the one channel, and a tool call id is unique to the agent
+        that made it - while the *replay* is per agent: Pydantic AI refuses a resume
+        whose results name a call the replayed response does not contain, so a
+        delegate's parked call handed to the parent's replay fails the whole
+        continuation. That is what a run parked inside a delegate used to do.
+
+        Raises:
+            BadRequestError: If any of them is still pending. Resuming with a
+                decision outstanding would drop that call silently.
+        """
+        approvals = await agent_run_repo.list_approvals_for_run(
+            self.db, run_id=run.id, organization_id=ctx.organization_id
+        )
+        undecided = [a for a in approvals if a.status == ApprovalStatus.PENDING.value]
+        if undecided:
+            raise BadRequestError(
+                message=f"{len(undecided)} tool call(s) on this run are still awaiting a decision",
+                details={"run_id": str(run.id), "pending": [str(a.id) for a in undecided]},
+            )
+
+        decided: dict[str, ApprovalDecision] = {}
+        approved_args: dict[str, dict[str, Any]] = {}
+        for approval in approvals:
+            tool_call_id = state.tool_call_ids.get(str(approval.id))
+            if tool_call_id is None:
+                # Decided during an earlier park of the same run and already
+                # replayed. Answering it again would repeat the side effect.
+                continue
+            decided[tool_call_id] = (
+                ApprovalGranted(tool_args=approval.tool_args)
+                if approval.status == ApprovalStatus.APPROVED.value
+                else ApprovalRejected(note=approval.note)
+            )
+            # "Approved" here means "let this call reach the tool pipeline", not
+            # "do it": the gate is the only place allowed to decide that, and it
+            # reads the verdict above. Denying here instead would give refusals
+            # two sources of truth.
+            approved_args[tool_call_id] = approval.tool_args
+        return decided, _resume_plan(state, approved_args)
+
+    async def _with_environment_observability(
+        self, ctx: AuthContext, spec: AgentSpec, *, environment_id: UUID | None
+    ) -> AgentSpec:
+        """The spec, with the environment's tracing choices folded in.
+
+        An environment can point its runs at their own Logfire project - the
+        client's production traces in the client's project, dev noise in the
+        operator's. The token and service name fall through to the spec's own
+        block field by field; the Logfire environment tag is always the
+        environment's *name*, never configured separately, so the tag and the
+        environment cannot disagree. A run with no token from either source
+        stays untraced rather than tagged into nowhere.
+        """
+        if environment_id is None:
+            return spec
+        environment = await agent_environment_repo.get(
+            self.db, environment_id, organization_id=ctx.organization_id
+        )
+        if environment is None:
+            return spec
+        base = spec.observability
+        token_secret_id = environment.logfire_token_secret_id or (
+            base.token_secret_id if base else None
+        )
+        if token_secret_id is None:
+            return spec
+        merged = ObservabilitySpec(
+            token_secret_id=token_secret_id,
+            service_name=environment.service_name or (base.service_name if base else None),
+            environment=environment.name,
+            content=base.content if base else "full",
+        )
+        return spec.model_copy(update={"observability": merged})
+
+    async def _parked_spec(self, ctx: AuthContext, run: AgentRun) -> tuple[Agent, AgentSpec]:
+        """The agent and the exact spec version this run was executing.
+
+        Raises:
+            BadRequestError: If the version is gone. A run cannot be continued
+                on a guess about what it was running.
+        """
+        agent = await self.registry.get(ctx, run.agent_id, perm=Perm.AGENTS_RUN)
+        await self.registry.refuse_a_switched_off_assistant(agent.id)
+        if run.test_spec is not None:
+            # A draft under test continues on the copy it started with, not on
+            # whatever the draft has become since (#2074).
+            return agent, AgentSpec.model_validate(run.test_spec)
+        version = (
+            None
+            if run.agent_version_id is None
+            else await agent_repo.get_version(
+                self.db, run.agent_version_id, organization_id=ctx.organization_id
+            )
+        )
+        if version is None:
+            raise BadRequestError(
+                message="The agent version this run was parked on no longer exists",
+                details={"run_id": str(run.id)},
+            )
+        return agent, AgentSpec.model_validate(version.spec)
+
+    @staticmethod
+    async def _answer(
+        prepared: PreparedRun,
+        *,
+        user_prompt: str | list[Any] | None,
+        message_history: Sequence[ModelMessage] | None,
+        deferred_tool_results: DeferredToolResults | None,
+        stream: RunStream | None,
+    ) -> AgentRunResult[Any]:
+        """One turn, streamed if the surface can show one arriving.
+
+        Both halves settle through the same `_run` around this call - the same
+        usage, the same budget stop, the same transcript row - so a channel that
+        watches an answer being written is metered identically to an HTTP caller
+        that waits for it. The alternative was a second copy of the settle path,
+        which is how the streaming chat came to bill nothing for a year
+        (agenticos#16).
+
+        `deferred_tool_results` wins over `stream`: `iterate()` cannot carry
+        them, and a resumed run is a run somebody already waited for. It resumes
+        the way it always has, and the surface gets its answer at the end.
+        """
+        if stream is None or deferred_tool_results is not None:
+            return await prepared.execute(
+                user_prompt,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+            )
+        async with prepared.iterate(user_prompt, message_history=message_history) as agent_run:
+            await stream(agent_run)
+        return _outcome(agent_run)
+
+    async def _run(
+        self,
+        prepared: PreparedRun,
+        *,
+        user_prompt: str | list[Any] | None,
+        said: str | None,
+        attachments: Sequence[ChatFile] = (),
+        attachment_context: str | None = None,
+        message_history: Sequence[ModelMessage] | None,
+        deferred_tool_results: DeferredToolResults | None,
+        stream: RunStream | None = None,
+    ) -> RunSegment:
+        """Execute the agent and account for it, however it ends.
+
+        `user_prompt` is what the model is given and `said` is what the person
+        wrote, which are not the same string on any surface that assembles one:
+        `AttachmentRouter` appends a briefing about each file, and an embedded
+        widget prepends the operator's placement note. Recording the assembled
+        version put the model's own briefing in the transcript as the user's words.
+        `said` is `None` on a resume, where nothing new was said at all.
+
+        The one place a run is executed, so a parked call, a budget stop, a
+        cancellation and a crash are all recorded the same way whether the run is
+        new or resumed.
+
+        **It is also where the transcript is written, for the same reason.** Every
+        surface that does not stream reaches this method, and every one of them
+        used to be responsible for recording what the run said: the embedded
+        widget, a channel mention, the HTTP API and every resumed run recorded
+        nothing at all, so an organization was billed for answers no row
+        described. A thing four surfaces have to remember is a thing the fifth
+        will not. The streaming chat does not come through here and keeps writing
+        its own, because it has events to attach and a socket to answer on.
+
+        **A cancellation is one of those endings, and it needs both halves.**
+        `asyncio.CancelledError` is a `BaseException`, so it reaches neither
+        handler below on its own: the status stayed at its initial `FAILED` with
+        no error text, which sends an operator filtering run history for problems
+        through runs that were working correctly and were stopped - exactly what
+        `BUDGET_EXCEEDED` was given its own status to avoid. And the commit is not
+        optional either. `get_db_session` commits on a clean exit, and a
+        propagating `BaseException` is not one, so the terminal write was rolled
+        back and the row stayed `RUNNING` for ever - taking the delegation rows
+        :meth:`finish` queues with it, which is how a delegate that spent real
+        money came to be recorded nowhere. Committing here is what makes the row
+        survive; re-raising is what lets whoever cancelled see it happen.
+
+        **And the transaction ends before the model is asked anything.** Each
+        half of the opening commit is load-bearing: the run row becomes visible
+        to every other session while the run executes, and the pooled connection
+        goes back to the pool for the seconds-to-minutes the model takes,
+        instead of sitting `idle in transaction` holding a row lock - fifteen
+        concurrent runs used to be the entire pool (#12). On a resume it is also
+        what makes `mark_running` durable: a crash mid-replay leaves the run
+        `running` rather than parked with its approval still marked approved,
+        which a second resume would replay - re-sending whatever the approved
+        call already sent (#3). `ChatAgentRunner.run`, the one surface not
+        routed through here, sets the same boundary.
+        """
+        status = RunStatus.FAILED
+        error: str | None = None
+        output = ""
+        structured: dict[str, Any] | None = None
+        paused: PausedRunState | None = None
+        budget_scope: BudgetScope | None = None
+        called: list[RecordedToolCall] = []
+        settled: dict[str, str] = {}
+        summarized: list[dict[str, Any]] | None = None
+        # True once this run reaches a terminal state here rather than unwinding -
+        # a completion, a park, or a caught budget/guardrail stop. It is what the
+        # terminal write below reads to decide whether a persistence failure
+        # should surface or be logged under the exception already propagating out
+        # of this run (#235). `sys.exc_info()` cannot answer that: it also reports
+        # a caller's handled exception when `execute` is awaited from inside one.
+        finished_cleanly = False
+        # The opening commit: the row is visible mid-run and no connection is
+        # held across the model call - the docstring carries the whole of it
+        # (#12, #3).
+        await self.db.commit()
+        # A resume carries the decisions it continues from; anything else is a
+        # run that just started.
+        await change_feed.publish_run(
+            prepared.run, "created" if deferred_tool_results is None else "updated"
+        )
+        try:
+            # Stamped alive while the model works, so a process dying under it
+            # is noticed in minutes (`app.services.run_heartbeat`).
+            async with run_heartbeat(prepared.run.id):
+                result = await self._answer(
+                    prepared,
+                    user_prompt=user_prompt,
+                    message_history=message_history,
+                    deferred_tool_results=deferred_tool_results,
+                    stream=stream,
+                )
+            # `new_messages`, not `all_messages`: a resumed run is handed
+            # everything up to the park as history, and the wider list would
+            # write the first attempt's calls again under the same run.
+            if prepared.built.context.summarized:
+                # Offloaded before it is stored, if the agent asked for it. The
+                # chat runner does the same with the same helper: hooking one of
+                # the two gave the capability to the WebSocket chat and to
+                # nothing else (#55).
+                summarized = await offloaded_history(
+                    prepared.built.capabilities,
+                    dump_messages(result.all_messages()),
+                )
+            new_messages = result.new_messages()
+            called = tool_calls_in(new_messages)
+            # And what the *inherited* calls returned. On a resume the approved
+            # call was made by the previous execution, so only its return is new -
+            # `tool_calls_in` has nothing to hang it on and drops it, which left
+            # the one call a person reviewed as the one call with no recorded
+            # output anywhere (agenticos#506).
+            settled = settled_calls_in(new_messages)
+            status, output, structured, paused = _classify_output(
+                result, parked=prepared.approvals.parked
+            )
+            if paused is not None:
+                logger.info(
+                    "Run %s parked on %d approval(s)", prepared.run.id, len(paused.tool_call_ids)
+                )
+            finished_cleanly = True
+        except asyncio.CancelledError:
+            # The caller went away, or a delegation this run sits under was
+            # stopped. Cancelled is not failed, and the tokens spent up to here
+            # were still spent.
+            status = RunStatus.CANCELLED
+            logger.info("Run %s cancelled", prepared.run.id)
+            raise
+        except BudgetExceeded as exc:
+            # Not a malfunction - the platform working. Recorded separately so
+            # an operator filtering for problems does not wade through it.
+            status = RunStatus.BUDGET_EXCEEDED
+            error = str(exc)
+            budget_scope = exc.scope
+            logger.info("Run %s stopped by budget: %s", prepared.run.id, exc)
+            finished_cleanly = True
+        except GuardrailBlocked as exc:
+            # A refusal, not a malfunction - its own status for the same reason
+            # `BUDGET_EXCEEDED` is. The message names the edge and the refusal, not
+            # the content that tripped it, so it is safe to store on the row.
+            status = RunStatus.GUARDRAIL_BLOCKED
+            error = str(exc)
+            logger.info("Run %s blocked by a %s guardrail", prepared.run.id, exc.edge)
+            finished_cleanly = True
+        except ToolLoopStopped as exc:
+            # The guard warned the model and it looped again - the platform
+            # stopping a run that was spending for nothing, not a malfunction.
+            status = RunStatus.LOOP_STOPPED
+            error = str(exc)
+            logger.info("Run %s stopped for looping: %s", prepared.run.id, exc)
+            finished_cleanly = True
+        except Exception as exc:
+            error = run_failure_summary(exc)
+            logger.exception("Agent run %s failed", prepared.run.id)
+            raise
+        finally:
+            # None of this terminal-persistence sequence may replace the
+            # exception that ended the run. A `stop` cancels the turn, and any of
+            # these writes raising - a serialization failure, a constraint the
+            # delegation savepoints did not catch, a connection dropped mid-turn -
+            # would otherwise surface as a failed turn instead of a cancelled one
+            # (#235); the commit is only the last of them, and `finish`/`record`
+            # hit the same connection first. If the run ended cleanly there is
+            # nothing else wrong, so a persistence failure does surface. Committed
+            # here rather than left to the session context: that exit rolls back
+            # on any exception and is skipped entirely by a cancellation, so a run
+            # that failed, was stopped or ran out of budget would otherwise vanish
+            # from the history somebody opens.
+            try:
+                await self.finish(
+                    prepared,
+                    status=status,
+                    error=error,
+                    paused_state=paused,
+                    budget_scope=budget_scope,
+                )
+                if prepared.run.status == RunStatus.FAILED.value:
+                    status = RunStatus.FAILED
+                    paused = None
+                # So a run that failed, parked or was stopped still says what was
+                # asked and what it managed to do.
+                await self.transcript.record(
+                    prepared.run,
+                    prompt=said,
+                    answer=output,
+                    attachments=attachments,
+                    # Replayed after the prompt on every later turn, where the input
+                    # edge no longer looks: a refused turn keeps none of it (#2578).
+                    attachment_context=(
+                        None if status is RunStatus.GUARDRAIL_BLOCKED else attachment_context
+                    ),
+                    tool_calls=called,
+                    settled=settled,
+                    # So the step the run stopped on reads "awaiting approval" when
+                    # the conversation is read back, not as a call that ran (#601).
+                    parked=frozenset(paused.tool_call_ids.values()) if paused else frozenset(),
+                    model_label=prepared.built.model_label,
+                    mcp_origins=prepared.mcp_origins,
+                    # The last request's own size, for the anchor a replayed history
+                    # is measured against - see `build_message_history`.
+                    context_used_tokens=prepared.built.context.latest,
+                )
+                # After the rows, because what is stored beside a summary is how
+                # far it reaches: recorded before them it would stop short of this
+                # turn and replay it twice. A channel thread is long-lived and
+                # never rolls over, so without this every message past the window
+                # buys its own summary of a history one turn longer (#49).
+                if prepared.run.conversation_id is not None:
+                    conversations = ConversationService(self.db)
+                    if summarized is not None:
+                        await conversations.keep_summary(prepared.run.conversation_id, summarized)
+                    # On every turn, not only a summarising one: it is what the
+                    # *next* turn needs before it has a response of its own.
+                    if prepared.built.context.overhead is not None:
+                        await conversations.keep_overhead(
+                            prepared.run.conversation_id, prepared.built.context.overhead
+                        )
+                    # How far the reminder cadence advanced this turn, so the next
+                    # one resumes it. Only when the counter has moved off zero,
+                    # which it does exactly when a reminders capability ran this
+                    # turn or a previous one recorded it - so an agent that has
+                    # none never writes an empty blob, and `keep_reminder_state`
+                    # skips a value unchanged since it was seeded.
+                    if prepared.built.reminder_state.request_count:
+                        await conversations.keep_reminder_state(
+                            prepared.run.conversation_id,
+                            prepared.built.reminder_state.snapshot(),
+                        )
+                    await self.keep_plan(prepared, status=status)
+                await self.db.commit()
+                await change_feed.publish_run(prepared.run, "updated")
+            except Exception:
+                if finished_cleanly:
+                    raise
+                logger.exception("Could not persist the terminal state of run %s", prepared.run.id)
+
+        return RunSegment(
+            output=output,
+            run=prepared.run,
+            tool_calls=called,
+            settled=settled,
+            structured=structured,
+            generated_files=frozenset(prepared.built.deps.generated_files),
+        )
+
+    async def list_runs(
+        self,
+        ctx: AuthContext,
+        *,
+        agent_id: UUID | None = None,
+        parent_run_id: UUID | None = None,
+        include_delegations: bool = False,
+        filters: RunFilters | None = None,
+        order_by: RunOrder = RunOrder.STARTED_AT,
+        descending: bool = True,
+        skip: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[AgentRun], int]:
+        """Runs for the organization, newest first, optionally for one agent.
+
+        Scoped to the caller's organization here rather than in the route, so
+        run history is read through the same tenant boundary the rest of this
+        service enforces - there is no second place a listing could widen.
+
+        Top-level runs only by default: a delegated row and a run somebody
+        started are never summed down one column, because a parent's cost
+        already contains its children's. `parent_run_id` lists one run's own
+        delegations; `include_delegations` keeps them in an agent's own history.
+
+        `filters` is the caller's narrowing, and the tenant clause is applied
+        here regardless of it: a filter can only ever shrink what this returns,
+        never reach outside the organization.
+
+        `filters.statuses` narrows to a set of outcomes and composes with all
+        three. The route validates the words against `RunStatus` before they
+        reach here, so an unknown one is refused by name rather than becoming a
+        filter that silently matches nothing. It travels *inside* `RunFilters`
+        rather than beside it, because `conditions()` is what the page query and
+        the count query share - a status clause applied on its own is the one way
+        those two could come to describe different rows.
+        """
+        return await agent_run_repo.list_runs(
+            self.db,
+            organization_id=ctx.organization_id,
+            agent_id=agent_id,
+            parent_run_id=parent_run_id,
+            include_delegations=include_delegations,
+            filters=filters,
+            order_by=order_by,
+            descending=descending,
+            skip=skip,
+            limit=limit,
+        )
+
+    async def down_rated_run_ids(self, ctx: AuthContext, run_ids: Sequence[UUID]) -> set[UUID]:
+        """Which of these runs an assistant answer was rated down on.
+
+        The marker run history draws its 👎 from, computed for a whole page at
+        once and again for a single run read - the same answer either way.
+        Scoped to the caller's organization, like every read in this service, so
+        the marker cannot be a place a listing widens past its tenant boundary.
+        """
+        return await agent_run_repo.down_rated_run_ids(
+            self.db, organization_id=ctx.organization_id, run_ids=run_ids
+        )
+
+    async def voice_chains(
+        self, ctx: AuthContext, run_ids: Sequence[UUID]
+    ) -> dict[UUID, VoiceChain]:
+        """Each listed call, every connection of it summed - Activity's one row per call (#54).
+
+        Nothing to ask for a page with no calls on it. Scoped to the caller's
+        organization like every read here.
+        """
+        if not run_ids:
+            return {}
+        return await voice_call_repo.chains_for_runs(
+            self.db, list(run_ids), organization_id=ctx.organization_id
+        )
+
+    async def get_run(self, ctx: AuthContext, run_id: UUID) -> AgentRun:
+        """One run in the caller's organization.
+
+        A run belonging to another organization reads as absent, not forbidden:
+        the repository filters on `organization_id`, so a foreign id returns no
+        row and this raises the same `NotFoundError` an unknown id would - a
+        tenant cannot tell a neighbour's run from one that never existed.
+        """
+        run = await agent_run_repo.get_run(self.db, run_id, organization_id=ctx.organization_id)
+        if run is None:
+            raise NotFoundError(message="Run not found", details={"run_id": str(run_id)})
+        return run
+
+    async def neighbor_run_ids(
+        self, ctx: AuthContext, run: AgentRun
+    ) -> tuple[UUID | None, UUID | None]:
+        """The runs either side of `run` in its conversation, for the detail view.
+
+        Its conversation, not its agent's history - the repository explains why
+        the walk stays inside the thread, and inside the run's own level of it.
+
+        Takes the run rather than an id because every caller has already been
+        through :meth:`get_run`, whose organization filter is the authorization -
+        the row in hand is proof the caller may ask about its neighbours.
+        """
+        return await agent_run_repo.neighbor_run_ids(self.db, run)
+
+    async def get_run_transcript(
+        self,
+        ctx: AuthContext,
+        run_id: UUID,
+        *,
+        skip: int = 0,
+        limit: int = 100,
+        whole_conversation: bool = False,
+    ) -> tuple[AgentRun, list[Message], int]:
+        """One run, and the turns it produced - authorized, not owned.
+
+        `whole_conversation` widens the read to every turn of the thread the run
+        sits in, for a detail view that shows the run *in context* and scrolls to
+        it. That includes turns no run wrote - a message a member appended by
+        hand carries `run_id: null` and iterating the thread's runs would never
+        reach it. The reach is deliberate: those turns were the run's context,
+        so a reviewer of the run must be able to read them, and `runs:view` is
+        the wider lens that authorizes it - which is exactly why the whole-thread
+        read lives on this route and not on the owner-scoped conversation one.
+
+        Reading a run is the organization's right rather than its starter's: a
+        colleague holding `runs:view` reads a run somebody else began, which is
+        the whole reason this is a route of its own and not a filter on the
+        conversation endpoint. That endpoint stays scoped to the owner, so
+        widening *it* to reach a colleague's run would widen who can read the
+        private thread the run sits in.
+
+        The two refusals are ordered so that the first cannot be used to defeat
+        the second. Existence is resolved against the organization *before* the
+        permission is read, so a run in another tenant reads as absent - the same
+        `NotFoundError` an id that never existed raises, down to its `details` -
+        rather than as forbidden, which would confirm the id to a stranger. Only
+        once the run is known to be the caller's organization's does a missing
+        `runs:view` become a 403: a refusal that necessarily tells a member the
+        run exists, and only ever reaches a member.
+
+        A run with no conversation has no transcript by construction - the runner
+        never writes a turn for one (:meth:`TranscriptService.record` returns at
+        once when `conversation_id` is `None`) - so its emptiness is reported
+        through `run.conversation_id` being `None`, and the message read is
+        skipped rather than run to confirm a certainty.
+
+        Returns:
+            The run, its turns oldest-first, and the total number of them - the
+            last so a paged read still knows the size of the whole.
+
+        Raises:
+            NotFoundError: The run is not in the caller's organization - whether
+                it belongs to another tenant or to nobody.
+            AuthorizationError: The caller's organization holds the run but the
+                caller does not hold `runs:view`.
+        """
+        run = await agent_run_repo.get_run(self.db, run_id, organization_id=ctx.organization_id)
+        if run is None:
+            raise NotFoundError(message="Run not found", details={"run_id": str(run_id)})
+        if not ctx.has(Perm.RUNS_VIEW):
+            raise AuthorizationError(
+                message="Insufficient permissions",
+                details={"required": [Perm.RUNS_VIEW.value], "run_id": str(run_id)},
+            )
+        if run.conversation_id is None:
+            return run, [], 0
+        if whole_conversation:
+            messages = await conversation_repo.get_messages_by_conversation(
+                self.db, run.conversation_id, skip=skip, limit=limit, include_tool_calls=True
+            )
+            total = await conversation_repo.count_messages(self.db, run.conversation_id)
+        else:
+            messages = await conversation_repo.get_messages_by_run(
+                self.db, run.id, skip=skip, limit=limit, include_tool_calls=True
+            )
+            total = await conversation_repo.count_messages_by_run(self.db, run.id)
+        return run, messages, total
+
+    async def get_run_attachment(self, ctx: AuthContext, run_id: UUID, file_id: UUID) -> ChatFile:
+        """One file that arrived with a turn of this run - authorized as the run is.
+
+        `/files/{id}` is scoped to the uploader, which is the wrong scope for a
+        run review: reading a run is the organization's right rather than its
+        starter's, so a colleague holding `runs:view` sees the attachment cards on
+        somebody else's transcript and every preview answered 404. This route
+        replaces ownership with the turn, and grants exactly what the transcript
+        already grants - the file has to hang on a message of the run's own
+        conversation.
+
+        The refusals are ordered as they are wherever a run is read: existence is
+        resolved against the caller's organization first, so a run in another
+        tenant reads as absent rather than as forbidden, and only a run known to
+        be this organization's turns a missing `runs:view` into a 403.
+
+        Raises:
+            NotFoundError: The run is not in the caller's organization, the run
+                has no conversation, or no turn of that conversation carries this
+                file. The last is deliberately the same answer as a file that does
+                not exist: this route must not confirm one to a caller who cannot
+                read the transcript it hangs on.
+            AuthorizationError: The caller's organization holds the run but the
+                caller does not hold `runs:view`.
+        """
+        run = await agent_run_repo.get_run(self.db, run_id, organization_id=ctx.organization_id)
+        if run is None:
+            raise NotFoundError(message="Run not found", details={"run_id": str(run_id)})
+        if not ctx.has(Perm.RUNS_VIEW):
+            raise AuthorizationError(
+                message="Insufficient permissions",
+                details={"required": [Perm.RUNS_VIEW.value], "run_id": str(run_id)},
+            )
+        file = (
+            None
+            if run.conversation_id is None
+            else await chat_file_repo.get_in_conversation(
+                self.db, file_id, conversation_id=run.conversation_id
+            )
+        )
+        if file is None:
+            raise NotFoundError(message="File not found", details={"file_id": str(file_id)})
+        return file
+
+    async def get_run_manifest(self, ctx: AuthContext, run_id: UUID) -> RunManifest:
+        """What the run handed its model - authorized the way its transcript is.
+
+        The two refusals are ordered as they are everywhere a run is read:
+        existence is resolved against the caller's organization *first*, so a run
+        in another tenant reads as absent rather than as forbidden, and only a
+        run known to be this organization's turns a missing `runs:view` into a
+        403.
+
+        A run with no manifest raises rather than answering an empty record. The
+        two are different facts - "this run never reached a model" and "this
+        build recorded nothing" - and a panel drawn from an empty document says
+        the agent was given no tools and no prompt, which of the runs somebody
+        opens is the most misleading thing it could say.
+
+        Raises:
+            NotFoundError: The run is not in the caller's organization, or
+                nothing was recorded for it.
+            AuthorizationError: The caller's organization holds the run but the
+                caller does not hold `runs:view`.
+        """
+        run = await agent_run_repo.get_run(self.db, run_id, organization_id=ctx.organization_id)
+        if run is None:
+            raise NotFoundError(message="Run not found", details={"run_id": str(run_id)})
+        if not ctx.has(Perm.RUNS_VIEW):
+            raise AuthorizationError(
+                message="Insufficient permissions",
+                details={"required": [Perm.RUNS_VIEW.value], "run_id": str(run_id)},
+            )
+        manifest = await run_manifest_repo.get_by_run(self.db, run.id, ctx.organization_id)
+        if manifest is None:
+            raise NotFoundError(
+                message="Nothing was recorded for this run", details={"run_id": str(run_id)}
+            )
+        return manifest
+
+    async def transcript_ratings(
+        self, ctx: AuthContext, message_ids: list[UUID]
+    ) -> dict[UUID, dict[str, Any]]:
+        """Per-turn rating detail for a run transcript, batched.
+
+        The run-detail feedback panel reads three things off each turn, and this
+        gathers all three in one query each rather than one per message: a
+        transcript is read a page at a time, and a per-row lookup would turn a
+        page into a page of round trips.
+
+        - `user_rating` is the reading caller's own thumb - `1`, `-1`, or absent.
+          Usually absent here: a transcript is read by whoever holds `runs:view`,
+          not by whoever the run ran as. A caller with no user behind it at all (a
+          service-to-service key) has no own thumb, so that lookup is skipped
+          rather than asked with a null id.
+        - `rating_count` is how the organization rated the turn, likes and
+          dislikes, which is what lets the panel mark a turn nobody-but-me
+          objected to.
+        - `rating_comment` is the most recent down rating's comment, or absent.
+          The panel shows "what people said was wrong", so an up rating's note is
+          not it, and when more than one person objected the latest word is shown.
+
+        Every id in `message_ids` gets an entry, so a caller can attach the result
+        to each turn without a membership test; a turn nobody rated maps to three
+        empty answers, which is how a plain turn stays indistinguishable from a
+        rated one until somebody actually rated it.
+        """
+        if not message_ids:
+            return {}
+        user_ratings = (
+            await message_rating_repo.get_user_ratings_for_messages(
+                self.db, message_ids=message_ids, user_id=ctx.user_id
+            )
+            if ctx.user_id is not None
+            else {}
+        )
+        counts = await message_rating_repo.get_rating_counts_for_messages(
+            self.db, message_ids=message_ids
+        )
+        comments = await message_rating_repo.get_down_rating_comments_for_messages(
+            self.db, message_ids=message_ids
+        )
+        return {
+            message_id: {
+                "user_rating": user_ratings.get(message_id),
+                "rating_count": counts.get(message_id),
+                "rating_comment": comments.get(message_id),
+            }
+            for message_id in message_ids
+        }
+
+    async def trace_url(self, ctx: AuthContext, run: AgentRun) -> str | None:
+        """Where this run's trace can be read, if anywhere can.
+
+        `None` on three honest paths, and a client renders no link for any of
+        them: the run has no trace id (nothing was tracing), no slugs are
+        configured, or the agent redirects its traces to a project whose slugs
+        nobody told us. All three are configuration facts. The trace id stays on
+        the row regardless, because it is useful to anybody with Logfire access
+        even with no URL in the product.
+
+        Resolved per run rather than once per deployment because
+        `ObservabilitySpec` exists to send *one agent's* traces to a client's own
+        project - so a link built from the deployment's slugs would point at a
+        project that does not contain this run. The agent's own slugs win; the
+        deployment's are the fallback for every agent that redirects nothing.
+
+        Offered on the detail read only. Resolving it needs the version's stored
+        spec, which is a lookup per row, and a list of fifty runs has no use for
+        fifty trace links.
+
+        `ctx` is taken rather than derived from the run because the version lookup
+        is tenant-scoped and every read in this service goes through the same
+        boundary - a spec fetched by id alone would be one place a listing could
+        widen.
+        """
+        if run.logfire_trace_id is None:
+            return None
+        organization, project = settings.LOGFIRE_ORGANIZATION, settings.LOGFIRE_PROJECT
+        if run.agent_version_id is not None:
+            version = await agent_repo.get_version(
+                self.db, run.agent_version_id, organization_id=ctx.organization_id
+            )
+            observability = None if version is None else _observability_of(version.spec)
+            if observability is not None and observability.organization and observability.project:
+                organization, project = observability.organization, observability.project
+        if not organization or not project:
+            return None
+        return (
+            f"{settings.LOGFIRE_BASE_URL.rstrip('/')}/{organization}/{project}"
+            f"?q=trace_id%3D%27{run.logfire_trace_id}%27"
+        )
+
+    async def monthly_spend(self, ctx: AuthContext, *, agent_id: UUID | None = None) -> Decimal:
+        """Spend so far this calendar month, for the org or one agent.
+
+        One entry point, two genuinely different sums - and the two behaving
+        alike is the bug, not the simplification.
+
+        The organization's number includes what ingestion spent on embeddings,
+        because that is money too and the organization's cap is a cap on the
+        bill, not on one kind of line item. It **excludes the runs a delegation
+        opened**: every run has one spend ledger, so a delegate's tokens are
+        already inside the parent run's cost, and counting the child row as well
+        would bill the organization twice for one request.
+
+        The agent's number is the mirror image. It carries no ingestion -
+        indexing a shared knowledge base is nobody's agent's spend - and it
+        *does* count the runs it was delegated into, because those rows are the
+        only record of what that agent cost. An agent used as a delegate
+        accumulates against its own monthly cap that way; the cap does not stop a
+        run mid-delegation (inside a delegation the parent's caps bind) but it is
+        what makes "the researcher agent cost $40 this month" answerable and what
+        a budget alert on that agent fires on.
+        """
+        if agent_id is not None:
+            return await agent_run_repo.sum_cost_since(
+                self.db,
+                organization_id=ctx.organization_id,
+                since=month_start(),
+                agent_id=agent_id,
+                include_delegations=True,
+            )
+        return await organization_monthly_spend(self.db, ctx.organization_id)
+
+    async def spend_by_provider(
+        self, ctx: AuthContext, *, since: datetime, until: datetime | None = None
+    ) -> list[tuple[str | None, Decimal, int]]:
+        """What each model provider was paid over a window.
+
+        Every run contributes its **own** spend, its delegations' share taken
+        back out, so a delegate on a second vendor appears under that vendor
+        rather than under the one its parent happened to use. The rows still sum
+        to the bill.
+
+        The window is passed in rather than derived from a day count, so this and
+        the per-agent rows beside it always describe the same runs. Two figures
+        on one screen over two windows is the defect #198 is about, one panel
+        further down.
+        """
+        return await agent_run_repo.spend_by_provider(
+            self.db, organization_id=ctx.organization_id, since=since, until=until
+        )
+
+    async def cache_collapses(
+        self, ctx: AuthContext, *, since: datetime, until: datetime | None = None
+    ) -> list[tuple[UUID, str, str, str | None, int, int, int, int]]:
+        """Prompt-cache busts and expiries per agent and model, over the Spend tab's window."""
+        return await agent_run_repo.cache_collapses(
+            self.db, organization_id=ctx.organization_id, since=since, until=until
+        )
+
+    async def spend_by_day(
+        self, ctx: AuthContext, *, since: datetime, until: datetime | None = None
+    ) -> list[tuple[date, Decimal, int]]:
+        """What the organization spent each day of a window, own spend per run.
+
+        Over the same window as the splits beside it, so the bars and the
+        breakdowns describe the same runs.
+        """
+        return await agent_run_repo.spend_by_day(
+            self.db, organization_id=ctx.organization_id, since=since, until=until
+        )
+
+    async def spend_by_key(
+        self, ctx: AuthContext, *, since: datetime, until: datetime | None = None
+    ) -> list[tuple[UUID | None, str | None, Decimal, int]]:
+        """What each stored key was spent through over a window.
+
+        Own spend per run, as :meth:`spend_by_provider` - a delegate running on a
+        different stored key is the same question about the same money.
+        """
+        return await agent_run_repo.spend_by_key(
+            self.db, organization_id=ctx.organization_id, since=since, until=until
+        )
+
+    async def spend_by_agent(
+        self, ctx: AuthContext, *, since: datetime, until: datetime | None = None
+    ) -> list[AgentSpendRow]:
+        """One row per agent for the Spend tab - the window, the month, the cap.
+
+        The month-to-date figure is always the calendar month regardless of the
+        window asked for, because that is the period a cap is a cap on. A tile
+        comparing a rolling seven days against a monthly ceiling would read as
+        20% used on the day the cap was actually reached.
+        """
+        return await agent_run_repo.spend_by_agent(
+            self.db,
+            organization_id=ctx.organization_id,
+            since=since,
+            until=until,
+            month_since=month_start(),
+        )

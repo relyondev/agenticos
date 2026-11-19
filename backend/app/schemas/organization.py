@@ -1,0 +1,430 @@
+"""Organization, OrganizationMember and Invitation schemas."""
+
+import re
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated
+from uuid import UUID
+
+from pydantic import AfterValidator, EmailStr, Field, field_validator
+
+from app.core.permissions import OrgRoleName
+from app.db.models.organization import MembershipSourceLiteral, ProactiveTiming
+from app.db.models.watch import MIN_WATCH_MINUTES
+from app.schemas.base import BaseSchema, TimestampSchema
+from app.schemas.user import UserRead
+
+_ID = UUID
+
+# The organization's monthly ceiling, as a client states it. Constrained inside
+# the union rather than on the field so that `null` stays a legal value: it is
+# how the cap is *removed*, and a `gt=0` applied to the whole field would
+# reject the one request that lifts the limit.
+MonthlyBudgetUsd = Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=6)]
+
+
+class OrganizationCreate(BaseSchema):
+    name: str = Field(min_length=2, max_length=128)
+    slug: str | None = Field(default=None, min_length=2, max_length=64)
+
+    @field_validator("slug")
+    @classmethod
+    def slug_format(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not re.match(r"^[a-z0-9][a-z0-9\-]*[a-z0-9]$", v):
+            raise ValueError(
+                "Slug must be lowercase alphanumeric with hyphens, no leading/trailing hyphens"
+            )
+        return v
+
+
+class OrganizationUpdate(BaseSchema):
+    """A partial update to an organization's settings.
+
+    `monthly_budget_usd` and `avatar_color` are the fields where omitting them
+    and sending `null` mean different things: absent leaves the setting as it
+    stands, `null` clears it (removes the cap; resets the colour to auto).
+    Renaming an organization must not uncap it or reset its colour, so the
+    service keys on whether the client named the field rather than on its value.
+    """
+
+    name: str | None = Field(default=None, min_length=2, max_length=128)
+    avatar_url: str | None = Field(default=None, max_length=500)
+    avatar_color: int | None = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description="Default-avatar colour, slot 1-10; send null to reset to auto.",
+    )
+    monthly_budget_usd: MonthlyBudgetUsd | None = Field(
+        default=None,
+        description=(
+            "Dollars this organization's agents may spend in a calendar month, "
+            "or null for no limit. Omit to leave the current setting alone."
+        ),
+    )
+    proactive_limit_usd: Decimal | None = Field(
+        default=None,
+        ge=0,
+        max_digits=12,
+        decimal_places=6,
+        description=(
+            "Dollars the platform may spend per person per month on work it does on its "
+            "own initiative - noticing repeated requests, writing first messages. Zero "
+            "switches that work off. Omit to leave it alone; changing it needs "
+            "'budgets:manage'."
+        ),
+    )
+    proactive_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the platform looks at each person's week on its own initiative and "
+            "proposes what would save them time. Turning it on needs a "
+            "`proactive_model_profile_id`. Needs 'budgets:manage'."
+        ),
+    )
+    proactive_model_profile_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The model profile that work runs on, one of this organization's. Send null "
+            "to clear it, which only an organization with the work off may do."
+        ),
+    )
+    proactive_days: list[int] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=7,
+        description="The ISO weekdays it runs on, in each person's time zone; 1 is Monday.",
+    )
+    proactive_hour: int | None = Field(
+        default=None,
+        ge=0,
+        le=23,
+        description="The hour it runs at, in each person's time zone.",
+    )
+    proactive_timing: ProactiveTiming | None = Field(
+        default=None,
+        description=(
+            "`fixed`: at `proactive_hour`. `before_work`: an hour before the working "
+            "hours a person's profile states, and at `proactive_hour` for anyone whose "
+            "profile states none."
+        ),
+    )
+    proactive_watches_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Whether people may have the platform watch their own MCP connections and "
+            "report what is new. Runs on the proactive model and limit. Needs "
+            "'budgets:manage'."
+        ),
+    )
+    proactive_watch_min_minutes: int | None = Field(
+        default=None,
+        ge=MIN_WATCH_MINUTES,
+        le=10080,
+        description="The most often any watch here may run, in minutes.",
+    )
+    welcome_dm_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Whether a new member gets a direct message from the organization's Slack, "
+            "Teams and Mattermost bots. Needs 'org:settings'."
+        ),
+    )
+    welcome_dm_text: str | None = Field(
+        default=None,
+        max_length=1000,
+        description=(
+            "What that message says; `{organization}`, `{bot}` and `{url}` are filled "
+            "in. Null for the built-in greeting in the member's language."
+        ),
+    )
+
+    @field_validator("proactive_days")
+    @classmethod
+    def _weekdays(cls, days: list[int] | None) -> list[int] | None:
+        if days is None:
+            return None
+        if any(day < 1 or day > 7 for day in days):
+            raise ValueError("Weekdays run from 1 (Monday) to 7 (Sunday)")
+        return sorted(set(days))
+
+    chat_may_waive_approvals: bool | None = Field(
+        default=None,
+        description=(
+            "Whether a chat session here may grant standing consent to gated tool "
+            "calls. Omit to leave it alone. Changing it needs 'approvals:decide' - "
+            "it is a decision about the approval queue, not about the organization's "
+            "name."
+        ),
+    )
+    public_live_data: bool | None = Field(
+        default=None,
+        description=(
+            "Whether a page's data may reach anyone with its public link or on the sites "
+            "that embed it, once the page's owner confirms it. Omit to leave it alone. "
+            "Needs 'org:settings' (Owner or Admin), signed in as themselves."
+        ),
+    )
+    speech_to_text_provider: str | None = Field(
+        default=None,
+        max_length=32,
+        description="A provider from the speech-to-text catalog; null clears it.",
+    )
+    speech_to_text_model: str | None = Field(
+        default=None,
+        max_length=255,
+        description="A model that provider offers; null clears it. Set with the provider.",
+    )
+    speech_to_text_secret_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The vault key the pair is sent with: an organization-visible API key "
+            "whose purpose is the provider. Required with a pair; null clears it."
+        ),
+    )
+    speech_to_text_language: str | None = Field(
+        default=None,
+        max_length=8,
+        description="ISO-639-1 code to pin recordings to, or null to auto-detect.",
+    )
+    dictation_max_seconds: int | None = Field(
+        default=None, ge=10, le=600, description="Longest dictation, in seconds (10-600)."
+    )
+
+
+class OrganizationRead(BaseSchema, TimestampSchema):
+    id: _ID
+    name: str
+    slug: str
+    is_personal: bool
+    is_default: bool = Field(
+        default=False,
+        description=(
+            "Whether this is the deployment's default organization: the one every new "
+            "account joins, and where a request naming no organization acts."
+        ),
+    )
+    avatar_url: str | None = None
+    avatar_color: int | None = None
+    member_count: int = 0
+    role: str  # current user's role in this org
+    monthly_budget_usd: Decimal | None = None
+    proactive_limit_usd: Decimal = Field(
+        default=Decimal("1"),
+        description="What background work may spend per person per month; zero is off.",
+    )
+    proactive_enabled: bool = False
+    proactive_model_profile_id: UUID | None = None
+    proactive_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
+    proactive_hour: int = 5
+    proactive_timing: ProactiveTiming = "fixed"
+    proactive_watches_enabled: bool = False
+    proactive_watch_min_minutes: int = 60
+    welcome_dm_enabled: bool = False
+    welcome_dm_text: str | None = None
+    chat_may_waive_approvals: bool = Field(
+        default=False,
+        description=(
+            "Whether a chat session here may grant standing consent to gated tool "
+            "calls. The chat reads it to decide whether to offer the control at "
+            "all; who may then use it is `approvals:decide`."
+        ),
+    )
+    public_live_data: bool = Field(
+        default=False,
+        description=(
+            "Whether a page's data may reach anonymous visitors of its public link or its "
+            "embeds, where the page's owner has confirmed it"
+        ),
+    )
+    speech_to_text_provider: str | None = None
+    speech_to_text_model: str | None = None
+    speech_to_text_secret_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The vault key the pair is sent with, by id. Null with a pair means the "
+            "key was deleted, and dictation waits for another to be chosen."
+        ),
+    )
+    speech_to_text_language: str | None = None
+    dictation_max_seconds: int = 300
+
+
+class OrganizationList(BaseSchema):
+    items: list[OrganizationRead]
+    total: int
+
+
+class OrganizationMemberRead(BaseSchema):
+    id: _ID
+    organization_id: _ID
+    user_id: _ID
+    role: str
+    email: str
+    full_name: str | None = None
+    avatar_url: str | None = None
+    avatar_color: int | None = None
+    joined_at: datetime
+    source: MembershipSourceLiteral = "manual"
+    """`directory` when the directory sync made this membership and keeps its
+    role - changing the role by hand takes it over and makes it `manual`."""
+    can_change_role: bool = False
+    """Whether the caller listing may change this member's role - the server's
+    own answer to `change_role`'s rule, so the client renders a selector only
+    where a change would be accepted rather than one that 403s (#700)."""
+
+
+class OrganizationMemberUpdate(BaseSchema):
+    role: str = Field(description="New role for the member")
+
+    @field_validator("role")
+    @classmethod
+    def role_valid(cls, v: str) -> str:
+        # A role change cannot make a second owner - ownership transfers
+        # explicitly, and transfer-ownership demotes the outgoing owner (#672).
+        allowed = {role.value for role in OrgRoleName} - {OrgRoleName.OWNER.value}
+        if v not in allowed:
+            raise ValueError(f"Role must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+
+class OrganizationMemberList(BaseSchema):
+    items: list[OrganizationMemberRead]
+    total: int
+
+
+def _invitable_role(v: str) -> str:
+    allowed = {role.value for role in OrgRoleName} - {OrgRoleName.OWNER.value}
+    if v not in allowed:
+        raise ValueError(f"Role must be one of: {', '.join(sorted(allowed))}")
+    return v
+
+
+# An invitation cannot make someone an owner - ownership transfers explicitly.
+# A link takes the same bound: it is built to be shared, so an unvalidated role
+# on it was a mintable owner credential (#551).
+InvitableRole = Annotated[str, AfterValidator(_invitable_role)]
+
+
+class InvitationCreate(BaseSchema):
+    email: EmailStr = Field(max_length=255)
+    role: InvitableRole = "member"
+
+
+class InviteLinkCreate(BaseSchema):
+    """A shareable link, as an administrator asks for one."""
+
+    role: InvitableRole = "member"
+    max_uses: int | None = Field(
+        default=None,
+        ge=1,
+        le=500,
+        description="How many people it admits; null is unlimited",
+    )
+    email_domain: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "Restrict to addresses at this domain. An unlimited link with no "
+            "domain only holds while the URL itself is treated as a secret, "
+            "which a link pasted into a channel is not."
+        ),
+    )
+
+
+class InvitationRead(BaseSchema):
+    """An invitation as anyone reading the organization's list sees it.
+
+    Deliberately without the token. A token is a bearer credential - whoever
+    holds one joins the organization as the role offered to somebody else's
+    address - and this model is what `GET /orgs/{id}/invitations` returns, so
+    carrying the token here handed out every pending credential on every call.
+    Email, role, status and expiry are what an administrator decides on;
+    revoking addresses the invitation by `id`.
+    """
+
+    id: _ID
+    organization_id: _ID
+    # Null makes this a link rather than an invitation to one address.
+    email: str | None = None
+    role: str
+    status: str
+    max_uses: int | None = None
+    used_count: int = 0
+    #: How many people registered through this link and have not joined yet.
+    #:
+    #: Beside `used_count` rather than folded into it, because they are different
+    #: facts about the same ceiling: one is who is in, the other is who spent a use
+    #: getting an account. `max_uses` is compared against their sum, so a console
+    #: showing only the acceptances would say a spent link had a place left. The
+    #: count, never the addresses - who registered under a link is not something a
+    #: list of invitations publishes.
+    reserved_count: int = 0
+    email_domain: str | None = None
+    expires_at: datetime
+    created_at: datetime
+    invited_by: UserRead | None = None
+
+
+class InvitationCreated(InvitationRead):
+    """The one response that carries the token, returned to the inviter once.
+
+    This is the copy of the link for the person who just sent it, for when the
+    mail does not arrive. Nothing reads it back afterwards - there is no endpoint
+    that returns a stored token.
+    """
+
+    invitation_token: str
+
+    email_delivered: bool | None = None
+    """Whether the email carrying this invitation was accepted for delivery.
+
+    Three states, and the third is why this is not a plain `bool`. `True` and
+    `False` are the outcome of an email that was attempted; `None` means none was
+    - which is what an invite *link* is, since it has no address to send to.
+
+    It exists because the inviter was being told "invitation sent" either way. A
+    deployment with no `SMTP_*` configured mails nobody, and on its first day that
+    is every deployment - so the one sentence on screen was false and the link
+    beside it was being discarded unread (#1484)."""
+
+
+class InvitationList(BaseSchema):
+    items: list[InvitationRead]
+    total: int
+
+
+class InvitationAccept(BaseSchema):
+    token: str
+
+
+class InvitationStageRequest(BaseSchema):
+    """The token an invitee holds, offered for the server-side exchange (#1414)."""
+
+    token: str = Field(min_length=1, max_length=64)
+
+
+class InvitationAccepted(BaseSchema):
+    """The organization an accepted invitation joined, for the console to switch to."""
+
+    organization_id: UUID
+
+
+class InvitationStaged(BaseSchema):
+    """The opaque handle the exchange mints, for the frontend's server layer to hold.
+
+    It stands in for the token through the sign-in round trip. What keeps it off a
+    script is not this model - it is the response body of a public endpoint - but
+    where the frontend puts it: its server layer reads the handle and sets it as an
+    `httpOnly` cookie the browser cannot read, rather than handing it to page code.
+    The handle holds nothing about the invitation - not the token, not the
+    organization - so it names nobody even to whoever reads it in transit.
+    """
+
+    handle: str
+
+
+class TransferOwnershipRequest(BaseSchema):
+    new_owner_user_id: _ID

@@ -1,0 +1,606 @@
+import { render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  MessageList,
+  continuesTurn,
+  endsTurn,
+  lastToolTurnIndex,
+  layoutMessages,
+} from "./message-list";
+import type { ChatMessage } from "@/types";
+
+const state = vi.hoisted(() => ({
+  agents: [] as { id: string; slug: string; name: string }[],
+  rendered: [] as {
+    id: string;
+    agent?: string;
+    groupPosition?: string;
+    continuesTurn: boolean;
+    canRegenerate: boolean;
+    openLastStep: boolean;
+    request?: string;
+  }[],
+}));
+
+vi.mock("@/hooks", () => ({ useAgents: () => ({ agents: state.agents }) }));
+const navigation = vi.hoisted(() => ({ push: vi.fn(), pointAt: vi.fn() }));
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push: navigation.push }) }));
+vi.mock("@/lib/assistant-highlight", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/assistant-highlight")>()),
+  pointAt: navigation.pointAt,
+}));
+// The extras are tested on their own; the list decides which agent they name.
+// The item is tested on its own; what this asserts is what the list decides to
+// hand it - which agent, where in a group, and whether it may be regenerated.
+vi.mock("./message-item", () => ({
+  MessageItem: ({
+    message,
+    agent,
+    groupPosition,
+    continuesTurn,
+    openLastStep,
+    onRegenerate,
+    request,
+  }: {
+    message: ChatMessage;
+    agent?: { name: string };
+    groupPosition?: string;
+    continuesTurn?: boolean;
+    openLastStep?: boolean;
+    onRegenerate?: () => void;
+    request?: string;
+  }) => {
+    state.rendered.push({
+      id: message.id,
+      agent: agent?.name,
+      groupPosition,
+      continuesTurn: continuesTurn === true,
+      canRegenerate: onRegenerate !== undefined,
+      openLastStep: openLastStep === true,
+      request,
+    });
+    return (
+      <div data-testid={`message-${message.id}`}>
+        {onRegenerate ? (
+          <button type="button" onClick={onRegenerate}>
+            regenerate {message.id}
+          </button>
+        ) : null}
+      </div>
+    );
+  },
+}));
+
+function message(overrides: Partial<ChatMessage> = {}): ChatMessage {
+  return {
+    id: "m-1",
+    role: "assistant",
+    content: "answer",
+    timestamp: new Date("2026-07-31T12:00:00Z"),
+    ...overrides,
+  };
+}
+
+const rendered = (id: string) => state.rendered.find((entry) => entry.id === id);
+
+const TOOL = {
+  id: "tc-1",
+  name: "write_file",
+  args: { path: "notes.md" },
+  status: "completed" as const,
+  result: "Wrote 1 lines",
+};
+
+beforeEach(() => {
+  state.agents = [];
+  state.rendered = [];
+});
+
+/**
+ * The transcript.
+ *
+ * Three decisions live here rather than in the item, because each one depends on
+ * the messages *around* a message.
+ *
+ * The agent is resolved from the current list rather than read off the message, so
+ * a renamed agent is labelled by its name today and a new picture appears on old
+ * turns. Archived agents are included on purpose - a conversation an agent took
+ * part in before it was retired still has to say who answered.
+ *
+ * Only the most recent assistant turn may be regenerated. Regenerating an older
+ * one would fork the transcript at a point everything after it already answered.
+ */
+describe("the transcript", () => {
+  it("renders every message, in order", () => {
+    render(
+      <MessageList messages={[message({ id: "m-1", role: "user" }), message({ id: "m-2" })]} />,
+    );
+
+    expect(state.rendered.map((entry) => entry.id)).toEqual(["m-1", "m-2"]);
+  });
+
+  it("keeps a streamed turn's bubble when the database id replaces its temporary one", () => {
+    // A new key is a new bubble: the reveal of the last words was cut off and
+    // the whole answer appeared at once, right as the turn ended.
+    const { rerender } = render(<MessageList messages={[message({ id: "tmp-1" })]} />);
+    const bubble = screen.getByTestId("message-tmp-1");
+
+    rerender(<MessageList messages={[message({ id: "m-real", renderKey: "tmp-1" })]} />);
+
+    expect(screen.getByTestId("message-m-real")).toBe(bubble);
+  });
+
+  it("labels a turn with the agent's name as it is today", () => {
+    // Not as it was when the turn was saved: the message carries an id, and the
+    // name comes from the list.
+    state.agents = [{ id: "a-1", slug: "support-(renamed)", name: "Support (renamed)" }];
+
+    render(<MessageList messages={[message({ agentId: "a-1" })]} />);
+
+    expect(rendered("m-1")?.agent).toBe("Support (renamed)");
+  });
+
+  it("leaves a turn unattributed when the agent is gone from the list entirely", () => {
+    // Deleted rather than archived. Better unlabelled than labelled wrongly.
+    state.agents = [];
+
+    render(<MessageList messages={[message({ agentId: "a-gone" })]} />);
+
+    expect(rendered("m-1")?.agent).toBeUndefined();
+  });
+
+  it("asks for archived agents too, so a retired agent's turns keep their name", () => {
+    render(<MessageList messages={[message()]} />);
+
+    // The assertion is on the hook's own contract: this list is the one place
+    // that needs the archived ones.
+    expect(state.rendered).toHaveLength(1);
+  });
+
+  it("leaves a turn nobody attributed unattributed", () => {
+    render(<MessageList messages={[message({ agentId: undefined })]} />);
+
+    expect(rendered("m-1")?.agent).toBeUndefined();
+  });
+
+  it("offers a regenerate on the last assistant turn only", () => {
+    render(
+      <MessageList
+        messages={[
+          message({ id: "m-1" }),
+          message({ id: "m-2", role: "user" }),
+          message({ id: "m-3" }),
+        ]}
+        onRegenerate={vi.fn()}
+      />,
+    );
+
+    expect(rendered("m-1")?.canRegenerate).toBe(false);
+    expect(rendered("m-3")?.canRegenerate).toBe(true);
+  });
+
+  it("never offers it on a person's own message", () => {
+    render(
+      <MessageList
+        messages={[message({ id: "m-1" }), message({ id: "m-2", role: "user" })]}
+        onRegenerate={vi.fn()}
+      />,
+    );
+
+    expect(rendered("m-2")?.canRegenerate).toBe(false);
+    expect(rendered("m-1")?.canRegenerate).toBe(true);
+  });
+
+  it("does not offer it while the answer is still arriving", () => {
+    // Regenerating a half-streamed turn would race the stream that is writing it.
+    render(<MessageList messages={[message({ isStreaming: true })]} onRegenerate={vi.fn()} />);
+
+    expect(rendered("m-1")?.canRegenerate).toBe(false);
+  });
+
+  it("offers nothing when the caller does not handle it", () => {
+    render(<MessageList messages={[message()]} />);
+
+    expect(rendered("m-1")?.canRegenerate).toBe(false);
+  });
+
+  it("regenerates the message whose button was pressed", () => {
+    const onRegenerate = vi.fn();
+    render(<MessageList messages={[message({ id: "m-9" })]} onRegenerate={onRegenerate} />);
+
+    screen.getByRole("button", { name: "regenerate m-9" }).click();
+
+    expect(onRegenerate).toHaveBeenCalledWith("m-9");
+  });
+
+  it("offers nothing in a conversation with no assistant turn yet", () => {
+    render(<MessageList messages={[message({ role: "user" })]} onRegenerate={vi.fn()} />);
+
+    expect(rendered("m-1")?.canRegenerate).toBe(false);
+  });
+
+  it("says where each message sits in its group, so the bubbles join up", () => {
+    // A group is one turn split across several messages; the item rounds its
+    // corners from this.
+    render(
+      <MessageList
+        messages={[
+          message({ id: "m-1", groupId: "g-1" }),
+          message({ id: "m-2", groupId: "g-1" }),
+          message({ id: "m-3", groupId: "g-1" }),
+        ]}
+      />,
+    );
+
+    expect(rendered("m-1")?.groupPosition).toBe("first");
+    expect(rendered("m-2")?.groupPosition).toBe("middle");
+    expect(rendered("m-3")?.groupPosition).toBe("last");
+  });
+
+  it("calls a group of one a single", () => {
+    render(<MessageList messages={[message({ groupId: "g-1" })]} />);
+
+    expect(rendered("m-1")?.groupPosition).toBe("single");
+  });
+
+  it("says nothing about position for a message in no group", () => {
+    render(<MessageList messages={[message()]} />);
+
+    expect(rendered("m-1")?.groupPosition).toBeUndefined();
+  });
+
+  it("groups by id rather than by adjacency", () => {
+    // Two groups interleaved is not a shape the stream produces today, but the
+    // position has to come from the group's own members either way.
+    render(
+      <MessageList
+        messages={[
+          message({ id: "m-1", groupId: "g-1" }),
+          message({ id: "m-2", groupId: "g-2" }),
+          message({ id: "m-3", groupId: "g-1" }),
+        ]}
+      />,
+    );
+
+    expect(rendered("m-1")?.groupPosition).toBe("first");
+    expect(rendered("m-2")?.groupPosition).toBe("single");
+    expect(rendered("m-3")?.groupPosition).toBe("last");
+  });
+
+  it("opens the last step of the last turn that used a tool, not of the last turn", async () => {
+    // The case this got wrong: an agent writes a file and then answers about it in
+    // prose. Anchoring on "the newest assistant message" left the file it had just
+    // written folded away, which is the one thing somebody reopening the chat wants.
+    render(
+      <MessageList
+        messages={[
+          message({ id: "wrote", parts: [{ id: "p1", type: "tool", toolCall: TOOL }] }),
+          message({ id: "spoke", content: "Done — the file is there." }),
+        ]}
+      />,
+    );
+
+    expect(rendered("wrote")?.openLastStep).toBe(true);
+    expect(rendered("spoke")?.openLastStep).toBe(false);
+  });
+
+  it("opens nothing in a conversation where no turn used a tool", () => {
+    render(<MessageList messages={[message({ id: "a" }), message({ id: "b" })]} />);
+
+    expect(state.rendered.every((entry) => !entry.openLastStep)).toBe(true);
+  });
+});
+
+/**
+ * Which turn's work stays open.
+ *
+ * Its own function because the answer depends on the messages around a message, and
+ * the awkward cases are all off-screen: a tool turn followed by prose, a user message
+ * after both, and a transcript with no tool call in it at all.
+ */
+describe("the last turn that used a tool", () => {
+  it("finds the most recent one, past anything said after it", () => {
+    const messages = [
+      message({ id: "a", parts: [{ id: "p1", type: "tool", toolCall: TOOL }] }),
+      message({ id: "b", parts: [{ id: "p2", type: "tool", toolCall: TOOL }] }),
+      message({ id: "c", content: "prose" }),
+      message({ id: "d", role: "user", content: "thanks" }),
+    ];
+
+    expect(lastToolTurnIndex(messages)).toBe(1);
+  });
+
+  it("counts a legacy message that carries its calls beside its parts", () => {
+    // Messages written before parts existed keep them on `toolCalls`.
+    expect(lastToolTurnIndex([message({ id: "a", toolCalls: [TOOL] })])).toBe(0);
+  });
+
+  it("answers -1 when nothing used a tool", () => {
+    expect(lastToolTurnIndex([message({ id: "a" })])).toBe(-1);
+    expect(lastToolTurnIndex([])).toBe(-1);
+  });
+
+  it("never answers with a user message, whatever it carries", () => {
+    const messages = [
+      message({ id: "u", role: "user", parts: [{ id: "p", type: "tool", toolCall: TOOL }] }),
+    ];
+
+    expect(lastToolTurnIndex(messages)).toBe(-1);
+  });
+});
+
+describe("one run drawn as one turn", () => {
+  it("continues the turn for the next segment of the same run", () => {
+    // A run parks on an approval, somebody decides, it runs again. Each segment
+    // is its own message - three avatars and three agent names down the page for
+    // one question, which reads as three agents having answered it.
+    const messages = [
+      message({ id: "a", runId: "r-9" }),
+      message({ id: "b", runId: "r-9" }),
+      message({ id: "c", runId: "r-9" }),
+    ];
+
+    expect([0, 1, 2].map((i) => continuesTurn(messages, i))).toEqual([false, true, true]);
+  });
+
+  it("starts a new turn for a different run", () => {
+    const messages = [message({ id: "a", runId: "r-9" }), message({ id: "b", runId: "r-10" })];
+
+    expect(continuesTurn(messages, 1)).toBe(false);
+  });
+
+  it("never groups messages with neither id recorded", () => {
+    // Absent is "not recorded", not "the same run". Guessing from adjacency
+    // would fold two unrelated answers into one turn.
+    const messages = [message({ id: "a" }), message({ id: "b" })];
+
+    expect(continuesTurn(messages, 1)).toBe(false);
+  });
+
+  it("groups a turn that is still streaming, which has no run id yet", () => {
+    // The row does not exist until the turn is saved, so a live segment carries
+    // the client's own `groupId` and nothing else. Keying on `runId` alone made
+    // grouping work after a reload and never while anybody watched it happen -
+    // measured on a four-segment turn as 32px of padding between each pair and an
+    // avatar on every one, which is the three-agents look this exists to stop.
+    const messages = [message({ id: "a", groupId: "g-1" }), message({ id: "b", groupId: "g-1" })];
+
+    expect(continuesTurn(messages, 1)).toBe(true);
+  });
+
+  it("starts a new turn for a different group", () => {
+    const messages = [message({ id: "a", groupId: "g-1" }), message({ id: "b", groupId: "g-2" })];
+
+    expect(continuesTurn(messages, 1)).toBe(false);
+  });
+
+  it("prefers the stored id where both segments have one", () => {
+    // A groupId is the client's guess at "one turn" and a runId is the server's
+    // answer, so a pair that disagrees is two runs the client happened to stamp
+    // together - not one turn.
+    const messages = [
+      message({ id: "a", runId: "r-9", groupId: "g-1" }),
+      message({ id: "b", runId: "r-10", groupId: "g-1" }),
+    ];
+
+    expect(continuesTurn(messages, 1)).toBe(false);
+  });
+
+  it("restarts the turn when the person said something in between", () => {
+    // Two segments of one run with a question between them is not one turn: the
+    // person spoke, and the answer after that is a reply to them.
+    const messages = [
+      message({ id: "a", runId: "r-9" }),
+      message({ id: "u", role: "user", content: "wait", runId: "r-9" }),
+      message({ id: "b", runId: "r-9" }),
+    ];
+
+    expect(continuesTurn(messages, 2)).toBe(false);
+  });
+
+  it("hands the flag to the item", () => {
+    render(
+      <MessageList
+        messages={[message({ id: "m-1", runId: "r-9" }), message({ id: "m-2", runId: "r-9" })]}
+      />,
+    );
+
+    expect(rendered("m-1")?.continuesTurn).toBe(false);
+    expect(rendered("m-2")?.continuesTurn).toBe(true);
+  });
+});
+
+describe("where a turn's time and cost belong", () => {
+  const USAGE = {
+    input_tokens: 6603,
+    output_tokens: 189,
+    cost_usd: "0.0133",
+    cost_is_partial: false,
+    budget_percent: null,
+    agent_budget_percent: null,
+    sandbox: null,
+    context: null,
+  };
+
+  it("ends the turn on its last segment, not on every one", () => {
+    const messages = [
+      message({ id: "a", runId: "r-9" }),
+      message({ id: "b", runId: "r-9" }),
+      message({ id: "c", runId: "r-9" }),
+    ];
+
+    expect([0, 1, 2].map((i) => endsTurn(messages, i))).toEqual([false, false, true]);
+  });
+
+  it("ends a turn of one message on that message", () => {
+    expect(endsTurn([message({ id: "a" })], 0)).toBe(true);
+  });
+
+  it("carries the figure forward from the segment that recorded it", () => {
+    // A run reports what it has spent when it *parks*, so the cost sat on the
+    // first segment - halfway up the answer, with nothing under the end of it.
+    const messages = [
+      message({ id: "a", runId: "r-9", usage: USAGE }),
+      message({ id: "b", runId: "r-9" }),
+    ];
+
+    expect(layoutMessages(messages)[1]?.turnUsage).toBe(USAGE);
+  });
+
+  it("prefers the last figure in the turn, which is the run's total by then", () => {
+    const later = { ...USAGE, cost_usd: "0.0201" };
+    const messages = [
+      message({ id: "a", runId: "r-9", usage: USAGE }),
+      message({ id: "b", runId: "r-9", usage: later }),
+    ];
+
+    expect(layoutMessages(messages)[1]?.turnUsage).toBe(later);
+  });
+
+  it("never reaches back past the turn it belongs to", () => {
+    // The previous answer's cost is not this answer's cost.
+    const messages = [
+      message({ id: "a", runId: "r-8", usage: USAGE }),
+      message({ id: "b", runId: "r-9" }),
+    ];
+
+    expect(layoutMessages(messages)[1]?.turnUsage).toBeUndefined();
+  });
+});
+
+describe("where the transcript crosses into another day", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 9, 13, 15, 0));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("marks each new day, and the first one unless it is today", () => {
+    render(
+      <MessageList
+        messages={[
+          message({ id: "a", timestamp: new Date(2026, 9, 5, 9, 0) }),
+          message({ id: "b", timestamp: new Date(2026, 9, 5, 9, 5) }),
+          message({ id: "c", timestamp: new Date(2026, 9, 12, 18, 0) }),
+          message({ id: "d", timestamp: new Date(2026, 9, 13, 8, 0) }),
+        ]}
+      />,
+    );
+
+    expect(screen.getAllByRole("separator").map((pill) => pill.textContent)).toEqual([
+      "Monday, October 5",
+      "Yesterday",
+      "Today",
+    ]);
+  });
+
+  it("says nothing over a thread that is wholly from today", () => {
+    render(<MessageList messages={[message({ timestamp: new Date(2026, 9, 13, 9, 0) })]} />);
+    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+  });
+
+  it("does not split one run that crossed midnight", () => {
+    render(
+      <MessageList
+        messages={[
+          message({ id: "a", runId: "r1", timestamp: new Date(2026, 9, 12, 23, 59) }),
+          message({ id: "b", runId: "r1", timestamp: new Date(2026, 9, 13, 0, 1) }),
+        ]}
+      />,
+    );
+    expect(screen.getAllByRole("separator").map((pill) => pill.textContent)).toEqual(["Yesterday"]);
+  });
+});
+
+describe("a console link an agent wrote", () => {
+  it("opens the page in the console and points at the control it names", async () => {
+    const { container } = render(<MessageList messages={[message({ id: "m-1" })]} />);
+    const link = document.createElement("a");
+    link.setAttribute("href", "/mcp-servers?highlight=mcp-add");
+    container.firstElementChild?.appendChild(link);
+
+    link.click();
+
+    expect(navigation.push).toHaveBeenCalledWith("/mcp-servers");
+    expect(navigation.pointAt).toHaveBeenCalledWith("mcp-add", "/mcp-servers");
+  });
+
+  it("leaves a link to anywhere else to the browser", () => {
+    navigation.push.mockClear();
+    const { container } = render(<MessageList messages={[message({ id: "m-1" })]} />);
+    const link = document.createElement("a");
+    link.setAttribute("href", "https://example.com/");
+    link.addEventListener("click", (event) => event.preventDefault());
+    container.firstElementChild?.appendChild(link);
+
+    link.click();
+
+    expect(navigation.push).not.toHaveBeenCalled();
+  });
+
+  it("opens a console page with nothing to point at", () => {
+    navigation.pointAt.mockClear();
+    const { container } = render(<MessageList messages={[message({ id: "m-1" })]} />);
+    const link = document.createElement("a");
+    link.setAttribute("href", "/routines");
+    container.firstElementChild?.appendChild(link);
+
+    link.click();
+
+    expect(navigation.push).toHaveBeenCalledWith("/routines");
+    expect(navigation.pointAt).not.toHaveBeenCalled();
+  });
+});
+
+describe("the request a skill can be made of", () => {
+  const asked = message({ id: "q", role: "user", content: "Compare the vendors" });
+
+  it("hands the answer that ends the turn what the person asked", () => {
+    const messages = [
+      asked,
+      message({ id: "a", runId: "r-1" }),
+      message({ id: "b", runId: "r-1" }),
+    ];
+
+    expect([0, 1, 2].map((i) => layoutMessages(messages)[i]?.request)).toEqual([
+      undefined,
+      undefined,
+      "Compare the vendors",
+    ]);
+  });
+
+  it("has nothing to hand an answer with no request above it", () => {
+    expect(layoutMessages([message({ id: "a" })])[0]?.request).toBeUndefined();
+  });
+
+  it("has nothing to hand when the request was only a file", () => {
+    const messages = [message({ id: "q", role: "user", content: "" }), message({ id: "a" })];
+
+    expect(layoutMessages(messages)[1]?.request).toBeUndefined();
+  });
+
+  it("offers it in a chat but not in the test panel", () => {
+    const messages = [asked, message({ id: "a" })];
+    const { rerender } = render(<MessageList messages={messages} />);
+    expect(rendered("a")?.request).toBe("Compare the vendors");
+
+    state.rendered = [];
+    rerender(<MessageList messages={messages} pins={{ pinned: [], toggle: vi.fn() }} />);
+    expect(rendered("a")?.request).toBeUndefined();
+  });
+});
+
+it("reads group identities linearly even for one long segmented turn", () => {
+  const reads = vi.fn(() => "one-group");
+  const messages = Array.from({ length: 1000 }, (_, index) => {
+    const row = message({ id: String(index), runId: "one-run" });
+    Object.defineProperty(row, "groupId", { get: reads });
+    return row;
+  });
+  const layout = layoutMessages(messages);
+  expect(reads.mock.calls.length).toBeLessThan(10000);
+  expect(layout[0]?.groupPosition).toBe("first");
+  expect(layout[500]?.groupPosition).toBe("middle");
+  expect(layout[999]?.groupPosition).toBe("last");
+});

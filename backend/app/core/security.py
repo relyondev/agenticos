@@ -1,0 +1,332 @@
+"""Security utilities for JWT authentication."""
+
+import hashlib
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
+from uuid import UUID, uuid4
+
+import bcrypt
+import jwt
+
+from app.core.config import settings
+
+
+def encode_untrusted(value: str) -> bytes:
+    """UTF-8 bytes for an attacker-controlled string, never raising on a surrogate.
+
+    A webhook body carries `{"token": "\\ud800"}` through `json.loads` as a lone
+    surrogate, and a bare `str.encode()` on it raises `UnicodeEncodeError` - a 500,
+    and exactly the log-flooding crash a credential check is meant to refuse
+    quietly (#33). `surrogatepass` turns it into bytes that cannot match a real
+    secret, so the check returns a clean non-match. A string with no surrogate
+    encodes byte-for-byte as it did before.
+    """
+    return value.encode("utf-8", "surrogatepass")
+
+
+def create_access_token(
+    subject: str | Any,
+    expires_delta: timedelta | None = None,
+    *,
+    act: str | None = None,
+    sid: str | None = None,
+) -> str:
+    """Create a JWT access token.
+
+    `act` is the actor behind the subject when the two differ - an administrator
+    impersonating another account. It is carried as its own claim so a request
+    made with the token is attributable to the person who is really acting, not
+    only to the account they are acting as (#943). `sid` names the session row the
+    token belongs to: on an impersonation so the token can be refused once the row
+    has been ended (#1044), and on an ordinary login so a password change can spare
+    the session that made it while revoking the account's others (#1439). Each is
+    omitted when unset, so a token minted without one is byte-for-byte what it was.
+    """
+    if expires_delta:
+        expire = datetime.now(UTC) + expires_delta
+    else:
+        expire = datetime.now(UTC) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode: dict[str, Any] = {"exp": expire, "sub": str(subject), "type": "access"}
+    if act is not None:
+        to_encode["act"] = str(act)
+    if sid is not None:
+        to_encode["sid"] = str(sid)
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_refresh_token(
+    subject: str | Any,
+    expires_delta: timedelta | None = None,
+    *,
+    credential_version: int = 0,
+    jti: str | None = None,
+    expires_at: datetime | None = None,
+) -> str:
+    """Create a JWT refresh token.
+
+    Carries a random `jti` so two tokens minted for the same subject in the same
+    second are not byte-identical. A session row stores the SHA-256 of its refresh
+    token, and `exp` is second-resolution, so without this two sign-ins a moment
+    apart would hash to the same value - two active rows under one hash, and the
+    next refresh's `scalar_one_or_none` lookup raises rather than resolving (#1501
+    review).
+
+    A rotation passes `jti` and `expires_at` instead, derived from the token it
+    spends, so the same spent token always mints the same successor - which is
+    what lets `SessionService.reissue_within_grace` hand every request in a burst
+    the one token the row now holds. The payload has no `iat`, so equal inputs
+    encode to equal bytes.
+
+    Carries the account's `credential_version` as `cv`: a password change bumps
+    the user's version, and the refresh path refuses a token whose `cv` is behind
+    it, so a token minted before the change cannot be rotated past it (#1517).
+    """
+    if expires_at is not None:
+        expire = expires_at
+    elif expires_delta:
+        expire = datetime.now(UTC) + expires_delta
+    else:
+        expire = datetime.now(UTC) + timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
+
+    to_encode = {
+        "exp": expire,
+        "sub": str(subject),
+        "type": "refresh",
+        "jti": jti or uuid4().hex,
+        "cv": credential_version,
+    }
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def verify_token(
+    token: str, *, verify_exp: bool = True, audience: tuple[str, ...] | None = None
+) -> dict[str, Any] | None:
+    """Verify a JWT token and return payload.
+
+    `verify_exp=False` decodes a signature-valid token whose `exp` has passed. It
+    is set only by an already-open chat WebSocket re-checking its handshake
+    credential: the socket is authenticated once, when the token is valid, and
+    then outlives the access token's own 30-minute lifetime, so tearing it down
+    for routine token aging would cancel a turn a still-signed-in person is
+    running (#1437). Revocation is judged from the session and account state
+    instead. The signature is still verified; every other caller keeps expiry
+    enforced.
+
+    A token that carries an `aud` claim is refused unless the caller names it in
+    `audience`, so a token minted for one purpose (an artifact's content address)
+    is never read as another.
+    """
+    try:
+        return jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            audience=list(audience) if audience is not None else None,
+            options={"verify_exp": verify_exp},
+        )
+    except jwt.PyJWTError:
+        return None
+
+
+def read_uuid_claim(payload: dict[str, Any], name: str) -> UUID | None:
+    """A token claim read as a uuid, or None when it is absent or not one.
+
+    A malformed claim is no claim rather than a refusal: the token is signed by
+    this deployment, so a value it cannot parse is one this code never wrote. Both
+    the impersonation `sid`/`act` (#943) and the ordinary-session `sid` (#1501)
+    read their row id through here, so the leniency is decided in one place.
+    """
+    value = payload.get(name)
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except ValueError:
+        return None
+
+
+def create_password_reset_token(
+    subject: str | Any,
+    expires_delta: timedelta | None = None,
+) -> str:
+    """Single-use JWT for password reset.
+
+    Short-lived (1h default). The `type` claim distinguishes it from access /
+    refresh / magic-link tokens - a stolen reset token can't be used as an
+    access token.
+    """
+    expire = datetime.now(UTC) + (expires_delta or timedelta(hours=1))
+    to_encode = {"exp": expire, "sub": str(subject), "type": "password_reset"}
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_email_change_token(
+    subject: str | Any,
+    new_email: str,
+    credential_version: int,
+    expires_delta: timedelta | None = None,
+) -> str:
+    """Proof that whoever holds it can read `new_email`. Short-lived (1h).
+
+    The address rides in the token as well as being staged on the row, and both
+    are checked at confirmation: a token minted for one address must not confirm
+    a different one staged after it. Single-use comes from the row rather than
+    from here - confirming clears `users.pending_email`, so a replayed token
+    finds nothing to move (#1772).
+
+    `cv` is the account's credential version, and it is what makes **recovery
+    revoke this token**. A stolen session can stage an attacker's address; the
+    notice sent to the old one tells its owner to change their password, and
+    that bumps `credential_version` - so the already-mailed link stops working
+    at the moment the person acts on the warning, rather than moving the account
+    to the attacker afterwards. It is the same claim the refresh gate uses, for
+    the same reason.
+    """
+    expire = datetime.now(UTC) + (expires_delta or timedelta(hours=1))
+    to_encode = {
+        "exp": expire,
+        "sub": str(subject),
+        "type": "email_change",
+        "new": new_email,
+        "cv": credential_version,
+    }
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_magic_link_token(
+    subject: str | Any,
+    expires_delta: timedelta | None = None,
+    return_to: str | None = None,
+) -> str:
+    """Sign-in-by-email JWT. Short-lived (15 min default).
+
+    `return_to` rides in the token because a magic link is followed from an
+    email - a different tab, often a different application, sometimes a
+    different browser - so the tab-local store the OAuth round trip uses is
+    empty by construction there (#1214). Signed, so the path cannot be edited
+    between the mint and the landing; validated before it gets here, by
+    `MagicLinkRequest`, so nothing unchecked is ever put in a token.
+    """
+    expire = datetime.now(UTC) + (expires_delta or timedelta(minutes=15))
+    to_encode: dict[str, Any] = {"exp": expire, "sub": str(subject), "type": "magic_link"}
+    if return_to is not None:
+        to_encode["rt"] = return_to
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+ArtifactTokenAudience = Literal["member", "public"]
+"""Who an artifact content address was minted for: a signed-in member, or a public link."""
+
+
+def public_key_digest(public_key: str) -> str:
+    """What a public artifact address carries of the link's key, so that rotating the key
+    ends the addresses minted for the old one."""
+    return hashlib.sha256(public_key.encode()).hexdigest()
+
+
+def password_digest(password_hash: str | None) -> str | None:
+    """A short fingerprint of a link's current password hash, or `None` with no password,
+    so that changing or removing the password ends the addresses minted under the old one."""
+    if password_hash is None:
+        return None
+    return hashlib.sha256(password_hash.encode()).hexdigest()[:16]
+
+
+def create_artifact_view_token(
+    version_id: UUID,
+    *,
+    expires_in: timedelta,
+    nonce: str,
+    live: bool,
+    audience: ArtifactTokenAudience,
+    user_id: UUID | None = None,
+    organization_id: UUID | None = None,
+    inject: bool = False,
+    actions: bool = False,
+    public_key: str | None = None,
+    password_hash: str | None = None,
+) -> str:
+    """A short-lived address for one artifact version's bytes.
+
+    The content route authenticates nothing else, which is the point: the page is
+    served where no cookie reaches, so the access decision is taken when the token
+    is minted - by a member's grant or by a public link - and the token carries
+    who it was minted for. It names a version rather than an artifact, so a frame
+    that was drawn for version 3 still shows version 3 after version 4 lands.
+
+    Claims: `aud` is `member` or `public`. A member token carries the viewer
+    (`uid`, `org`) and `inj` - whether the page is served with its data written
+    in, which the route decides afresh for that viewer on every load, and `acts` - the
+    address is the page viewer's, whose frame may start the page's declared actions (not
+    the impersonation `act`). A public
+    token carries `pk`, a hash of the link's key - which the route requires to still be
+    the link's - and, when the link's data gate held at mint time, `inj`, with `pw`,
+    a digest of the link's password hash (`None` with no password); the route serves data only while both
+    hold, and decides the rest afresh on every load. `n` is the
+    nonce the served page and the console match their messages on, and `live`
+    says whether the page asks the console for its bindings' data at all.
+    """
+    expire = datetime.now(UTC) + expires_in
+    to_encode: dict[str, Any] = {
+        "exp": expire,
+        "sub": str(version_id),
+        "type": "artifact_view",
+        "aud": audience,
+        "n": nonce,
+        "live": live,
+    }
+    if audience == "member":
+        if user_id is None or organization_id is None:
+            raise ValueError("A member's artifact address names the member and their organization")
+        to_encode.update(uid=str(user_id), org=str(organization_id), inj=inject, acts=actions)
+    elif public_key is not None:
+        to_encode.update(
+            pk=public_key_digest(public_key), inj=inject, pw=password_digest(password_hash)
+        )
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def verify_special_token(
+    token: str, expected_type: str, *, audience: tuple[str, ...] | None = None
+) -> dict[str, Any] | None:
+    """Verify a non-access JWT (password_reset, magic_link) and require a
+    specific `type` claim. Returns payload on success, None otherwise.
+
+    A token with an `aud` claim passes only for a caller that names it in `audience`.
+    """
+    payload = verify_token(token, audience=audience)
+    if payload is None:
+        return None
+    if payload.get("type") != expected_type:
+        return None
+    return payload
+
+
+# bcrypt only ever uses the first 72 bytes of a password, and bcrypt 5.0 raises
+# rather than truncating silently. Both helpers truncate to the same 72 bytes, so
+# hashing and verifying agree - and an overlong password submitted at the login
+# form (a `UserCreate.password` of up to 128 characters can exceed 72 bytes once
+# encoded, and an unknown account still runs bcrypt against the dummy hash) is an
+# authentication failure rather than an unauthenticated 500 (#947).
+_BCRYPT_MAX_BYTES = 72
+
+
+def _bcrypt_bytes(password: str) -> bytes:
+    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against a hash."""
+    return bcrypt.checkpw(
+        _bcrypt_bytes(plain_password),
+        hashed_password.encode("utf-8"),
+    )
+
+
+def get_password_hash(password: str) -> str:
+    """Hash a password."""
+    return bcrypt.hashpw(
+        _bcrypt_bytes(password),
+        bcrypt.gensalt(),
+    ).decode("utf-8")

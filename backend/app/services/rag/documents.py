@@ -1,0 +1,823 @@
+import asyncio
+import hashlib
+import logging
+import re
+import tempfile
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from app.core.office_convert import (
+    OfficeConversionError,
+    OfficeConversionTimeout,
+    convert_to_pdf,
+    soffice_command,
+)
+from app.services.office_archive import safe_unzip
+from app.services.rag._splitters import (
+    MarkdownHeaderSplitter,
+    RecursiveCharacterSplitter,
+    TextSplitter,
+)
+from app.services.rag.config import (
+    LITEPARSE_OFFICE_FORMATS,
+    LITEPARSE_PDF_FORMATS,
+    LLAMAPARSE_PDF_FORMATS,
+    PYMUPDF_PDF_FORMATS,
+    DocumentExtensions,
+    PdfParser,
+    RAGSettings,
+)
+from app.services.rag.image_describer import BaseImageDescriber
+from app.services.rag.models import (
+    Document,
+    DocumentImage,
+    DocumentMetadata,
+    DocumentPage,
+    DocumentPageChunk,
+)
+
+if TYPE_CHECKING:
+    from pymupdf import Document as PDFDocument
+    from pymupdf import Page as PDFPage
+
+
+logger = logging.getLogger(__name__)
+
+# Markdown reconstruction wraps a page with no text in an empty fenced block, so
+# ``"```text\n\n```"`` is what an unreadable scan looks like once it reaches us.
+# It is not whitespace, so a plain `.strip()` keeps it, and the page goes on to
+# be embedded as a chunk that says nothing and matches nothing.
+_MARKDOWN_NOISE = re.compile(r"```[a-z]*|`|\s+")
+
+
+def has_indexable_text(content: str) -> bool:
+    """Whether a parsed page carries anything worth embedding.
+
+    Public because it is also the honest answer to "did this document parse to
+    anything" when the stored chunks are read back for display.
+    """
+    return bool(_MARKDOWN_NOISE.sub("", content))
+
+
+class BaseDocumentParser(ABC):
+    allowed = [f"{ext.value}" for ext in DocumentExtensions]
+
+    def is_file_existing(self, filepath: Path) -> bool:
+        return Path.exists(filepath)
+
+    def is_extension_allowed(self, filepath: Path) -> bool:
+        return filepath.suffix.lower() in self.allowed and self.is_file_existing(filepath)
+
+    def get_document_metadata(self, filepath: Path) -> DocumentMetadata:
+        content_hash = hashlib.sha256(filepath.read_bytes()).hexdigest()
+        return DocumentMetadata(
+            filename=filepath.name,
+            filesize=filepath.stat().st_size,
+            filetype=filepath.suffix.replace(".", ""),
+            source_path=str(filepath.resolve()),
+            content_hash=content_hash,
+        )
+
+    @abstractmethod
+    async def parse(self, filepath: Path) -> Document:
+        """Parse a file and read its content into a Document object.
+        Args:
+            filepath: Path to the file to parse.
+        Returns:
+            Document object with parsed content and metadata.
+        """
+
+
+class TextDocumentParser(BaseDocumentParser):
+    """Parser for text-based documents (TXT, MD).
+    Uses Python's built-in file reading capabilities to extract
+    text content from plain text and Markdown files.
+    """
+
+    # Narrower than the base class, which lists everything the pipeline reads.
+    # `is_extension_allowed` lower-cases before comparing, so this is also what
+    # makes `README.MD` work: the upload endpoint validates a lower-cased
+    # extension, and a parser that then compared `filepath.suffix` verbatim
+    # refused in a worker the file the API had just accepted.
+    allowed = [".txt", ".md"]
+
+    def _parse_text_file(self, filepath: Path) -> Document:
+        """Extract raw text from a TXT or MD file.
+        Args:
+            filepath: Path to the text file.
+        Returns:
+            Document object with the file content.
+        """
+        with open(filepath, encoding="utf-8") as f:
+            page = DocumentPage(page_num=1, content=f.read())
+
+        return Document(pages=[page], metadata=self.get_document_metadata(filepath))
+
+    async def parse(self, filepath: Path) -> Document:
+        """Parse a text file (TXT or MD).
+
+        Args:
+            filepath: Path to the text file.
+
+        Returns:
+            Document object with parsed content.
+
+        Raises:
+            ValueError: If the file extension is not supported.
+        """
+        if not self.is_extension_allowed(filepath):
+            raise ValueError(f"Extension {filepath.suffix} not supported by TextDocumentParser")
+
+        return self._parse_text_file(filepath)
+
+
+class DocxDocumentParser(BaseDocumentParser):
+    """Parser for DOCX documents using python-docx.
+
+    Extracts text content from Microsoft Word documents by reading
+    all paragraphs and joining them with newline characters.
+    """
+
+    allowed = [".docx"]
+
+    def _parse_docx_file(self, filepath: Path) -> Document:
+        """Extract raw text from the DOCX file.
+
+        Args:
+            filepath: Path to the DOCX file.
+
+        Returns:
+            Document object with the file content.
+        """
+        # Imported where a .docx is parsed: every API worker and background worker loads
+        # this module, and most never parse a document (#2225).
+        from docx import Document as DOCXDocument
+
+        # Through the bounded unzip the chat's office files take: a DOCX is a ZIP,
+        # and a few megabytes of upload can inflate to gigabytes in python-docx -
+        # a child the memory watchdog kills, over and over (Codex, #2248). Over a
+        # bound is a `ValueError`, the document's own failure, not a death.
+        file: Any = DOCXDocument(safe_unzip(filepath.read_bytes()))
+        page = DocumentPage(page_num=1, content="\n".join([p.text for p in file.paragraphs]))
+        return Document(pages=[page], metadata=self.get_document_metadata(filepath))
+
+    async def parse(self, filepath: Path) -> Document:
+        """Parse a DOCX file.
+
+        Args:
+            filepath: Path to the DOCX file.
+
+        Returns:
+            Document object with parsed content.
+
+        Raises:
+            ValueError: If the file is not a DOCX file.
+        """
+        if not self.is_extension_allowed(filepath):
+            raise ValueError(f"Extension {filepath.suffix} not supported by DocxDocumentParser")
+
+        return self._parse_docx_file(filepath)
+
+
+class PyMuPDFParser(BaseDocumentParser):
+    """Smart PDF parser using PyMuPDF.
+
+    Features:
+    - Text extraction with layout preservation (blocks)
+    - Table detection -> markdown tables
+    - Header/footer detection and removal
+    - OCR fallback for scanned pages (optional, requires tesseract)
+    - Image extraction for LLM-based description
+    - Document metadata (author, title, TOC)
+    """
+
+    MIN_TEXT_LENGTH = 50  # below this -> likely a scan, try OCR
+
+    # PDFs only. The base class allows what the *pipeline* reads, which includes
+    # the three formats the Python-native parsers take; this parser is never
+    # routed them, and saying so here keeps `is_extension_allowed` honest.
+    allowed = sorted(PYMUPDF_PDF_FORMATS)
+
+    def __init__(self, enable_ocr: bool = False, image_describer: BaseImageDescriber | None = None):
+        self.enable_ocr = enable_ocr
+        self._image_describer = image_describer
+
+    def _detect_repeated_content(self, doc: Any) -> set[str]:
+        """Detect headers/footers -- text appearing on >70% of pages."""
+        if len(doc) < 3:
+            return set()
+        text_counts: dict[str, int] = {}
+        for page in doc:
+            for b in page.get_text("blocks"):
+                if b[6] != 0:  # skip image blocks
+                    continue
+                y_ratio = b[1] / page.rect.height if page.rect.height else 0
+                if y_ratio < 0.15 or y_ratio > 0.85:
+                    text = b[4].strip()
+                    if text and len(text) < 200:
+                        text_counts[text] = text_counts.get(text, 0) + 1
+        threshold = len(doc) * 0.7
+        return {t for t, c in text_counts.items() if c >= threshold}
+
+    def _extract_text(self, page: Any, repeated: set[str]) -> str:
+        """Extract text blocks, filtering headers/footers."""
+        texts = []
+        for b in page.get_text("blocks"):
+            if b[6] != 0:  # skip image blocks
+                continue
+            text = b[4].strip()
+            if text and text not in repeated:
+                texts.append(text)
+        return str("\n\n".join(texts))
+
+    def _extract_tables(self, page: Any) -> str:
+        """Extract tables as markdown."""
+        try:
+            tables = page.find_tables()
+            if not tables or not tables.tables:
+                return ""
+            parts = []
+            for table in tables.tables:
+                df = table.to_pandas()
+                if not df.empty:
+                    parts.append(df.to_markdown(index=False))
+            return "\n\n".join(parts)
+        except Exception:
+            return ""
+
+    async def _ocr_page(self, page: Any, image_describer: BaseImageDescriber | None = None) -> str:
+        """OCR a scanned page by rendering it as an image and sending it to LLM vision.
+
+        Awaited on the caller's loop: a second loop via `run_until_complete`
+        raised `RuntimeError` inside an already-running loop, so every
+        scanned page OCR'd to `""` and the document indexed empty (#550).
+        """
+        if not image_describer:
+            return ""
+        try:
+            pix = page.get_pixmap(dpi=200)
+            image_bytes = pix.tobytes("png")
+        except Exception as e:
+            logger.warning("Rendering page %d as an image for OCR failed: %s", page.number + 1, e)
+            return ""
+        return await image_describer.describe(image_bytes, "image/png")
+
+    def _extract_images(
+        self,
+        doc: PDFDocument,
+        page: PDFPage,
+        *,
+        image_cache: dict[int, tuple[bytes, str] | None],
+    ) -> list[DocumentImage]:
+        """Extract each xref once, sharing its bytes across page-local images."""
+        page_number = page.number
+        assert page_number is not None  # Pages are attached to the open PDF throughout extraction.
+        images: list[DocumentImage] = []
+        seen: set[int] = set()
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in seen:
+                continue
+            seen.add(xref)
+            if xref not in image_cache:
+                # Cache refusals too: a broken or tiny shared logo must not be
+                # decoded (or logged) again on every page that references it.
+                image_cache[xref] = None
+                try:
+                    base = doc.extract_image(xref)
+                    if base and base["image"] and len(base["image"]) > 1000:
+                        ext = base.get("ext", "png")
+                        mime_map = {"png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg"}
+                        image_cache[xref] = (base["image"], mime_map.get(ext, f"image/{ext}"))
+                except Exception:
+                    # One unreadable embedded image should not fail the text.
+                    logger.warning("Skipping an unreadable image on page %d", page_number + 1)
+            cached = image_cache[xref]
+            if cached is not None:
+                image_bytes, mime_type = cached
+                images.append(
+                    DocumentImage(
+                        page_num=page_number + 1, image_bytes=image_bytes, mime_type=mime_type
+                    )
+                )
+        return images
+
+    async def _parse_pdf_file(self, filepath: Path) -> Document:
+        """Parse PDF with smart extraction pipeline."""
+        # Imported where a PDF is parsed, for the reason `_parse_docx_file` gives.
+        import pymupdf
+
+        with pymupdf.open(filepath) as doc:
+            meta = doc.metadata or {}
+            toc = doc.get_toc()
+
+            repeated = self._detect_repeated_content(doc)
+
+            image_cache: dict[int, tuple[bytes, str] | None] = {}
+            pages: list[DocumentPage] = []
+            for page in doc:
+                text = self._extract_text(page, repeated)
+
+                tables_md = self._extract_tables(page)
+                if tables_md:
+                    text = text + "\n\n" + tables_md if text.strip() else tables_md
+
+                if self.enable_ocr and len(text.strip()) < self.MIN_TEXT_LENGTH:
+                    ocr_text = await self._ocr_page(page, self._image_describer)
+                    if len(ocr_text.strip()) > len(text.strip()):
+                        text = ocr_text
+                        logger.info("OCR fallback used for page %d", page.number + 1)
+                images = (
+                    self._extract_images(doc, page, image_cache=image_cache)
+                    if self._image_describer is not None
+                    else []
+                )
+
+                pages.append(
+                    DocumentPage(
+                        page_num=page.number + 1,
+                        content=text,
+                        images=images,
+                    )
+                )
+
+        additional: dict[str, Any] = {}
+        if meta.get("title"):
+            additional["pdf_title"] = meta["title"]
+        if meta.get("author"):
+            additional["pdf_author"] = meta["author"]
+        if toc:
+            additional["toc"] = [{"level": t[0], "title": t[1], "page": t[2]} for t in toc[:20]]
+
+        doc_meta = self.get_document_metadata(filepath)
+        if additional:
+            doc_meta.additional_info = {**(doc_meta.additional_info or {}), **additional}
+
+        return Document(pages=pages, metadata=doc_meta)
+
+    async def parse(self, filepath: Path) -> Document:
+        if not self.is_extension_allowed(filepath):
+            raise ValueError(f"Extension {filepath.suffix} not supported by PyMuPDFParser")
+        return await self._parse_pdf_file(filepath)
+
+
+class LlamaParseParser(BaseDocumentParser):
+    """Advanced document parser using LlamaParse cloud API.
+
+    Provides AI-powered document parsing with support for 130+ formats
+    including PDF, DOCX, PPTX, XLSX, images (OCR), and more.
+    Returns markdown-formatted content.
+    """
+
+    allowed = sorted(LLAMAPARSE_PDF_FORMATS)
+
+    def __init__(self, api_key: str, tier: str = "agentic"):
+        """Initialize the LlamaParse parser.
+
+        Args:
+            api_key: LlamaCloud API key for authentication.
+            tier: Parsing tier (fast, cost_effective, agentic, agentic_plus).
+        """
+        from llama_cloud import AsyncLlamaCloud
+
+        self.parser = AsyncLlamaCloud(api_key=api_key)
+        self.tier = tier
+
+    async def parse(self, filepath: Path) -> Document:
+        """Parse a document using LlamaParse.
+
+        Supports PDF, DOCX, PPTX, XLSX, images, and many more formats.
+        See https://developers.llamaindex.ai/python/cloud/llamaparse/supported_document_types/
+
+        Args:
+            filepath: Path to the file to parse.
+
+        Returns:
+            Document object with parsed markdown content.
+
+        Raises:
+            ValueError: If the file extension is not supported.
+        """
+        if not self.is_extension_allowed(filepath):
+            raise ValueError(f"Extension {filepath.suffix} not supported by LlamaParse")
+
+        file_obj = await self.parser.files.create(file=filepath, purpose="parse")
+        result = await self.parser.parsing.parse(
+            file_id=file_obj.id,
+            tier=self.tier,
+            version="latest",
+            expand=["text", "markdown"],
+        )
+        if result.markdown is None:
+            raise ValueError(f"LlamaParse returned no markdown result for {filepath.name}")
+
+        pages = []
+        for page in result.markdown.pages:
+            if not page.success:
+                raise ValueError(
+                    f"LlamaParse failed to parse page {page.page_number} of "
+                    f"{filepath.name}: {page.error}"
+                )
+            pages.append(DocumentPage(page_num=page.page_number, content=page.markdown))
+
+        return Document(pages=pages, metadata=self.get_document_metadata(filepath))
+
+
+class LiteParseParser(BaseDocumentParser):
+    """Document parser using LiteParse -- fast, local, layout-aware parsing.
+
+    LiteParse reads PDFs through PDFium and converts everything else to PDF
+    first: images natively in its Rust core, office documents by shelling out to
+    LibreOffice. Nothing leaves the machine and there is no API key, which is
+    what makes it the useful middle between PyMuPDF and LlamaParse.
+
+    Configuration is passed to the **constructor**, not to `parse()`, which
+    takes the file and nothing else. The previous version of this class passed
+    `ocr_enabled`/`ocr_server_url`/`ocr_language`/`timeout` as keyword
+    arguments to `parse()` and read `page.pageNum` (the Node binding's
+    spelling; Python exposes `page_num`). Both are hard errors, so every
+    LiteParse ingestion raised `TypeError` on the first call - and since
+    `TypeError` was outside the `except` clauses below, it surfaced as an
+    unhandled worker crash rather than a parse failure. The parser was
+    selectable in the UI and had never once run.
+
+    Requires: `pip install liteparse` (ships its own native binary; there is
+    no Node.js CLI to pre-install). Office formats additionally need LibreOffice
+    on PATH -- see :meth:`libreoffice_available`.
+    """
+
+    allowed = sorted(LITEPARSE_PDF_FORMATS)
+
+    # Probed once per process. Resolving the command is a handful of stat calls,
+    # but this is consulted per document to explain a failure, and the answer
+    # cannot change without the container being replaced.
+    _libreoffice: bool | None = None
+
+    def __init__(
+        self,
+        *,
+        enable_ocr: bool = True,
+        auto_ocr: bool = True,
+        ocr_server_url: str | None = None,
+        ocr_language: str = "eng",
+        timeout_seconds: float = 600.0,
+        output_format: str = "markdown",
+        dpi: float = 150.0,
+        max_pages: int = 1000,
+        num_workers: int | None = None,
+    ) -> None:
+        self.enable_ocr = enable_ocr
+        self.auto_ocr = auto_ocr
+        self.ocr_language = ocr_language
+        self.timeout_seconds = timeout_seconds
+        self.output_format = output_format
+        self._options: dict[str, Any] = {
+            "ocr_server_url": ocr_server_url,
+            "ocr_language": ocr_language,
+            "output_format": output_format,
+            "dpi": dpi,
+            "max_pages": max_pages,
+            "num_workers": num_workers,
+            # Progress output goes to stdout, where it interleaves with the
+            # worker's logs and belongs to no request in particular.
+            "quiet": True,
+        }
+
+    @classmethod
+    def libreoffice_available(cls) -> bool:
+        """Whether office documents can be converted on this machine.
+
+        Delegates to `office_convert.soffice_command`, the single owner of the
+        discovery order (the two command names, then the macOS bundle), so this
+        gate and the converter that actually spawns `soffice` cannot disagree
+        about whether a machine can convert.
+        """
+        if cls._libreoffice is None:
+            cls._libreoffice = soffice_command() is not None
+        return cls._libreoffice
+
+    def _build(self, *, ocr: bool) -> Any:
+        from liteparse import LiteParse
+
+        return LiteParse(ocr_enabled=ocr, **self._options)
+
+    async def _needs_ocr(self, filepath: Path, *, deadline: float) -> bool:
+        """Ask the cheap text-layer pass whether OCR is worth running.
+
+        This is the single biggest saving LiteParse offers. OCR dominates the
+        cost of a parse, and most PDFs are born digital and need none of it;
+        `is_complex` reads only the text layer and reports per page. Running it
+        first turns "OCR every page of every document" into "OCR the documents
+        that are actually scans".
+
+        Like the parse itself, `is_complex` is a synchronous native call, so it
+        runs in a thread bounded by `deadline` rather than on the event loop -
+        otherwise a slow probe would block the worker and spend time the
+        whole-document ceiling does not account for. A failure or a probe that
+        overruns the deadline is not a parse failure: the honest thing is to
+        parse with OCR on rather than to refuse, and the parse's own remaining
+        budget then enforces the ceiling.
+        """
+        budget = max(deadline - asyncio.get_running_loop().time(), 0.0)
+        try:
+            stats = await asyncio.wait_for(
+                asyncio.to_thread(lambda: self._build(ocr=False).is_complex(str(filepath))),
+                timeout=budget,
+            )
+        except Exception:
+            logger.warning("LiteParse: complexity check failed for %s", filepath.name)
+            return True
+        return any(page.needs_ocr for page in stats)
+
+    async def parse(self, filepath: Path) -> Document:
+        """Parse a document using LiteParse.
+
+        Office formats are converted to PDF first, by a LibreOffice subprocess we
+        own and can kill on timeout, and then read as PDFs; everything else goes
+        straight to LiteParse's native pipeline. Catches the parser's exceptions
+        and re-raises as RuntimeError so callers can surface them as a structured
+        ingestion failure instead of an opaque subprocess error.
+        """
+        if filepath.suffix.lower() in LITEPARSE_OFFICE_FORMATS:
+            if not self.libreoffice_available():
+                raise RuntimeError(
+                    f"LiteParse converts {filepath.suffix} through LibreOffice, which is not "
+                    f"installed. Install it (`apt-get install libreoffice`), or choose a parser "
+                    f"that reads {filepath.suffix} directly."
+                )
+            return await self._parse_office(filepath)
+
+        return await self._parse_pdf(filepath, source=filepath)
+
+    async def _parse_office(self, filepath: Path) -> Document:
+        """Convert an office document to PDF ourselves, then parse the PDF.
+
+        LiteParse would shell out to LibreOffice from its Rust core with no way
+        to kill it on timeout (#1685), so a hung conversion leaves an orphaned
+        `soffice` and ties up the worker. Converting through
+        `app.core.office_convert` runs `soffice` in a process group we tear down
+        on timeout or cancellation; the resulting PDF then goes through the
+        ordinary native pipeline - no further LibreOffice - while the document
+        keeps the original file's name and type in its metadata.
+        """
+        # One deadline spans conversion *and* parsing, so `timeout_seconds` is a
+        # ceiling on the whole document rather than one each: a slow conversion
+        # leaves the native parse only the remaining budget.
+        deadline = asyncio.get_running_loop().time() + self.timeout_seconds
+        with tempfile.TemporaryDirectory(prefix="liteparse-office-") as tmp:
+            try:
+                pdf_path = await convert_to_pdf(
+                    filepath, Path(tmp), timeout_seconds=self.timeout_seconds
+                )
+            except OfficeConversionTimeout as e:
+                raise RuntimeError(
+                    f"LiteParse: LibreOffice conversion timed out after "
+                    f"{self.timeout_seconds}s for {filepath.name}"
+                ) from e
+            except OfficeConversionError as e:
+                raise RuntimeError(
+                    f"LiteParse: LibreOffice could not convert {filepath.name} to PDF"
+                ) from e
+            return await self._parse_pdf(pdf_path, source=filepath, deadline=deadline)
+
+    async def _parse_pdf(
+        self, parse_target: Path, *, source: Path, deadline: float | None = None
+    ) -> Document:
+        """Read a PDF (or image) through LiteParse's native pipeline.
+
+        `parse_target` is what LiteParse reads - the file itself for a PDF, or the
+        PDF an office document was converted to. `source` is the original upload,
+        whose name and type the returned document carries. `deadline` is an event-
+        loop timestamp the whole read must finish by; `None` starts a fresh one
+        from the configured ceiling, and the office path passes its own so the
+        OCR preflight and the parse together cannot outlast the conversion's
+        remaining budget.
+        """
+        from liteparse.types import ParseError  # type: ignore[import-not-found]
+
+        loop = asyncio.get_running_loop()
+        if deadline is None:
+            deadline = loop.time() + self.timeout_seconds
+
+        # The OCR preflight is a synchronous read too, so it spends the deadline
+        # like the parse does; the budget is what remains once it has answered.
+        ocr = self.enable_ocr
+        if ocr and self.auto_ocr:
+            ocr = await self._needs_ocr(parse_target, deadline=deadline)
+        budget = max(deadline - loop.time(), 0.0)
+
+        try:
+            # The Python binding is synchronous, and a parse is CPU-bound work
+            # measured in seconds -- doing it on the event loop stalls every
+            # other request on this worker.
+            #
+            # `wait_for` bounds how long *we* wait, not how long the thread
+            # runs: a cancelled `to_thread` leaves its thread working to
+            # completion. It is a ceiling on the request, not on the machine,
+            # which is why `max_pages` is the setting that actually bounds cost.
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self._build(ocr=ocr).parse, str(parse_target)),
+                timeout=budget,
+            )
+        except FileNotFoundError as e:
+            raise RuntimeError(f"LiteParse: file not found: {source.name}") from e
+        except TimeoutError as e:
+            raise RuntimeError(
+                f"LiteParse: parse timed out after {self.timeout_seconds}s for {source.name}"
+            ) from e
+        except ParseError as e:
+            raise RuntimeError(f"LiteParse: parse failed for {source.name}: {e}") from e
+
+        # `page.markdown` is populated only in markdown mode; `page.text` always
+        # holds the spatial-layout rendering, so it is the fallback rather than
+        # a competing choice.
+        pages: list[DocumentPage] = []
+        for page in result.pages:
+            content = page.markdown if self.output_format == "markdown" and page.markdown else ""
+            content = content or page.text
+            if has_indexable_text(content):
+                pages.append(DocumentPage(page_num=page.page_num, content=content))
+
+        return Document(
+            pages=pages,
+            metadata=self.get_document_metadata(source),
+        )
+
+
+class PdfParserFactory:
+    """Builds the parser a collection's stored configuration asks for."""
+
+    @staticmethod
+    def create(
+        parser_name: str, settings: RAGSettings | None = None, image_describer: Any = None
+    ) -> BaseDocumentParser:
+        if parser_name == "llamaparse":
+            if not settings or not settings.pdf_parser.api_key:
+                raise ValueError(
+                    "LlamaParse needs the collection's vault key, and none was resolved"
+                )
+            return LlamaParseParser(
+                api_key=settings.pdf_parser.api_key,
+                tier=settings.pdf_parser.tier,
+            )
+        if parser_name == "liteparse":
+            pdf = settings.pdf_parser if settings else PdfParser()
+            return LiteParseParser(
+                enable_ocr=settings.enable_ocr if settings else True,
+                auto_ocr=pdf.liteparse_auto_ocr,
+                ocr_server_url=pdf.liteparse_ocr_server_url,
+                ocr_language=pdf.liteparse_ocr_language,
+                timeout_seconds=pdf.liteparse_timeout_seconds,
+                output_format=pdf.liteparse_output_format,
+                dpi=pdf.liteparse_dpi,
+                max_pages=pdf.liteparse_max_pages,
+            )
+        return PyMuPDFParser(
+            enable_ocr=settings.enable_ocr if settings else False,
+            image_describer=image_describer,
+        )
+
+
+class DocumentProcessor:
+    """Orchestrates parsing and chunking of files into Document objects.
+
+    Manages the document processing pipeline:
+    1. Route to appropriate parser based on file extension
+    2. Parse document content
+    3. Chunk document pages using RecursiveCharacterTextSplitter
+    Supported file types:
+    - TXT, MD: TextDocumentParser (Python native)
+    - DOCX: DocxDocumentParser (Python native)
+    - PDF: PdfParserFactory selects PyMuPDF, LlamaParse, or LiteParse at runtime
+    """
+
+    def __init__(self, settings: RAGSettings, image_describer: BaseImageDescriber | None = None):
+        """Initialize the document processor.
+
+        Args:
+            settings: RAG configuration settings.
+            image_describer: The model that reads pictures found inside a
+                document, or `None` to index them as nothing. Injected rather
+                than built here: which model that is belongs to the collection
+                the document is being ingested into, and its credential is
+                sealed for that collection's organization - neither of which
+                this class can see. See
+                :class:`app.services.ingestion_config.IngestionConfigService`.
+        """
+        self.settings = settings
+        self.splitter = self._create_splitter(settings)
+
+        self.text_parser = TextDocumentParser()
+        self.docx_parser = DocxDocumentParser()
+        self.image_describer = image_describer
+        self.pdf_parser = PdfParserFactory.create(
+            parser_name=settings.pdf_parser.method,
+            settings=settings,
+            image_describer=self.image_describer,
+        )
+
+    @staticmethod
+    def _create_splitter(settings: RAGSettings) -> TextSplitter:
+        """Build the splitter this collection's chunking strategy asks for."""
+        if settings.chunking_strategy == "markdown":
+            return MarkdownHeaderSplitter(
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
+            )
+
+        if settings.chunking_strategy == "fixed":
+            return RecursiveCharacterSplitter(
+                chunk_size=settings.chunk_size,
+                chunk_overlap=settings.chunk_overlap,
+                separators=["\n"],
+            )
+
+        return RecursiveCharacterSplitter(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+        )
+
+    async def _describe_images(self, document: Document) -> None:
+        """Generate text descriptions for all images in document pages."""
+        if self.image_describer is None:
+            return
+        descriptions: dict[bytes, str] = {}
+        for page in document.pages:
+            if not page.images:
+                continue
+            for image in page.images:
+                if image.image_bytes not in descriptions:
+                    descriptions[image.image_bytes] = await self.image_describer.describe(
+                        image.image_bytes, image.mime_type
+                    )
+                image.description = descriptions[image.image_bytes]
+            img_descriptions = [
+                f"[Image: {img.description}]" for img in page.images if img.description
+            ]
+            if img_descriptions:
+                page.content = f"{page.content}\n\n{chr(10).join(img_descriptions)}"
+
+    async def process_file(self, filepath: Path) -> Document:
+        """Main entry point: filepath -> Document with chunks.
+
+        Args:
+            filepath: Path to the file to process.
+
+        Returns:
+            Document object with parsed pages and chunked content.
+
+        Raises:
+            ValueError: If the configured parser cannot read the file type.
+        """
+        suffix = filepath.suffix.lower()
+        if suffix in (".txt", ".md"):
+            document = await self.text_parser.parse(filepath)
+        elif suffix == ".docx":
+            document = await self.docx_parser.parse(filepath)
+        elif suffix in self.pdf_parser.allowed:
+            # Not only `.pdf`: LlamaParse is routed the spreadsheets, decks and
+            # images it accepts. Asking the parser what it takes, rather than
+            # naming extensions here, is what keeps this branch in step with
+            # `PARSER_FORMATS` - the set the upload endpoint validated against
+            # before the file ever reached a worker.
+            document = await self.pdf_parser.parse(filepath)
+        else:
+            raise ValueError(
+                f"Unsupported file type: {suffix}. "
+                f"{type(self.pdf_parser).__name__} reads {', '.join(self.pdf_parser.allowed)}"
+            )
+        await self._describe_images(document)
+
+        pages = document.pages
+
+        chunked_pages: list[DocumentPageChunk] = []
+        for page in pages:
+            for chunk_num, chunk in enumerate(self.splitter.split_text(page.content)):
+                chunked_pages.append(
+                    DocumentPageChunk(
+                        chunk_content=chunk,
+                        chunk_num=chunk_num,
+                        parent_doc_id=document.id,
+                        # Keep the page text by reference; serializing the page
+                        # also rebuilds every embedded image for every chunk.
+                        page_id=page.page_id,
+                        page_num=page.page_num,
+                        content=page.content,
+                        image_count=len(page.images),
+                    )
+                )
+
+        if not chunked_pages:
+            # A document that yields nothing is indistinguishable, once stored,
+            # from one that ingested fine and simply never matches a search. The
+            # overwhelmingly common cause is a scan parsed with OCR off, so the
+            # message names that rather than making somebody guess.
+            raise ValueError(
+                f"{filepath.name} produced no indexable text. If it is a scan or an image, "
+                f"turn OCR on for this collection; {type(self.pdf_parser).__name__} read it "
+                f"with OCR {'on' if self.settings.enable_ocr else 'off'}."
+            )
+
+        document.chunked_pages = chunked_pages
+        return document

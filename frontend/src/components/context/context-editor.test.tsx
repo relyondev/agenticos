@@ -1,0 +1,192 @@
+import { describe, expect, it, vi } from "vitest";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+import { ContextEditor } from "./context-editor";
+import type { ContextFile } from "@/types/providers";
+
+/**
+ * Editing a context file, in the shape a skill is edited in: the facts in a
+ * strip, the body in the shared pane, one footer.
+ *
+ * Two consequences the old flat form did not have, and both are asserted here.
+ * The body is behind a preview/source toggle, so a test that types into it has
+ * to ask for the source first - the way a person does. And Save is refused
+ * while nothing has changed, so "an untouched field is not lost" is now proved
+ * by changing one thing and reading the other four back.
+ */
+
+const FILE: ContextFile = {
+  id: "c1",
+  name: "glossary",
+  description: "terms",
+  content: "SLA: service level agreement.",
+  format: "md",
+  mode: "inject",
+  enabled: true,
+  visibility: "organization",
+  owner_user_id: null,
+};
+
+vi.mock("@/components/chat/markdown-content", () => ({
+  MarkdownContent: ({ content }: { content: string }) => (
+    <div data-testid="rendered">{content}</div>
+  ),
+}));
+
+function mount(props: Partial<React.ComponentProps<typeof ContextEditor>> = {}) {
+  const onSave = vi.fn();
+  const onCancel = vi.fn();
+  render(
+    <ContextEditor
+      file={FILE}
+      canEdit
+      isSaving={false}
+      onSave={onSave}
+      onCancel={onCancel}
+      {...props}
+    />,
+  );
+  return { onSave, onCancel };
+}
+
+const save = () => screen.getByRole("button", { name: "Save" });
+const openSource = async () => {
+  const source = screen.queryByRole("button", { name: "Source" });
+  if (source) await userEvent.click(source);
+};
+const body = () => screen.getByLabelText("glossary.md source");
+
+describe("ContextEditor", () => {
+  it("names the file with the format it is stored in, so the body renders as one", () => {
+    // The name carries no extension and the format is a separate field, but the
+    // renderer is chosen from a filename - so `glossary` alone read as plain
+    // text where the agent receives Markdown.
+    mount();
+
+    expect(screen.getByText("glossary.md")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
+  });
+
+  it("opens on the text, and renders it behind the toggle", async () => {
+    // An editor for a file somebody came to write, so the source is what it
+    // opens on - a rendering of what has not been typed yet is a picture of an
+    // empty file.
+    mount();
+    expect(body()).toHaveValue("SLA: service level agreement.");
+
+    await userEvent.click(screen.getByRole("button", { name: /preview/i }));
+
+    expect(screen.getByTestId("rendered")).toHaveTextContent("SLA: service level agreement.");
+  });
+
+  it("saves the whole editable set, so an untouched field is not lost", async () => {
+    const { onSave } = mount();
+
+    await openSource();
+    await userEvent.type(body(), " extra");
+    await userEvent.click(save());
+
+    expect(onSave).toHaveBeenCalledWith({
+      description: "terms",
+      content: "SLA: service level agreement. extra",
+    });
+  });
+
+  it("refuses a save that would write nothing", () => {
+    mount();
+
+    expect(save()).toBeDisabled();
+  });
+
+  it("says what a save reaches, once there is something to save", async () => {
+    mount();
+    expect(screen.queryByText(/Saving reaches every agent/)).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText("Description"), " and acronyms");
+
+    expect(screen.getByText(/Saving reaches every agent/)).toBeInTheDocument();
+  });
+
+  it("sends an emptied description as null", async () => {
+    const { onSave } = mount();
+
+    await userEvent.clear(screen.getByLabelText("Description"));
+    await userEvent.click(save());
+
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ description: null }));
+  });
+
+  it("keeps usage policy in the agent builder instead of editing it globally", () => {
+    mount();
+    expect(screen.queryByLabelText("Mode")).toBeNull();
+    expect(screen.queryByLabelText("Format")).toBeNull();
+    expect(screen.queryByRole("switch")).toBeNull();
+    expect(screen.getByText(/Choose how each agent/)).toBeInTheDocument();
+  });
+
+  it("preserves a legacy format when opening and editing the content", async () => {
+    const { onSave } = mount({ file: { ...FILE, format: "html" } });
+    expect(save()).toBeDisabled();
+    await userEvent.type(screen.getByLabelText("Description"), " updated");
+    await userEvent.click(save());
+    expect(onSave).toHaveBeenCalledWith({ description: "terms updated", content: FILE.content });
+  });
+
+  it("starts an editor for a file with no description without crashing", async () => {
+    const { onSave } = mount({ file: { ...FILE, description: null } });
+
+    await userEvent.type(body(), " extra");
+    await userEvent.click(save());
+
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ description: null }));
+  });
+
+  it("cancels without saving", async () => {
+    const { onSave, onCancel } = mount();
+
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(onCancel).toHaveBeenCalled();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("gives a viewer a way out and nothing to write with", async () => {
+    mount({ canEdit: false });
+
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close" })).toBeInTheDocument();
+    await openSource();
+    expect(body()).toHaveAttribute("readonly");
+  });
+});
+
+it("offers deletion from the editor's resource menu", async () => {
+  const onDelete = vi.fn();
+  mount({ onDelete });
+  await userEvent.click(screen.getByRole("button", { name: "More actions for glossary" }));
+  expect(onDelete).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole("menuitem", { name: "Delete glossary" }));
+  expect(onDelete).toHaveBeenCalledOnce();
+});
+
+it("does not offer the resource menu to a reader", () => {
+  mount({ canEdit: false, onDelete: vi.fn() });
+  expect(screen.queryByRole("button", { name: "More actions for glossary" })).toBeNull();
+});
+
+it("disables destructive actions while a save is pending", () => {
+  mount({ isSaving: true, onDelete: vi.fn() });
+  expect(screen.getByRole("button", { name: "More actions for glossary" })).toBeDisabled();
+});
+
+it("folds context details without losing the description draft", async () => {
+  mount();
+  const toggle = screen.getByRole("button", { name: "Description" });
+  expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await userEvent.click(toggle);
+  await userEvent.type(screen.getByLabelText("Description"), " revised");
+  await userEvent.click(toggle);
+  await userEvent.click(toggle);
+  expect(screen.getByLabelText("Description")).toHaveValue("terms revised");
+});

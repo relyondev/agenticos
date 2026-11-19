@@ -1,0 +1,216 @@
+import { QueryClient } from "@tanstack/react-query";
+import { describe, expect, it } from "vitest";
+
+import { qk } from "./query-keys";
+
+/**
+ * The cache's vocabulary.
+ *
+ * Two rules, and both are invisible until something goes stale: a key is
+ * hierarchical, so a broader prefix invalidates everything beneath it, and two
+ * keys that should differ must actually differ. A detail key that collides with
+ * its list renders one agent's spec for another; a list key that ignores its
+ * filter serves the unarchived list to a page that asked for archived rows.
+ *
+ * Asserted structurally rather than value-by-value: the invariant is the shape,
+ * and a table of two hundred literals would need editing every time a namespace
+ * is added without ever failing for a reason worth knowing.
+ */
+
+/** Every factory in the tree, with the arguments its arity implies. */
+function keys(): [string, readonly unknown[]][] {
+  const out: [string, readonly unknown[]][] = [];
+  const walk = (node: unknown, path: string) => {
+    if (typeof node === "function") {
+      const args = Array.from({ length: node.length }, (_, index) => `arg${index}`);
+      out.push([path, (node as (...a: string[]) => readonly unknown[])(...args)]);
+      return;
+    }
+    if (node && typeof node === "object") {
+      for (const [name, child] of Object.entries(node))
+        walk(child, path ? `${path}.${name}` : name);
+    }
+  };
+  walk(qk, "");
+  return out;
+}
+
+describe("the query key factory", () => {
+  it("has a factory for every entry, and every one answers with an array", () => {
+    const all = keys();
+
+    expect(all.length).toBeGreaterThan(40);
+    for (const [path, key] of all) {
+      expect(Array.isArray(key), path).toBe(true);
+      expect(key.length, path).toBeGreaterThan(0);
+    }
+  });
+
+  it("gives every key a string namespace to invalidate by", () => {
+    for (const [path, key] of keys()) {
+      expect(typeof key[0], path).toBe("string");
+    }
+  });
+
+  it("hands no two entries the same key", () => {
+    // A collision serves one query's data to another, which reads as a caching
+    // bug somewhere else entirely.
+    const seen = new Map<string, string>();
+
+    for (const [path, key] of keys()) {
+      const serialized = JSON.stringify(key);
+      expect(seen.get(serialized), `${path} collides with ${seen.get(serialized)}`).toBeUndefined();
+      seen.set(serialized, path);
+    }
+  });
+
+  it("nests a detail key under the list it belongs to", () => {
+    // Which is what lets `invalidateQueries({ queryKey: qk.agents.all() })` reach
+    // a single agent's spec as well as the listing.
+    expect(qk.agents.detail("a1")[0]).toBe(qk.agents.all()[0]);
+    expect(qk.agents.version("a1", "v1").slice(0, 2)).toEqual(qk.agents.detail("a1"));
+  });
+
+  it("keeps the archived filter in the agents list key", () => {
+    // The two lists are different rows; one key would serve whichever arrived
+    // first to both pages.
+    expect(qk.agents.list(true)).not.toEqual(qk.agents.list(false));
+    expect(qk.agents.list()).toEqual(qk.agents.list(false));
+  });
+
+  it("keys the discovery facet on a sorted copy, so a category selection cannot reuse another's page", () => {
+    // A server-driven facet with no key would let two selections share a stale
+    // cached page.
+    expect(qk.agents.list(false, ["sales"], [])).not.toEqual(qk.agents.list(false, [], []));
+    // The order chips were typed in must not split the cache.
+    expect(qk.agents.list(false, ["b", "a"], ["y", "x"])).toEqual(
+      qk.agents.list(false, ["a", "b"], ["x", "y"]),
+    );
+  });
+
+  it("keys sharing by resource type as well as by id", () => {
+    // An agent and a skill can hold the same id, and their sharing is not the
+    // same row.
+    expect(qk.sharing.detail("agent", "x")).not.toEqual(qk.sharing.detail("skill", "x"));
+  });
+
+  it("names the whole-organization run list rather than keying it on undefined", () => {
+    // `["runs","list",undefined]` and `["runs","list"]` are different keys to
+    // React Query and the same list to a reader. The window, the sort and the
+    // minimum-duration filter are named the same way, and for the same reason.
+    expect(qk.runs.list()).toEqual([
+      "runs",
+      "list",
+      "all",
+      "all-time",
+      "no-end",
+      "started_at",
+      true,
+      "any-rating",
+      "any-status",
+      "any-surface",
+      "any-modality",
+      "any-model",
+      "anyone",
+      "any-conversation",
+      "any-version",
+      "tests-included",
+      0,
+    ]);
+    expect(qk.runs.list({ agentId: "a1" })).toEqual([
+      "runs",
+      "list",
+      "a1",
+      "all-time",
+      "no-end",
+      "started_at",
+      true,
+      "any-rating",
+      "any-status",
+      "any-surface",
+      "any-modality",
+      "any-model",
+      "anyone",
+      "any-conversation",
+      "any-version",
+      "tests-included",
+      0,
+    ]);
+  });
+
+  it("keys a run list by its window as well as its agent", () => {
+    // The same agent over two windows is two answers. Caching one as the other
+    // is how a figure ends up describing a period nobody asked for - which is
+    // the shape of #198, one layer up.
+    expect(qk.runs.list({ startedFrom: "2026-08-01T00:00:00.000Z" })).not.toEqual(qk.runs.list());
+  });
+
+  it("keys a run list by its sort", () => {
+    // The slowest runs and the newest runs are two answers over one window, so
+    // they must not share a cache entry. The minimum-duration filter that used
+    // to key beside them is gone - the "slow runs" preset it existed for was
+    // removed, and the Took column's sort is what finds an outlier now.
+    expect(qk.runs.list({ orderBy: "duration" })).not.toEqual(qk.runs.list());
+    expect(qk.runs.list({ descending: false })).not.toEqual(qk.runs.list());
+    expect(qk.runs.list({ startedTo: "2026-08-31T23:59:59.999Z" })).not.toEqual(qk.runs.list());
+  });
+
+  it("keys the rated-down list apart from the whole", () => {
+    // "Rated down" is a narrower request over the same rows: it must not answer
+    // for the whole list.
+    expect(qk.runs.list({ rated: "down" })).toEqual([
+      "runs",
+      "list",
+      "all",
+      "all-time",
+      "no-end",
+      "started_at",
+      true,
+      "down",
+      "any-status",
+      "any-surface",
+      "any-modality",
+      "any-model",
+      "anyone",
+      "any-conversation",
+      "any-version",
+      "tests-included",
+      0,
+    ]);
+    expect(qk.runs.list({ rated: "down" })).not.toEqual(qk.runs.list());
+    // Test runs, the rest and both are three answers over one window (#2074).
+    expect(qk.runs.list({ isTest: true })).not.toEqual(qk.runs.list({ isTest: false }));
+  });
+
+  it("keys a run's transcript apart from the run row it belongs to", () => {
+    expect(qk.runs.transcript("run-1")).toEqual(["runs", "run-1", "transcript", "run"]);
+    // The whole thread is a different answer from the run's own turns.
+    expect(qk.runs.transcript("run-1", "conversation")).not.toEqual(qk.runs.transcript("run-1"));
+    expect(qk.runs.transcript("run-1")).not.toEqual(qk.runs.detail("run-1"));
+  });
+
+  it("keys a paged list by its window", () => {
+    expect(qk.conversationShares.sharedWithMe(0, 20)).not.toEqual(
+      qk.conversationShares.sharedWithMe(20, 20),
+    );
+  });
+
+  it("separates one tenant's cache from another's", () => {
+    // Sharing a key serves the second tenant the first one's rows out of the cache
+    // while its own request is still in flight - a leak that looks like a delay.
+    expect(qk.integrations.reusable("org-a")).not.toEqual(qk.integrations.reusable("org-b"));
+  });
+});
+
+it("keeps trigger conversation histories separate from each other and Activity", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } });
+  for (const conversationId of [undefined, "thread-a", "thread-b"]) {
+    const answer = await client.fetchQuery({
+      queryKey: qk.runs.list({ conversationId }),
+      queryFn: async () => ({ conversationId: conversationId ?? "unfiltered" }),
+    });
+    expect(answer.conversationId).toBe(conversationId ?? "unfiltered");
+  }
+  expect(client.getQueryCache().getAll()).toHaveLength(3);
+  client.clear();
+});

@@ -1,0 +1,151 @@
+---
+name: channel-bot
+description: Work with messaging-channel bots — Telegram, Slack, Mattermost, Microsoft Teams or Discord. Register a bot, route inbound messages through an agent, choose webhook vs polling, handle an @slug mention, or add a new channel adapter. Use when wiring chat into a messaging platform or debugging bot delivery, identity linking or "the bot answered as itself".
+---
+
+# Channels — Telegram, Slack, Mattermost, Teams, Discord
+
+**Read `docs/channels.md`.** Code: `app/services/channels/` — a thick service with
+per-platform adapters plus a router that funnels inbound messages into the **same**
+agent pipeline as the web chat.
+
+| File | Responsibility |
+|---|---|
+| `base.py` | Shared adapter interface |
+| `telegram.py` | Telegram (aiogram v3) |
+| `slack.py` | Slack (Events API + Socket Mode) |
+| `mattermost.py` | Mattermost |
+| `teams.py`, `teams_auth.py` | Microsoft Teams over the Bot Connector's HTTP protocol (#1985): JWT-verified activities, Adaptive Cards, conversation references in `teams_conversations` |
+| `discord.py`, `discord_protocol.py` | Discord over its Gateway and REST API, no library (#2079); the protocol module holds the pure payloads, chunking and the channel-visibility arithmetic |
+| `router.py` | Inbound platform message → conversation/session → agent run → reply |
+| `mentions.py` | `@slug` resolution, and the identity rules below |
+
+Bots live in the DB (`channel_bots`), with per-user identity (`channel_identity`) and
+per-thread session (`channel_session`).
+
+## Surface prompts
+
+`formatting.house_style` supplies current defaults at run time. Binding prompts
+store custom additions only; do not seed a snapshot of defaults into a new row.
+Migration `0183_channel_prompt_defaults.py` removes exact historical defaults.
+Channel messages persist raw text and `channel_identity_id`; history author labels
+are resolved just before dispatch by `ChannelReference`, so erasure removes the
+labels as well. `build_message_history` carries opaque identity references;
+`PreparedRun.channel_authors` preserves per-user-part attribution across provider
+normalization and approval resumption. `ChannelReferencePart` marks reference-only
+parts omitted from run manifests. Screen editable reference values with the input
+policy, keeping fixed transport metadata out of question checks. Keep JSON envelopes out of `Message.content`.
+Channel metadata remains request-only reference data, outside system instructions
+and the guarded input. Never infer identity or authorization from display labels.
+
+## Tokens go through the vault
+
+Bot tokens are sealed with `app/core/vault.py`, bound to the organization.
+**`CHANNEL_ENCRYPTION_KEY` and the deployment-wide Fernet key are gone**, removed
+before the chain was squashed into `0001_baseline`.
+`channel_bots.secret_key_version` exists because the token is now an envelope
+and a staged master-key rotation has to know which key sealed it. See the
+`vault-secrets` skill.
+
+## The mention invariants
+
+These are the ones worth testing and the ones easiest to break:
+
+- **A bot serves exactly one agent** - `uq_exposure_bot`, migration `0018`. So
+  `answer_default` takes the single active binding without asking what a second row
+  would have meant, and `@slug` is an alias for that agent rather than a router
+  between several. Binding a second agent is refused by the service *and* by the
+  database.
+- **`@slug` resolves only inside the bot's organization.** A slug from another org is
+  not found, not borrowed.
+- **A mention runs as the *sender*, never as the bot.** The bot's own identity would
+  carry whatever permissions it was registered with, which is how a channel becomes a
+  privilege-escalation path.
+- **An unlinked identity is refused, not run with no role.** "No role" is not a safe
+  default; it is an unauthenticated run.
+
+`tests/test_channel_mentions.py` and `tests/test_channel_bot_org_scope.py` pin these.
+
+## CLI
+
+```bash
+uv run agenticos cmd channel-add-bot \
+    --platform telegram --name "Support" --token <token> --mode jwt_linked
+uv run agenticos cmd channel-list-bots [--platform telegram]
+uv run agenticos cmd channel-test-message --bot-id <uuid> --chat-id <chat> --text ping
+uv run agenticos cmd channel-webhook-register --bot-id <uuid>
+uv run agenticos cmd channel-webhook-delete --bot-id <uuid>   # back to polling
+```
+
+There is no `cmd channel` group — the commands are flat, hyphenated names.
+
+Access modes: `open`, `whitelist`, `jwt_linked`, `group_only`. `jwt_linked` refuses
+an unlinked chat account everywhere on its own; `require_link` is the switch that
+makes the *other* modes refuse in a channel too (#639).
+
+## Webhook vs polling
+
+- **Polling (dev)** — the adapter long-polls; no public URL needed.
+- **Webhook (prod)** — the platform POSTs to a route under `api/routes/v1/`.
+  **Verify the signature or secret before processing anything** (HMAC for Telegram,
+  signing secret for Slack, the Bot Connector JWT for Teams - `TeamsAuth.verify`,
+  which needs the network and so is not `verify_webhook_signature`).
+- **Teams is push only** - there is nothing to poll, and a reply needs the
+  conversation's `serviceUrl`, which the route records on every activity.
+- **Discord is stream only** - everything, interactions included, arrives over
+  the bot's Gateway connection. `STREAM_ONLY` in `webhooks.py` makes the schema,
+  the service and `channel-webhook-register` refuse a webhook for it. An
+  interaction must be acknowledged within three seconds, so the adapter defers
+  first and does the work after.
+
+## Adding an adapter
+
+1. Implement `services/channels/<platform>.py` against `base.py`: parse inbound into
+   the normalized message, send outbound.
+   Anything per bot the connection needs before it opens - a server address, an
+   app token - is registered in `prepare_connection`, the base hook the supervisor
+   calls on every adapter; do not add a differently named method for it.
+2. Wire it into `router.py` so inbound reaches the agent and replies stream back.
+   **Do not fork the agent pipeline** — one runner behind every surface is the whole
+   design.
+3. Add a signature-verified webhook route and/or a polling entrypoint. A polling
+   entrypoint runs its session under `supervise_stream` from `base.py` — the one
+   reconnect loop — and raises `ChannelNotConfigured` for anything a retry cannot
+   fix (a missing token or URL, a token the platform rejects); do not hand-roll a
+   `while True` with its own sleep.
+4. Reuse the existing conversation/session model.
+5. Respect the per-group/per-thread concurrency controls already in the adapters.
+
+## Where charts come from
+
+Two halves, and the split is the point. The `charts` capability
+(`app/agents/capabilities/charts/`) owns the **spec**: `create_chart` returns a
+`ChartSpec`, which the web chat renders with Recharts and a replay draws again.
+A chat platform can render neither, so `services/channels/chart_png.py` owns the
+**channel raster**: `mentions.drawn_chart` takes the turn's last chart call and
+`render_chart_png` rasterises it to a PNG the adapter attaches. `RENDERERS` there
+is one entry per `ChartType`, held equal to the capability's list by
+`tests/test_channel_charts.py` — a new type is added in both places or fails
+there. There is no `chart_render.py`; the file is `chart_png.py`.
+
+## Coverage
+
+`app/services/channels/mentions.py` is in the gated platform layer at 100%. The
+adapters are template-inherited and are not. See the `backend-tests` skill.
+
+
+## Discord server admission
+
+`AccessPolicy.discord_guild_ids` is the operator's persisted server allowlist.
+Empty means DM-only, including for a private bot already installed elsewhere.
+The service and the startup/catch-up pass forward these IDs through
+`open_inbound_stream` and `prepare_connection`; each edit reopens the stream.
+READY and GUILD_CREATE do not approve a server. Non-outage GUILD_DELETE forgets
+it, and join-specific check markers prevent a stale public-status result from
+releasing a re-added server. The router checks the persisted policy again.
+
+`/ask` defers privately before I/O, resolves its parent/thread key, and preflights
+access before posting a separate public question. A link invitation consumes the
+identity's rate limit before minting its bearer token. Console transcripts need
+both VIEW_CHANNEL and READ_MESSAGE_HISTORY. Keep signed CDN queries out of logs
+as well as request tracing.

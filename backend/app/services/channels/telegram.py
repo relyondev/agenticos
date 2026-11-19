@@ -1,0 +1,790 @@
+"""Telegram channel adapter using aiogram v3."""
+
+import asyncio
+import contextlib
+import hashlib
+import hmac
+import logging
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from typing import Any
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.middlewares.base import (
+    BaseRequestMiddleware,
+    NextRequestMiddlewareType,
+)
+from aiogram.enums import ParseMode
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramUnauthorizedError,
+)
+from aiogram.methods import GetUpdates, TelegramMethod
+from aiogram.methods.base import Response, TelegramType
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReactionTypeEmoji,
+)
+from aiogram.types import Message as AiogramMessage
+
+from app.agents.capabilities.channel_tools import ChannelDetails, ChannelMember
+from app.core.security import encode_untrusted
+from app.db.session import get_db_context
+from app.services.channels import connection_state, stream_lease
+from app.services.channels.base import (
+    CHANNEL_COMMANDS,
+    ChannelAdapter,
+    IncomingAttachment,
+    IncomingMessage,
+    IncomingPress,
+    OutgoingMessage,
+    PromptMessage,
+    broadcast_mentioned,
+    feedback_value,
+    split_thread,
+    supervise_stream,
+)
+from app.services.channels.exceptions import ChannelNotConfigured
+from app.services.channels.router import ChannelMessageRouter
+from app.services.channels.telegram_format import to_telegram_html
+from app.services.channels.telegram_press import parse_press
+
+logger = logging.getLogger(__name__)
+
+
+# Every field Telegram puts a file in, with a name and a type for the kinds that
+# arrive without one. A voice note has neither: it is `voice.ogg` by convention and
+# `audio/ogg` by format, and inventing them here is better than storing a file
+# nothing downstream can identify.
+_MEDIA_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("document", "file", "application/octet-stream"),
+    ("voice", "voice.ogg", "audio/ogg"),
+    ("audio", "audio", "audio/mpeg"),
+    ("video", "video.mp4", "video/mp4"),
+    ("video_note", "video-note.mp4", "video/mp4"),
+)
+
+
+_REACTIONS = {
+    "eyes": "👀",
+    "+1": "👍",
+    "thumbsup": "👍",
+    "ok_hand": "👌",
+    "fire": "🔥",
+    "thinking_face": "🤔",
+    "writing_hand": "✍",
+    "zap": "⚡",
+    "hourglass": "⏳",
+}
+"""Telegram reacts with the emoji itself, and only from a fixed set; these are the
+names Slack and Mattermost use for ones that set holds. Another name is skipped."""
+
+
+ANOTHER_POLLER = (
+    "Another process is polling this bot's token, so Telegram ends one of the two "
+    "requests on every poll. Look for a second deployment, or a script, using the "
+    "same token."
+)
+
+
+class _ConflictWatch(BaseRequestMiddleware):
+    """Tells the adapter when Telegram ends this bot's poll for somebody else's (#2224),
+    and when it stops (#2252).
+
+    aiogram catches every error a poll raises, logs it and polls again, so two
+    pollers on one token end each other's requests for as long as both run - on
+    prod that was fifteen minutes, about ten times a minute. Only a request made
+    with the bot can see the error, which is why this sits on the polling bot's
+    session rather than around `start_polling`.
+
+    The poll that succeeds after a conflict is the recovery, in the same
+    dispatcher session: `record_up` ran once before polling began, so without
+    this the channels listing kept naming the other poller until the heartbeat
+    overwrote it - and the heartbeat, firing mid-conflict, briefly read `up`.
+    `conflicted` is what keeps it from doing so.
+    """
+
+    def __init__(
+        self,
+        on_conflict: Callable[[], Awaitable[None]],
+        on_recovery: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._on_conflict = on_conflict
+        self._on_recovery = on_recovery
+        self.conflicted = False
+
+    async def __call__(
+        self,
+        make_request: NextRequestMiddlewareType[TelegramType],
+        bot: Bot,
+        method: TelegramMethod[TelegramType],
+    ) -> Response[TelegramType]:
+        try:
+            response = await make_request(bot, method)
+        except TelegramConflictError:
+            if isinstance(method, GetUpdates):
+                self.conflicted = True
+                await self._on_conflict()
+            raise
+        if self.conflicted and isinstance(method, GetUpdates):
+            self.conflicted = False
+            await self._on_recovery()
+        return response
+
+
+def _where(platform_chat_id: str) -> dict[str, Any]:
+    """The chat a message goes to, and the forum topic within it if there is one."""
+    chat, thread = split_thread(platform_chat_id)
+    where: dict[str, Any] = {"chat_id": chat}
+    if thread:
+        where["message_thread_id"] = int(thread)
+    return where
+
+
+class TelegramAdapter(ChannelAdapter):
+    """Concrete Telegram adapter using aiogram v3."""
+
+    platform: str = "telegram"
+
+    def __init__(self) -> None:
+        self._polling_tasks: dict[str, asyncio.Task[None]] = {}
+        self._own_accounts: dict[str, tuple[str, int, str, float]] = {}
+
+    async def resolve_addressing(self, bot_token: str, incoming: IncomingMessage) -> bool | None:
+        if incoming.chat_type == "private":
+            return True
+        fingerprint = hashlib.sha256(bot_token.encode()).hexdigest()
+        own = self._own_accounts.get(incoming.bot_id)
+        if own is None or own[0] != fingerprint or time.monotonic() - own[3] >= 300:
+            async with self._bot(bot_token) as bot:
+                account = await bot.get_me()
+            own = (fingerprint, account.id, (account.username or "").casefold(), time.monotonic())
+            self._own_accounts[incoming.bot_id] = own
+        message = incoming.raw.get("message") or incoming.raw.get("edited_message") or {}
+        if ((message.get("reply_to_message") or {}).get("from") or {}).get("id") == own[1]:
+            return True
+        encoded = incoming.text.encode("utf-16-le")
+        for entity in message.get("entities") or message.get("caption_entities") or []:
+            kind = entity.get("type")
+            if kind == "text_mention" and (entity.get("user") or {}).get("id") == own[1]:
+                return True
+            if kind not in ("mention", "bot_command"):
+                continue
+            offset, length = entity.get("offset", 0), entity.get("length", 0)
+            token = (
+                encoded[offset * 2 : (offset + length) * 2]
+                .decode("utf-16-le", errors="replace")
+                .casefold()
+            )
+            if kind == "mention" and token == "@" + own[2]:
+                return True
+            if kind == "bot_command" and ("@" not in token or token.rsplit("@", 1)[1] == own[2]):
+                return True
+        return False
+
+    @staticmethod
+    @contextlib.asynccontextmanager
+    async def _bot(
+        bot_token: str, *, default: DefaultBotProperties | None = None
+    ) -> AsyncGenerator[Bot]:
+        """A Telegram bot bound to one token, its TLS session closed on the way out.
+
+        aiogram opens a fresh session per `Bot` and leaks the connection if it is
+        not closed, so every send and every read goes through one of these rather
+        than repeating the try/finally. `default` is how the streamed replies ask
+        for Markdown parse mode while the plain sends take none; `None` builds a bot
+        with no default, the historic form the rest use.
+        """
+        bot = Bot(token=bot_token, default=default) if default is not None else Bot(token=bot_token)
+        try:
+            yield bot
+        finally:
+            await bot.session.close()
+
+    async def begin_reply(self, bot_token: str, msg: OutgoingMessage) -> str | None:
+        """Send the message that will become the answer, and return its id.
+
+        "typing…" first, in the chat's header, so the bot reads as working from
+        the moment the question lands (#2068). Never fatal: it is decoration.
+        """
+        async with self._bot(bot_token) as bot:
+            with contextlib.suppress(Exception):
+                await bot.send_chat_action(action="typing", **_where(msg.platform_chat_id))
+            sent = await bot.send_message(
+                text=msg.text,
+                reply_to_message_id=int(msg.reply_to_message_id)
+                if msg.reply_to_message_id
+                else None,
+                **_where(msg.platform_chat_id),
+            )
+        return str(sent.message_id)
+
+    async def update_reply(self, bot_token: str, msg: OutgoingMessage, handle: str) -> None:
+        """Rewrite a message already in the chat.
+
+        No parse mode: half-written Markdown is the normal state of a message
+        being streamed, and Telegram rejects an unclosed `**` with a 400. The
+        final send formats it, once the text is whole.
+        """
+        async with self._bot(bot_token) as bot:
+            await bot.edit_message_text(
+                chat_id=_where(msg.platform_chat_id)["chat_id"],
+                message_id=int(handle),
+                text=msg.text,
+            )
+
+    async def send_message(self, bot_token: str, msg: OutgoingMessage) -> None:
+        """Send a reply back to Telegram.
+
+        As HTML converted from the agent's Markdown (#2068) - Telegram's own
+        Markdown rejects half of what a model writes - and as plain text if even
+        that is refused, so the answer always arrives.
+        """
+        reply_to = int(msg.reply_to_message_id) if msg.reply_to_message_id else None
+        where = _where(msg.platform_chat_id)
+        async with self._bot(bot_token) as bot:
+            if msg.image_png is not None:
+                from aiogram.types import BufferedInputFile
+
+                await bot.send_photo(
+                    photo=BufferedInputFile(msg.image_png, filename=msg.image_filename),
+                    caption=msg.text,
+                    reply_to_message_id=reply_to,
+                    **where,
+                )
+                return
+            if msg.attachments:
+                await self._send_documents(bot, msg, reply_to)
+                return
+            try:
+                await bot.send_message(
+                    text=to_telegram_html(msg.text),
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=reply_to,
+                    **where,
+                )
+            except TelegramBadRequest:
+                await bot.send_message(
+                    text=msg.text, parse_mode=None, reply_to_message_id=reply_to, **where
+                )
+
+    @staticmethod
+    async def _send_documents(bot: Bot, msg: OutgoingMessage, reply_to: int | None) -> None:
+        """Post the files, with the text as the first one's caption.
+
+        The caption rides on the first document rather than being sent as its own
+        message, so the answer and the file it is about arrive together. Telegram
+        caps a caption at 1024 characters, so a longer answer is sent as a message
+        first and the files follow - truncating an agent's answer to fit a caption
+        would lose the part somebody asked for.
+        """
+        from aiogram.types import BufferedInputFile
+
+        caption: str | None = msg.text if len(msg.text) <= 1024 else None
+        where = _where(msg.platform_chat_id)
+        if caption is None:
+            await bot.send_message(
+                text=msg.text, parse_mode=None, reply_to_message_id=reply_to, **where
+            )
+
+        for index, attachment in enumerate(msg.attachments):
+            await bot.send_document(
+                document=BufferedInputFile(attachment.content, filename=attachment.filename),
+                caption=caption if index == 0 else None,
+                reply_to_message_id=reply_to,
+                **where,
+            )
+
+    #
+    # Two of the four, and that is the whole of what Telegram gives a bot.
+    # `search_channels` and `channel_history` are inherited from the base class,
+    # which refuses with a sentence: Telegram has no directory of chats to
+    # search, and a bot receives messages rather than reading them back - there
+    # is no `getChatHistory`, and the closest thing needs a *user* account.
+    # Answering those two with empty lists would read as "there is nothing
+    # there", which is a different and wrong statement.
+
+    async def channel_details(
+        self, bot_token: str, channel_id: str, *, api_base_url: str | None
+    ) -> ChannelDetails:
+        """`getChat` and `getChatMemberCount`.
+
+        A Telegram chat has a `description` and no separate topic, so `purpose`
+        carries it and `topic` stays empty rather than repeating it.
+        """
+        async with self._bot(bot_token) as bot:
+            chat = await bot.get_chat(chat_id=channel_id)
+            count = await bot.get_chat_member_count(chat_id=channel_id)
+
+        return ChannelDetails(
+            channel_id=str(chat.id),
+            name=chat.title or chat.username or str(chat.id),
+            purpose=chat.description or None,
+            is_private=chat.type != "channel",
+            member_count=count,
+        )
+
+    async def channel_members(
+        self, bot_token: str, channel_id: str, *, api_base_url: str | None, limit: int
+    ) -> list[ChannelMember]:
+        """`getChatAdministrators` - which is as far as a bot can see.
+
+        Telegram gives a bot no way to enumerate ordinary members of a group,
+        deliberately. So this returns the administrators, and every row says
+        `admin` in its role: a list that quietly stopped at the administrators
+        while reading as "everybody here" would have the model tell somebody
+        their colleague is not in the chat.
+        """
+        async with self._bot(bot_token) as bot:
+            administrators = await bot.get_chat_administrators(chat_id=channel_id)
+
+        return [
+            ChannelMember(
+                user_id=str(entry.user.id),
+                username=entry.user.username,
+                display_name=entry.user.full_name,
+                is_bot=entry.user.is_bot,
+                role="admin",
+            )
+            for entry in administrators[:limit]
+        ]
+
+    async def is_channel_member(
+        self, bot_token: str, channel_id: str, platform_user_id: str, *, api_base_url: str | None
+    ) -> bool:
+        """`getChatMember`, read for its status.
+
+        The one membership question Telegram does answer per account, where
+        enumerating ordinary members is refused outright. `left` and `kicked`
+        are Telegram's words for "was here, is not"; every other status - down
+        to `restricted`, which is a member who may not speak - is still in the
+        room. An account Telegram cannot place in the chat at all raises
+        `TelegramBadRequest`, which is the same answer as `left` for the
+        question being asked.
+        """
+        try:
+            member_id = int(platform_user_id)
+        except ValueError:
+            return False
+        async with self._bot(bot_token) as bot:
+            try:
+                found = await bot.get_chat_member(chat_id=channel_id, user_id=member_id)
+            except TelegramBadRequest:
+                return False
+        return found.status not in ("left", "kicked")
+
+    async def start_polling(self, bot_id: str, bot_token: str) -> None:
+        """Start a supervised polling loop for this bot."""
+        if bot_id in self._polling_tasks and not self._polling_tasks[bot_id].done():
+            logger.info("Polling already running for bot %s", bot_id)
+            return
+
+        task = asyncio.create_task(
+            self._polling_supervisor(bot_id, bot_token),
+            name=f"telegram_polling_{bot_id}",
+        )
+        self._polling_tasks[bot_id] = task
+        logger.info("Started Telegram polling for bot %s", bot_id)
+
+    async def stop_polling(self, bot_id: str) -> None:
+        """Cancel the polling task for this bot."""
+        task = self._polling_tasks.pop(bot_id, None)
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        logger.info("Stopped Telegram polling for bot %s", bot_id)
+
+    async def _another_poller(self, bot_id: str) -> None:
+        """Telegram ended this bot's poll because another process polls it.
+
+        A worker that no longer holds the bot's stream lease is the extra copy:
+        it closes, and the holder goes on alone. A worker that does hold it is
+        the rightful poller and has nothing to close - so it says what is in the
+        way, on the channels listing, because the other process is outside
+        anything this deployment can stop.
+        """
+        leases = stream_lease.leases()
+        if not await leases.holds(bot_id):
+            logger.warning(
+                "Telegram: bot %s is polled by the worker holding its lease; closing "
+                "the copy on worker %s",
+                bot_id,
+                leases.holder,
+            )
+            leases.drop(bot_id)
+            task = self._polling_tasks.pop(bot_id, None)
+            if task is not None:
+                # This runs inside that task. The cancellation lands at its next
+                # await, so the poll unwinds itself instead of being awaited here.
+                task.cancel()
+            return
+        await connection_state.record_down(bot_id, ANOTHER_POLLER)
+
+    async def _polling_supervisor(self, bot_id: str, bot_token: str) -> None:
+        """Polling sessions, reopened under the shared reconnect loop."""
+        await supervise_stream(
+            bot_id,
+            platform="Telegram polling",
+            session=lambda: self._run_polling_once(bot_id, bot_token),
+            failing=(
+                "Telegram polling keeps failing. Check the bot token, and "
+                "whether a webhook is registered - Telegram will not do both."
+            ),
+        )
+
+    async def _run_polling_once(self, bot_id: str, bot_token: str) -> None:
+        """Run one polling session using aiogram Dispatcher.
+
+        A token Telegram rejects is raised as `ChannelNotConfigured` rather than
+        left as the vendor's 401: nothing a retry does will make the token valid,
+        and the supervisor retried it for ever, a traceback every five seconds,
+        where the other two platforms record `down` once and stop.
+
+        The connection entry is re-stamped on its own clock for as long as the
+        poll runs, as the other two streams do (#1351): `record_up` fires once
+        and the entry expires on a TTL, so a bot nobody messaged for fifteen
+        minutes read `unknown` on the channels listing while polling fine.
+        """
+        async with self._bot(
+            bot_token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+        ) as bot:
+            watch = _ConflictWatch(
+                lambda: self._another_poller(bot_id),
+                lambda: connection_state.record_up(bot_id),
+            )
+            bot.session.middleware(watch)
+            dp = Dispatcher()
+
+            @dp.message()
+            async def on_message(message: AiogramMessage) -> None:
+                await self._handle_update(message, bot_id)
+
+            # Buttons on approvals and questions (#2064, #2068). A handler is what
+            # makes aiogram ask Telegram for `callback_query` updates at all.
+            @dp.callback_query()
+            async def on_press(query: CallbackQuery) -> None:
+                await self._handle_press(query, bot_id)
+
+            await self._offer_commands(bot)
+            await connection_state.record_up(bot_id)
+            beat = asyncio.create_task(
+                connection_state.heartbeat(bot_id, live=lambda: not watch.conflicted)
+            )
+            try:
+                await dp.start_polling(bot, handle_signals=False)
+            except TelegramUnauthorizedError as exc:
+                raise ChannelNotConfigured(
+                    message=(
+                        "Telegram rejected the bot token - polling not started. "
+                        "Check the token in the bot's settings."
+                    ),
+                    details={"bot_id": bot_id},
+                ) from exc
+            finally:
+                beat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await beat
+
+    @staticmethod
+    async def _offer_commands(bot: Bot) -> None:
+        """The bot's command menu - the `/` button beside the chat's input (#2068).
+
+        Never fatal: a bot without a menu still answers every command typed.
+        """
+        try:
+            await bot.set_my_commands(
+                [BotCommand(command=name, description=what) for name, what in CHANNEL_COMMANDS]
+            )
+        except Exception:
+            logger.warning("Could not set the Telegram command menu", exc_info=True)
+
+    async def register_webhook(self, bot_token: str, url: str, secret: str | None) -> bool:
+        """Register a webhook URL with Telegram."""
+        async with self._bot(bot_token) as bot:
+            try:
+                await bot.set_webhook(url=url, secret_token=secret)
+                await self._offer_commands(bot)
+                return True
+            except Exception:
+                logger.exception("Failed to register Telegram webhook")
+                return False
+
+    async def delete_webhook(self, bot_token: str) -> bool:
+        """Remove the webhook from Telegram."""
+        async with self._bot(bot_token) as bot:
+            try:
+                await bot.delete_webhook()
+                return True
+            except Exception:
+                logger.exception("Failed to delete Telegram webhook")
+                return False
+
+    def verify_webhook_signature(
+        self, headers: dict[str, str], secret: str, body: str | None = None
+    ) -> bool:
+        """Verify that the request came from Telegram via the secret token header.
+
+        The `body` parameter is unused for Telegram (signature is header-only)
+        but accepted for interface compatibility with ChannelAdapter.
+        """
+        received = headers.get("x-telegram-bot-api-secret-token", "")
+        return hmac.compare_digest(encode_untrusted(received), secret.encode())
+
+    def parse_incoming(self, raw_payload: dict[str, Any], bot_id: str) -> IncomingMessage | None:
+        """Normalise one Telegram update, whichever transport delivered it.
+
+        The webhook receiver and the polling loop both arrive here, so the rules
+        about what counts as a message are stated once. They were stated twice
+        until #547, and the copies disagreed about files.
+
+        `message` and `edited_message` only. A file with no caption is a message;
+        a message with no sender is not. The Bot API leaves `from` empty for a
+        message sent to a channel, and a run has to be somebody's - answering one
+        would key a single shared identity on an empty user id. A post made on
+        behalf of a chat elsewhere carries a stand-in sender rather than nothing,
+        so this refuses less than it sounds like: it refuses the case where there
+        is genuinely nobody to link the run to.
+        """
+        msg_data: dict[str, Any] | None = raw_payload.get("message") or raw_payload.get(
+            "edited_message"
+        )
+
+        if not msg_data:
+            return None
+
+        from_user: dict[str, Any] = msg_data.get("from") or {}
+        if not from_user.get("id"):
+            return None
+
+        attachments = self._attachments(msg_data)
+        text: str = msg_data.get("text") or msg_data.get("caption") or ""
+        if not text and not attachments:
+            return None
+
+        chat = msg_data.get("chat", {})
+
+        # Normalised to the two-word vocabulary Slack and Mattermost emit, so the
+        # persisted `chat_type` reads the same across platforms: Telegram's own
+        # `group`, `supergroup` and `channel` are all rooms, and only `private` is
+        # a DM (#556).
+        chat_type: str = "private" if chat.get("type") == "private" else "group"
+        platform_chat_id: str = str(chat.get("id", ""))
+        # A forum group's topic is its own conversation, answered in that topic
+        # rather than in General (#2068) - folded in the way a Slack thread is.
+        if msg_data.get("is_topic_message") and msg_data.get("message_thread_id"):
+            platform_chat_id = f"{platform_chat_id}:{msg_data['message_thread_id']}"
+        platform_user_id: str = str(from_user.get("id", ""))
+
+        username: str | None = from_user.get("username")
+        first_name: str = from_user.get("first_name", "")
+        last_name: str = from_user.get("last_name", "")
+        display_name: str = f"{first_name} {last_name}".strip() or username or platform_user_id
+
+        message_id: str | None = str(msg_data["message_id"]) if "message_id" in msg_data else None
+
+        return IncomingMessage(
+            platform="telegram",
+            bot_id=bot_id,
+            platform_user_id=platform_user_id,
+            platform_chat_id=platform_chat_id,
+            chat_type=chat_type,
+            text=text,
+            raw=raw_payload,
+            platform_username=username,
+            platform_display_name=display_name,
+            message_id=message_id,
+            broadcast_mention=broadcast_mentioned(self.platform, text),
+            attachments=attachments,
+        )
+
+    @staticmethod
+    def _attachments(msg_data: dict[str, Any]) -> list[IncomingAttachment]:
+        """The files on a Telegram message, as handles.
+
+        Telegram does not put files in one list. Each kind is its own field, and a
+        message carrying only one of them has no text at all - which is why a voice
+        note used to parse as nothing and vanish without a log line. Every kind it
+        can send is read here, and one it cannot yet do anything with is refused
+        further down *by name* rather than dropped.
+
+        A `photo` arrives as the same image in several sizes and the last is the
+        largest, which is the one worth having - the rest are thumbnails Telegram
+        generated. It also sends no MIME type for one, so a JPEG is stated rather
+        than guessed from bytes nobody has yet.
+
+        A voice note or an audio file states its `duration` in whole seconds,
+        which is kept as the recording's length for the usage record (#1797).
+        """
+        found: list[IncomingAttachment] = []
+
+        for field, fallback_name, fallback_mime in _MEDIA_FIELDS:
+            media = msg_data.get(field)
+            if not isinstance(media, dict) or not media.get("file_id"):
+                continue
+            duration = media.get("duration")
+            found.append(
+                IncomingAttachment(
+                    filename=media.get("file_name") or fallback_name,
+                    mime_type=media.get("mime_type") or fallback_mime,
+                    size=int(media.get("file_size") or 0),
+                    handle=str(media["file_id"]),
+                    duration_seconds=(
+                        float(duration) if isinstance(duration, int | float) else None
+                    ),
+                )
+            )
+
+        photos = msg_data.get("photo")
+        if isinstance(photos, list) and photos:
+            largest = photos[-1]
+            found.append(
+                IncomingAttachment(
+                    filename=f"photo-{largest.get('file_unique_id', 'image')}.jpg",
+                    mime_type="image/jpeg",
+                    size=int(largest.get("file_size") or 0),
+                    handle=str(largest.get("file_id", "")),
+                )
+            )
+
+        return found
+
+    async def download_attachment(self, bot_token: str, attachment: IncomingAttachment) -> bytes:
+        """Fetch a file: `getFile` for the path, then the file API for the bytes.
+
+        Two requests because that is Telegram's design - a `file_id` is not a URL
+        and the path it resolves to expires - so resolving it at parse time would
+        hand the router a link that had gone stale by the time anybody used it.
+        """
+        async with self._bot(bot_token) as bot:
+            info = await bot.get_file(attachment.handle)
+            if info.file_path is None:
+                raise ValueError(f"Telegram returned no path for {attachment.filename}")
+            buffer = await bot.download_file(info.file_path)
+            if buffer is None:
+                raise ValueError(f"Telegram returned no bytes for {attachment.filename}")
+            return buffer.read()
+
+    async def send_prompt(self, bot_token: str, prompt: PromptMessage) -> None:
+        """An approval or a question with an inline keyboard, a button per row."""
+        async with self._bot(bot_token) as bot:
+            await bot.send_message(
+                text=prompt.text,
+                **_where(prompt.platform_chat_id),
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text=choice.label, callback_data=choice.value)]
+                        for choice in prompt.choices
+                    ]
+                ),
+            )
+
+    async def offer_feedback(
+        self, bot_token: str, msg: OutgoingMessage, handle: str, run_id: str, *, bot_id: str
+    ) -> None:
+        """Thumbs under a finished answer, as an inline keyboard on it (#2084)."""
+        async with self._bot(bot_token) as bot:
+            await bot.edit_message_reply_markup(
+                chat_id=_where(msg.platform_chat_id)["chat_id"],
+                message_id=int(handle),
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="👍", callback_data=feedback_value(run_id, helpful=True)
+                            ),
+                            InlineKeyboardButton(
+                                text="👎", callback_data=feedback_value(run_id, helpful=False)
+                            ),
+                        ]
+                    ]
+                ),
+            )
+
+    async def settle_feedback(self, bot_token: str, press: IncomingPress, helpful: bool) -> None:
+        """Take the thumbs off the answer once one is pressed."""
+        if press.message_id is None:
+            return
+        async with self._bot(bot_token) as bot:
+            await bot.edit_message_reply_markup(
+                chat_id=press.platform_chat_id, message_id=int(press.message_id), reply_markup=None
+            )
+
+    async def acknowledge_message(
+        self, bot_token: str, incoming: IncomingMessage, reaction: str
+    ) -> None:
+        """React to the question with the bot's emoji, where Telegram allows it (#2084)."""
+        emoji = _REACTIONS.get(reaction)
+        if emoji is None or not incoming.message_id:
+            return
+        async with self._bot(bot_token) as bot:
+            await bot.set_message_reaction(
+                chat_id=_where(incoming.platform_chat_id)["chat_id"],
+                message_id=int(incoming.message_id),
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+            )
+
+    async def acknowledge(self, bot_token: str, press: IncomingPress) -> None:
+        """Stop the pressed button spinning; it does until the bot answers the query."""
+        if press.ack_id is None:
+            return
+        async with self._bot(bot_token) as bot:
+            await bot.answer_callback_query(callback_query_id=press.ack_id)
+
+    async def settle_prompt(self, bot_token: str, press: IncomingPress, text: str) -> None:
+        """Take the keyboard off the pressed message, leaving what was asked and chosen."""
+        if press.message_id is None:
+            return
+        shown = f"{press.prompt_text}\n{text}" if press.prompt_text else text
+        async with self._bot(bot_token) as bot:
+            await bot.edit_message_text(
+                chat_id=press.platform_chat_id, message_id=int(press.message_id), text=shown
+            )
+
+    async def _handle_press(self, query: CallbackQuery, bot_id: str) -> None:
+        """A press from the polling loop, through the same parser as the webhook's."""
+        from app.worker.background.channel import process_channel_press
+
+        press = parse_press(
+            {"callback_query": query.model_dump(mode="json", by_alias=True, exclude_none=True)},
+            bot_id,
+        )
+        if press is not None:
+            await process_channel_press(press)
+
+    async def _handle_update(self, message: AiogramMessage, bot_id: str) -> None:
+        """Route one update from the polling loop, through the one parser.
+
+        aiogram has already decoded what Telegram POSTs to the webhook receiver,
+        so the update is put back into that shape and normalised by
+        `parse_incoming` rather than by a second copy of it - which is what this
+        was, and the copy read no files (#547): a spreadsheet dropped on a bot in
+        polling mode, the mode a self-hosted deployment runs, was discarded and
+        the agent answered about a document it never received.
+
+        `by_alias` because the Bot API's `from` is a Python keyword and aiogram
+        renames it - without it nothing here finds a sender and every polled
+        message is refused. `exclude_none` because Telegram omits a field it has
+        nothing for while aiogram holds a `None`: left in, a sender with no
+        surname is displayed as "Ada None".
+
+        Only `message` reaches this. `@dp.message()` is the sole handler, so
+        aiogram asks Telegram for that update type alone and an edit is never
+        delivered - unlike the webhook receiver, which is sent whatever the
+        platform has and reads `edited_message` too.
+        """
+        incoming = self.parse_incoming(
+            {"message": message.model_dump(mode="json", by_alias=True, exclude_none=True)}, bot_id
+        )
+        if incoming is None:
+            return
+
+        router = ChannelMessageRouter()
+
+        async with get_db_context() as db:
+            await router.route(incoming, db)

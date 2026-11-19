@@ -1,0 +1,571 @@
+"""The reads and hard deletes one retention sweep makes.
+
+Every function here is scoped to one organization and one cutoff, because a sweep
+is per-organization policy applied to one class at a time - and because a query
+that spanned tenants would be one mistake away from purging under the wrong
+policy. The exception is `organizations_with_data`, which is the sweep's own
+"who is there to sweep" and reads ids only.
+
+**Batched, and the batch is the point.** An organization arriving at a ninety-day
+policy after two years has two years to remove, and one statement deleting a
+million rows takes a lock for the length of it. Each delete takes the oldest
+`limit` rows and answers how many it removed, so the caller loops until a pass
+removes nothing - which also makes a sweep that is killed halfway simply resume,
+rather than start again.
+"""
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, cast
+from uuid import UUID
+
+from sqlalchemy import (
+    CursorResult,
+    DateTime,
+    and_,
+    delete,
+    func,
+    or_,
+    select,
+    type_coerce,
+)
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models.agent_run import AgentRun, RunStatus
+from app.db.models.agent_workspace import AgentWorkspace
+from app.db.models.artifact import Artifact, ArtifactVersion
+from app.db.models.chat_file import ChatFile
+from app.db.models.conversation import Conversation, Message
+from app.db.models.generated_media import GeneratedMedia
+from app.db.models.knowledge_base import KnowledgeBase
+from app.db.models.memory import AgentMemoryFile
+from app.db.models.organization import Organization
+from app.db.models.purged_run_spend import PurgedRunSpend
+from app.db.models.rag_document import DocumentStatus, RAGDocument
+from app.db.models.resource_grant import ResourceGrant
+from app.db.models.virtual_table import (
+    VirtualTableOutbox,
+    VirtualTableReceipt,
+    VirtualTableRecordHistory,
+)
+from app.db.vector_tables import VectorScope
+
+#: The statuses a retention sweep may retire.
+#:
+#: `running` is a row a live process still means to finalize and
+#: `awaiting_approval` is somebody's pending decision; deleting either loses work
+#: rather than retiring it. A short window reaches both first, which is exactly
+#: when this matters.
+_RETIRABLE = (
+    RunStatus.COMPLETED,
+    RunStatus.FAILED,
+    RunStatus.CANCELLED,
+    RunStatus.BUDGET_EXCEEDED,
+    RunStatus.GUARDRAIL_BLOCKED,
+    RunStatus.LOOP_STOPPED,
+)
+
+
+async def organizations_with_retention(
+    db: AsyncSession,
+) -> list[tuple[UUID, dict[str, Any] | None]]:
+    """Every organization and the retention it asked for, ids and policy only.
+
+    The whole table rather than a filtered one: an organization that has set
+    nothing still inherits the deployment's defaults, so "has a policy" is not a
+    question this query can answer - only `effective_policy` can.
+    """
+    rows = await db.execute(select(Organization.id, Organization.retention_days))
+    return [(row[0], row[1]) for row in rows.all()]
+
+
+async def lock_expiring_conversations(
+    db: AsyncSession, *, organization_id: UUID, cutoff: datetime, limit: int
+) -> list[UUID]:
+    """One locked batch for both file collection and deletion.
+
+    Appends update the same conversation row. SKIP LOCKED leaves an in-flight
+    append alone; active and parked runs keep their conversations even when a
+    long approval wait has exceeded the retention period.
+    """
+    active_run = (
+        select(AgentRun.id)
+        .where(
+            AgentRun.conversation_id == Conversation.id,
+            AgentRun.organization_id == organization_id,
+            AgentRun.status.not_in(_RETIRABLE),
+        )
+        .exists()
+    )
+    rows = await db.execute(
+        select(Conversation.id)
+        .where(
+            Conversation.organization_id == organization_id,
+            Conversation.updated_at < cutoff,
+            ~active_run,
+        )
+        .order_by(Conversation.updated_at, Conversation.id)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return list(rows.scalars().all())
+
+
+async def stored_paths_for_expiring_conversations(
+    db: AsyncSession, *, organization_id: UUID, conversation_ids: list[UUID]
+) -> list[str]:
+    """Files and generated media for exactly the caller's locked conversations."""
+    rows = await db.execute(
+        select(ChatFile.storage_path)
+        .join(Message, Message.id == ChatFile.message_id)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.organization_id == organization_id,
+            Message.conversation_id.in_(conversation_ids),
+            ChatFile.storage_path.is_not(None),
+        )
+        .union_all(
+            select(GeneratedMedia.storage_path).where(
+                GeneratedMedia.organization_id == organization_id,
+                GeneratedMedia.conversation_id.in_(conversation_ids),
+            )
+        )
+    )
+    return [path for (path,) in rows.all() if path]
+
+
+async def delete_conversations(
+    db: AsyncSession, *, organization_id: UUID, conversation_ids: list[UUID]
+) -> int:
+    """Delete exactly the locked batch whose files have a durable cleanup intent."""
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            delete(Conversation).where(
+                Conversation.organization_id == organization_id,
+                Conversation.id.in_(conversation_ids),
+            )
+        ),
+    )
+    return result.rowcount or 0
+
+
+async def delete_runs_keeping_their_spend(
+    db: AsyncSession, *, organization_id: UUID, cutoff: datetime, limit: int
+) -> tuple[int, list[tuple[datetime, Decimal, int]]]:
+    """Delete the oldest finished runs and answer what they cost, atomically.
+
+    **One statement, and that is the point.** Reading the costs and then deleting
+    the rows lets two overlapping sweeps read the same batch: the first delete
+    wins, the second removes nothing, and its additive upsert of the same figure
+    stays - permanently inflating the month and the budget metered on it. A
+    `DELETE ... RETURNING` cannot be read by a sweep that is not going to remove
+    the row, so the figure kept is exactly the figure lost.
+
+    **Only terminal runs.** `running` is a row a live process still means to
+    finalize and `awaiting_approval` is somebody's pending decision; deleting
+    either loses work rather than retiring it, and a short window reaches both
+    first. Manifests and tool approvals cascade; a delegated child whose parent
+    goes keeps its own row (`parent_run_id` is `SET NULL`) and is retired by its
+    own age like any other run.
+
+    Returns:
+        How many rows went, and their cost grouped by the month they started in -
+        **top-level runs only**, because a parent's `cost_usd` already contains
+        what its delegates spent and the live billing query filters the children
+        out for exactly that reason. Counting both would double-charge the work
+        the moment retention removed it.
+    """
+    expiring = (
+        select(AgentRun.id)
+        .where(
+            AgentRun.organization_id == organization_id,
+            AgentRun.started_at < cutoff,
+            AgentRun.status.in_(_RETIRABLE),
+        )
+        .order_by(AgentRun.started_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    removed = await db.execute(
+        delete(AgentRun)
+        .where(AgentRun.id.in_(expiring))
+        # `expiring` compares `started_at` with the cutoff, so a deleted row has
+        # one; `type_coerce` carries that past the nullable column.
+        .returning(
+            type_coerce(AgentRun.started_at, DateTime(timezone=True)),
+            AgentRun.cost_usd,
+            AgentRun.parent_run_id,
+        )
+    )
+    rows = removed.all()
+
+    by_month: dict[datetime, tuple[Decimal, int]] = {}
+    for started_at, cost, parent_run_id in rows:
+        if parent_run_id is not None:
+            continue
+        period = started_at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        total, count = by_month.get(period, (Decimal(0), 0))
+        by_month[period] = (total + Decimal(cost or 0), count + 1)
+    return len(rows), [(period, total, count) for period, (total, count) in by_month.items()]
+
+
+async def record_purged_spend(
+    db: AsyncSession, *, organization_id: UUID, period_start: datetime, cost: Decimal, runs: int
+) -> None:
+    """Add a purged month's total to what is already kept for that month.
+
+    An upsert that *adds*, because a sweep purges in batches and a month is
+    reached by several of them - a replace would leave the month holding whatever
+    the last batch happened to contain.
+    """
+    statement = insert(PurgedRunSpend).values(
+        organization_id=organization_id,
+        period_start=period_start,
+        cost_usd=cost,
+        run_count=runs,
+    )
+    await db.execute(
+        statement.on_conflict_do_update(
+            constraint="purged_run_spend_period_key",
+            set_={
+                "cost_usd": PurgedRunSpend.cost_usd + statement.excluded.cost_usd,
+                "run_count": PurgedRunSpend.run_count + statement.excluded.run_count,
+            },
+        )
+    )
+
+
+def _month_of(moment: datetime) -> datetime:
+    """The first instant of the month `moment` falls in - the grain
+    `purged_run_spend` records at."""
+    return moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+async def sum_purged_cost_since(
+    db: AsyncSession, *, organization_id: UUID, since: datetime, until: datetime | None = None
+) -> Decimal:
+    """What purged runs spent in months at or after `since`, up to `until`.
+
+    The grain is a month, so a window starting mid-month counts the whole month
+    it starts in. That is the honest answer available: the runs are gone, and
+    under-reporting a cap's baseline is the worse error of the two.
+
+    `until` bounds the other end, and for the opposite reason: a scheduled
+    report passes a fixed window end so a delayed run computes the figure its
+    dedup key was keyed on, and without a bound here a report delayed past its
+    own window picks up months of purged spend it never described. A month
+    that *begins* at or after the end is entirely outside the window and is
+    excluded; a month the end falls inside is counted whole, the same
+    concession the lower bound already makes. A budget leaves `until` open -
+    its question is always "up to now" - and is unaffected.
+    """
+    conditions = [
+        PurgedRunSpend.organization_id == organization_id,
+        PurgedRunSpend.period_start >= _month_of(since),
+    ]
+    if until is not None:
+        conditions.append(PurgedRunSpend.period_start < until)
+    total = await db.scalar(
+        select(func.coalesce(func.sum(PurgedRunSpend.cost_usd), 0)).where(*conditions)
+    )
+    return Decimal(total or 0)
+
+
+async def delete_workspaces(
+    db: AsyncSession, *, organization_id: UUID, cutoff: datetime, limit: int
+) -> int:
+    """Drop the oldest workspaces unused since `cutoff`.
+
+    For the `state` backend the row is the storage, so this is the whole purge.
+    A workspace on a sandbox backend keeps its files in the sandbox, whose own
+    TTL reaps them; what leaves here is the platform's record of it.
+
+    Never a project's: its files are the project's, kept as long as the project
+    is, however long nobody has run an agent in them - and deleted with it.
+    """
+    expiring = (
+        select(AgentWorkspace.id)
+        .where(
+            AgentWorkspace.organization_id == organization_id,
+            AgentWorkspace.last_used_at < cutoff,
+            AgentWorkspace.project_id.is_(None),
+        )
+        .order_by(AgentWorkspace.last_used_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = cast(
+        CursorResult[Any],
+        await db.execute(delete(AgentWorkspace).where(AgentWorkspace.id.in_(expiring))),
+    )
+    return result.rowcount or 0
+
+
+async def delete_memory(
+    db: AsyncSession, *, organization_id: UUID, cutoff: datetime, limit: int
+) -> int:
+    """Drop the oldest memory files untouched since `cutoff`.
+
+    `updated_at` again, and it matters more here than anywhere: a memory file is
+    written once and read for months, so an age measured from creation would
+    delete precisely the notes an agent relies on most.
+    """
+    expiring = (
+        select(AgentMemoryFile.id)
+        .where(
+            AgentMemoryFile.organization_id == organization_id,
+            AgentMemoryFile.updated_at < cutoff,
+        )
+        .order_by(AgentMemoryFile.updated_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = cast(
+        CursorResult[Any],
+        await db.execute(delete(AgentMemoryFile).where(AgentMemoryFile.id.in_(expiring))),
+    )
+    return result.rowcount or 0
+
+
+async def lock_expiring_artifacts(
+    db: AsyncSession, *, organization_id: UUID, cutoff: datetime, limit: int
+) -> list[UUID]:
+    """The oldest artifacts nothing has republished since `cutoff`, locked.
+
+    `published_at`, not `created_at`: a report a schedule republishes every week
+    is alive however long ago its first version was written.
+
+    Selected once and locked because the sweep collects paths before deleting
+    rows, and those are two statements. A publish that landed between two
+    evaluations of the cutoff would lose its files to the first and keep its
+    rows through the second - a page whose versions all point at nothing. A
+    publish takes the same row lock, so it waits for the sweep and then finds
+    the artifact gone. `SKIP LOCKED` leaves a row a publish already holds to
+    the next pass: it is being republished, so it is not old.
+    """
+    rows = await db.execute(
+        select(Artifact.id)
+        .where(Artifact.organization_id == organization_id, Artifact.published_at < cutoff)
+        .order_by(Artifact.published_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return list(rows.scalars().all())
+
+
+async def stored_paths_for_artifacts(db: AsyncSession, *, artifact_ids: list[UUID]) -> list[str]:
+    """Every stored version of these artifacts.
+
+    Read before the delete for the reason conversations are: the version rows
+    cascade with the artifact and the bytes in file storage do not.
+    """
+    rows = await db.execute(
+        select(ArtifactVersion.storage_path).where(ArtifactVersion.artifact_id.in_(artifact_ids))
+    )
+    return [path for (path,) in rows.all()]
+
+
+async def delete_artifacts(
+    db: AsyncSession, *, organization_id: UUID, artifact_ids: list[UUID]
+) -> int:
+    """Drop exactly these artifacts, and their grants.
+
+    Versions cascade. Grants do not - the grant table carries no foreign key to
+    what it shares - so they go in the same pass, or a later artifact given the
+    same id would inherit them. The public link goes with the row.
+    """
+    await db.execute(
+        delete(ResourceGrant).where(
+            ResourceGrant.organization_id == organization_id,
+            ResourceGrant.resource_type == "artifact",
+            ResourceGrant.resource_id.in_(artifact_ids),
+        )
+    )
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            delete(Artifact).where(
+                Artifact.organization_id == organization_id, Artifact.id.in_(artifact_ids)
+            )
+        ),
+    )
+    return result.rowcount or 0
+
+
+async def expiring_documents(
+    db: AsyncSession, *, organization_id: UUID, cutoff: datetime, limit: int
+) -> list[tuple[UUID, str, str | None, str | None, VectorScope]]:
+    """Uploaded documents past their window: id, collection, vector id, file, scope.
+
+    **The scope comes off the knowledge base, not off the document.** A
+    collection name is not unique, so the runtime table is shared and each row
+    carries the tags its chunks were stamped with at ingest: the base's tenant -
+    its organization, `None` for an app-scoped one (#1684) - and the base itself
+    (#2537). Sweeping with this organization's id instead would match nothing for
+    an app-scoped base and leave content searchable with its row gone. A document
+    with no base, or whose base is gone, is deployment-wide with no base.
+
+    **`source_path IS NULL` is the whole of the synchronization answer.** A
+    document a connector put there is that source's to remove - purging it here
+    would delete a row the next `new_only` sync recreates from the same unchanged
+    file, which is a sweep that burns embedding spend to no effect. What is swept
+    is what somebody uploaded, whose lifetime nothing else owns.
+
+    **Terminal rows only.** A document still `processing` is one a worker is
+    holding: taking its row and its stored original out from under an ingestion
+    that then writes vectors leaves searchable content no later sweep can even
+    name. The minimum period is a day, which is long enough for a delayed
+    ingestion to still be running when the cutoff passes.
+    """
+    rows = await db.execute(
+        select(
+            RAGDocument.id,
+            RAGDocument.collection_name,
+            RAGDocument.vector_document_id,
+            RAGDocument.storage_path,
+            KnowledgeBase,
+        )
+        .outerjoin(KnowledgeBase, KnowledgeBase.id == RAGDocument.knowledge_base_id)
+        .where(
+            RAGDocument.organization_id == organization_id,
+            RAGDocument.created_at < cutoff,
+            RAGDocument.source_path.is_(None),
+            RAGDocument.status.in_((DocumentStatus.DONE, DocumentStatus.ERROR)),
+        )
+        .order_by(RAGDocument.created_at, RAGDocument.id)
+        .limit(limit)
+        .with_for_update(of=RAGDocument, skip_locked=True)
+    )
+    return [
+        (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            VectorScope(tenant=None) if row[4] is None else row[4].vector_scope,
+        )
+        for row in rows.all()
+    ]
+
+
+async def delete_documents(db: AsyncSession, *, document_ids: list[UUID]) -> int:
+    """Drop exactly the document rows whose vectors and files were dealt with.
+
+    Never called with an empty list: the caller reads the batch first and returns
+    before this if there was nothing in it.
+    """
+    result = cast(
+        CursorResult[Any],
+        await db.execute(delete(RAGDocument).where(RAGDocument.id.in_(document_ids))),
+    )
+    return result.rowcount or 0
+
+
+async def set_retention(
+    db: AsyncSession, *, organization: Organization, retention_days: dict[str, int | None]
+) -> Organization:
+    """Store what this organization asks to keep, per class."""
+    organization.retention_days = retention_days
+    await db.flush()
+    await db.refresh(organization)
+    return organization
+
+
+async def delete_table_receipts(
+    db: AsyncSession, *, organization_id: UUID, cutoff: datetime, limit: int
+) -> int:
+    """Drop the oldest idempotency receipts created before `cutoff`.
+
+    A receipt holds a whole copy of a record and answers a retry only while its key
+    can plausibly still be retried, so what leaves here is the copy and the promise.
+    """
+    expiring = (
+        select(VirtualTableReceipt.id)
+        .where(
+            VirtualTableReceipt.organization_id == organization_id,
+            VirtualTableReceipt.created_at < cutoff,
+        )
+        .order_by(VirtualTableReceipt.created_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = cast(
+        CursorResult[Any],
+        await db.execute(delete(VirtualTableReceipt).where(VirtualTableReceipt.id.in_(expiring))),
+    )
+    return result.rowcount or 0
+
+
+async def delete_table_outbox(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    cutoff: datetime,
+    undispatched_cutoff: datetime,
+    limit: int,
+) -> int:
+    """Drop the oldest outbox rows: dispatched before `cutoff`, or never dispatched and
+    older than `undispatched_cutoff`.
+
+    The second half is a dead-letter cutoff, not a claim the event was delivered: no
+    consumer of this outbox exists yet (#1785), so nothing sets `dispatched_at`, and
+    without it an undispatched row would sit here for as long as the record that created
+    it did not - one permanent row per create, for an event nobody will ever collect.
+    `undispatched_cutoff` is ordinarily far later than `cutoff`, so this reaches an
+    undispatched row only long after a dispatched one of the same age would already be
+    gone; sorting by `created_at` (rather than `dispatched_at`, which an undispatched row
+    has none of) still takes the oldest of whichever kind a batch happens to find.
+    """
+    expiring = (
+        select(VirtualTableOutbox.id)
+        .where(
+            VirtualTableOutbox.organization_id == organization_id,
+            or_(
+                and_(
+                    VirtualTableOutbox.dispatched_at.is_not(None),
+                    VirtualTableOutbox.dispatched_at < cutoff,
+                ),
+                and_(
+                    VirtualTableOutbox.dispatched_at.is_(None),
+                    VirtualTableOutbox.created_at < undispatched_cutoff,
+                ),
+            ),
+        )
+        .order_by(VirtualTableOutbox.created_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = cast(
+        CursorResult[Any],
+        await db.execute(delete(VirtualTableOutbox).where(VirtualTableOutbox.id.in_(expiring))),
+    )
+    return result.rowcount or 0
+
+
+async def delete_table_history(
+    db: AsyncSession, *, organization_id: UUID, cutoff: datetime, limit: int
+) -> int:
+    """Drop the oldest record history written before `cutoff`.
+
+    By the change's own date, for a live record and a deleted one alike: a delete
+    leaves its history behind on purpose, and this is what eventually removes it.
+    """
+    expiring = (
+        select(VirtualTableRecordHistory.id)
+        .where(
+            VirtualTableRecordHistory.organization_id == organization_id,
+            VirtualTableRecordHistory.created_at < cutoff,
+        )
+        .order_by(VirtualTableRecordHistory.created_at)
+        .limit(limit)
+        .scalar_subquery()
+    )
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            delete(VirtualTableRecordHistory).where(VirtualTableRecordHistory.id.in_(expiring))
+        ),
+    )
+    return result.rowcount or 0

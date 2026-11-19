@@ -1,0 +1,937 @@
+# ruff: noqa: I001 - Imports structured for Jinja2 template conditionals
+"""RAG document service."""
+
+import logging
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import anyio
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.exceptions import AlreadyExistsError, BadRequestError, NotFoundError
+from app.core.permissions import AuthContext
+from app.db.locks import LockScope, hold_name
+from app.db.models.knowledge_base import KnowledgeBase
+from app.db.models.rag_document import DocumentStatus, RAGDocument
+from app.db.vector_tables import VectorScope
+from app.services.rag.config import get_supported_formats
+from app.services.rag.documents import has_indexable_text
+from app.services.rag.ingestion import IngestionService
+from app.services.rag.models import CollectionInfo
+from app.services.rag.vectorstore import BaseVectorStore
+from app.repositories import collection_teardown_repo, knowledge_base_repo, rag_document_repo
+from app.repositories.rag_document import CollectionScope, IngestionCounts
+from app.schemas.rag import (
+    RAGCollectionInfo,
+    RAGIngestionStatus,
+    RAGIngestResponse,
+    RAGParsedContent,
+    RAGParsedPage,
+    RAGTrackedDocumentItem,
+    RAGTrackedDocumentList,
+)
+from app.schemas.sync_source import blank_is_absent
+from app.services.file_storage import get_file_storage
+from app.services.background_jobs import enqueue
+from app.services.notifications import NotificationService
+from app.services.spend import assert_organization_within_budget
+from app.services.ingestion_config import (
+    IngestionConfig,
+    IngestionConfigService,
+    IngestionOverride,
+)
+from app.worker.jobs import (
+    DISCARD_VECTOR_DOCUMENT,
+    INGEST_DOCUMENT,
+    DiscardVectorDocument,
+    IngestDocument,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _ingestion_status(counts: IngestionCounts) -> RAGIngestionStatus:
+    """`indexing` while any document is processing; a failed one is terminal."""
+    return RAGIngestionStatus(
+        indexing_status="indexing" if counts.processing else "complete",
+        processing_count=counts.processing,
+        indexed_count=counts.indexed,
+        failed_count=counts.failed,
+    )
+
+
+def _tracked_item(doc: RAGDocument) -> RAGTrackedDocumentItem:
+    """One tracked document, including what actually read it.
+
+    `parser` is projected out of the stored configuration rather than kept in
+    a column of its own, so the headline answer and the full record cannot drift
+    apart. A document ingested before any of this was recorded has an empty
+    configuration and reports `None`, which is the truth: nobody wrote it down.
+    """
+    return RAGTrackedDocumentItem(
+        id=str(doc.id),
+        collection_name=doc.collection_name,
+        filename=doc.filename,
+        filesize=doc.filesize,
+        filetype=doc.filetype,
+        status=doc.status,
+        error_message=doc.error_message,
+        vector_document_id=doc.vector_document_id,
+        chunk_count=doc.chunk_count,
+        has_file=bool(doc.storage_path),
+        created_at=doc.created_at.isoformat() if doc.created_at else None,
+        completed_at=doc.completed_at.isoformat() if doc.completed_at else None,
+        parser=str(doc.ingestion_config["pdf_parser"]) if doc.ingestion_config else None,
+        image_description_model=doc.image_description_model,
+        embedding_model=doc.embedding_model,
+        was_overridden=doc.ingestion_override is not None,
+        organizational_unit=doc.organizational_unit,
+    )
+
+
+class RAGDocumentService:
+    """Service for RAG document tracking and lifecycle management."""
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def list_documents(
+        self, *, scopes: list[CollectionScope], skip: int = 0, limit: int = 50
+    ) -> RAGTrackedDocumentList:
+        """List a page of tracked RAG documents in the given collections.
+
+        `scopes` - the knowledge bases the caller reads, see
+        `rag_document_repo.get_all` - is required and takes no default on
+        purpose: the caller decides which collections it is entitled to see, and
+        there is no way to ask for "all of them" by forgetting to say. An empty
+        list is an empty answer.
+        """
+        rows, total = await rag_document_repo.get_all(
+            self.db, scopes=scopes, skip=skip, limit=limit
+        )
+        return RAGTrackedDocumentList(
+            items=[_tracked_item(d) for d in rows],
+            total=total,
+        )
+
+    async def list_for_kb(
+        self, *, kb_id: UUID, skip: int = 0, limit: int = 50, filename: str | None = None
+    ) -> RAGTrackedDocumentList:
+        """List documents ingested into a Knowledge Base, paginated, optionally by name."""
+        rows, total = await rag_document_repo.get_for_kb(
+            self.db, kb_id, skip=skip, limit=limit, filename=filename
+        )
+        return RAGTrackedDocumentList(
+            items=[_tracked_item(d) for d in rows],
+            total=total,
+        )
+
+    async def collection_info(
+        self, info: CollectionInfo, *, kb: KnowledgeBase
+    ) -> RAGCollectionInfo:
+        """The vector store's statistics, with where the collection's documents stand.
+
+        `kb` is the knowledge base the caller was authorized through, and the
+        count is that base's rows (`rag_document_repo.in_collection_scope`), the
+        ones the document listing shows for it. `total_vectors` is counted by the
+        caller in the base's own vector scope, so a same-named base of the same
+        tenant is not summed in (#2537).
+        """
+        counts = await rag_document_repo.ingestion_counts(self.db, scope=CollectionScope.of(kb))
+        return RAGCollectionInfo(
+            name=info.name,
+            total_vectors=info.total_vectors,
+            dim=info.dim,
+            **_ingestion_status(counts).model_dump(),
+        )
+
+    async def ingestion_for_kb(self, kb_id: UUID) -> RAGIngestionStatus:
+        """Where one knowledge base's documents stand - the rows `list_for_kb` lists."""
+        counts = await rag_document_repo.ingestion_counts_for_kb(self.db, kb_id)
+        return _ingestion_status(counts)
+
+    async def get_document(self, doc_id: str) -> RAGDocument:
+        """Get a RAG document by ID.
+
+        Raises:
+            NotFoundError: If document does not exist.
+        """
+        doc = await rag_document_repo.get_by_id(self.db, UUID(doc_id))
+        if not doc:
+            raise NotFoundError(
+                message="Document not found",
+                details={"doc_id": doc_id},
+            )
+        return doc
+
+    async def hold_ingestion_name(self, collection_name: str) -> None:
+        """Hold a CLI destination through its tracking-row insert, refusing queued drops.
+
+        The teardown uses this lock before reserving a name and deleting its rows.
+        A CLI insert therefore either precedes that delete or observes its tombstone.
+        """
+        await hold_name(self.db, LockScope.COLLECTION_TEARDOWN, collection_name)
+        if await collection_teardown_repo.is_reserved(self.db, collection_name):
+            raise BadRequestError(
+                message="Collection is being deleted. Try again shortly.",
+                details={"collection": collection_name},
+            )
+
+    async def create_document(
+        self,
+        *,
+        collection_name: str,
+        filename: str,
+        filesize: int,
+        filetype: str,
+        storage_path: str | None = None,
+        source_path: str | None = None,
+        sync_source_id: UUID | None = None,
+        organization_id: UUID | None = None,
+        knowledge_base_id: UUID | None = None,
+        ingestion_config: IngestionConfig | None = None,
+        ingestion_override: IngestionOverride | None = None,
+        image_description_model: str | None = None,
+        embedding_model: str | None = None,
+        organizational_unit: str | None = None,
+        initiated_by_user_id: UUID | None = None,
+    ) -> RAGDocument:
+        """Create a new RAG document tracking record.
+
+        `source_path` is how the ingest addressed the file, and it is what lets a
+        later run find this row again - `discard_failed` retires a previous
+        attempt at the *same file* rather than at the same basename, which two
+        keys in one bucket share (#996).
+
+        An **upload passes none**, and that is the point of the argument being
+        optional. A browser upload's only name is its basename, which is not an
+        address: two people can upload different `report.pdf`s and, with
+        `replace=false`, mean both to exist. Retiring by that name would delete
+        the first one's failed row - its diagnosis, its retry and its stored file
+        - for a caller who asked for no such thing.
+
+        `initiated_by_user_id` is who to notify about this document's outcome
+        (#1598) - `dispatch_upload` passes its caller's; a sync or a CLI ingest
+        passes none, and their `ingestion_completed`/`ingestion_failed` falls
+        back to the organization's administrators instead.
+
+        `organizational_unit` is which part of the organization this document
+        belongs to - the FA-039 retrieval dimension. It is stored on the row so
+        the worker reads what this upload decided rather than a flow parameter a
+        queued run would not carry, exactly as the resolved `ingestion_config`
+        is. `None` leaves the dimension absent, which is what every chunk
+        carried before anything wrote it (#1777).
+
+        `sync_source_id` is the source a connector sync ingested this for, and
+        the row is opened claimed by it: that claim is what lets a later run of
+        the source remove it once it is no longer listed (`unlisted_by_source`).
+        """
+        if source_path:
+            await rag_document_repo.discard_failed(
+                self.db, collection_name=collection_name, source_path=source_path
+            )
+        return await rag_document_repo.create(
+            self.db,
+            collection_name=collection_name,
+            filename=filename,
+            filesize=filesize,
+            filetype=filetype,
+            storage_path=storage_path or "",
+            source_path=source_path,
+            sync_source_id=sync_source_id,
+            organization_id=organization_id,
+            knowledge_base_id=knowledge_base_id,
+            ingestion_config=(
+                None if ingestion_config is None else ingestion_config.model_dump(mode="json")
+            ),
+            ingestion_override=(
+                None
+                if ingestion_override is None or ingestion_override.is_empty
+                else ingestion_override.model_dump(mode="json", exclude_unset=True)
+            ),
+            image_description_model=image_description_model,
+            embedding_model=embedding_model,
+            organizational_unit=organizational_unit,
+            initiated_by_user_id=initiated_by_user_id,
+        )
+
+    async def dispatch_upload(
+        self,
+        *,
+        ctx: AuthContext,
+        collection: KnowledgeBase,
+        file_data: bytes,
+        filename: str,
+        replace: bool,
+        vector_store: Any,
+        override: IngestionOverride | None = None,
+        organization_id: UUID | None = None,
+        knowledge_base_id: UUID | None = None,
+        organizational_unit: str | None = None,
+    ) -> RAGIngestResponse:
+        """Validate, persist, and queue an uploaded file for ingestion.
+
+        Takes the `knowledge_bases` row rather than a collection name, because
+        the row is what says how its documents are read. The caller has already
+        resolved which collection it may write to; looking the name up again
+        here would find whichever row the database returned first, and two
+        organizations may share a collection name.
+
+        Performs:
+          0. refusal if the organization's monthly budget is already spent -
+             ingesting is spending, and the check belongs before the file is
+             stored rather than in a worker an hour later;
+          1. refusal if the collection's vectors and this deployment's embedding
+             model no longer agree - nothing else is worth doing if they do not;
+          2. file-extension and size validation, the former against the parser
+             *this upload* resolved to rather than the deployment's;
+          3. resolution of the image-description model, so a bad profile id in
+             an override is refused here and not in a worker an hour later;
+          4. permanent storage via `FileStorage`;
+          5. a RAGDocument recording the resolved configuration, the override
+             that produced it and the organizational unit this upload named;
+          6. lazy creation of the target vector collection;
+          7. tmp-copy under `MEDIA_DIR/_rag_tmp` (shared with worker container);
+          8. dispatch of the ingestion task on the configured task backend.
+        """
+        if organization_id is not None:
+            await assert_organization_within_budget(self.db, organization_id)
+
+        collection_name = collection.collection_name
+        ingestion = IngestionConfigService(self.db)
+        ingestion.check_embedding_model(
+            collection=collection_name, built_with=collection.embedding_model
+        )
+
+        config = IngestionConfig.model_validate(collection.ingestion_config)
+        if override is not None:
+            config = override.applied_to(config)
+
+        allowed = get_supported_formats(config.pdf_parser.value)
+        max_size = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+        ext = Path(filename).suffix.lower()
+        if ext not in allowed:
+            raise BadRequestError(
+                message=f"File type '{ext}' not supported",
+                details={"ext": ext, "allowed": sorted(allowed), "parser": config.pdf_parser.value},
+            )
+        if len(file_data) > max_size:
+            raise BadRequestError(
+                message=f"File too large. Maximum {settings.MAX_UPLOAD_SIZE_MB}MB.",
+                details={"size": len(file_data), "max_mb": settings.MAX_UPLOAD_SIZE_MB},
+            )
+
+        image_model = await ingestion.resolved_image_model(ctx.organization_id, config)
+
+        # Refuse a write to a name mid-teardown, the way `claim` refuses a create of
+        # one: the durable drop frees the name only once its table is gone, and a write
+        # slipped into that window would `_ensure_collection`-recreate the table the
+        # drop then destroys, orphaning this row and losing its vectors. The reservation
+        # is committed with the delete, so this catches every upload that arrives after
+        # it. Deliberately unlocked: taking the teardown lock here, before the insert's
+        # foreign-key lock on the knowledge_bases row, would invert
+        # `KnowledgeBaseService.delete`'s order (that row first, then the teardown lock)
+        # and deadlock. Fully serialising the narrow commit-to-reserve window, and the
+        # worker ingestion paths, is #1382 (#1362, #1364).
+        if await collection_teardown_repo.is_reserved(self.db, collection_name):
+            raise AlreadyExistsError(
+                message=f"A collection named '{collection_name}' is being torn down; "
+                "try again shortly",
+                details={"collection": collection_name},
+            )
+
+        storage = get_file_storage()
+        storage_path = await storage.save(f"rag/{collection_name}", filename, file_data)
+        rag_doc = await self.create_document(
+            collection_name=collection_name,
+            filename=filename,
+            filesize=len(file_data),
+            filetype=ext.lstrip("."),
+            storage_path=storage_path,
+            organization_id=organization_id,
+            knowledge_base_id=knowledge_base_id,
+            ingestion_config=config,
+            ingestion_override=override,
+            image_description_model=image_model,
+            embedding_model=collection.embedding_model,
+            organizational_unit=blank_is_absent(organizational_unit),
+            initiated_by_user_id=ctx.user_id,
+        )
+        doc_id = rag_doc.id
+
+        await vector_store.create_collection(collection_name)
+
+        await self._queue_parse(
+            doc_id,
+            organization_id=rag_doc.organization_id,
+            collection_name=collection_name,
+            filename=filename,
+            file_data=file_data,
+            replace=replace,
+            attempt=1,
+        )
+
+        return RAGIngestResponse(
+            id=str(doc_id),
+            status=DocumentStatus.PROCESSING,
+            filename=filename,
+            collection=collection_name,
+            message="File accepted. Processing in background.",
+        )
+
+    async def _queue_parse(
+        self,
+        doc_id: UUID,
+        *,
+        organization_id: UUID | None,
+        collection_name: str,
+        filename: str,
+        file_data: bytes,
+        replace: bool,
+        attempt: int,
+    ) -> None:
+        """Put the file where the worker can read it and dispatch the parse.
+
+        `attempt` has no default: `dispatch_upload` passes `1`, `retry_ingestion`
+        its freshly bumped value, and each is a deliberate choice at the one
+        place that knows which attempt is being dispatched (#1598) - carried
+        through to `complete_ingestion`/`fail_ingestion` at settlement, per
+        Decision 1's "threaded through the call, not read back" rule.
+
+        The copy under `MEDIA_DIR/_rag_tmp` is what the flow opens: permanent
+        storage may be somewhere the worker container cannot reach, and the
+        directory is shared between the two.
+
+        Queued as an `ingest-document` job in this request's transaction: the job
+        reads this document by id on a session of its own, and the two commit
+        together, so a worker never looks for a row that is not there yet (#417)
+        and an upload whose request rolled back leaves no job behind. The job runs
+        in a child process of the ingest pool, so a parse that runs out of memory
+        is stopped there and written down on the job, not in the API.
+        """
+        tmp_dir = Path(settings.MEDIA_DIR) / "_rag_tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = str(tmp_dir / f"{doc_id!s}{Path(filename).suffix.lower()}")
+        # anyio, not open(): an upload can be tens of megabytes, and writing it
+        # synchronously stalls every other request on this worker until it lands.
+        async with await anyio.open_file(tmp_path, "wb") as f:
+            await f.write(file_data)
+        await enqueue(
+            self.db,
+            INGEST_DOCUMENT,
+            IngestDocument(
+                rag_document_id=doc_id,
+                collection_name=collection_name,
+                filepath=tmp_path,
+                source_path=filename,
+                replace=replace,
+                attempt=attempt,
+            ),
+            organization_id=organization_id,
+        )
+
+    async def complete_ingestion(
+        self,
+        doc_id: str,
+        vector_document_id: str,
+        *,
+        chunk_count: int,
+        replaced_document_id: str | None,
+        attempt: int,
+    ) -> bool:
+        """Mark a document as successfully ingested, retiring what it replaced.
+
+        Returns `False` when the tracking row is gone - the document was deleted
+        while it was being indexed - and `True` otherwise, a superseded attempt
+        included. On `False` the caller owns the chunks it has just written and
+        queues their removal with `discard_untracked`: the delete read the row
+        before it held a vector id, so it purged nothing, and nothing else tracks
+        them (#2565).
+
+        Neither `chunk_count` nor `replaced_document_id` has a default on
+        purpose. `chunk_count` had one, `0`, and all four call sites took it -
+        so every document in the product reported an empty collection that
+        answered searches perfectly well (#147). `replaced_document_id` is the
+        same shape of trap one step on: a call site that omits it leaves a
+        stale row behind and the collection over-reports by exactly the size
+        of the document just replaced. `attempt` is the same shape again, one
+        layer up (#1598): it is the attempt this settlement is *about*,
+        carried from whichever call dispatched it (`dispatch_upload` or
+        `retry_ingestion`, by way of the `ingest-document` job) rather than read
+        back from `doc.ingestion_attempt` here - a slow attempt settling after
+        a newer retry has already bumped that column would otherwise steal the
+        newer attempt's notification dedup key. A settlement whose `attempt`
+        no longer matches the row's current one belongs to a superseded retry
+        and is silently ignored, matching the delivery sweep's own "who still
+        holds the claim" rule one layer up (Decision 3).
+        """
+        doc = await rag_document_repo.get_by_id(self.db, UUID(doc_id))
+        if doc is None:
+            return False
+        updated = await rag_document_repo.update_status(
+            self.db,
+            doc.id,
+            status=DocumentStatus.DONE,
+            vector_document_id=vector_document_id,
+            chunk_count=chunk_count,
+            completed_at=datetime.now(UTC),
+            expected_attempt=attempt,
+        )
+        if updated is None:
+            # No row matched: deleted after the read above, or moved on to a newer
+            # attempt. Only the first leaves these chunks without an owner.
+            if not await rag_document_repo.is_present(self.db, doc.id):
+                return False
+            logger.info(
+                "Ignoring a stale ingestion settlement for %s: attempt %d no longer current",
+                doc_id,
+                attempt,
+            )
+            return True
+        if replaced_document_id:
+            await self._retire_superseded(
+                collection_name=doc.collection_name,
+                vector_document_id=replaced_document_id,
+                keep_id=doc.id,
+                source_path=doc.source_path,
+            )
+        # No notification on the way out. A document that indexed cleanly is
+        # not news: the collection already shows its status, and one row per
+        # file made the ordinary case - thirty files dropped in at once -
+        # thirty interruptions that buried the rows worth reading.
+        # `ingestion_failed` still fires, and a connector run still reports its
+        # whole-attempt figure through `sync_completed`.
+        return True
+
+    async def discard_untracked(
+        self, collection_name: str, vector_document_id: str, *, scope: VectorScope
+    ) -> None:
+        """Queue the removal of chunks whose document was deleted while it indexed.
+
+        For a `complete_ingestion` that returned `False`, in the same transaction:
+        the row is gone, so the job is the only record of the chunks, and a removal
+        that only logged its failure left them searchable for good (#2565). `scope`
+        is the one the chunks were stamped with - the ingester's.
+        """
+        await enqueue(
+            self.db,
+            DISCARD_VECTOR_DOCUMENT,
+            DiscardVectorDocument(
+                collection=collection_name,
+                vector_document_id=vector_document_id,
+                tenant=scope.tenant,
+                knowledge_base_id=scope.knowledge_base_id,
+            ),
+            organization_id=scope.tenant,
+        )
+
+    async def _retire_superseded(
+        self,
+        *,
+        collection_name: str,
+        vector_document_id: str,
+        keep_id: UUID,
+        source_path: str | None,
+    ) -> None:
+        """Drop the tracking rows for a vector document a replacement deleted.
+
+        Every ingest path creates a fresh `rag_documents` row, including the
+        replacing one - the upload, the CLI and the sync all do - while the
+        vector store keeps one document. So the old row outlives the vectors it
+        describes: `counts_by_scope` sums its `chunk_count` into the
+        collection's total, its "view parsed content" reads a document that is
+        gone, and a directory synced nightly accumulates one dead row per file
+        per run.
+
+        The stored files are unlinked by a cleanup job queued in this transaction
+        (`queue_external_state_cleanup`), so a rollback leaves them beside the rows
+        it restores rather than gone (#1293), and a worker restart mid-drain no
+        longer orphans the ones still queued - the job is retried (#1349). An unlink
+        before the commit would strand a restored row on a missing file.
+
+        The sync sources claiming a superseded row at the replacement's own
+        address claim the replacement instead: a second source re-ingesting a
+        page the first also lists must not leave the first with no claim on it,
+        or the second dropping the page later would remove it from under the
+        first (#1879). A row at another address - one the store matched by name
+        or by content - keeps its claims to itself, and they go with it.
+        """
+        superseded = await rag_document_repo.get_superseded(
+            self.db,
+            collection_name=collection_name,
+            vector_document_id=vector_document_id,
+            keep_id=keep_id,
+        )
+        if source_path is not None:
+            await rag_document_repo.transfer_claims(
+                self.db,
+                from_ids=[stale.id for stale in superseded if stale.source_path == source_path],
+                to_id=keep_id,
+            )
+        storage_paths = [stale.storage_path for stale in superseded if stale.storage_path]
+        for stale in superseded:
+            await rag_document_repo.delete(self.db, stale.id)
+        if storage_paths:
+            from app.worker.tasks.teardown_tasks import queue_external_state_cleanup
+
+            await queue_external_state_cleanup(self.db, storage_paths, [])
+
+    async def fail_ingestion(self, doc_id: str, error_message: str, *, attempt: int) -> None:
+        """Mark a document ingestion as failed.
+
+        `attempt` carries the same "no default, threaded from dispatch, never
+        read back" rule `complete_ingestion` documents (#1598): a stale
+        settlement - from an attempt a later retry already superseded - is
+        ignored rather than overwriting a newer attempt's own outcome.
+        """
+        doc = await self.get_document(doc_id)
+        updated = await rag_document_repo.update_status(
+            self.db,
+            doc.id,
+            status=DocumentStatus.ERROR,
+            error_message=error_message,
+            completed_at=datetime.now(UTC),
+            expected_attempt=attempt,
+        )
+        if updated is None:
+            logger.info(
+                "Ignoring a stale ingestion settlement for %s: attempt %d no longer current",
+                doc_id,
+                attempt,
+            )
+            return
+        try:
+            await NotificationService(self.db).ingestion_failed(
+                doc, attempt=attempt, error_message=error_message
+            )
+        except Exception:
+            # The same best-effort boundary `complete_ingestion` draws, and
+            # for a sharper reason: a worker caller runs this inside
+            # `get_worker_db_context`, so an exception escaping here rolls
+            # back the `ERROR` transition just recorded, and `_fail_document`
+            # swallows it - leaving a failed document in `PROCESSING` for
+            # ever because its failure notification could not be addressed.
+            logger.exception("Failed to notify about a failed ingestion for %s", doc_id)
+
+    async def retry_ingestion(self, doc_id: str) -> RAGDocument:
+        """Parse a failed document again, from the file it was uploaded with.
+
+        It reads the stored copy rather than asking for the file again: the
+        upload kept one for exactly this, and a retry that needed the original
+        would be an upload. `replace=True` because the previous attempt may have
+        indexed some of it before failing, and a retry must not leave a document
+        represented twice in a collection.
+
+        Dispatching is the whole of the operation. Until #441 this method moved
+        the row to `processing`, cleared the error message and dispatched
+        nothing - so a retry replaced the diagnosis with a document that would
+        stay `processing` for ever, which is worse than the failure it was
+        asked to fix.
+
+        Bumps `ingestion_attempt` before dispatching (#1598): this is a
+        resubmission of the same document id, not a new document, so without
+        a counter a second failure would carry the same notification dedup
+        key as the first and the unique constraint would silently drop it -
+        exactly when a person most wants to hear that the retry failed too.
+
+        Raises:
+            NotFoundError: If document does not exist.
+            BadRequestError: If the document did not fail, or was ingested
+                before uploads kept their file and so has nothing to re-read.
+        """
+        doc = await self.get_document(doc_id)
+        if doc.status != DocumentStatus.ERROR:
+            raise BadRequestError(
+                message="Only failed documents can be retried",
+                details={"doc_id": doc_id, "status": doc.status},
+            )
+        if not doc.storage_path:
+            raise BadRequestError(
+                message="This document has no stored file to re-read; upload it again",
+                details={"doc_id": doc_id, "filename": doc.filename},
+            )
+        file_data = await get_file_storage().load(doc.storage_path)
+        new_attempt = doc.ingestion_attempt + 1
+        updated = await rag_document_repo.update_status(
+            self.db,
+            doc.id,
+            status=DocumentStatus.PROCESSING,
+            error_message="",
+            completed_at=None,
+            ingestion_attempt=new_attempt,
+            # Conditioned on the attempt this read still saw, not an
+            # unconditional write - two concurrent retries reading the same
+            # `doc.ingestion_attempt` must not both compute and dispatch the
+            # same `new_attempt`, which is exactly the collision
+            # `expected_attempt` closes for `complete_ingestion`/
+            # `fail_ingestion` one layer up.
+            expected_attempt=doc.ingestion_attempt,
+        )
+        if updated is None:
+            raise NotFoundError(message="Document not found", details={"doc_id": doc_id})
+        await self._queue_parse(
+            updated.id,
+            organization_id=updated.organization_id,
+            collection_name=updated.collection_name,
+            filename=updated.filename,
+            file_data=file_data,
+            replace=True,
+            attempt=new_attempt,
+        )
+        return updated
+
+    async def vector_scope(self, doc: RAGDocument) -> VectorScope:
+        """The scope this document's chunks are stamped and read under (#1684, #2537).
+
+        Off the knowledge base the document is tracked under, not `organization_id`
+        on the row: an app-scoped base's documents carry the uploader's
+        organization for billing, but their vectors are deployment-wide and carry
+        no tenant, so scoping a read or a delete by the row's organization would
+        miss them. A document with no base, or whose base is gone, is
+        deployment-wide: no tenant and no base.
+        """
+        if doc.knowledge_base_id is None:
+            return VectorScope(tenant=None)
+        kb = await knowledge_base_repo.get_by_id(self.db, doc.knowledge_base_id)
+        return kb.vector_scope if kb is not None else VectorScope(tenant=None)
+
+    async def delete_document(
+        self,
+        doc_id: str,
+        ingestion_service: IngestionService,
+    ) -> None:
+        """Delete a document's row, then its vectors and its file after the commit.
+
+        The row goes in the request's transaction; the vector-store entry and the
+        stored file are removed only once it commits (`spawn_after_commit`). Doing
+        either before the commit strands a rolled-back delete on state already gone -
+        a restored row pointing at vectors, or a file, the failed request deleted
+        anyway (#1293, #1347). Both are best-effort in the background: `remove_document`
+        catches its own store failures, and an escaped one is logged by the background
+        runner rather than raised. The store rides the process's vector engine, not
+        this request's session, so the deferred coroutine may hold it safely.
+
+        A settled document's cleanup stays in-process, where the bulk teardown paths
+        (`_retire_superseded`, `KnowledgeBaseService.delete` and
+        `delete_for_rag_collection`) queue theirs as a durable job (#1349): the leak
+        a lost single-document task would strand is one file and one document's
+        vectors, and a durable job per document delete is disproportionate to that.
+        A vector id discovered only by the delete belongs to an ingest that settled
+        concurrently; queue that removal durably, like the row-gone settlement path.
+
+        **`ingestion_service` has no default, and that is the whole of it.** It
+        was `Any = None`, and the vector cleanup ran only when a caller happened
+        to pass one - so `DELETE /kb/{kb_id}/documents/{doc_id}`, which did not,
+        removed the row and left the content searchable. A collection then held a
+        document nobody could see, delete or re-ingest, because the next
+        `new_only` sync matched its unchanged hash and skipped it (#992). That is
+        the same trap `complete_ingestion` describes one method down: an argument
+        the caller may omit is an argument some caller will.
+        """
+        doc = await self.get_document(doc_id)
+        collection_name = doc.collection_name
+        # The scope the chunks were stamped with at ingest - the knowledge base's
+        # own - so the vector delete is confined to them and cannot reach another
+        # org's or base's document in a collection whose name they share (#1684,
+        # #2537). Read now, before the row is deleted.
+        scope = await self.vector_scope(doc)
+        loaded_vector_id = doc.vector_document_id
+        # The vector id comes from the delete, not `doc`: the caller may have loaded
+        # the row before an ingest settled it, and a delete that waited on that
+        # settlement deletes the settled row. A row still without one belongs to an
+        # ingest whose settlement removes its own chunks (#2565).
+        deleted = await rag_document_repo.delete_with_vectors(self.db, doc.id)
+
+        from app.core.background import spawn_after_commit
+
+        for vector_document_id in deleted.vector_document_ids:
+            if vector_document_id != loaded_vector_id:
+                await self.discard_untracked(collection_name, vector_document_id, scope=scope)
+                continue
+            spawn_after_commit(
+                self.db,
+                ingestion_service.remove_document(collection_name, vector_document_id, scope=scope),
+                name="delete-document-vectors",
+            )
+        if deleted.storage_paths:
+            from app.services.file_storage import delete_files_best_effort
+
+            spawn_after_commit(
+                self.db,
+                delete_files_best_effort(deleted.storage_paths),
+                name="delete-document-file",
+            )
+
+    async def unlisted_by_source(
+        self, *, sync_source_id: UUID, collection_name: str, listed: set[str]
+    ) -> list[RAGDocument]:
+        """The documents a source claims that its latest listing no longer names.
+
+        `listed` is every `source_path` the listing answered, whether or not this
+        run ingested it: a file skipped as unchanged, or one that failed to
+        download, is still there.
+        """
+        rows = await rag_document_repo.get_settled_for_sync_source(
+            self.db, sync_source_id=sync_source_id, collection_name=collection_name
+        )
+        return [row for row in rows if row.source_path not in listed]
+
+    async def release_claim(self, doc_id: str, *, sync_source_id: UUID) -> RAGDocument | None:
+        """Withdraw this source's claim, or answer the document for it to remove.
+
+        The document is locked first, until this session's transaction ends
+        (`lock_for_removal`). When another source feeding the collection still
+        claims it, this source's claim is dropped and the answer is `None`, as
+        it is for a row already gone. Otherwise this source is the last to list
+        it: its claim stays, and the locked row is answered for the caller to
+        remove whole in the same transaction - vectors first, then
+        `forget_document` - so a vector delete that fails leaves it claimed and
+        the next run of this source tries again (#1879).
+        """
+        row_id = UUID(doc_id)
+        doc = await rag_document_repo.lock_for_removal(self.db, row_id)
+        if doc is None:
+            return None
+        if not await rag_document_repo.is_claimed_by_another_source(
+            self.db, row_id, sync_source_id=sync_source_id
+        ):
+            return doc
+        await rag_document_repo.delete_claim(self.db, row_id, sync_source_id=sync_source_id)
+        return None
+
+    async def claim_listed(
+        self, *, sync_source_id: UUID, collection_name: str, documents: set[tuple[str, str]]
+    ) -> None:
+        """Claim the stored documents at addresses a sync listed (`claim_listed`).
+
+        `documents` are `(source_path, vector_document_id)` pairs, each the
+        stored document the run found at a listed file's address.
+        """
+        await rag_document_repo.claim_listed(
+            self.db,
+            sync_source_id=sync_source_id,
+            collection_name=collection_name,
+            documents=documents,
+        )
+
+    async def add_claims(self, doc_id: str, *, sync_source_ids: set[UUID]) -> None:
+        """Claim a settled document for other sources that list its address (`add_claims`)."""
+        await rag_document_repo.add_claims(self.db, UUID(doc_id), sync_source_ids=sync_source_ids)
+
+    async def claimants(self, doc_ids: list[str]) -> set[UUID]:
+        """Every source claiming any of these documents."""
+        return await rag_document_repo.get_claimants(self.db, [UUID(doc_id) for doc_id in doc_ids])
+
+    async def stale_for_source(
+        self, *, sync_source_id: UUID, collection_name: str
+    ) -> list[RAGDocument]:
+        """The rows a dead run of this source left `PROCESSING` (`get_stale_for_sync_source`)."""
+        return await rag_document_repo.get_stale_for_sync_source(
+            self.db, sync_source_id=sync_source_id, collection_name=collection_name
+        )
+
+    async def settled_at(
+        self, *, sync_source_id: UUID, collection_name: str, source_path: str
+    ) -> list[RAGDocument]:
+        """The settled rows this source claims at one address."""
+        rows = await rag_document_repo.get_settled_for_sync_source(
+            self.db, sync_source_id=sync_source_id, collection_name=collection_name
+        )
+        return [row for row in rows if row.source_path == source_path]
+
+    async def tracked_vector_ids(
+        self, *, collection_name: str, vector_document_ids: set[str]
+    ) -> set[str]:
+        """Which of these stored documents some row of the collection tracks."""
+        return await rag_document_repo.get_tracked_vector_ids(
+            self.db, collection_name=collection_name, vector_document_ids=vector_document_ids
+        )
+
+    async def forget_document(self, doc_id: str) -> None:
+        """Delete a document's row alone, once its vectors are already gone.
+
+        The worker's half of `delete_document`: a sync removing what its source
+        no longer lists holds the ingester for the collection, removes the
+        vectors through it first and calls this only when that succeeded - so a
+        failed vector delete leaves the row for the next run to try again,
+        rather than vectors nothing tracks. A synced document stores no file.
+        """
+        await rag_document_repo.delete(self.db, UUID(doc_id))
+
+    async def get_parsed_content(
+        self, doc_id: str, vector_store: BaseVectorStore
+    ) -> RAGParsedContent:
+        """How a document parsed: its stored chunks, grouped back into pages.
+
+        The chunks in the vector store are the parse - there is no other record
+        of what the parser produced - so this reads them back in document order
+        rather than re-running a parse that may involve OCR or a paid API.
+
+        `has_text` uses `has_indexable_text`, not `.strip()`: markdown
+        reconstruction wraps an unreadable scan in an empty fenced block, which
+        is not whitespace and would otherwise pass for content.
+
+        Raises:
+            NotFoundError: If the document does not exist, or has not (yet)
+                been ingested - a parse that is still running or failed has no
+                parsed content to show.
+        """
+        doc = await self.get_document(doc_id)
+        if doc.status != DocumentStatus.DONE or not doc.vector_document_id:
+            raise NotFoundError(
+                message="No parsed content for this document",
+                details={"doc_id": doc_id, "status": doc.status},
+            )
+
+        chunks = await vector_store.get_document_chunks(
+            doc.collection_name, doc.vector_document_id, await self.vector_scope(doc)
+        )
+
+        pages: list[RAGParsedPage] = []
+        for chunk in chunks:
+            if not pages or pages[-1].page_num != chunk.page_num:
+                pages.append(RAGParsedPage(page_num=chunk.page_num, chunks=[], has_text=False))
+            pages[-1].chunks.append(chunk.content)
+            if has_indexable_text(chunk.content):
+                pages[-1].has_text = True
+
+        return RAGParsedContent(
+            id=str(doc.id),
+            filename=doc.filename,
+            parser=str(doc.ingestion_config["pdf_parser"]) if doc.ingestion_config else None,
+            chunk_count=len(chunks),
+            has_text=any(page.has_text for page in pages),
+            pages=pages,
+        )
+
+    async def get_download_info(self, doc_id: str) -> tuple[str, str, str]:
+        """Get file download information for a document.
+
+        Returns:
+            Tuple of (storage_path, filename, mime_type). The storage path the
+            backend wrote, not a path on this host: an object store has no
+            second kind, and the route hands this to the one place that knows how
+            to turn either into a response (#1423).
+
+        Raises:
+            NotFoundError: If document or its file does not exist.
+        """
+        doc = await self.get_document(doc_id)
+        if not doc.storage_path:
+            raise NotFoundError(message="No file stored for this document")
+
+        if not await get_file_storage().exists(doc.storage_path):
+            raise NotFoundError(message="File not found on disk")
+
+        mime_map = {
+            "pdf": "application/pdf",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "txt": "text/plain",
+            "md": "text/markdown",
+        }
+        mime_type = mime_map.get(doc.filetype, "application/octet-stream")
+        return doc.storage_path, doc.filename, mime_type

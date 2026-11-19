@@ -1,0 +1,924 @@
+"""Agent registry routes - the Builder's backend.
+
+Note where the permission checks are, and where they are not. Routes that act on
+the *collection* of agents - listing, creating, reading the catalogs - carry a
+`require(...)` gate, because there is no specific agent whose grants could
+change the answer.
+
+Routes that act on *one* agent deliberately do not. A resource permission cannot
+be decided without the resource: a Viewer holding an explicit edit grant on a
+single agent is entitled to edit it, and a role-level gate would refuse them
+before `resolve_access` ever saw the grant - contradicting the rule the whole
+access layer is built on, that a grant widens what a role allows. Those routes
+delegate to `AgentRegistryService`, which checks the role scope *and* the
+grant, and reports a refusal as "not found" so ids stay unprobeable.
+
+Every endpoint here is part of the public API by design: the Builder UI is one
+client of it, and a client's own scripts are another. There is deliberately no
+private variant, which is what keeps "the Builder is just another client" true.
+"""
+
+from typing import Annotated, Any, Literal
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, File, Form, Header, Query, Response, UploadFile, status
+from fastapi.responses import JSONResponse
+
+from app.agents.capabilities import all_capabilities
+from app.agents.prompt_variables import SYSTEM_VARIABLES
+from app.agents.spec import AgentSpec
+from app.api.deps import (
+    AgentRegistrySvc,
+    AgentRunnerSvc,
+    ApiRunSvc,
+    Auth,
+    ConversationSvc,
+    DBSession,
+    KnowledgeReachSvc,
+    MentionSvc,
+    MLSvc,
+    PrefersAsync,
+    limit_agent_run,
+    limit_dictation,
+    require,
+)
+from app.api.public_api import INTERNAL, PUBLIC
+from app.api.routes.v1._stored_bytes import stored_image_response
+from app.core.config import settings
+from app.core.exceptions import BadRequestError, NotFoundError
+from app.core.field_errors import refused_field
+from app.core.permissions import Perm
+from app.db.models.agent_run import RunSurface
+from app.schemas.agent import (
+    AgentA2ARequest,
+    AgentAvatarColorRequest,
+    AgentCeiling,
+    AgentClone,
+    AgentCreate,
+    AgentDetail,
+    AgentDraftUpdate,
+    AgentKnowledgeReach,
+    AgentList,
+    AgentMetadataRequest,
+    AgentPublish,
+    AgentRead,
+    AgentRollback,
+    AgentRunRequest,
+    AgentRunResult,
+    AgentSpecImport,
+    AgentTemplateCatalog,
+    AgentVersionDetail,
+    AgentVersionList,
+    AgentVersionRead,
+    CapabilityCatalog,
+    CapabilityCatalogEntry,
+    CapabilityEnabled,
+    CapabilityRequest,
+    CapabilityToolContract,
+    DelegationTree,
+    McpCatalog,
+    McpCatalogEntry,
+    PlatformMcpTool,
+    PlatformMcpToolList,
+    PromptVariableCatalog,
+    PromptVariableRead,
+    RunRequestRead,
+    SpecialistPromote,
+    TemplateInstallRequest,
+    TemplateInstallResult,
+)
+from app.schemas.mention import MentionableList
+from app.schemas.ml import DictationRead, DictationStatusRead
+from app.services import agent_templates, mcp_listing, transcription
+from app.services.attachments import load_attached_files
+from app.services.capability_contracts import tool_contracts
+from app.services.platform_mcp import platform_tool_catalog
+
+router = APIRouter(dependencies=[PUBLIC])
+
+
+@router.get(
+    "/prompt-variables",
+    response_model=PromptVariableCatalog,
+    dependencies=[Depends(require(Perm.AGENTS_VIEW))],
+)
+async def list_prompt_variables() -> Any:
+    """The system variables any agent's instructions may use, in the order to offer them."""
+    return PromptVariableCatalog(
+        items=[
+            PromptVariableRead(name=item.name, description=item.description, example=item.example)
+            for item in SYSTEM_VARIABLES
+        ]
+    )
+
+
+@router.get(
+    "/capabilities",
+    response_model=CapabilityCatalog,
+    dependencies=[Depends(require(Perm.AGENTS_VIEW))],
+)
+async def list_capability_catalog() -> Any:
+    """Every capability an agent can be given, with the schema its form is built from."""
+    contracts = await tool_contracts()
+    starter = agent_templates.starter_capabilities()
+    items = [
+        CapabilityCatalogEntry(
+            id=definition.id,
+            name=definition.name,
+            category=definition.category,
+            description=definition.description,
+            side_effecting=definition.side_effecting,
+            tools=list(definition.tools),
+            tool_settings=definition.tool_settings,
+            scopes=sorted(definition.scopes),
+            voice=definition.voice,
+            contracts=[
+                CapabilityToolContract(
+                    tool_id=tool_id,
+                    description=contract.description,
+                    parameters=contract.parameters,
+                )
+                for tool_id, contract in contracts.get(definition.id, {}).items()
+            ],
+            config_schema=definition.config_json_schema(),
+            requires_secret=definition.secret,
+            recommended=starter.get(definition.id),
+        )
+        # `selectable` only. A capability a spec may not bind is a switch the
+        # Toolbox cannot honestly offer: `channel_tools` is chosen per bound bot
+        # under "Where this agent is available", because an agent on two
+        # Mattermost servers has two answers and this form has one.
+        for definition in all_capabilities()
+        if definition.selectable
+    ]
+    return CapabilityCatalog(items=items, total=len(items))
+
+
+@router.get(
+    "/templates",
+    response_model=AgentTemplateCatalog,
+    dependencies=[Depends(require(Perm.AGENTS_VIEW))],
+)
+async def list_agent_templates(service: AgentRegistrySvc, ctx: Auth) -> Any:
+    """Shipped agent templates by industry, with what this organization already has."""
+    return await service.templates(ctx)
+
+
+@router.post(
+    "/templates/install",
+    response_model=TemplateInstallResult,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require(Perm.AGENTS_EDIT))],
+)
+async def install_agent_template(
+    data: TemplateInstallRequest, service: AgentRegistrySvc, ctx: Auth
+) -> Any:
+    """Create a draft agent from a template, installing the skills it expects.
+
+    A draft, not a published agent: the template names no model - there is no
+    organization-wide default here, so the draft starts on the organization's
+    model only when it has exactly one an agent can run on - and may name no
+    collection. The result says what is still to attach.
+    """
+    return await service.install_template(ctx, data.key)
+
+
+@router.get(
+    "/mcp-catalog",
+    response_model=McpCatalog,
+    dependencies=[Depends(require(Perm.AGENTS_VIEW))],
+)
+async def list_mcp_catalog(db: DBSession) -> Any:
+    """The whole curated catalog, unpaged, plus what the mirror reaches.
+
+    Unpaged on purpose and not the browsable list: a caller resolving a
+    *connection* to the entry it points at needs every entry to compare against,
+    and a page cannot answer that. `/agents/mcp-servers` is the paged list.
+
+    Hand-curated rather than mirrored: each entry is a small promise that the
+    auth flow works and the description is honest. `registry_total` says how many
+    the mirror holds beside them, so a count line can say what searching reaches.
+    """
+    items = [McpCatalogEntry(**vars(server)) for server in await mcp_listing.curated(db)]
+    return McpCatalog(
+        items=items,
+        total=len(items),
+        registry_total=await mcp_listing.mirror_size(db),
+    )
+
+
+@router.get(
+    "/platform-mcp-tools",
+    response_model=PlatformMcpToolList,
+    dependencies=[Depends(require(Perm.AGENTS_VIEW))],
+)
+async def list_platform_mcp_tools() -> Any:
+    """The tools of this deployment's own MCP server, for a binding to choose from.
+
+    Every caller sees the same list: a tool runs with the permissions of whoever
+    the agent runs for, so what may actually be done is decided per call, not
+    by who reads this list.
+    """
+    items = [
+        PlatformMcpTool(
+            name=tool.name,
+            description=tool.summary,
+            writes=tool.writes,
+            ungated=tool.ungated,
+            held=tool.held,
+        )
+        for tool in platform_tool_catalog()
+    ]
+    return PlatformMcpToolList(items=items, total=len(items))
+
+
+@router.get(
+    "/mcp-servers",
+    response_model=McpCatalog,
+    dependencies=[Depends(require(Perm.AGENTS_VIEW))],
+)
+async def list_mcp_servers(
+    db: DBSession,
+    q: str = Query("", max_length=100, description="Filter by name, description, host or category"),
+    category: str = Query("", max_length=32, description="One catalog category, or blank for all"),
+    auth: Literal["", "none", "token", "oauth"] = Query(
+        "", description="What the server asks for, or blank for any"
+    ),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+) -> Any:
+    """One paged list: the curated catalog, then the mirrored public registry.
+
+    The console used to hold the curated hundred and filter it in the browser,
+    which is right for a list the client holds - and this one stopped being that
+    when 5,703 mirrored servers arrived behind them. Merging two paged sources in
+    the browser means the browser working out which page of which source a page of
+    the list needs, so the join happens in `mcp_listing.page` and the client
+    renders rows.
+
+    A registry row carries `reviewed: false`: nobody here wrote it, the description
+    is the publisher's, and there is no token hint because the registry has no such
+    field. `verified` and `check` say what the last catalog check found, for either
+    kind; a registry listing it found dead or duplicated is not on the list.
+    """
+    found = await mcp_listing.page(
+        db, query=q, category=category, auth=auth, skip=skip, limit=limit
+    )
+    return McpCatalog(
+        items=[McpCatalogEntry(**vars(server)) for server in found.items],
+        total=found.total,
+        registry_total=found.registry_total,
+    )
+
+
+@router.get("", response_model=AgentList, dependencies=[Depends(require(Perm.AGENTS_VIEW))])
+async def list_agents(
+    service: AgentRegistrySvc,
+    ctx: Auth,
+    shared_with_me: bool = Query(
+        False, description="Only what was shared with the caller - never their own rows"
+    ),
+    include_archived: bool = Query(False),
+    category: Annotated[
+        list[str], Query(description="Keep agents in any of these categories")
+    ] = [],  # noqa: B006
+    tag: Annotated[list[str], Query(description="Keep agents carrying any of these tags")] = [],  # noqa: B006
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+) -> Any:
+    """Agents this member can see - their own, plus what was shared with them.
+
+    `category`/`tag` are repeatable discovery filters: OR within a facet, AND
+    across facets, matched case-insensitively (query values are folded the same
+    way stored ones are). The service folds and bounds them.
+    """
+    items, total = await service.list_agents(
+        ctx,
+        shared_with_me=shared_with_me,
+        include_archived=include_archived,
+        categories=category,
+        tags=tag,
+        skip=skip,
+        limit=limit,
+    )
+    categories, tags = await service.list_labels(
+        ctx, shared_with_me=shared_with_me, include_archived=include_archived
+    )
+    return AgentList(items=items, total=total, categories=categories, tags=tags)
+
+
+@router.get(
+    "/ceiling",
+    response_model=AgentCeiling,
+    dependencies=[Depends(require(Perm.AGENTS_EDIT))],
+)
+async def get_agent_ceiling(service: AgentRegistrySvc, ctx: Auth) -> Any:
+    """The deployment's agents-per-organization limit, and whether a create would hit it.
+
+    So a console can say a create would be refused before a form is filled in;
+    the create itself stays the guarantee. `limit` is null where the deployment
+    sets no limit. `held`, the organization's count of agents that are not
+    archived, is given only to a caller whose `agents:view` reaches every agent
+    in the organization - to anyone else it would reveal how many are hidden
+    from them - and `at_limit` to every caller.
+    """
+    return await service.ceiling(ctx)
+
+
+@router.post(
+    "",
+    response_model=AgentRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require(Perm.AGENTS_EDIT))],
+)
+async def create_agent(data: AgentCreate, service: AgentRegistrySvc, ctx: Auth) -> Any:
+    """Create an agent in draft. It cannot run until published."""
+    return await service.create(
+        ctx,
+        data.spec,
+        visibility=data.visibility,
+        categories=data.categories,
+        tags=data.tags,
+        group_ids=data.group_ids,
+        user_ids=data.user_ids,
+        from_starter=data.from_starter,
+    )
+
+
+@router.post(
+    "/promote",
+    response_model=AgentRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require(Perm.AGENTS_EDIT))],
+)
+async def promote_specialist(data: SpecialistPromote, service: AgentRegistrySvc, ctx: Auth) -> Any:
+    """Promote a specialist into a draft agent the caller owns.
+
+    A collection route, gated like `create`: promoting creates an agent, and a
+    specialist a model invented inside somebody else's run must not become the
+    caller's agent without the permission to add one. It does not publish, pin or
+    remove anything - each of those is the author's next, separate decision.
+    """
+    return await service.promote_specialist(
+        ctx, data.specialist, fallback_model_profile_id=data.fallback_model_profile_id
+    )
+
+
+@router.get("/{agent_id}/knowledge-reach", response_model=AgentKnowledgeReach)
+async def get_knowledge_reach(agent_id: UUID, service: KnowledgeReachSvc, ctx: Auth) -> Any:
+    """Which groups the agent's knowledge bases, skills and context come from (#2072).
+
+    Each source says whether the agent reaches people it is not shared with - who
+    are answered from it all the same. Sources the caller may not see are left out.
+    """
+    return await service.for_agent(ctx, agent_id)
+
+
+@router.get("/{agent_id}/mentionables", response_model=MentionableList)
+async def list_mentionables(
+    agent_id: UUID,
+    service: MentionSvc,
+    ctx: Auth,
+    draft: Annotated[
+        bool, Query(description="Read the Builder's draft, as its test panel runs it")
+    ] = False,
+) -> Any:
+    """What the person may point this agent at with `@` in the composer (#2189).
+
+    Its MCP servers, the capabilities that give it tools, the agents it delegates
+    to, and its knowledge bases, skills and context files - nothing the agent
+    could not already reach, and nothing the caller could not use.
+    """
+    items = await service.available(ctx, agent_id, draft=draft)
+    return MentionableList(items=items, total=len(items))
+
+
+@router.get("/{agent_id}", response_model=AgentDetail)
+async def get_agent(agent_id: UUID, service: AgentRegistrySvc, ctx: Auth) -> Any:
+    """One agent with the spec currently being edited."""
+    agent = await service.get(ctx, agent_id)
+    # `model_validate` reads the row's columns and parses `draft_spec` (JSONB) into
+    # `AgentSpec` off the schema field, so this route names only the one value the
+    # row does not carry: `can_run` is this caller's, not the agent's (#545).
+    return AgentDetail.model_validate(agent).model_copy(
+        update={"can_run": await service.may_run(ctx, agent)}
+    )
+
+
+@router.put(
+    "/{agent_id}/draft",
+    response_model=AgentRead,
+)
+async def save_draft(
+    agent_id: UUID, data: AgentDraftUpdate, service: AgentRegistrySvc, ctx: Auth
+) -> Any:
+    """Save an edit without making it live. Half-finished specs are allowed here."""
+    return await service.save_draft(ctx, agent_id, data.spec)
+
+
+@router.post(
+    "/{agent_id}/validate",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def validate_draft(agent_id: UUID, service: AgentRegistrySvc, ctx: Auth) -> None:
+    """Check the draft without publishing - what the Builder calls as you type.
+
+    `agent_id` is passed on so the cycle check can see a delegation loop that
+    closes on *this* agent. Without it the Builder would call a draft valid and
+    publish would refuse it one round trip later, which is the worst place to
+    learn it: the person has already left the form.
+    """
+    agent = await service.get(ctx, agent_id, perm=Perm.AGENTS_EDIT)
+    await service.validate_spec(ctx, AgentSpec.model_validate(agent.draft_spec), agent_id=agent.id)
+
+
+@router.post(
+    "/{agent_id}/publish",
+    response_model=AgentVersionRead,
+)
+async def publish_agent(
+    agent_id: UUID, data: AgentPublish, service: AgentRegistrySvc, ctx: Auth
+) -> Any:
+    """Validate the draft and freeze it as the version that runs."""
+    return await service.publish(ctx, agent_id, note=data.note)
+
+
+@router.post(
+    "/{agent_id}/capabilities/{capability_id}/enable",
+    response_model=CapabilityEnabled,
+    openapi_extra=INTERNAL,
+)
+async def enable_capability(
+    agent_id: UUID, capability_id: str, service: AgentRegistrySvc, ctx: Auth
+) -> Any:
+    """Switch on a capability the agent said it lacks, from its card in the chat (#2301).
+
+    Published at once only when nothing else was waiting in the draft and the
+    caller may publish; otherwise it waits in the draft for the Builder.
+    """
+    return await service.enable_capability(ctx, agent_id, capability_id)
+
+
+@router.post(
+    "/{agent_id}/capabilities/{capability_id}/request",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+    openapi_extra=INTERNAL,
+)
+async def request_capability(
+    agent_id: UUID,
+    capability_id: str,
+    data: CapabilityRequest,
+    service: AgentRegistrySvc,
+    ctx: Auth,
+) -> Any:
+    """Ask the agent's owner to switch a capability on, from its card in the chat (#2301)."""
+    await service.ask_for_capability(ctx, agent_id, capability_id, reason=data.reason)
+
+
+@router.post(
+    "/{agent_id}/rollback",
+    response_model=AgentVersionRead,
+)
+async def rollback_agent(
+    agent_id: UUID, data: AgentRollback, service: AgentRegistrySvc, ctx: Auth
+) -> Any:
+    """Republish an earlier spec as a new version, keeping history linear."""
+    return await service.rollback(ctx, agent_id, to_version_id=data.version_id)
+
+
+@router.get(
+    "/{agent_id}/delegation-tree",
+    response_model=DelegationTree,
+)
+async def get_delegation_tree(agent_id: UUID, service: AgentRegistrySvc, ctx: Auth) -> Any:
+    """The delegation tree under this agent's draft, to the depth a run can reach.
+
+    What the agent map renders recursively - delegates, their delegates, inline
+    specialists - in one response instead of a page-walk per hop. Each pin is
+    access-checked against the caller: a delegate they may not see is
+    `restricted`, with no name and no children, indistinguishable from one that
+    does not exist.
+    """
+    return await service.delegation_tree(ctx, agent_id)
+
+
+@router.get(
+    "/{agent_id}/versions",
+    response_model=AgentVersionList,
+)
+async def list_versions(
+    agent_id: UUID,
+    service: AgentRegistrySvc,
+    ctx: Auth,
+    skip: int = Query(0, ge=0, description="Items to skip"),
+    limit: int = Query(25, ge=1, le=100, description="Max items to return"),
+) -> Any:
+    """Publication history, newest first, one page at a time.
+
+    `total` is the count of every version, not the length of this page: the
+    listing was capped at fifty and reported the cap, so an agent published
+    sixty times said it had fifty and its ten oldest were unreachable.
+    """
+    items, total = await service.list_versions(ctx, agent_id, skip=skip, limit=limit)
+    return AgentVersionList(items=items, total=total)
+
+
+@router.get(
+    "/{agent_id}/versions/{version_id}",
+    response_model=AgentVersionDetail,
+)
+async def get_version(
+    agent_id: UUID, version_id: UUID, service: AgentRegistrySvc, ctx: Auth
+) -> Any:
+    """One version with the spec it froze - what a diff is read from."""
+    version = await service.get_version(ctx, agent_id, version_id)
+    # The whole row maps off the schema, `spec` (JSONB) parsed into `AgentSpec` on
+    # the field rather than by hand here (#545).
+    return AgentVersionDetail.model_validate(version)
+
+
+@router.get(
+    "/{agent_id}/spec.yaml",
+    response_class=Response,
+)
+async def export_spec(agent_id: UUID, service: AgentRegistrySvc, ctx: Auth) -> Response:
+    """Export the draft as YAML for the client's own git repository.
+
+    The file carries references, never secrets - which is what makes committing
+    it safe and what backs the platform's anti-lock-in promise.
+    """
+    agent = await service.get(ctx, agent_id)
+    spec = AgentSpec.model_validate(agent.draft_spec)
+    return Response(
+        content=spec.to_yaml(),
+        media_type="application/yaml",
+        headers={"Content-Disposition": f'attachment; filename="{agent.slug}.yaml"'},
+    )
+
+
+@router.post(
+    "/{agent_id}/spec.yaml",
+    response_model=AgentRead,
+)
+async def import_spec(
+    agent_id: UUID, data: AgentSpecImport, service: AgentRegistrySvc, ctx: Auth
+) -> Any:
+    """Replace the draft with a hand-written or externally-managed spec."""
+    return await service.import_spec(ctx, agent_id, data.yaml)
+
+
+@router.post(
+    "/{agent_id}/clone",
+    response_model=AgentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def clone_agent(
+    agent_id: UUID, data: AgentClone, service: AgentRegistrySvc, ctx: Auth
+) -> Any:
+    """Copy an agent's draft into a new agent, in draft.
+
+    No role gate, like every other route that names one agent: whether the
+    caller may read *this* one depends on its grants. That cloning also creates
+    is checked in the service, which is the only place that knows both halves.
+    """
+    return await service.clone(ctx, agent_id, name=data.name)
+
+
+@router.post(
+    "/{agent_id}/avatar",
+    response_model=AgentRead,
+)
+async def upload_agent_avatar(
+    agent_id: UUID,
+    service: AgentRegistrySvc,
+    ctx: Auth,
+    file: UploadFile = File(...),
+) -> Any:
+    """Give the agent a picture, or replace the one it has."""
+    return await service.set_avatar(
+        ctx,
+        agent_id,
+        file_data=await file.read(),
+        content_type=file.content_type,
+    )
+
+
+@router.patch(
+    "/{agent_id}/avatar-color",
+    response_model=AgentRead,
+)
+async def set_agent_avatar_color(
+    agent_id: UUID,
+    data: AgentAvatarColorRequest,
+    service: AgentRegistrySvc,
+    ctx: Auth,
+) -> Any:
+    """Choose the colour the agent's fallback avatar uses, or null for auto."""
+    return await service.set_avatar_color(ctx, agent_id, color=data.color)
+
+
+@router.put(
+    "/{agent_id}/a2a",
+    response_model=AgentRead,
+)
+async def set_agent_a2a(
+    agent_id: UUID,
+    data: AgentA2ARequest,
+    service: AgentRegistrySvc,
+    ctx: Auth,
+) -> Any:
+    """Serve this agent over A2A, or stop (#2092).
+
+    Per-resource: the service's grant-aware `AGENTS_PUBLISH` check decides. Served,
+    its card is at `/a2a/{agent_id}/.well-known/agent-card.json` and its tasks at
+    `POST /a2a/{agent_id}`.
+    """
+    return await service.set_a2a(ctx, agent_id, enabled=data.enabled)
+
+
+@router.patch(
+    "/{agent_id}/metadata",
+    response_model=AgentRead,
+)
+async def set_agent_metadata(
+    agent_id: UUID,
+    data: AgentMetadataRequest,
+    service: AgentRegistrySvc,
+    ctx: Auth,
+) -> Any:
+    """Set the agent's discovery categories and tags, or clear a facet with [].
+
+    Per-resource, so no route gate: the service's grant-aware `AGENTS_EDIT` check
+    decides, and a Viewer holding an explicit edit grant on this agent is allowed.
+    """
+    return await service.set_metadata(ctx, agent_id, categories=data.categories, tags=data.tags)
+
+
+@router.get(
+    "/{agent_id}/avatar",
+    response_class=Response,
+    response_model=None,
+)
+async def get_agent_avatar(agent_id: UUID, service: AgentRegistrySvc, ctx: Auth) -> Response:
+    """Stream the agent's picture to someone entitled to see the agent."""
+    stored = await service.avatar_path(ctx, agent_id)
+    # The type comes from the file's own bytes, not its stored name, and it is
+    # refused if the bytes are not an image: the avatar is served from the app's
+    # own origin, so a file whose bytes are HTML must never be served as something
+    # a browser runs, whatever it was named (#1035, same class as #702).
+    response = await stored_image_response(stored, headers={"X-Content-Type-Options": "nosniff"})
+    if response is None:
+        raise NotFoundError(message="This agent has no avatar", details={"agent_id": str(agent_id)})
+    return response
+
+
+@router.post(
+    "/{agent_id}/archive",
+    response_model=AgentRead,
+)
+async def archive_agent(agent_id: UUID, service: AgentRegistrySvc, ctx: Auth) -> Any:
+    """Retire an agent, keeping its history and its runs."""
+    return await service.archive(ctx, agent_id)
+
+
+@router.post(
+    "/{agent_id}/unarchive",
+    response_model=AgentRead,
+)
+async def unarchive_agent(agent_id: UUID, service: AgentRegistrySvc, ctx: Auth) -> Any:
+    """Bring a retired agent back to draft, or to published if it has a version."""
+    return await service.unarchive(ctx, agent_id)
+
+
+@router.delete(
+    "/{agent_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def delete_agent(
+    agent_id: UUID,
+    service: AgentRegistrySvc,
+    ctx: Auth,
+    draft_only: bool = Query(
+        False,
+        description=(
+            "Delete only a never-published draft the caller created; refused "
+            "otherwise, checked on the locked row so a publish in between is seen."
+        ),
+    ),
+) -> None:
+    """Permanently remove an agent, its versions and its shares."""
+    await service.delete(ctx, agent_id, draft_only=draft_only)
+
+
+@router.get("/{agent_id}/dictation", response_model=DictationStatusRead)
+async def dictation_status(agent_id: UUID, registry: AgentRegistrySvc, ml: MLSvc, ctx: Auth) -> Any:
+    """Whether the composer can dictate to this agent, and on which provider (#1797).
+
+    The same access as dictating: anyone who may run the agent, a grant included,
+    and a 404 for an agent the caller may not run. Read before the microphone is
+    offered, so nobody records only to be refused, and for the format to record
+    in - WAV, unless the deployment accepts compressed audio and the provider
+    takes WebM. The composer always has the browser's own recognition; `engine`
+    says whether the agent's Dictation switch sends it to a provider instead.
+    `server_available` is the provider half alone, for the embed form.
+
+    An agent with nothing published answers `browser`, never with a refusal.
+    """
+    agent = await registry.get(ctx, agent_id, perm=Perm.AGENTS_RUN)
+    status = await ml.dictation_status(ctx, agent=agent)
+    return DictationStatusRead(
+        engine=status.engine,
+        requested=status.requested,
+        server_available=status.server_available,
+        unavailable=status.unavailable,
+        max_seconds=status.max_seconds,
+        provider=status.provider,
+        format=status.format,
+    )
+
+
+@router.post(
+    "/{agent_id}/dictation",
+    response_model=DictationRead,
+    # A rate limit, not a permission gate: access is per agent and decided by the
+    # registry below, which reads the caller's grants on it.
+    dependencies=[Depends(limit_dictation)],
+)
+async def dictate_into_composer(
+    agent_id: UUID,
+    registry: AgentRegistrySvc,
+    ml: MLSvc,
+    ctx: Auth,
+    file: UploadFile = File(
+        ...,
+        description=(
+            "The recording: WAV holding 16 kHz mono 16-bit PCM, or - where the deployment "
+            "accepts compressed audio - WebM, Ogg or MP4 as the browser's MediaRecorder made it"
+        ),
+    ),
+    duration: float | None = Form(
+        default=None,
+        ge=0,
+        description=(
+            "How many seconds the browser recorded. Client-reported: used for the usage "
+            "record only where the provider states no length, and clamped to the "
+            "organization's longest dictation"
+        ),
+    ),
+) -> Any:
+    """Turn a composer recording into text on the organization's own engine (#1797).
+
+    Anyone who may run this agent may dictate to it, a Viewer with a `use` grant
+    included - so this is a per-resource check, not a role gate - and an agent the
+    caller may not run answers 404, as everywhere else. The engine is the
+    organization's; the provider, model and language are the agent's published
+    speech-to-text override where it has one and the organization's otherwise.
+    The caller names none.
+
+    The audio is not stored; the text comes back for the person to edit before
+    sending. Refusals carry `details.reason`: 400 `empty`, `unsupported_type` or
+    `too_large`; 503 `not_configured`, `provider_error` or `timeout`; 429 past
+    `RATE_LIMIT_DICTATION_PER_MINUTE`.
+    """
+    agent = await registry.get(ctx, agent_id, perm=Perm.AGENTS_RUN)
+    text = await ml.dictate(
+        ctx,
+        agent=agent,
+        # One byte past the ceiling, so an oversized body is never copied whole
+        # and the service can still name the limit it is over.
+        content=await file.read(transcription.MAX_BYTES + 1),
+        mime_type=file.content_type or "application/octet-stream",
+        reported_seconds=duration,
+    )
+    return DictationRead(text=text)
+
+
+@router.post(
+    "/{agent_id}/run",
+    response_model=AgentRunResult,
+    # Answered in the error envelope with `details.run_id` (#2121); the public
+    # document draws them as it draws every other refusal.
+    openapi_extra={
+        "x-error-responses": {
+            "500": "The run started and failed. `details.run_id` names it, and `message` says why.",
+            "502": "The model provider refused or failed the run's request. "
+            "`details.run_id` names the run, which is recorded as failed.",
+            "409": "With `Idempotency-Key`: the key was already used for a different request.",
+        }
+    },
+    responses={
+        202: {
+            "model": RunRequestRead,
+            "description": "Sent with `Prefer: respond-async`: the run is queued. Poll "
+            "`Location` (`GET /api/v1/run-requests/{id}`) for its outcome.",
+        }
+    },
+    # Not a permission gate - see the boundary about `require(...)` on
+    # per-resource routes. A rate limit is about the caller, not about the row,
+    # and this is the one route on this surface a stranger with a token reaches.
+    dependencies=[Depends(limit_agent_run)],
+)
+async def run_agent(
+    agent_id: UUID,
+    data: AgentRunRequest,
+    service: AgentRunnerSvc,
+    conversations: ConversationSvc,
+    api_runs: ApiRunSvc,
+    db: DBSession,
+    ctx: Auth,
+    respond_async: PrefersAsync,
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            alias="Idempotency-Key",
+            max_length=255,
+            description="With `Prefer: respond-async`: a retry under the same key answers "
+            "the same run request instead of starting another run.",
+        ),
+    ] = None,
+) -> Any:
+    """Run a published agent and return its answer.
+
+    The non-streaming path. It goes through the same runner as every other
+    surface, so the run is recorded, the budget applies, and the cost lands in
+    the same dashboard - an API caller cannot route around governance by not
+    using the UI.
+
+    **It can attach a file and it can say what it parked on** (#936). Both were
+    accidents rather than decisions: `execute` has taken attachments since the
+    widget grew them, and `parked_calls` has computed the parked list since the
+    resume needed it - this surface simply never passed the one or read the
+    other. The surface whose whole purpose is "run it from your own backend" was
+    the one that could not send a document, and a caller whose run stopped for an
+    approval got an empty string and a status.
+
+    **Sent with `Prefer: respond-async` it answers `202` at once** (#2219): the run
+    is queued for a worker and the answer is a run request to poll, so a run of
+    minutes does not hold a connection - or a proxy's read timeout - open. Only
+    then is `Idempotency-Key` honoured; a synchronous call carrying one is refused
+    rather than letting the caller believe a retry is safe when it is not.
+    """
+    if respond_async and data.draft:
+        raise refused_field(
+            "draft", "A draft is tried synchronously - leave out Prefer: respond-async"
+        )
+    if respond_async:
+        queued = await api_runs.queue(ctx, agent_id, data, idempotency_key=idempotency_key)
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=queued.model_dump(mode="json"),
+            headers={
+                "Location": f"{settings.API_V1_STR}/run-requests/{queued.id}",
+                "Preference-Applied": "respond-async",
+            },
+        )
+    if idempotency_key is not None:
+        raise BadRequestError(
+            message="Idempotency-Key is honoured only with Prefer: respond-async",
+            details={"header": "Idempotency-Key"},
+        )
+    # The caller's own conversation, checked - an unknown id was a foreign-key
+    # 500, and somebody else's would have handed this run its workspace and its
+    # plan (#1796) - or a new one, so the next call can continue it (#2122).
+    conversation_id, history = await conversations.for_api_run(
+        ctx, data.conversation_id, prompt=data.prompt
+    )
+    attachments = await load_attached_files(
+        db,
+        [str(file_id) for file_id in data.file_ids],
+        # Their own uploads and nobody else's. `POST /files/upload` attributes an
+        # upload to whoever made it, and this is the same scope the chat reads
+        # under - so a caller cannot attach a file by guessing its id.
+        user_id=ctx.subject_id,
+    )
+    structured: list[dict[str, Any]] = []
+    output, run = await service.execute(
+        ctx,
+        agent_id,
+        data.prompt,
+        surface=RunSurface.API,
+        conversation_id=conversation_id,
+        message_history=history,
+        environment_id=data.environment_id,
+        attachments=attachments,
+        structured=structured,
+        reports_failure=True,
+        draft=data.draft,
+    )
+    return AgentRunResult(
+        run_id=run.id,
+        conversation_id=conversation_id,
+        output=output,
+        structured=structured[0] if structured else None,
+        status=run.status,
+        cost_usd=run.cost_usd,
+        cost_is_partial=run.cost_is_partial,
+        input_tokens=run.input_tokens,
+        output_tokens=run.output_tokens,
+        cache_read_tokens=run.cache_read_tokens,
+        cache_write_tokens=run.cache_write_tokens,
+        parked=await service.parked_calls(ctx, run),
+    )

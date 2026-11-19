@@ -1,0 +1,49 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)",
+      "Bash(git show*)",
+      "Bash(git stash list*)",
+      "Bash(make lint*)",
+      "Bash(make format*)",
+      "Bash(make test*)",
+      "Bash(make coverage-all*)",
+      "Bash(make check*)",
+      "Bash(make docs-build*)",
+      "Bash(make routes*)",
+      "Bash(cd backend && uv run pytest*)",
+      "Bash(cd backend && uv run ruff*)",
+      "Bash(cd backend && uv run ty*)",
+      "Bash(cd backend && uv run alembic current*)",
+      "Bash(cd backend && uv run alembic heads*)",
+      "Bash(cd backend && uv run alembic history*)",
+      "Bash(cd backend && uv run agenticos cmd doctor*)",
+      "Bash(cd backend && uv run agenticos --help*)",
+      "Bash(cd backend && uv run agenticos cmd --help*)",
+      "Bash(cd frontend && bun run type-check*)",
+      "Bash(cd frontend && bun run lint*)",
+      "Bash(cd frontend && bun run test:run*)",
+      "Bash(cd frontend && bun run test:coverage*)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/docs_drift.py\" --json 2>/dev/null || true",
+            "timeout": 10,
+            "statusMessage": "Checking whether the docs moved with the code"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,684 @@
+"""The health probes, including every way they fail.
+
+A health check nobody has watched fail is a health check that does not work: the
+failure path is the entire product. So each probe here is exercised three or four
+ways - it answered, it refused, it hung - and the assertions are on the `detail`
+as much as the status, because a status with nothing behind it is what this
+module was written to remove.
+
+The fakes are hand-written rather than `MagicMock`: a probe is a few lines of
+branching over what a query returned, and a fake that returns rows makes that
+readable in a way a mock with three `side_effect` lists does not.
+"""
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+import pytest
+
+from app.services import health
+
+pytestmark = pytest.mark.anyio
+
+
+class _Result:
+    """One query's answer, in whichever shape the caller asks for it."""
+
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    def scalar_one_or_none(self) -> Any:
+        return self._value
+
+    def scalar_one(self) -> Any:
+        return self._value
+
+    def one(self) -> Any:
+        return self._value
+
+
+class _Session:
+    """A session that answers queries from a queue, raises, or never returns.
+
+    It records `rollback` because a probe that swallows a failed query has to
+    reset the transaction it broke: the request's session commits *before* the
+    response is written, so an abandoned transaction turns the 503 the probe
+    diagnosed into a 500 (#416). A fake without `rollback` would let that pass -
+    `AttributeError` is an exception like any other, and the guard in
+    `_abandon_the_transaction` would swallow it.
+    """
+
+    def __init__(
+        self,
+        *answers: Any,
+        raises: Exception | None = None,
+        hangs: bool = False,
+        rollback_raises: Exception | None = None,
+    ) -> None:
+        self._answers = list(answers)
+        self._raises = raises
+        self._hangs = hangs
+        self._rollback_raises = rollback_raises
+        self.queries = 0
+        self.rolled_back = False
+
+    async def execute(self, statement: Any) -> _Result:
+        self.queries += 1
+        if self._hangs:
+            await asyncio.sleep(10)
+        if self._raises is not None:
+            raise self._raises
+        assert self._answers, "the probe ran more queries than the fake was given"
+        return _Result(self._answers.pop(0))
+
+    async def rollback(self) -> None:
+        if self._rollback_raises is not None:
+            raise self._rollback_raises
+        self.rolled_back = True
+
+
+class _Redis:
+    def __init__(
+        self,
+        *,
+        answers: bool = True,
+        raises: Exception | None = None,
+        hangs: bool = False,
+    ) -> None:
+        self._answers = answers
+        self._raises = raises
+        self._hangs = hangs
+
+    async def ping(self) -> bool:
+        if self._hangs:
+            await asyncio.sleep(10)
+        if self._raises is not None:
+            raise self._raises
+        return self._answers
+
+
+@pytest.fixture
+def impatient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the probe timeout so a hang is a test rather than a coffee break."""
+    monkeypatch.setattr(health, "PROBE_TIMEOUT_SECONDS", 0.01)
+
+
+def _heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workers: int = 1,
+    fired: datetime | Exception | None,
+    every: int = 60,
+    paused: tuple[str, ...] = (),
+    pools: tuple[str, ...] = ("agent", "ingest", "system", "workflow"),
+) -> None:
+    """Make the queue's tables report these workers, one schedule and these paused kinds."""
+    from app.repositories import background_schedule, background_task_kind, background_worker
+
+    async def seen(*_: object, **__: object) -> list[SimpleNamespace]:
+        if isinstance(fired, Exception):
+            raise fired
+        return [SimpleNamespace(id=f"w{n}", pools=list(pools)) for n in range(workers)]
+
+    async def schedules(*_: object) -> list[SimpleNamespace]:
+        assert not isinstance(fired, Exception)
+        return [
+            SimpleNamespace(
+                name="check-agent-triggers", interval_seconds=every, last_fired_at=fired
+            ),
+            SimpleNamespace(name="apply-retention", interval_seconds=86400, last_fired_at=None),
+        ]
+
+    async def kinds(*_: object) -> list[tuple[SimpleNamespace, str | None]]:
+        # "kind@organization" is a pause for that organization alone.
+        return [
+            (
+                SimpleNamespace(kind=kind.split("@")[0], paused_at=datetime.now(UTC)),
+                kind.split("@")[1] if "@" in kind else None,
+            )
+            for kind in paused
+        ]
+
+    monkeypatch.setattr(background_worker, "list_seen_since", seen)
+    monkeypatch.setattr(background_schedule, "list_all", schedules)
+    monkeypatch.setattr(background_task_kind, "list_all", kinds)
+
+
+@pytest.fixture
+def heartbeat_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker alive and the minute schedule fired just now."""
+    _heartbeat(monkeypatch, fired=datetime.now(UTC))
+
+
+class TestDatabaseProbe:
+    async def test_a_query_that_answers_is_healthy_and_timed(self) -> None:
+        check = await health.probe_database(_Session(1))  # type: ignore[arg-type]
+
+        assert check.status == "healthy"
+        assert check.detail == "SELECT 1 answered"
+        assert check.latency_ms is not None
+
+    async def test_a_refused_query_is_unhealthy_and_says_why(self) -> None:
+        check = await health.probe_database(
+            _Session(raises=RuntimeError("connection refused"))  # type: ignore[arg-type]
+        )
+
+        assert check.status == "unhealthy"
+        assert "connection refused" in check.detail
+        assert check.latency_ms is None
+
+    async def test_a_hanging_query_is_unhealthy_rather_than_a_hanging_endpoint(
+        self, impatient: None
+    ) -> None:
+        """The probe has to answer while the thing it probes does not.
+
+        A readiness endpoint that blocks on a wedged database fails the kubelet's
+        own timeout, which looks identical to a wedged pod - so the diagnosis is
+        lost exactly when it is needed.
+        """
+        check = await health.probe_database(_Session(hangs=True))  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "did not answer within" in check.detail
+
+    async def test_a_refused_query_leaves_the_session_usable(self) -> None:
+        """Diagnosing a broken database must not break the response carrying it.
+
+        A statement that raised leaves the transaction aborted, and the request's
+        session commits on the way out - before the response is written, since
+        #353. Without the rollback the endpoint an operator reads *because*
+        something is wrong answers 500 rather than the 503 it worked out (#416).
+        """
+        session = _Session(raises=RuntimeError("connection refused"))
+
+        await health.probe_database(session)  # type: ignore[arg-type]
+
+        assert session.rolled_back
+
+    async def test_a_hanging_query_leaves_the_session_usable(self, impatient: None) -> None:
+        """The timeout path abandons the transaction too.
+
+        It is the likelier of the two in production - a database under load
+        answers slowly before it stops answering - and it leaves the session in
+        the same state.
+        """
+        session = _Session(hangs=True)
+
+        await health.probe_database(session)  # type: ignore[arg-type]
+
+        assert session.rolled_back
+
+    async def test_a_session_that_cannot_be_reset_still_answers_with_the_diagnosis(
+        self,
+    ) -> None:
+        """The guard around the rollback, and the reason it is there.
+
+        A session too broken to roll back is not a reason for a health endpoint
+        to raise - that is the one thing every probe in this module refuses to
+        do. The commit after it will fail, and that is the honest floor.
+        """
+        session = _Session(
+            raises=RuntimeError("connection refused"),
+            rollback_raises=RuntimeError("the connection is gone"),
+        )
+
+        check = await health.probe_database(session)  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert not session.rolled_back
+
+
+class TestRedisProbe:
+    async def test_a_ping_that_comes_back_is_healthy(self) -> None:
+        check = await health.probe_redis(_Redis())  # type: ignore[arg-type]
+
+        assert check.status == "healthy"
+        assert check.latency_ms is not None
+
+    async def test_an_unanswered_ping_is_unhealthy(self) -> None:
+        """`RedisClient.ping` returns False when it has no connection."""
+        check = await health.probe_redis(_Redis(answers=False))  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert check.detail == "PING was not answered"
+
+    async def test_a_client_that_raises_is_reported_not_propagated(self) -> None:
+        check = await health.probe_redis(
+            _Redis(raises=RuntimeError("no route to host"))  # type: ignore[arg-type]
+        )
+
+        assert check.status == "unhealthy"
+        assert "no route to host" in check.detail
+
+    async def test_a_hanging_ping_is_bounded(self, impatient: None) -> None:
+        check = await health.probe_redis(_Redis(hangs=True))  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "did not answer within" in check.detail
+
+
+def _capable(
+    *,
+    available: str = "0.8.0",
+    trusted: bool = True,
+    superuser: bool = True,
+    may_create: bool = True,
+) -> tuple[str | None, bool | None, bool, bool]:
+    """One row of `_PGVECTOR_CAPABILITY`: what the image ships, what the role may do."""
+    return (available, trusted, superuser, may_create)
+
+
+class TestVectorStoreProbe:
+    async def test_it_reports_the_extension_version_and_how_many_collections(self) -> None:
+        check = await health.probe_vector_store(
+            _Session(_capable(), "0.8.0", 3)  # type: ignore[arg-type]
+        )
+
+        assert check.status == "healthy"
+        assert "pgvector 0.8.0" in check.detail
+        assert "3 collection table(s)" in check.detail
+
+    async def test_an_extension_not_created_yet_is_unconfigured_not_broken(self) -> None:
+        """A deployment that never ingests a document is not having an incident.
+
+        The RAG store creates the extension the first time a collection is
+        written to, so on the image every compose file here pins, and as a role
+        that may create it, this is a state that resolves itself - and the detail
+        says so rather than predicting a failure that will not happen (#1504).
+        """
+        session = _Session(_capable(), None)
+        check = await health.probe_vector_store(session)  # type: ignore[arg-type]
+
+        assert check.status == "unconfigured"
+        assert "may create it" in check.detail
+        assert "0.8.0" in check.detail
+        # No point counting embedding tables when the type they use does not
+        # exist yet.
+        assert session.queries == 2
+
+    async def test_a_trusted_extension_is_creatable_without_being_superuser(self) -> None:
+        """`CREATE EXTENSION` needs superuser *unless* the extension is trusted,
+        which pgvector is - then CREATE on the database is enough."""
+        check = await health.probe_vector_store(
+            _Session(_capable(superuser=False), None)  # type: ignore[arg-type]
+        )
+
+        assert check.status == "unconfigured"
+
+    async def test_a_role_that_cannot_create_it_is_unhealthy_however_available(self) -> None:
+        """Availability is the image's answer, not the role's.
+
+        An application connecting as a restricted role sees `vector` in
+        `pg_available_extensions` and still cannot run `CREATE EXTENSION`, so
+        promising that the first ingestion creates it is the same unverified
+        claim this probe exists to stop making.
+        """
+        check = await health.probe_vector_store(
+            _Session(_capable(superuser=False, may_create=False), None)  # type: ignore[arg-type]
+        )
+
+        assert check.status == "unhealthy"
+        assert "cannot create it" in check.detail
+
+    async def test_an_untrusted_extension_needs_superuser(self) -> None:
+        check = await health.probe_vector_store(
+            _Session(_capable(superuser=False, trusted=False), None)  # type: ignore[arg-type]
+        )
+
+        assert check.status == "unhealthy"
+        assert "cannot create it" in check.detail
+
+    async def test_an_image_without_pgvector_is_unhealthy_and_says_which_image(self) -> None:
+        """The other half, and the opposite consequence.
+
+        On stock Postgres the extension cannot be created at all, so the first
+        upload 500s *after* the bytes have been accepted. Reported as unhealthy,
+        because nothing about it resolves itself, and naming the image because
+        that is the fix.
+        """
+        session = _Session((None, None, False, True), None)
+        check = await health.probe_vector_store(session)  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "does not ship pgvector" in check.detail
+        assert "pgvector/pgvector:pg16" in check.detail
+        assert session.queries == 2
+
+    async def test_a_volume_that_outlived_its_image_is_unhealthy(self) -> None:
+        """The row survives; the shared library does not.
+
+        A data directory carrying `pg_extension` started on an image without
+        pgvector keeps the catalog row and loses `$libdir/vector`, so the
+        extension reads as installed, the collection tables are still countable,
+        and every vector operation fails. Availability is therefore read whether
+        or not the extension exists (#1504).
+        """
+        check = await health.probe_vector_store(
+            _Session((None, None, False, True), "0.8.0")  # type: ignore[arg-type]
+        )
+
+        assert check.status == "unhealthy"
+        assert "$libdir/vector" in check.detail
+
+    async def test_a_catalog_read_that_fails_is_unhealthy(self) -> None:
+        check = await health.probe_vector_store(
+            _Session(raises=RuntimeError("permission denied for pg_extension"))  # type: ignore[arg-type]
+        )
+
+        assert check.status == "unhealthy"
+        assert "permission denied" in check.detail
+
+    async def test_it_does_not_hang(self, impatient: None) -> None:
+        check = await health.probe_vector_store(_Session(hangs=True))  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "did not answer within" in check.detail
+
+
+class TestModelAccessProbe:
+    async def test_it_counts_profiles_and_organizations_without_calling_a_provider(self) -> None:
+        check = await health.probe_model_access(_Session((4, 2)))  # type: ignore[arg-type]
+
+        assert check.status == "healthy"
+        assert "4 model profile(s)" in check.detail
+        assert "2 organization(s)" in check.detail
+        assert "no provider was called" in check.detail
+
+    async def test_no_usable_profile_is_unconfigured_and_names_the_consequence(self) -> None:
+        """The row exists to answer "could anything here run", so 0 has to be loud.
+
+        This is the case the old check got backwards: it read a platform-wide
+        environment variable and reported healthy while no organization had a key
+        a run could use.
+        """
+        check = await health.probe_model_access(_Session((0, 0)))  # type: ignore[arg-type]
+
+        assert check.status == "unconfigured"
+        assert "no organization has a model profile with an active key" in check.detail
+
+    async def test_a_failed_count_is_unhealthy(self) -> None:
+        check = await health.probe_model_access(
+            _Session(raises=RuntimeError("relation does not exist"))  # type: ignore[arg-type]
+        )
+
+        assert check.status == "unhealthy"
+        assert "relation does not exist" in check.detail
+
+    async def test_it_does_not_hang(self, impatient: None) -> None:
+        check = await health.probe_model_access(_Session(hangs=True))  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "did not answer within" in check.detail
+
+
+class TestReadiness:
+    async def test_both_dependencies_answering_is_ready(self) -> None:
+        ready, checks = await health.readiness(db=_Session(1), redis=_Redis())  # type: ignore[arg-type]
+
+        assert ready
+        assert set(checks) == {"database", "redis"}
+
+    async def test_one_dependency_down_is_not_ready(self) -> None:
+        ready, checks = await health.readiness(
+            db=_Session(1),  # type: ignore[arg-type]
+            redis=_Redis(answers=False),  # type: ignore[arg-type]
+        )
+
+        assert not ready
+        assert checks["redis"]["status"] == "unhealthy"
+
+    async def test_the_published_payload_carries_no_reason(self) -> None:
+        """Nobody authenticates to reach this, so nothing here may describe the
+        network: a driver error names the host, the port and the database user.
+        """
+        _, checks = await health.readiness(
+            db=_Session(raises=RuntimeError("connection to server at 10.0.1.7 failed")),  # type: ignore[arg-type]
+            redis=_Redis(),  # type: ignore[arg-type]
+        )
+
+        assert checks["database"] == {"status": "unhealthy", "latency_ms": None}
+
+
+class TestSchedulerProbe:
+    async def test_a_live_worker_and_a_minute_schedule_that_fired_are_healthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _heartbeat(monkeypatch, workers=2, fired=datetime.now(UTC) - timedelta(seconds=40))
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "healthy"
+        assert check.detail.startswith("2 worker(s) alive")
+        assert check.latency_ms is not None
+
+    async def test_no_live_worker_is_unhealthy_and_says_what_stops(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _heartbeat(monkeypatch, workers=0, fired=datetime.now(UTC))
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "no worker has said it is alive" in check.detail
+        assert "scheduled triggers" in check.detail
+
+    async def test_a_pool_no_live_worker_serves_is_unhealthy_by_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The `ingest` worker died; the `agent,system` one keeps the schedules firing."""
+        _heartbeat(monkeypatch, fired=datetime.now(UTC), pools=("agent", "system", "workflow"))
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "no live worker serves the ingest pool(s)" in check.detail
+
+    async def test_a_minute_schedule_five_ticks_late_is_unhealthy_by_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _heartbeat(monkeypatch, fired=datetime.now(UTC) - timedelta(minutes=10))
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "the check-agent-triggers schedule last fired 10 min ago" in check.detail
+
+    async def test_a_minute_schedule_that_never_fired_is_unhealthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _heartbeat(monkeypatch, fired=None)
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "check-agent-triggers schedule has never fired" in check.detail
+
+    async def test_a_daily_schedule_that_has_not_fired_yet_is_not_a_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh deployment's daily sweeps have not come round; only minute ones are judged."""
+        _heartbeat(monkeypatch, fired=datetime.now(UTC))
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "healthy"
+        assert "apply-retention" not in check.detail
+
+    async def test_a_paused_kind_is_unhealthy_until_resumed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _heartbeat(monkeypatch, fired=datetime.now(UTC), paused=("ingest-document",))
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "paused after repeated worker deaths: ingest-document" in check.detail
+        assert "Background jobs page" in check.detail
+
+    async def test_a_kind_paused_for_one_organization_names_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _heartbeat(monkeypatch, fired=datetime.now(UTC), paused=("ingest-document@Acme",))
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert "paused after repeated worker deaths: ingest-document (Acme)" in check.detail
+
+    async def test_an_unreadable_queue_is_unhealthy_and_says_why(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        _heartbeat(monkeypatch, fired=OperationalError("SELECT", {}, Exception("gone")))
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert check.detail == "reading the background job tables failed: OperationalError"
+
+    async def test_a_hanging_read_is_unhealthy_rather_than_a_hanging_page(
+        self, monkeypatch: pytest.MonkeyPatch, impatient: None
+    ) -> None:
+        from app.repositories import background_worker
+
+        async def hangs(*_: object, **__: object) -> list[object]:
+            await asyncio.sleep(60)
+            return []
+
+        _heartbeat(monkeypatch, fired=datetime.now(UTC))
+        monkeypatch.setattr(background_worker, "list_seen_since", hangs)
+
+        check = await health.probe_scheduler(_Session())  # type: ignore[arg-type]
+
+        assert check.status == "unhealthy"
+        assert "the background job tables" in check.detail
+
+
+def _tile_server(
+    monkeypatch: pytest.MonkeyPatch, answer: httpx.Response | Exception
+) -> list[httpx.Request]:
+    """Point the map tiles probe at a server that answers this, and record what it asked."""
+    monkeypatch.setattr(
+        health.settings, "VISUAL_MAP_TILES", "https://t.example/{z}/{x}/{y}.png?key=secret"
+    )
+    monkeypatch.setattr(health.settings, "VISUAL_MAP_TILES_ATTRIBUTION", "© Example")
+    asked: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        asked.append(request)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    real = httpx.AsyncClient
+
+    def client(**kwargs: Any) -> httpx.AsyncClient:
+        return real(transport=httpx.MockTransport(handle), **kwargs)
+
+    monkeypatch.setattr(health.httpx, "AsyncClient", client)
+    return asked
+
+
+class TestMapTilesProbe:
+    async def test_no_server_is_unconfigured_not_broken(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(health.settings, "VISUAL_MAP_TILES", "")
+        check = await health.probe_map_tiles()
+        assert check.status == "unconfigured"
+        assert "outline" in check.detail
+
+    async def test_a_server_that_serves_its_first_tile_is_healthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        asked = _tile_server(
+            monkeypatch, httpx.Response(200, headers={"content-type": "image/png"}, content=b"png")
+        )
+        check = await health.probe_map_tiles()
+
+        assert check.status == "healthy"
+        assert check.latency_ms is not None
+        assert str(asked[0].url) == "https://t.example/0/0/0.png?key=secret"
+        assert asked[0].headers["user-agent"] == health.tile_proxy.USER_AGENT
+
+    @pytest.mark.security
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            httpx.Response(403, headers={"content-type": "text/html"}, content=b"no"),
+            httpx.Response(200, headers={"content-type": "text/html"}, content=b"<html>"),
+            httpx.Response(200, content=b""),
+        ],
+    )
+    async def test_a_server_that_does_not_serve_an_image_is_unhealthy_and_its_key_unsaid(
+        self, monkeypatch: pytest.MonkeyPatch, answer: httpx.Response
+    ) -> None:
+        _tile_server(monkeypatch, answer)
+        check = await health.probe_map_tiles()
+
+        assert check.status == "unhealthy"
+        assert "t.example" in check.detail
+        assert "secret" not in check.detail
+
+    async def test_a_server_that_cannot_be_reached_is_unhealthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _tile_server(monkeypatch, httpx.ConnectError("refused"))
+        check = await health.probe_map_tiles()
+        assert check.status == "unhealthy"
+        assert "ConnectError" in check.detail
+
+    async def test_a_server_that_does_not_answer_in_time_is_unhealthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _tile_server(monkeypatch, httpx.ReadTimeout("slow"))
+        check = await health.probe_map_tiles()
+        assert check.status == "unhealthy"
+        assert "did not answer" in check.detail
+
+
+class TestSystemHealth:
+    async def test_it_reports_every_check_an_operator_can_act_on(
+        self, heartbeat_ok: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(health.settings, "VISUAL_MAP_TILES", "")
+        report = await health.system_health(
+            db=_Session(1, _capable(), "0.8.0", 2, (1, 1)),  # type: ignore[arg-type]
+            redis=_Redis(),  # type: ignore[arg-type]
+        )
+
+        assert [check.key for check in report.checks] == [
+            "database",
+            "redis",
+            "vector_store",
+            "model_access",
+            "scheduler",
+            "map_tiles",
+        ]
+        assert all(check.status == "healthy" for check in report.checks[:-1])
+        assert report.checks[-1].status == "unconfigured"
+        assert all(check.detail for check in report.checks)
+
+    async def test_a_dead_database_does_not_produce_three_broken_services(
+        self, heartbeat_ok: None
+    ) -> None:
+        """The two checks that read through the session are skipped, and say so.
+
+        Running them anyway would answer with whatever the driver says about a
+        session whose last query was cancelled, which reads as three unrelated
+        outages instead of one.
+        """
+        report = await health.system_health(
+            db=_Session(raises=RuntimeError("the database is gone")),  # type: ignore[arg-type]
+            redis=_Redis(),  # type: ignore[arg-type]
+        )
+
+        by_key = {check.key: check for check in report.checks}
+        assert by_key["database"].status == "unhealthy"
+        assert by_key["vector_store"].status == "not_checked"
+        assert by_key["model_access"].status == "not_checked"
+        assert by_key["scheduler"].status == "not_checked"
+        assert by_key["model_access"].detail == "not checked: the database probe failed"

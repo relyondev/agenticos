@@ -1,0 +1,662 @@
+"""Tests for CLI commands module."""
+
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from uuid import uuid4
+
+import click
+from click.testing import CliRunner
+
+from app.commands import (
+    _commands,
+    command,
+    discover_commands,
+    error,
+    info,
+    register_commands,
+    success,
+    warning,
+)
+from app.commands.seed import seed
+
+
+class TestCommandDecorator:
+    """Tests for the command decorator."""
+
+    def test_command_registers_function(self):
+        """Test that @command decorator registers a click command."""
+        initial_count = len(_commands)
+
+        @command("test-cmd", help="Test command")
+        def test_func():
+            pass
+
+        assert len(_commands) == initial_count + 1
+        assert _commands[-1].name == "test-cmd"
+
+    def test_command_uses_function_name_as_default(self):
+        """Test that command name defaults to function name."""
+
+        @command()
+        def my_test_command():
+            pass
+
+        assert _commands[-1].name == "my-test-command"
+
+
+class TestHelperFunctions:
+    """Tests for helper output functions."""
+
+    def test_success_prints_green(self, capsys):
+        """Test success prints in green."""
+        success("Test message")
+        # Click uses escape codes for colors
+        captured = capsys.readouterr()
+        assert "Test message" in captured.out
+
+    def test_error_prints_red(self, capsys):
+        """Test error prints in red."""
+        error("Error message")
+        captured = capsys.readouterr()
+        assert "Error message" in captured.out
+
+    def test_warning_prints_yellow(self, capsys):
+        """Test warning prints in yellow."""
+        warning("Warning message")
+        captured = capsys.readouterr()
+        assert "Warning message" in captured.out
+
+    def test_info_prints_plain(self, capsys):
+        """Test info prints plain text."""
+        info("Info message")
+        captured = capsys.readouterr()
+        assert "Info message" in captured.out
+
+
+class TestDiscoverCommands:
+    """Tests for command discovery."""
+
+    def test_discover_commands_returns_list(self):
+        """Test that discover_commands returns a list."""
+        commands = discover_commands()
+        assert isinstance(commands, list)
+
+    def test_discover_commands_caches_results(self):
+        """Test that discover_commands caches on second call."""
+        commands1 = discover_commands()
+        commands2 = discover_commands()
+        assert commands1 is commands2
+
+
+class TestRegisterCommands:
+    """Tests for registering commands."""
+
+    def test_register_commands_adds_to_group(self):
+        """Test that register_commands adds discovered commands to CLI group."""
+
+        @click.group()
+        def cli():
+            pass
+
+        register_commands(cli)
+        # After registration, cli should have commands
+        # We can't assert exact count since it depends on what's discovered
+
+
+class TestSeedCommand:
+    """Tests for the seed command."""
+
+    def test_seed_dry_run(self):
+        """Test seed command with --dry-run."""
+        runner = CliRunner()
+        result = runner.invoke(seed, ["--dry-run", "--count", "5"])
+        assert result.exit_code == 0
+        assert "[DRY RUN]" in result.output
+        assert "5" in result.output
+
+    def test_seed_dry_run_with_clear(self):
+        """Test seed command with --dry-run and --clear."""
+        runner = CliRunner()
+        result = runner.invoke(seed, ["--dry-run", "--clear"])
+        assert result.exit_code == 0
+        assert "Would clear existing data" in result.output
+
+
+class TestRagSourceSyncWaitsForItsWork:
+    """#439: the command reported a sync and then cancelled it.
+
+    `asyncio.run` cancels every task still pending when the coroutine it was
+    given returns, so a command that dispatches and exits has killed the work
+    by the time it prints that the work started.
+    """
+
+    def test_the_command_does_not_return_until_the_sync_it_started_has_finished(
+        self, monkeypatch
+    ) -> None:
+        from app.commands import rag as rag_command
+        from app.core import background
+
+        finished: list[str] = []
+
+        async def sync() -> None:
+            # Two trips through the loop: one is about as far as a task gets
+            # before `asyncio.run` cancels it on the way out.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            finished.append("done")
+
+        class DispatchingService:
+            """Stands in for the service, dispatching the way it dispatches."""
+
+            def __init__(self, db: object) -> None:
+                self.db = db
+
+            async def trigger_sync(self, source_id: str) -> SimpleNamespace:
+                background.spawn(sync(), name=f"sync-source-{source_id}")
+                return SimpleNamespace(id=uuid4())
+
+        @asynccontextmanager
+        async def session() -> AsyncGenerator[object]:
+            yield object()
+
+        monkeypatch.setattr(rag_command, "get_db_context", session)
+        monkeypatch.setattr(rag_command, "SyncSourceService", DispatchingService)
+        background._running.clear()
+
+        result = CliRunner().invoke(rag_command.rag_source_sync, ["a-source"])
+
+        assert result.exit_code == 0, result.output
+        assert finished == ["done"], (
+            "the command returned while its sync was still running, and "
+            "`asyncio.run` cancelled it on the way out (#439)"
+        )
+
+
+def _kb(
+    *,
+    organization_id,
+    collection_name: str = "docs",
+    scope: str = "org",
+    owner=None,
+) -> SimpleNamespace:
+    """A knowledge base row as the command reads one: name, tenant and scope."""
+    return SimpleNamespace(
+        collection_name=collection_name,
+        organization_id=organization_id,
+        scope=scope,
+        owner_user_id=owner,
+    )
+
+
+class TestRagSourceAddRefusesWhatItCannotOwn:
+    """#707. The command wrote a caller-supplied collection name straight into a
+    `sync_sources` row without asking whether it was a legal identifier, whether
+    a knowledge base of that name existed, or whose it was. The HTTP route for
+    the same thing asks all three, and its docstring says why: "a sync writes
+    into the collection, so pointing one at another tenant's is an injection,
+    not a read".
+
+    The row also had no organization - `create_source` was called without one and
+    the column is nullable - while the model's docstring opens "Belongs to an
+    organization". `--org` is now required and is what answers the ownership
+    question the CLI has no `ctx` for.
+    """
+
+    ORG = uuid4()
+
+    @staticmethod
+    def _run(monkeypatch, *, organization, candidates, service=None):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.commands import rag as rag_command
+
+        created: list[dict[str, object]] = []
+
+        class RecordingService:
+            def __init__(self, db: object) -> None:
+                self.db = db
+
+            async def create_source(self, data, *, ctx):
+                created.append({"data": data, "organization_id": ctx.organization_id})
+                return SimpleNamespace(name=data.name, id=uuid4())
+
+        @asynccontextmanager
+        async def session() -> AsyncGenerator[object]:
+            yield object()
+
+        monkeypatch.setattr(rag_command, "get_db_context", session)
+        monkeypatch.setattr(
+            rag_command.organization_repo, "get_by_id", AsyncMock(return_value=organization)
+        )
+        monkeypatch.setattr(
+            rag_command.knowledge_base_repo,
+            "list_by_collection_name",
+            AsyncMock(return_value=candidates),
+        )
+        monkeypatch.setattr(rag_command, "SyncSourceService", service or RecordingService)
+        return created, MagicMock
+
+    def _invoke(self, collection: str, org: str | None = None):
+        from app.commands import rag as rag_command
+
+        return CliRunner().invoke(
+            rag_command.rag_source_add,
+            [
+                "--name",
+                "My Drive",
+                "--type",
+                "gdrive",
+                "--org",
+                org or str(self.ORG),
+                "--collection",
+                collection,
+                "--config",
+                '{"folder_id": "abc123"}',
+            ],
+        )
+
+    def test_a_collection_the_organization_holds_is_accepted_and_owns_the_row(
+        self, monkeypatch
+    ) -> None:
+        """And the row carries the organization, which every row this command
+        made used to lack."""
+        organization = SimpleNamespace(id=self.ORG, name="Acme")
+        kb = _kb(organization_id=self.ORG)
+        created, _ = self._run(monkeypatch, organization=organization, candidates=[kb])
+
+        result = self._invoke("docs")
+
+        assert result.exit_code == 0, result.output
+        assert len(created) == 1
+        assert created[0]["organization_id"] == self.ORG
+        assert created[0]["data"].collection_name == "docs"
+
+    def test_a_collection_no_knowledge_base_claims_is_refused(self, monkeypatch) -> None:
+        """It was accepted, and then failed in a worker - attributed to the sync
+        rather than to the configuration that caused it."""
+        organization = SimpleNamespace(id=self.ORG, name="Acme")
+        created, _ = self._run(monkeypatch, organization=organization, candidates=[])
+
+        result = self._invoke("absent")
+
+        assert created == []
+        assert result.exit_code != 0
+        assert "'absent'" in result.output
+
+    def test_another_organizations_collection_is_refused(self, monkeypatch) -> None:
+        """The injection the route's docstring names. `collection_name` is not
+        unique, so a name can exist and still not be this organization's - which
+        is why the command filters the candidates rather than taking the first
+        row the database returns (#913).
+        """
+        organization = SimpleNamespace(id=self.ORG, name="Acme")
+        theirs = _kb(organization_id=uuid4())
+        created, _ = self._run(monkeypatch, organization=organization, candidates=[theirs])
+
+        result = self._invoke("docs")
+
+        assert created == []
+        assert result.exit_code != 0
+        assert "'docs'" in result.output
+
+    def test_a_members_personal_collection_is_refused(self, monkeypatch) -> None:
+        """A personal base carries the organization's id too, so "same tenant" is
+        not ownership: `writable_kb` lets only its owner write to one.
+
+        Accepting it here would point an *organization-owned* source at a
+        member's private collection, which every member holding
+        `connections:manage` could then see and trigger. The command has no
+        caller identity, so the org scope is the only one it can claim on the
+        organization's behalf.
+        """
+        organization = SimpleNamespace(id=self.ORG, name="Acme")
+        personal = _kb(organization_id=self.ORG, scope="personal", owner=uuid4())
+        created, _ = self._run(monkeypatch, organization=organization, candidates=[personal])
+
+        result = self._invoke("docs")
+
+        assert created == []
+        assert result.exit_code != 0
+        assert "personal collection" in result.output
+
+    def test_an_app_scoped_collection_is_refused(self, monkeypatch) -> None:
+        """It belongs to the deployment, and takes an app admin - which a
+        `--org` cannot stand in for."""
+        organization = SimpleNamespace(id=self.ORG, name="Acme")
+        shared = _kb(organization_id=self.ORG, scope="app")
+        created, _ = self._run(monkeypatch, organization=organization, candidates=[shared])
+
+        result = self._invoke("docs")
+
+        assert created == []
+        assert result.exit_code != 0
+
+    def test_an_organization_that_does_not_exist_is_refused(self, monkeypatch) -> None:
+        created, _ = self._run(monkeypatch, organization=None, candidates=[])
+
+        result = self._invoke("docs")
+
+        assert created == []
+        assert result.exit_code != 0
+        assert "No such organization" in result.output
+
+    def test_something_that_is_not_an_organization_id_is_refused_before_any_query(
+        self, monkeypatch
+    ) -> None:
+        """Left to `UUID()` inside the coroutine this was a `ValueError`
+        traceback rather than a sentence."""
+        created, _ = self._run(monkeypatch, organization=None, candidates=[])
+
+        result = self._invoke("docs", org="acme")
+
+        assert created == []
+        assert result.exit_code != 0
+        assert "Not an organization id" in result.output
+
+    def test_a_name_no_table_can_be_called_is_refused_by_the_service(self, monkeypatch) -> None:
+        """The shape check lives in `create_source`, so the route and the CLI
+        share it. The command reports it rather than raising a traceback.
+        """
+        from app.services.sync_source import SyncSourceService
+
+        organization = SimpleNamespace(id=self.ORG, name="Acme")
+        kb = _kb(collection_name="Bad Name!", organization_id=self.ORG)
+        self._run(
+            monkeypatch, organization=organization, candidates=[kb], service=SyncSourceService
+        )
+
+        result = self._invoke("Bad Name!")
+
+        assert result.exit_code != 0
+        assert "Failed to create source" in result.output
+        assert "collection name" in result.output
+
+    def test_a_refusal_exits_non_zero_so_a_script_can_read_it(self, monkeypatch) -> None:
+        """`error` is `click.secho`, so a command that printed and returned exited
+        **0** - and a shell script carried on as though the source had been
+        created when no row existed.
+        """
+        organization = SimpleNamespace(id=self.ORG, name="Acme")
+        created, _ = self._run(monkeypatch, organization=organization, candidates=[])
+
+        result = self._invoke("absent")
+
+        assert created == []
+        assert result.exit_code == 1
+
+
+class TestSeedSkillsSurvivesARacingListing:
+    """A listing top-up can commit the same skill between the command's name
+    check and its flush. That surfaces as `IntegrityError`, not
+    `AlreadyExistsError`, and it must cost that one skill rather than the run -
+    which takes both the catch and the savepoint, because a caught
+    `IntegrityError` without a rollback leaves the session dead for every
+    skill after it.
+    """
+
+    def test_an_integrity_error_skips_that_skill_and_the_rest_still_install(
+        self, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sqlalchemy.exc import IntegrityError
+
+        from app.commands import seed_skills as seed_command
+
+        db = MagicMock()
+        bundled = [
+            SimpleNamespace(key="code-review", name="code-review", resources=()),
+            SimpleNamespace(key="incident-report", name="incident-report", resources=()),
+        ]
+        refresh = AsyncMock(
+            side_effect=[
+                IntegrityError("INSERT", {}, Exception("duplicate key")),
+                seed_command.LibraryRefresh.INSTALL,
+            ]
+        )
+
+        @asynccontextmanager
+        async def session() -> AsyncGenerator[object]:
+            yield db
+
+        monkeypatch.setattr(seed_command, "get_db_context", session)
+        monkeypatch.setattr(
+            seed_command,
+            "SkillService",
+            lambda _db: SimpleNamespace(refresh_from_library=refresh),
+        )
+        monkeypatch.setattr(seed_command.skill_library, "library", lambda: bundled)
+        monkeypatch.setattr(
+            seed_command.organization_repo,
+            "list_all",
+            AsyncMock(return_value=[SimpleNamespace(id=uuid4(), name="Acme")]),
+        )
+        monkeypatch.setattr(
+            seed_command.member_repo, "first_owner_id", AsyncMock(return_value=uuid4())
+        )
+
+        result = CliRunner().invoke(seed_command.seed_skills, [])
+
+        assert result.exit_code == 0, result.output
+        assert "code-review - installed by somebody else meanwhile, left alone" in result.output
+        assert "incident-report - installed" in result.output
+        # One savepoint per install, so the rollback of the loser's is what the
+        # winner's flush runs after.
+        assert db.begin_nested.call_count == 2
+
+
+class TestSeedSkillsSaysWhatItDoes:
+    """Each outcome is named, and a dry run reports the plan rather than "would
+    install" for every skill - which is what made an up-to-date organization look
+    like one missing all of them."""
+
+    def _run(self, monkeypatch, args: list[str], outcomes: list[object]):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.commands import seed_skills as seed_command
+
+        bundled = [
+            SimpleNamespace(key=f"skill-{i}", name=f"skill-{i}", resources=())
+            for i in range(len(outcomes))
+        ]
+        service = SimpleNamespace(
+            refresh_from_library=AsyncMock(side_effect=outcomes),
+            plan_library_refresh=AsyncMock(side_effect=outcomes),
+        )
+
+        @asynccontextmanager
+        async def session() -> AsyncGenerator[object]:
+            yield MagicMock()
+
+        monkeypatch.setattr(seed_command, "get_db_context", session)
+        monkeypatch.setattr(seed_command, "SkillService", lambda _db: service)
+        monkeypatch.setattr(seed_command.skill_library, "library", lambda: bundled)
+        monkeypatch.setattr(
+            seed_command.organization_repo,
+            "list_all",
+            AsyncMock(return_value=[SimpleNamespace(id=uuid4(), name="Acme")]),
+        )
+        monkeypatch.setattr(
+            seed_command.member_repo, "first_owner_id", AsyncMock(return_value=uuid4())
+        )
+        return CliRunner().invoke(seed_command.seed_skills, args), service
+
+    def test_every_outcome_is_named(self, monkeypatch) -> None:
+        from app.services.skills import LibraryRefresh
+
+        result, service = self._run(monkeypatch, [], list(LibraryRefresh))
+
+        assert result.exit_code == 0, result.output
+        for line in (
+            "skill-0 - installed",
+            "skill-1 - up to date",
+            "skill-2 - updated to the bundled version",
+            "skill-3 - edited here, left alone (--replace takes the bundled version)",
+            "skill-4 - differs from the bundled version",
+        ):
+            assert line in result.output
+        assert service.refresh_from_library.await_args.kwargs == {"replace_edited": False}
+
+    def test_a_dry_run_plans_and_writes_nothing(self, monkeypatch) -> None:
+        from app.services.skills import LibraryRefresh
+
+        result, service = self._run(
+            monkeypatch, ["--dry-run", "--replace"], [LibraryRefresh.UPDATE, LibraryRefresh.INSTALL]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "skill-0 - would update to the bundled version" in result.output
+        assert "skill-1 - would install" in result.output
+        assert "Dry run - nothing was written." in result.output
+        service.refresh_from_library.assert_not_called()
+        assert service.plan_library_refresh.await_args.kwargs == {"replace_edited": True}
+
+    def test_skill_narrows_the_run_to_the_named_skills(self, monkeypatch) -> None:
+        """A release adding one bundled skill installs that one, and does not bring
+        back the skills an organization deleted."""
+        from app.services.skills import LibraryRefresh
+
+        result, service = self._run(
+            monkeypatch, ["--skill", "skill-1"], [LibraryRefresh.INSTALL, LibraryRefresh.INSTALL]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "skill-1 - installed" in result.output
+        assert "skill-0" not in result.output.split("bundled skill(s)")[1]
+        assert service.refresh_from_library.await_count == 1
+
+    def test_an_unknown_skill_writes_nothing(self, monkeypatch) -> None:
+        from app.services.skills import LibraryRefresh
+
+        result, service = self._run(monkeypatch, ["--skill", "nope"], [LibraryRefresh.INSTALL])
+
+        assert result.exit_code == 0, result.output
+        assert "No bundled skill named nope." in result.output
+        service.refresh_from_library.assert_not_called()
+
+
+class TestTheConsoleScript:
+    """`agenticos` lives in `cli/`, which the unit suite never imported, so its
+    dependencies were only ever exercised by the e2e seed step - 45 seconds into
+    CI and long after this suite had gone green. Deleting `tabulate` as unimported
+    is what found that out (#155)."""
+
+    def test_the_entry_point_runs_with_every_dependency_its_module_names(self):
+        from app import __version__
+        from cli.commands import cli
+
+        result = CliRunner().invoke(cli, ["--version"])
+
+        assert result.exit_code == 0, result.output
+        assert __version__ in result.output
+
+
+class TestRagDropGoesThroughTheTeardown:
+    """#2560. `rag-drop` called the vector store's `delete_collection` with no
+    reference check, teardown lock or reservation, and left the document rows
+    behind - so a name another base, possibly another organization's, still held
+    lost its table. It now clears through `KnowledgeBaseService`."""
+
+    @staticmethod
+    def _run(monkeypatch, *, holders):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.commands import rag as rag_command
+        from app.repositories import collection_teardown_repo, knowledge_base_repo, sync_source_repo
+        from app.repositories import rag_document as rag_document_repo
+
+        db = MagicMock(execute=AsyncMock())
+
+        @asynccontextmanager
+        async def session() -> AsyncGenerator[object]:
+            yield db
+
+        store = MagicMock(delete_collection=AsyncMock())
+        monkeypatch.setattr(rag_command, "get_db_context", session)
+        monkeypatch.setattr(rag_command, "process_vector_store", MagicMock(return_value=store))
+        monkeypatch.setattr(
+            knowledge_base_repo, "list_by_collection_name", AsyncMock(return_value=holders)
+        )
+        monkeypatch.setattr(knowledge_base_repo, "lock", AsyncMock())
+        monkeypatch.setattr(knowledge_base_repo, "delete", AsyncMock())
+        monkeypatch.setattr(sync_source_repo, "get_all", AsyncMock(return_value=[]))
+        monkeypatch.setattr(collection_teardown_repo, "reserve", AsyncMock())
+        repos = {
+            "by_name": AsyncMock(return_value=[]),
+            "by_base": AsyncMock(return_value=[]),
+        }
+        monkeypatch.setattr(rag_document_repo, "delete_by_collection", repos["by_name"])
+        monkeypatch.setattr(rag_document_repo, "delete_by_knowledge_base", repos["by_base"])
+        monkeypatch.setattr(
+            rag_document_repo,
+            "delete_unfiled_with_vectors",
+            AsyncMock(
+                return_value=rag_document_repo.DeletedDocuments(
+                    storage_paths=[], vector_document_ids=[]
+                )
+            ),
+        )
+        dispatch = AsyncMock()
+        monkeypatch.setattr(
+            "app.worker.tasks.teardown_tasks.queue_external_state_cleanup", dispatch
+        )
+        return store, repos, dispatch
+
+    @staticmethod
+    def _holder(organization_id):
+        from app.db.vector_tables import VectorScope
+
+        kb_id = uuid4()
+        return SimpleNamespace(
+            id=kb_id,
+            collection_name="docs",
+            organization_id=organization_id,
+            is_default=False,
+            vector_scope=VectorScope(
+                tenant=organization_id, knowledge_base_id=kb_id, takes_unfiled=True
+            ),
+        )
+
+    def test_a_name_two_organizations_hold_is_not_destroyed(self, monkeypatch) -> None:
+        from app.commands import rag as rag_command
+
+        ours, theirs = self._holder(uuid4()), self._holder(uuid4())
+        store, repos, dispatch = self._run(monkeypatch, holders=[ours, theirs])
+
+        result = CliRunner().invoke(rag_command.rag_drop, ["docs", "--yes"])
+
+        assert result.exit_code != 0
+        assert str(ours.id) in result.output and str(theirs.id) in result.output
+        store.delete_collection.assert_not_awaited()
+        repos["by_name"].assert_not_awaited()
+        dispatch.assert_not_awaited()
+
+    def test_naming_one_base_clears_it_and_keeps_the_shared_table(self, monkeypatch) -> None:
+        from app.commands import rag as rag_command
+
+        ours, theirs = self._holder(uuid4()), self._holder(uuid4())
+        store, repos, dispatch = self._run(monkeypatch, holders=[ours, theirs])
+
+        result = CliRunner().invoke(
+            rag_command.rag_drop, ["docs", "--knowledge-base", str(ours.id), "--yes"]
+        )
+
+        assert result.exit_code == 0, result.output
+        store.delete_collection.assert_not_awaited()
+        repos["by_name"].assert_not_awaited()
+        repos["by_base"].assert_awaited_once()
+        assert dispatch.await_args.args[2] == [], "the shared table must not be dropped"
+
+    def test_a_name_no_base_holds_is_dropped_by_the_cleanup(self, monkeypatch) -> None:
+        from app.commands import rag as rag_command
+
+        store, repos, dispatch = self._run(monkeypatch, holders=[])
+
+        result = CliRunner().invoke(rag_command.rag_drop, ["cli-docs", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        store.delete_collection.assert_not_awaited()
+        repos["by_name"].assert_awaited_once()
+        assert dispatch.await_args.args[2] == ["cli-docs"]

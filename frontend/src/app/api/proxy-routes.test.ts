@@ -1,0 +1,235 @@
+/**
+ * @vitest-environment node
+ *
+ * Route handlers, in the environment they actually run in.
+ */
+import { describe, expect, it } from "vitest";
+
+import * as adminBackgroundJobs from "./admin/background-jobs/[[...path]]/route";
+import * as adminConversations from "./admin/conversations/route";
+import * as adminOrganizations from "./admin/organizations/route";
+import * as adminOrganization from "./admin/organizations/[id]/route";
+import * as adminRatingsSummary from "./admin/ratings/summary/route";
+import * as adminSettings from "./admin/settings/[[...path]]/route";
+import * as adminStats from "./admin/stats/route";
+import * as adminSystem from "./admin/system/route";
+import * as adminUserDetail from "./admin/users/[userId]/detail/route";
+import * as adminUser from "./admin/users/[userId]/route";
+import * as adminUsers from "./admin/users/route";
+import * as agent from "./agent/[[...path]]/route";
+import * as agents from "./agents/[[...path]]/route";
+import * as apiKeys from "./api-keys/[[...path]]/route";
+import * as assistant from "./assistant/[[...path]]/route";
+import * as approvals from "./approvals/[[...path]]/route";
+import * as apps from "./apps/[[...path]]/route";
+import * as audit from "./audit/[[...path]]/route";
+import * as catalog from "./catalog/[[...path]]/route";
+import * as channels from "./channels/[[...path]]/route";
+import * as context from "./context/[[...path]]/route";
+import * as conversations from "./conversations/[[...path]]/route";
+import * as externalAgents from "./external-agents/[[...path]]/route";
+import * as visuals from "./visuals/[[...path]]/route";
+import * as kb from "./kb/[[...path]]/route";
+import * as localServices from "./local-services/[[...path]]/route";
+import * as mcpConnections from "./mcp-connections/[[...path]]/route";
+import * as mcpOauth from "./mcp-oauth/[[...path]]/route";
+import * as memory from "./memory/[[...path]]/route";
+import * as mlCalls from "./ml/calls/[[...path]]/route";
+import * as projects from "./projects/[[...path]]/route";
+import * as browserSignIns from "./browser-sign-ins/[[...path]]/route";
+import * as channelLink from "./me/channel-link/[[...path]]/route";
+import * as notifications from "./notifications/[[...path]]/route";
+import * as permissions from "./me/permissions/route";
+import * as dashboardLayout from "./me/dashboard-layout/route";
+import * as dashboardPresets from "./me/dashboard-layout/presets/route";
+import * as dashboardPreset from "./me/dashboard-layout/presets/[presetId]/route";
+import * as myMcpConnections from "./me/mcp-connections/route";
+import * as myMcpConnection from "./me/mcp-connections/[id]/route";
+import * as myMcpConnectionTest from "./me/mcp-connections/[id]/test/route";
+import * as mcpOauthStart from "./me/mcp-connections/oauth/start/route";
+import * as slashCommands from "./me/slash-commands/[[...path]]/route";
+import * as orgs from "./orgs/route";
+import * as org from "./orgs/[id]/route";
+import * as orgInvitations from "./orgs/[id]/invitations/route";
+import * as orgInvitation from "./orgs/[id]/invitations/[invitationId]/route";
+import * as orgMembers from "./orgs/[id]/members/route";
+import * as orgMember from "./orgs/[id]/members/[userId]/route";
+import * as orgRetention from "./orgs/[id]/retention/route";
+import * as orgGroups from "./orgs/[id]/groups/route";
+import * as orgGroup from "./orgs/[id]/groups/[groupId]/route";
+import * as orgGroupMembers from "./orgs/[id]/groups/[groupId]/members/route";
+import * as orgGroupMember from "./orgs/[id]/groups/[groupId]/members/[userId]/route";
+import * as orgGroupResources from "./orgs/[id]/groups/[groupId]/resources/route";
+import * as orgGroupShareable from "./orgs/[id]/groups/[groupId]/shareable/route";
+import * as orgGroupQuality from "./orgs/[id]/groups/[groupId]/quality/route";
+import * as orgGroupShares from "./orgs/[id]/groups/[groupId]/shares/route";
+import * as orgGroupSpendCsv from "./orgs/[id]/groups/[groupId]/spend.csv/route";
+import * as orgDirectoryMappings from "./orgs/[id]/directory-mappings/route";
+import * as orgDirectoryMapping from "./orgs/[id]/directory-mappings/[mappingId]/route";
+import * as providers from "./providers/[[...path]]/route";
+import * as rag from "./rag/[[...path]]/route";
+import * as ratings from "./ratings/[[...path]]/route";
+import * as roles from "./roles/[[...path]]/route";
+import * as runs from "./runs/[[...path]]/route";
+import * as triggerTemplates from "./trigger-templates/[[...path]]/route";
+import * as sandboxConnections from "./sandbox-connections/[[...path]]/route";
+import * as sandboxWorkspaces from "./sandbox-workspaces/[[...path]]/route";
+import * as secrets from "./secrets/[[...path]]/route";
+import * as push from "./push/[[...path]]/route";
+import * as sessions from "./sessions/[[...path]]/route";
+import * as skillChanges from "./skill-changes/[[...path]]/route";
+import * as skills from "./skills/[[...path]]/route";
+import * as spend from "./spend/[[...path]]/route";
+import * as stats from "./stats/[[...path]]/route";
+import * as tables from "./tables/[[...path]]/route";
+import * as triggerPortals from "./trigger-portals/[[...path]]/route";
+import * as triggers from "./triggers/[[...path]]/route";
+import * as users from "./users/[userId]/route";
+import * as workflowApprovals from "./workflow-approvals/[[...path]]/route";
+import * as workflowLogs from "./workflow-logs/[[...path]]/route";
+import * as workflowRuns from "./workflow-runs/[[...path]]/route";
+import * as workflows from "./workflows/[[...path]]/route";
+import * as userLocale from "./users/me/locale/route";
+import * as mySuggestions from "./me/suggestions/[[...path]]/route";
+import * as myWatches from "./me/watches/[[...path]]/route";
+import * as voice from "./voice/[[...path]]/route";
+
+/**
+ * Every mount of the shared forwarder.
+ *
+ * What the forwarder *does* is asserted in `platform-proxy.test.ts`; what is
+ * asserted here is that each mount exports the five verbs Next looks for. A
+ * route file missing one answers 405 for that method, and nothing in a type
+ * check or a page render says so - the symptom is a delete button that does
+ * nothing, on one page only.
+ */
+const MOUNTED: [string, Record<string, unknown>][] = [
+  ["admin/conversations", adminConversations],
+  ["admin/organizations", adminOrganizations],
+  ["admin/organizations/[id]", adminOrganization],
+  ["admin/ratings/summary", adminRatingsSummary],
+  ["admin/background-jobs", adminBackgroundJobs],
+  ["admin/settings", adminSettings],
+  ["admin/stats", adminStats],
+  ["admin/system", adminSystem],
+  ["admin/users", adminUsers],
+  ["admin/users/[userId]", adminUser],
+  ["admin/users/[userId]/detail", adminUserDetail],
+  ["agent", agent],
+  ["agents", agents],
+  ["api-keys", apiKeys],
+  ["assistant", assistant],
+  ["approvals", approvals],
+  ["apps", apps],
+  ["audit", audit],
+  ["browser-sign-ins", browserSignIns],
+  ["catalog", catalog],
+  ["channels", channels],
+  ["context", context],
+  ["conversations", conversations],
+  ["external-agents", externalAgents],
+  ["visuals", visuals],
+  ["kb", kb],
+  ["local-services", localServices],
+  ["mcp-connections", mcpConnections],
+  ["mcp-oauth", mcpOauth],
+  ["memory", memory],
+  ["ml/calls", mlCalls],
+  ["me/channel-link", channelLink],
+  ["me/mcp-connections", myMcpConnections],
+  ["me/mcp-connections/[id]", myMcpConnection],
+  ["me/mcp-connections/[id]/test", myMcpConnectionTest],
+  ["me/mcp-connections/oauth/start", mcpOauthStart],
+  ["me/slash-commands", slashCommands],
+  ["notifications", notifications],
+  ["projects", projects],
+  ["orgs", orgs],
+  ["orgs/[id]", org],
+  ["orgs/[id]/invitations", orgInvitations],
+  ["orgs/[id]/invitations/[invitationId]", orgInvitation],
+  ["orgs/[id]/members", orgMembers],
+  ["orgs/[id]/members/[userId]", orgMember],
+  ["orgs/[id]/retention", orgRetention],
+  ["orgs/[id]/groups", orgGroups],
+  ["orgs/[id]/groups/[groupId]", orgGroup],
+  ["orgs/[id]/groups/[groupId]/members", orgGroupMembers],
+  ["orgs/[id]/groups/[groupId]/members/[userId]", orgGroupMember],
+  ["orgs/[id]/groups/[groupId]/resources", orgGroupResources],
+  ["orgs/[id]/groups/[groupId]/shareable", orgGroupShareable],
+  ["orgs/[id]/groups/[groupId]/quality", orgGroupQuality],
+  ["orgs/[id]/groups/[groupId]/shares", orgGroupShares],
+  ["orgs/[id]/groups/[groupId]/spend.csv", orgGroupSpendCsv],
+  ["orgs/[id]/directory-mappings", orgDirectoryMappings],
+  ["orgs/[id]/directory-mappings/[mappingId]", orgDirectoryMapping],
+  ["providers", providers],
+  ["rag", rag],
+  ["ratings", ratings],
+  ["roles", roles],
+  ["runs", runs],
+  ["sandbox-connections", sandboxConnections],
+  ["sandbox-workspaces", sandboxWorkspaces],
+  ["trigger-templates", triggerTemplates],
+  ["secrets", secrets],
+  ["push", push],
+  ["sessions", sessions],
+  ["skill-changes", skillChanges],
+  ["skills", skills],
+  ["spend", spend],
+  ["stats", stats],
+  ["tables", tables],
+  ["trigger-portals", triggerPortals],
+  ["triggers", triggers],
+  ["users/[userId]", users],
+  ["workflow-approvals", workflowApprovals],
+  ["workflow-runs", workflowRuns],
+  ["workflows", workflows],
+  ["users/me/locale", userLocale],
+  ["voice", voice],
+  ["me/permissions", permissions],
+  ["me/dashboard-layout", dashboardLayout],
+  ["me/dashboard-layout/presets", dashboardPresets],
+  ["me/dashboard-layout/presets/[presetId]", dashboardPreset],
+  ["me/suggestions", mySuggestions],
+  ["me/watches", myWatches],
+];
+
+const VERBS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
+
+describe("the proxied route mounts", () => {
+  it.each(MOUNTED)("%s handles every verb", (_name, module) => {
+    for (const verb of VERBS) {
+      expect(typeof module[verb], verb).toBe("function");
+    }
+  });
+
+  it("mounts the workflow logs as a read-only forwarder that refuses an unauthenticated request", async () => {
+    const { NextRequest } = await import("next/server");
+
+    expect(Object.keys(workflowLogs)).toEqual(["GET"]);
+    const response = await workflowLogs.GET(
+      new NextRequest("http://localhost:3000/api/workflow-logs"),
+    );
+
+    expect(response.status).toBe(401);
+  });
+
+  it("mounts one forwarder per file rather than sharing an instance", () => {
+    // Each `platformProxy()` call closes over nothing but the request, so two
+    // mounts are independent - and a shared instance would be a shared
+    // handler with a path taken from whichever request arrived first.
+    expect(agents.GET).not.toBe(runs.GET);
+  });
+
+  it("refuses an unauthenticated request at every mount", async () => {
+    // The gate is the forwarder's, but a mount that somehow bypassed it would be
+    // an open door to that whole endpoint family.
+    const { NextRequest } = await import("next/server");
+
+    for (const [name, module] of MOUNTED) {
+      const handler = module.GET as (request: unknown) => Promise<Response>;
+      const response = await handler(new NextRequest(`http://localhost:3000/api/${name}`));
+
+      expect(response.status, name).toBe(401);
+    }
+  });
+});

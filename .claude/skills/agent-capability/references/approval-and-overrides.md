@@ -1,0 +1,98 @@
+# Approval and per-tool presentation
+
+Two things are decided finer than "is this capability on", and both key on a tool's
+**stable id**.
+
+## Why the id and not the name
+
+A binding may rename a tool for its model. The approval gate matches on the name the
+model actually called — resolved back from the id. Keying a stored decision on the
+visible name instead would mean a rename silently removes the gate, and a
+side-effecting call goes unattended with nothing reporting it.
+
+The same applies to `tool_approval` and `tool_overrides` in a spec: both are keyed by
+tool id. An id no such capability exposes is refused at publish, and so is a name no
+model could call (`TOOL_NAME_PATTERN` — `[a-zA-Z0-9_-]{1,64}`).
+
+## How approval resolves
+
+Most-specific first, in `app/agents/capabilities/approval/_policy.py`:
+
+1. `tool_approval[<tool_id>]` in the binding — `required` or `never`
+2. `approval` on the binding — the default for every tool it contributes
+3. the capability's `side_effecting` flag
+
+`"default"` at levels 1 and 2 means "fall through". The Builder states the outcome in
+words rather than describing the rule, because a rule the reader has to run in their
+head is a setting nobody dares touch.
+
+`approval_required_tools(spec)` turns all of that into a set of tool *names*, once,
+while the agent is assembled. The gate consults that set on every call. Keeping the
+rule in one place means no surface re-derives it and gets a different answer.
+
+## What the gate guarantees
+
+From `capabilities/approval/_capability.py` — the gate wraps *tool execution* rather
+than living inside a tool, for the same reason the budget guard wraps model requests:
+enforcement a tool has to remember to call is enforcement a new tool will forget.
+
+- **The approved arguments are what runs.** A decision is granted against the
+  arguments a person read. On replay the gate executes those, not whatever the model
+  proposes the second time round.
+- **No channel means no.** An agent running somewhere nobody can be asked — a
+  schedule, a webhook — refuses the call and says so.
+- **A refusal is an answer, not a crash.** Both a rejection and a missing channel
+  come back to the model as tool output.
+- **A description never blocks the ask.** A tool whose arguments are ids can name
+  them for the approver: `register(..., describers={tool_id: describe})`, where
+  `describe(deps, args)` returns `{"view": ..., "table": ...}` resolved as
+  `deps.run_person` through the services, or `None` for anything that person may
+  not see. Name ids, never record contents: the context is stored on the row and
+  read by every approver. The channel runs the describer only for a call it is
+  about to record, so a resumed call is not described again; any error or a slow
+  answer parks the call without one. The frontend sentence is `approvalSummary` on
+  the tool's row in `frontend/src/lib/tool-catalog.ts`, looked up by the stable
+  tool id the approval carries as `capability_tool_id`, so a renamed tool keeps
+  it. See `virtual_tables/_describe.py`.
+
+## What is *not* gated
+
+**MCP tools.** `approval_required_tools` iterates `spec.capabilities` only. MCP
+server tools are discovered at run time, so nothing declared them and nothing gates
+them. Do not assume otherwise when reviewing a change that adds an MCP connection to
+a published agent.
+
+**A tool the model provider executes** — a native fetch, a native search. There is
+no local execution to wrap, so the gate never sees the call. A capability declares
+those with `provider_executed` in its `register(...)`, and `_policy.py` refuses on
+it twice: `ungateable_tool_problems` at publish, and `refuse_ungateable_approvals`
+in `build_agent`, because a frozen `AgentVersion` is never re-validated and a
+publish-only refusal leaves every agent already published with it running
+unapproved (#857, #871). A new capability whose config can hand a tool to the
+provider **must** declare it; nothing infers it, and the failure without it is
+silent.
+
+## Presentation overrides
+
+```python
+tool_overrides={"search_documents": ToolOverride(
+    name="search_refund_policy",
+    description="Look up what our refund policy says about this order.",
+)}
+```
+
+Both fields are prompt surface. Neither can reach the tool's identity.
+
+A field nobody set is **absent** from the serialised spec rather than stored as
+`null`: "explicitly no name" is not a state this can be in, and a stored `null` made
+a reverted field look permanently overridden in the Builder.
+
+`ToolOverrides` (in `_overrides.py`) wraps a capability only when something is
+actually overridden, which keeps the common agent exactly what it was.
+
+## Splitting a capability
+
+If a new tool has side effects and the existing ones do not, the capability is now
+two decisions wearing one name. Prefer a second capability. `side_effecting` is per
+capability, and per-tool `approval` in a spec is a way for an *agent author* to be
+stricter than the default — not a substitute for declaring the truth in code.

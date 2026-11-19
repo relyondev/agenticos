@@ -1,0 +1,1305 @@
+"""Files across a channel, in both directions.
+
+Inbound, the property that matters is that a bot is not the lenient edge. Anyone
+in a Slack channel can drop a file on it, so it goes through exactly what the web
+upload applies — and the size is checked twice, because a platform's claim about
+how big a file is arrives before the bytes do.
+
+Outbound, the property is that nothing is silently dropped. An agent told its
+attachment was delivered will tell the user the same, so anything a reply cannot
+carry is named in it.
+"""
+
+import contextlib
+import uuid
+from collections.abc import Iterator, Sequence
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from pydantic_ai.workspaces import (
+    CommandResult,
+    FileEntry,
+    LocalWorkspaceBackend,
+    Workspace,
+    WrapperWorkspace,
+)
+from pydantic_ai_backends import StateBackend
+
+from app.core.exceptions import BadRequestError, NotFoundError
+from app.db.models.chat_file import ChatFile
+from app.services.channels.attachments import (
+    MAX_OUTBOUND_BYTES,
+    MAX_OUTBOUND_FILES,
+    ChannelAttachmentService,
+    DeliveredFiles,
+    files_written,
+    workspace_snapshot,
+)
+from app.services.channels.base import IncomingAttachment, IncomingMessage
+from app.services.channels.mentions import AnsweredTurn, UnaddressedMessage
+from app.services.channels.router import ChannelMessageRouter
+from app.services.file_storage import LocalFileStorage
+from app.services.file_upload import FileUploadService
+from app.services.workflow_execution.exceptions import WorkflowAdmissionQuotaError
+from tests.workspaces import document_workspace
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture(autouse=True)
+def _no_question_waiting() -> Iterator[None]:
+    """No run in these chats is parked on a question, so every message is a turn."""
+    with patch("app.services.channels.router.ChannelPrompts.reply", AsyncMock(return_value=False)):
+        yield
+
+
+def _attachment(**overrides: Any) -> IncomingAttachment:
+    fields: dict[str, Any] = {
+        "filename": "report.csv",
+        "mime_type": "text/csv",
+        "size": 128,
+        "handle": "https://files.slack.test/report.csv",
+    }
+    return IncomingAttachment(**{**fields, **overrides})
+
+
+def _adapter(*, downloads: Any = b"month,total") -> MagicMock:
+    adapter = MagicMock(platform="slack")
+    adapter.describe_attachments = AsyncMock(side_effect=lambda _token, found: found)
+    # No native stream: these turns answer through an edited placeholder.
+    adapter.open_answer = AsyncMock(return_value=None)
+    adapter.download_attachment = AsyncMock(
+        side_effect=downloads if isinstance(downloads, Exception) else None,
+        return_value=downloads if not isinstance(downloads, Exception) else None,
+    )
+    return adapter
+
+
+def _service(*, uploads: Any = None) -> ChannelAttachmentService:
+    """A service whose vault-free upload path succeeds.
+
+    `FileUploadService` is proven in its own tests; here the question is which
+    files reach it and which are turned away before they do.
+    """
+    service = ChannelAttachmentService(MagicMock())
+    service.uploads = MagicMock()
+    service.uploads.validate_upload = FileUploadService.validate_upload
+    service.uploads.validate_bytes = FileUploadService.validate_bytes
+    service.uploads.upload = AsyncMock(return_value=uploads or MagicMock(filename="report.csv"))
+    return service
+
+
+def _incoming(text: str) -> IncomingMessage:
+    return IncomingMessage(
+        platform="slack",
+        bot_id=str(uuid.uuid4()),
+        platform_user_id="U1",
+        platform_chat_id="C1",
+        chat_type="channel",
+        text=text,
+        attachments=[_attachment()],
+    )
+
+
+def _router() -> tuple[ChannelMessageRouter, AsyncMock, list[Any]]:
+    """A router whose replies are captured, and the files it is still holding."""
+    router = ChannelMessageRouter()
+    router._send_reply = AsyncMock()  # type: ignore[method-assign]
+    return router, router._send_reply, []
+
+
+def _agent_router(
+    *, answer: Exception | None = None, answer_default: Exception | None = None
+) -> Any:
+    """`ChannelAgentRouter`, refusing where the test says to.
+
+    A mention that is not the subject raises `UnaddressedMessage`, which is what
+    sends an ordinary message on to the default path.
+    """
+    return MagicMock(
+        return_value=MagicMock(
+            answer=AsyncMock(side_effect=answer or UnaddressedMessage()),
+            answer_default=AsyncMock(
+                side_effect=answer_default,
+                return_value=MagicMock(text="answered", refused=[]),
+            ),
+        )
+    )
+
+
+@contextlib.contextmanager
+def _channel(agent_router: Any, rows: list[Any]) -> Iterator[None]:
+    """One bot, one linked sender, one open session - and files that are counted.
+
+    `rows` is what the attachment service is still holding: `receive` adds to it
+    and `discard` takes back out, so a test asserts on what survived the turn
+    rather than on which method was called.
+    """
+
+    class _Attachments:
+        def __init__(self, db: Any) -> None:
+            self.db = db
+
+        async def receive(
+            self, adapter: Any, token: str, attachments: list[Any], *, user_id: uuid.UUID
+        ) -> tuple[list[Any], list[str]]:
+            stored = [
+                SimpleNamespace(id=uuid.uuid4(), filename=one.filename) for one in attachments
+            ]
+            rows.extend(stored)
+            return stored, []
+
+        async def discard(self, files: list[Any]) -> None:
+            for stored in files:
+                rows.remove(stored)
+
+    bot = MagicMock(id=uuid.uuid4(), organization_id=uuid.uuid4(), is_active=True, access_policy={})
+    identity = MagicMock(id=uuid.uuid4(), user_id=uuid.uuid4())
+    session = MagicMock(id=uuid.uuid4(), conversation_id=uuid.uuid4(), turn_count=1)
+    router = "app.services.channels.router"
+    with (
+        patch(f"{router}.channel_bot_repo.get_for_inbound", AsyncMock(return_value=bot)),
+        # No workflow listens to this bot: its messages are the agent's.
+        patch(
+            f"{router}.WorkflowExposureService.receive_channel_message",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            f"{router}.channel_identity_repo.get_by_platform_user",
+            AsyncMock(return_value=identity),
+        ),
+        patch(
+            f"{router}.channel_session_repo.get_by_bot_and_chat", AsyncMock(return_value=session)
+        ),
+        patch(f"{router}.channel_session_repo.touch", AsyncMock(return_value=session)),
+        patch(
+            f"{router}.conversation_repo.get_messages_by_conversation", AsyncMock(return_value=[])
+        ),
+        # The thread the model is told. Read through the service since #49,
+        # because where a summary has run that is where the history starts.
+        patch(
+            f"{router}.ConversationService",
+            return_value=MagicMock(model_history=AsyncMock(return_value=[])),
+        ),
+        patch(
+            f"{router}.get_adapter",
+            return_value=MagicMock(
+                begin_reply=AsyncMock(return_value=None),
+                open_answer=AsyncMock(return_value=None),
+                describe_attachments=AsyncMock(side_effect=lambda _token, found: found),
+            ),
+        ),
+        patch(f"{router}.unseal_bot_token", return_value="xoxb-token"),
+        patch(f"{router}.ChannelAttachmentService", _Attachments),
+        patch(f"{router}.ChannelAgentRouter", agent_router),
+        # These turns never link a file (the run is mocked), so every stored row
+        # is an orphan the discard should give back.
+        patch(
+            f"{router}.chat_file_repo.unlinked_ids",
+            AsyncMock(side_effect=lambda _db, ids: set(ids)),
+        ),
+    ):
+        yield
+
+
+class TestReceivingWhatSomebodySent:
+    async def test_a_supported_file_is_stored_as_the_web_upload_would(self):
+        service = _service()
+        adapter = _adapter()
+
+        stored, refused = await service.receive(
+            adapter, "xoxb-token", [_attachment()], user_id=uuid.uuid4()
+        )
+
+        assert len(stored) == 1
+        assert refused == []
+        assert service.uploads.upload.await_args.kwargs["filename"] == "report.csv"
+
+    async def test_the_bot_token_is_what_fetches_it(self):
+        """Slack's file URLs are private; an unauthenticated GET answers with a
+        sign-in page rather than a 401."""
+        service = _service()
+        adapter = _adapter()
+
+        await service.receive(adapter, "xoxb-token", [_attachment()], user_id=uuid.uuid4())
+
+        assert adapter.download_attachment.await_args.args[0] == "xoxb-token"
+
+    async def test_an_unsupported_type_is_refused_before_it_is_fetched(self):
+        """A bot is the most permissive edge this platform has - anyone in a
+        channel can drop a file on it - so it must not be the lenient one."""
+        service = _service()
+        adapter = _adapter()
+
+        stored, refused = await service.receive(
+            adapter,
+            "t",
+            [_attachment(filename="payload.exe", mime_type="application/x-msdownload")],
+            user_id=uuid.uuid4(),
+        )
+
+        assert stored == []
+        assert "payload.exe" in refused[0]
+        adapter.download_attachment.assert_not_called()
+
+    async def test_a_file_the_platform_says_is_huge_is_never_downloaded(self):
+        """Fetching a gigabyte in order to reject it is the thing worth not doing."""
+        service = _service()
+        adapter = _adapter()
+
+        stored, refused = await service.receive(
+            adapter, "t", [_attachment(size=500 * 1024 * 1024)], user_id=uuid.uuid4()
+        )
+
+        assert stored == []
+        assert "too large" in refused[0].lower()
+        adapter.download_attachment.assert_not_called()
+
+    async def test_the_bytes_are_checked_as_well_as_the_claim(self):
+        """A claim is not a measurement: a platform that under-reported the size,
+        or a handle that resolved to something else, is caught here."""
+        service = _service()
+        adapter = _adapter(downloads=b"x" * (60 * 1024 * 1024))
+
+        stored, refused = await service.receive(
+            adapter, "t", [_attachment(size=10)], user_id=uuid.uuid4()
+        )
+
+        assert stored == []
+        assert "too large" in refused[0].lower()
+        service.uploads.upload.assert_not_called()
+
+    async def test_an_earlier_voice_note_says_how_to_have_it_heard(self):
+        """Only a thread's earlier files reach this with audio - the router
+        transcribes the message's own. Those are not transcribed on purpose, and
+        "File type 'audio/ogg' is not supported" would send people looking for a
+        bug: the sender is told to send it again."""
+        service = _service()
+        adapter = _adapter()
+
+        stored, refused = await service.receive(
+            adapter,
+            "t",
+            [_attachment(filename="voice.ogg", mime_type="audio/ogg", size=4211)],
+            user_id=uuid.uuid4(),
+        )
+
+        assert stored == []
+        assert refused == [
+            "voice.ogg: Voice messages sent before I joined this thread are not "
+            "transcribed - send it again here."
+        ]
+        adapter.download_attachment.assert_not_called()
+
+    async def test_a_video_is_refused_as_a_video(self):
+        service = _service()
+
+        _stored, refused = await service.receive(
+            _adapter(),
+            "t",
+            [_attachment(filename="clip.mp4", mime_type="video/mp4")],
+            user_id=uuid.uuid4(),
+        )
+
+        assert refused == ["clip.mp4: I cannot watch videos - type it out, or send a file."]
+
+    async def test_an_octet_stream_office_file_passes_preflight_on_its_extension(self):
+        """Platforms routinely send `application/octet-stream` for `.odt`/`.msg`; the
+        filename carries the extension the metadata phase accepts it on. A real ODT
+        is downloaded so the byte phase (a ZIP sniff) also passes."""
+        import io as _io
+        import zipfile as _zip
+
+        buffer = _io.BytesIO()
+        with _zip.ZipFile(buffer, "w") as archive:
+            archive.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+        service = _service()
+        adapter = _adapter(downloads=buffer.getvalue())
+
+        stored, refused = await service.receive(
+            adapter,
+            "t",
+            [_attachment(filename="notes.odt", mime_type="application/octet-stream", size=64)],
+            user_id=uuid.uuid4(),
+        )
+
+        assert len(stored) == 1
+        assert refused == []
+
+    async def test_a_forged_signature_is_refused_after_download_not_attached(self):
+        """A file that clears the pre-download preflight but whose bytes contradict
+        its type/extension is refused at the post-download byte phase, with a message
+        distinct from the size one - and it is not attached to the turn."""
+        service = _service()
+        adapter = _adapter(downloads=b"month,total,not an OLE document")
+
+        stored, refused = await service.receive(
+            adapter,
+            "t",
+            [_attachment(filename="payload.doc", mime_type="application/msword", size=30)],
+            user_id=uuid.uuid4(),
+        )
+
+        assert stored == []
+        assert "contents do not match" in refused[0]
+        service.uploads.upload.assert_not_called()
+
+    async def test_a_platform_this_build_cannot_fetch_from_says_so(self):
+        """Rather than a bot that ignores an attachment, which looks exactly like
+        a bot that read it."""
+        service = _service()
+        adapter = _adapter(downloads=NotImplementedError("no"))
+
+        stored, refused = await service.receive(adapter, "t", [_attachment()], user_id=uuid.uuid4())
+
+        assert stored == []
+        assert "cannot fetch files" in refused[0]
+
+    async def test_a_download_that_failed_is_reported_not_raised(self):
+        service = _service()
+        adapter = _adapter(downloads=RuntimeError("connection reset"))
+
+        stored, refused = await service.receive(adapter, "t", [_attachment()], user_id=uuid.uuid4())
+
+        assert stored == []
+        assert "could not be downloaded" in refused[0]
+
+    async def test_one_bad_file_does_not_lose_the_others(self):
+        """Or the question that came with them."""
+        service = _service()
+        adapter = _adapter()
+
+        stored, refused = await service.receive(
+            adapter,
+            "t",
+            [_attachment(filename="bad.exe", mime_type="application/x-msdownload"), _attachment()],
+            user_id=uuid.uuid4(),
+        )
+
+        assert len(stored) == 1
+        assert len(refused) == 1
+
+
+class TestATurnRefusedBeforeTheRunKeepsNothing:
+    """The bytes are stored before the agent is resolved, so whatever refuses in
+    its place has to give them back (#661). `chat_files` carries no organization:
+    a row with no message is scoped by `user_id` alone, and nothing collects it.
+    """
+
+    async def test_a_refused_turn_leaves_no_stored_file(self):
+        router, replies, rows = _router()
+        router._answer_mention = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        # The window is read off the database and these tests hand `_route_inner`
+        # a mock; what they are about is the file rows, not the history.
+        router._load_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        with _channel(
+            _agent_router(
+                answer_default=BadRequestError(message="No agent is available on this bot yet.")
+            ),
+            rows,
+        ):
+            await router._route_inner(_incoming("here is the report"), MagicMock())
+
+        assert rows == []
+        assert "No agent is available" in replies.await_args.args[2]
+
+    async def test_a_refused_mention_leaves_no_stored_file(self):
+        """The same defect on the path that stores first and refuses second."""
+        router, replies, rows = _router()
+
+        with _channel(
+            _agent_router(answer=NotFoundError(message="No agent here answers to @support.")), rows
+        ):
+            await router._route_inner(_incoming("@support where is my refund"), MagicMock())
+
+        assert rows == []
+        assert "@support" in replies.await_args.args[2]
+
+    async def test_a_turn_that_actually_ran_keeps_its_file(self):
+        """The file is the user's, and the run it fed is in the transcript."""
+        router, _replies, rows = _router()
+        router._answer_mention = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        router._deliver = AsyncMock()  # type: ignore[method-assign]
+        router._load_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        with _channel(_agent_router(answer_default=None), rows):
+            await router._route_inner(_incoming("here is the report"), MagicMock())
+
+        assert [stored.filename for stored in rows] == ["report.csv"]
+
+    async def test_a_file_that_cannot_be_deleted_costs_neither_the_others_nor_the_reply(self):
+        """A cleanup that raised would replace a refusal somebody can act on with
+        a bot that answered nothing at all."""
+        service = _service()
+        service.uploads.discard = AsyncMock(side_effect=[RuntimeError("storage is down"), None])
+        stuck, next_one = MagicMock(id=uuid.uuid4()), MagicMock(id=uuid.uuid4())
+
+        await service.discard([stuck, next_one])
+
+        assert service.uploads.discard.await_count == 2
+
+    async def test_discarding_removes_the_bytes_and_the_row(self, tmp_path):
+        db = AsyncMock()
+        storage = LocalFileStorage(base_dir=tmp_path)
+        path = await storage.save("u1", "report.csv", b"month,total")
+        chat_file = ChatFile(
+            user_id=uuid.uuid4(),
+            filename="report.csv",
+            mime_type="text/csv",
+            size=11,
+            storage_path=path,
+            file_type="spreadsheet",
+        )
+
+        with patch("app.services.file_upload.get_file_storage", return_value=storage):
+            await FileUploadService(db).discard(chat_file)
+
+        assert not (tmp_path / path).exists()
+        assert db.delete.await_args.args[0] is chat_file
+
+    async def test_a_message_with_no_files_asks_nothing_of_the_platform(self):
+        service = _service()
+        adapter = _adapter()
+
+        assert await service.receive(adapter, "t", [], user_id=uuid.uuid4()) == ([], [])
+        adapter.download_attachment.assert_not_called()
+
+
+def _write(document: StateBackend, path: str, content: str | bytes) -> None:
+    document.write_bytes(path, content.encode() if isinstance(content, str) else content)
+
+
+class _ListingFails(WrapperWorkspace):
+    async def list_dir(self, path: str) -> Sequence[FileEntry]:
+        raise RuntimeError("the service is down")
+
+
+class TestChoosingWhatToSendBack:
+    """What a reply carries, and what it declines to.
+
+    Both functions are awaited and work in the run's workspace. Most tests below
+    use a stored document, which is a `state` agent's; the ones about a shell use
+    a real directory, which lists itself with `find` as a container does.
+    """
+
+    async def test_a_file_the_turn_wrote_is_sent(self):
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        _write(document, "/report.csv", "month,total")
+
+        delivered = await files_written(workspace, before)
+
+        assert [a.filename for a in delivered.attachments] == ["report.csv"]
+        assert delivered.attachments[0].content == b"month,total"
+        assert delivered.attachments[0].mime_type == "text/csv"
+
+    async def test_a_produced_file_carries_its_own_type(self):
+        """A chart is the commonest thing an agent writes, and every file used to
+        go out as `application/octet-stream` - so the picture somebody asked for
+        arrived as a blob they had to download to identify."""
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        _write(document, "/chart.png", b"\x89PNG\r\n")
+
+        delivered = await files_written(workspace, before)
+
+        assert delivered.attachments[0].mime_type == "image/png"
+
+    async def test_a_name_with_no_recognisable_suffix_stays_opaque(self):
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        _write(document, "/dump", "raw")
+
+        delivered = await files_written(workspace, before)
+
+        assert delivered.attachments[0].mime_type == "application/octet-stream"
+
+    async def test_a_dotfile_that_was_already_there_is_not_sent_again(self):
+        """A dotfile is listed like any other, so a `.env` written
+        before the turn was absent from the snapshot - and rewriting it during the
+        turn read as new and would have been posted into the channel."""
+        document = StateBackend()
+        workspace = document_workspace(document)
+        _write(document, "/.env", "A=1")
+        before = await workspace_snapshot(workspace)
+        _write(document, "/.env", "A=2")
+
+        assert (await files_written(workspace, before)).attachments == []
+
+    async def test_a_file_that_was_already_there_is_not_sent_again(self):
+        """Rewriting a script it is iterating on is ordinary work, and posting it
+        every turn would fill the channel with the same attachment."""
+        document = StateBackend()
+        workspace = document_workspace(document)
+        _write(document, "/run.py", "print(1)")
+        before = await workspace_snapshot(workspace)
+        _write(document, "/run.py", "print(2)")
+
+        assert (await files_written(workspace, before)).attachments == []
+
+    async def test_the_users_own_upload_is_not_posted_back_at_them(self):
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        _write(document, "/uploads/theirs.csv", "a,b")
+
+        assert (await files_written(workspace, before)).attachments == []
+
+    async def test_a_materialised_skill_is_not_the_agents_work(self):
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        _write(document, "/workspace/skills/refunds/SKILL.md", "---\nname: refunds\n---\n\nbody")
+
+        assert (await files_written(workspace, before)).attachments == []
+
+    async def test_a_container_listing_a_skill_relatively_is_not_the_agents_work(self):
+        """A container lists its workspace relative to its own root, so the same
+        file the `state` backend calls `/workspace/skills/...` arrives as
+        `skills/...`. One filter has to catch both spellings, or a channel reply
+        posts organizational know-how back as the agent's own work."""
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        _write(document, "skills/refunds/reconcile.py", "print('hi')")
+
+        assert (await files_written(workspace, before)).attachments == []
+
+    async def test_a_spilled_tool_return_is_not_the_agents_work(self):
+        """A `tool_output_limits` spill is parked for the model to page through,
+        not produced for the user - posting it would hand a channel the raw
+        oversized return the reduction existed to keep out of sight (#803)."""
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        _write(document, "/tool_output/run-1/call-1.0", "y" * 5_000)
+
+        assert (await files_written(workspace, before)).attachments == []
+
+    async def test_a_file_too_large_for_a_reply_is_named_rather_than_dropped(self):
+        """An agent told its file was delivered will tell the user the same."""
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        _write(document, "/huge.csv", "x" * (MAX_OUTBOUND_BYTES + 1))
+
+        delivered = await files_written(workspace, before)
+
+        assert delivered.attachments == []
+        assert delivered.refused == ["/huge.csv"]
+        assert "stayed in the workspace" in delivered.note()
+
+    async def test_past_the_per_reply_cap_the_rest_are_named(self):
+        """A turn that writes twelve intermediate CSVs should not post twelve."""
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+        for index in range(MAX_OUTBOUND_FILES + 2):
+            _write(document, f"/out-{index}.csv", "a")
+
+        delivered = await files_written(workspace, before)
+
+        assert len(delivered.attachments) == MAX_OUTBOUND_FILES
+        assert len(delivered.refused) == 2
+
+    async def test_nothing_written_is_nothing_said(self):
+        document = StateBackend()
+        workspace = document_workspace(document)
+        before = await workspace_snapshot(workspace)
+
+        delivered = await files_written(workspace, before)
+
+        assert delivered.attachments == []
+        assert delivered.note() == ""
+
+    async def test_a_workspace_with_a_shell_is_listed_from_its_working_directory(self, tmp_path):
+        """Not from `/`, which a shell reads as the machine: on a container a snapshot
+        rooted there was 2540 paths of `/proc` and `/usr`, taken twice per turn, and
+        "what did the agent write" came down to whether `/proc` had changed (#1039).
+        And a spill it lists as `./tool_output/...` is still the platform's."""
+        (tmp_path / "old.csv").write_text("kept")
+        workspace = Workspace(LocalWorkspaceBackend(tmp_path))
+        before = await workspace_snapshot(workspace)
+        (tmp_path / "report.csv").write_text("a,b")
+        (tmp_path / "tool_output" / "run-1").mkdir(parents=True)
+        (tmp_path / "tool_output" / "run-1" / "call-1.0").write_text("y")
+
+        delivered = await files_written(workspace, before)
+
+        assert before == {"./old.csv"}
+        assert [a.filename for a in delivered.attachments] == ["report.csv"]
+
+    async def test_a_listing_command_that_fails_means_no_snapshot(self, tmp_path):
+        class _FindFails(WrapperWorkspace):
+            async def run(self, command, **kwargs):
+                return CommandResult(exit_code=1, stdout="", stderr="find: no")
+
+        workspace = _FindFails(Workspace(LocalWorkspaceBackend(tmp_path)))
+
+        assert await workspace_snapshot(workspace) is None
+
+    async def test_a_file_that_cannot_be_read_is_skipped_rather_than_failing_the_reply(self):
+        class _ReadFails(WrapperWorkspace):
+            async def read_bytes(self, path):
+                raise RuntimeError("vanished between the listing and the read")
+
+        document = StateBackend()
+        _write(document, "/gone.csv", "a")
+
+        assert (
+            await files_written(_ReadFails(document_workspace(document)), set())
+        ).attachments == []
+
+    async def test_a_workspace_that_cannot_be_listed_means_no_attachments_not_no_reply(self):
+        assert await files_written(_ListingFails(document_workspace()), set()) == DeliveredFiles(
+            attachments=[], refused=[]
+        )
+
+    async def test_a_snapshot_of_an_unreadable_workspace_is_not_an_empty_one(self):
+        """It used to answer `set()`, and that is the unsafe direction.
+
+        `files_written` answers `paths - before`, so an empty `before` does not
+        mean "nothing to compare against" - it means "the workspace was empty",
+        and every file already in it reads as this turn's output.
+        """
+        assert await workspace_snapshot(_ListingFails(document_workspace())) is None
+
+    async def test_a_turn_whose_snapshot_failed_posts_nothing(self):
+        """The refusal the return type exists for.
+
+        Under `agent` or `channel` scope the files already in the workspace belong
+        to other people, so treating them as this turn's output would post a
+        colleague's work into a shared channel. It needs only a transient failure:
+        both calls read the same workspace, so a persistently broken listing fails
+        both and posts nothing anyway.
+        """
+        document = StateBackend()
+        workspace = document_workspace(document)
+        _write(document, "/someone-elses.csv", "month,total")
+        _write(document, "/another.txt", "private")
+
+        assert await files_written(workspace, None) == DeliveredFiles(attachments=[], refused=[])
+
+    async def test_directories_are_not_files(self):
+        document = StateBackend()
+        document.make_dir("/out/empty")
+        _write(document, "/out/report.csv", "a,b")
+
+        delivered = await files_written(document_workspace(document), set())
+
+        assert [a.filename for a in delivered.attachments] == ["report.csv"]
+
+
+async def _route_one_file(text: str) -> tuple[MagicMock, MagicMock, AsyncMock]:
+    """Route one message carrying one file, and report what the turn did.
+
+    Returns the platform adapter, the agent router standing in for a run, and the
+    upload the attachment service reaches - so a caller can count the downloads
+    and the stored rows one message cost. Everything a turn touches on the way is
+    replaced; the question here is how many times the file is fetched, not what
+    the agent said about it.
+    """
+    bot = MagicMock(
+        id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        is_active=True,
+        access_policy={},
+        api_base_url=None,
+    )
+    identity = MagicMock(id=uuid.uuid4(), user_id=uuid.uuid4())
+    session = MagicMock(conversation_id=uuid.uuid4(), turn_count=1)
+
+    adapter = _adapter()
+    adapter.begin_reply = AsyncMock(return_value=None)
+    adapter.send_message = AsyncMock()
+
+    agents = MagicMock()
+    agents.answer = AsyncMock(
+        return_value=AnsweredTurn(text="answered"),
+        side_effect=None if text.startswith("@") else UnaddressedMessage,
+    )
+    agents.answer_default = AsyncMock(return_value=AnsweredTurn(text="answered"))
+    upload = AsyncMock(return_value=MagicMock(filename="report.csv"))
+
+    incoming = IncomingMessage(
+        platform="slack",
+        bot_id=str(uuid.uuid4()),
+        platform_user_id="U1",
+        platform_chat_id="C1",
+        chat_type="group",
+        text=text,
+        message_id="m1",
+        attachments=[_attachment()],
+    )
+
+    router = "app.services.channels.router"
+    with (
+        patch(f"{router}.get_adapter", return_value=adapter),
+        patch(f"{router}.unseal_bot_token", return_value="tok"),
+        patch(f"{router}.channel_bot_repo.get_for_inbound", AsyncMock(return_value=bot)),
+        # No workflow listens to this bot: its messages are the agent's.
+        patch(
+            f"{router}.WorkflowExposureService.receive_channel_message",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            f"{router}.channel_identity_repo.get_by_platform_user",
+            AsyncMock(return_value=identity),
+        ),
+        patch(
+            f"{router}.channel_session_repo.get_by_bot_and_chat", AsyncMock(return_value=session)
+        ),
+        patch(f"{router}.channel_session_repo.touch", AsyncMock(return_value=session)),
+        patch(
+            f"{router}.conversation_repo.get_messages_by_conversation", AsyncMock(return_value=[])
+        ),
+        # The window is sized off a `COUNT`, and the session here is a mock. What
+        # this helper is about is which files reach the run.
+        patch(f"{router}.conversation_repo.count_messages", AsyncMock(return_value=0)),
+        patch(
+            f"{router}.ConversationService",
+            return_value=MagicMock(model_history=AsyncMock(return_value=[])),
+        ),
+        patch(f"{router}.ChannelAgentRouter", return_value=agents),
+        patch.object(FileUploadService, "upload", upload),
+    ):
+        await ChannelMessageRouter()._route_inner(incoming, MagicMock())
+
+    return adapter, agents, upload
+
+
+class TestOneMessageOneStoredFile:
+    """What arrives with a message is fetched once, whichever path answers it.
+
+    The mention path runs first and needs the files; a message naming no agent
+    then fell through to the default path, which fetched and stored the same
+    files all over again - two downloads and two `ChatFile` rows per attachment,
+    only the second of each linked to the turn (#660).
+    """
+
+    async def test_a_message_naming_no_agent_stores_its_file_once(self):
+        """One download and one row - and the row is what the turn runs with. The
+        duplicate was not only wasted work: the run was handed the second set,
+        leaving the first stored against the sender and referenced by nothing."""
+        adapter, agents, upload = await _route_one_file("here is the report")
+
+        assert adapter.download_attachment.await_count == 1
+        assert upload.await_count == 1
+        assert agents.answer_default.await_args.kwargs["attachments"] == [upload.return_value]
+        author = agents.answer_default.await_args.kwargs["incoming"]
+        assert author.platform_user_id == "U1" and author.message_id == "m1"
+
+    async def test_a_mention_still_gets_the_file_it_came_with(self):
+        adapter, agents, upload = await _route_one_file("@support what is in this")
+
+        assert adapter.download_attachment.await_count == 1
+        assert agents.answer.await_args.kwargs["attachments"] == [upload.return_value]
+        author = agents.answer.await_args.kwargs["incoming"]
+        assert author.platform_user_id == "U1" and author.message_id == "m1"
+        agents.answer_default.assert_not_awaited()
+
+
+class TestACrashAnswersTheSameOnEitherPath:
+    """The mention path let a crash propagate - releasing the dedupe claim and
+    answering nothing - where the default path apologised once. One `_run_turn`
+    now, so a crash on either apologises and consumes the claim (#1459).
+    """
+
+    async def test_a_crash_on_the_mention_path_answers_like_one_on_the_default_path(self):
+        router_m, replies_m, rows_m = _router()
+        router_m._load_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        with _channel(_agent_router(answer=RuntimeError("provider exploded")), rows_m):
+            # Without the fix this would raise out of `_route_inner` and answer
+            # nothing; with it the crash is caught and apologised for.
+            await router_m._route_inner(_incoming("@support help"), MagicMock())
+
+        router_d, replies_d, rows_d = _router()
+        router_d._answer_mention = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        router_d._load_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        with _channel(_agent_router(answer_default=RuntimeError("provider exploded")), rows_d):
+            await router_d._route_inner(_incoming("just a question"), MagicMock())
+
+        mention_reply = replies_m.await_args.args[2]
+        default_reply = replies_d.await_args.args[2]
+        assert "something went wrong" in mention_reply.lower()
+        assert mention_reply == default_reply
+
+    async def test_a_crashed_turn_leaves_no_stored_file(self):
+        """A crash before the run links anything leaves the turn's stored
+        attachments as orphaned as a refused turn's, so they are given back on
+        either path. A crash that had already linked them keeps them - covered
+        below (#1503)."""
+        router_m, _replies_m, rows_m = _router()
+        router_m._load_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        with _channel(_agent_router(answer=RuntimeError("provider exploded")), rows_m):
+            await router_m._route_inner(_incoming("@support here is the report"), MagicMock())
+
+        router_d, _replies_d, rows_d = _router()
+        router_d._answer_mention = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        router_d._load_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        with _channel(_agent_router(answer_default=RuntimeError("provider exploded")), rows_d):
+            await router_d._route_inner(_incoming("here is the report"), MagicMock())
+
+        assert rows_m == []
+        assert rows_d == []
+
+    async def test_a_crash_that_already_linked_the_files_keeps_them(self):
+        """A provider error inside the run records the failed turn and links its
+        attachments before re-raising, so the discard gives back only the rows the
+        database still shows as unlinked - never the ones a persisted failed-turn
+        transcript now points at (#1503)."""
+        linked = SimpleNamespace(id=uuid.uuid4())
+        orphan = SimpleNamespace(id=uuid.uuid4())
+        discarded: list[Any] = []
+
+        class _Attachments:
+            def __init__(self, _db: Any) -> None: ...
+
+            async def discard(self, files: list[Any]) -> None:
+                discarded.extend(files)
+
+        router_mod = "app.services.channels.router"
+        with (
+            patch(f"{router_mod}.chat_file_repo.unlinked_ids", AsyncMock(return_value={orphan.id})),
+            patch(f"{router_mod}.ChannelAttachmentService", _Attachments),
+        ):
+            await ChannelMessageRouter._discard_files(AsyncMock(), [linked, orphan])
+
+        assert discarded == [orphan]
+
+    async def test_a_failure_after_streaming_edits_the_open_reply(self):
+        """A turn that already streamed a status has a placeholder on screen, so
+        the apology edits *it* into place rather than leaving the "…" hanging and
+        posting a separate message the room may never even be shown (#1459)."""
+        router = ChannelMessageRouter()
+        router._send_reply = AsyncMock()  # type: ignore[method-assign]
+        router._refuse_if_named = AsyncMock()  # type: ignore[method-assign]
+        adapter = MagicMock(update_reply=AsyncMock())
+        with (
+            patch("app.services.channels.router.get_adapter", return_value=adapter),
+            patch("app.services.channels.router.unseal_bot_token", return_value="xoxb"),
+        ):
+            await router._post_failure(
+                MagicMock(), _incoming("@support help"), "msg-42", "Sorry, something went wrong."
+            )
+
+        adapter.update_reply.assert_awaited_once()
+        assert "something went wrong" in adapter.update_reply.await_args.args[1].text.lower()
+        assert adapter.update_reply.await_args.args[2] == "msg-42"
+        router._refuse_if_named.assert_not_awaited()
+        router._send_reply.assert_not_awaited()
+
+    async def test_a_failure_with_no_open_reply_refuses_if_named(self):
+        """Nothing was streamed, so there is no placeholder to edit and it is
+        `_refuse_if_named` - silent in a room the bot was not named in (#1459)."""
+        router = ChannelMessageRouter()
+        router._refuse_if_named = AsyncMock()  # type: ignore[method-assign]
+        adapter = MagicMock(update_reply=AsyncMock())
+        with patch("app.services.channels.router.get_adapter", return_value=adapter):
+            await router._post_failure(MagicMock(), _incoming("just a question"), None, "Sorry.")
+
+        adapter.update_reply.assert_not_awaited()
+        router._refuse_if_named.assert_awaited_once()
+
+    async def test_a_failed_edit_of_the_open_reply_falls_back_to_a_whole_post(self):
+        """A placeholder that cannot be edited - deleted, rate-limited - still has
+        to be answered, so the message is posted whole rather than left as the
+        "…" it was (#1459)."""
+        router = ChannelMessageRouter()
+        router._send_reply = AsyncMock()  # type: ignore[method-assign]
+        adapter = MagicMock(update_reply=AsyncMock(side_effect=RuntimeError("gone")))
+        with (
+            patch("app.services.channels.router.get_adapter", return_value=adapter),
+            patch("app.services.channels.router.unseal_bot_token", return_value="xoxb"),
+        ):
+            await router._post_failure(MagicMock(), _incoming("@support help"), "msg-42", "Sorry.")
+
+        router._send_reply.assert_awaited_once()
+        assert router._send_reply.await_args.args[2] == "Sorry."
+
+
+class TestADeactivatedLinkedSenderIsRefusedEarly:
+    """A link in `channel_identities` outlives the deactivation of the account
+    behind it, so a departed member's chat account stays linked. That turn is now
+    refused at admission - before any attachment is fetched, stored or sent to the
+    paid transcription - and `_membership_context` refuses it again at the run, the
+    second lock rather than the first (#1456).
+    """
+
+    async def test_a_deactivated_linked_sender_costs_no_transcription(self):
+        router, replies, rows = _router()
+        router._receive_files = AsyncMock()  # type: ignore[method-assign]
+        router._transcribe = AsyncMock()  # type: ignore[method-assign]
+        router._invite_to_link = AsyncMock(return_value="Connect your account")  # type: ignore[method-assign]
+
+        incoming = IncomingMessage(
+            platform="slack",
+            bot_id=str(uuid.uuid4()),
+            platform_user_id="U1",
+            platform_chat_id="C1",
+            chat_type="private",
+            text="please handle this",
+            attachments=[_attachment(mime_type="audio/ogg", filename="voice.ogg")],
+        )
+
+        with (
+            _channel(_agent_router(), rows),
+            patch(
+                "app.services.channels.router.member_repo.get_active",
+                AsyncMock(return_value=None),
+            ) as get_active,
+        ):
+            await router._route_inner(incoming, MagicMock())
+
+        get_active.assert_awaited_once()
+        router._transcribe.assert_not_awaited()
+        router._receive_files.assert_not_awaited()
+        assert rows == []
+        assert "Connect your account" in replies.await_args.args[2]
+
+    async def test_an_active_linked_sender_in_a_dm_is_admitted(self):
+        """The gate refuses only a departed member, not an active one - a linked
+        member's own DM still reaches the file and transcription work."""
+        router, _replies, rows = _router()
+        router._receive_files = AsyncMock(return_value=([], []))  # type: ignore[method-assign]
+        router._transcribe = AsyncMock(return_value=([], []))  # type: ignore[method-assign]
+        router._answer_mention = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        router._load_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        router._deliver = AsyncMock()  # type: ignore[method-assign]
+
+        incoming = IncomingMessage(
+            platform="slack",
+            bot_id=str(uuid.uuid4()),
+            platform_user_id="U1",
+            platform_chat_id="C1",
+            chat_type="private",
+            text="please handle this",
+            attachments=[_attachment(mime_type="audio/ogg", filename="voice.ogg")],
+        )
+
+        with (
+            _channel(_agent_router(answer_default=None), rows),
+            patch(
+                "app.services.channels.router.member_repo.get_active",
+                AsyncMock(return_value=MagicMock()),
+            ),
+        ):
+            await router._route_inner(incoming, MagicMock())
+
+        router._receive_files.assert_awaited_once()
+        router._transcribe.assert_awaited_once()
+        # The voice note's usage row names the person the sender is linked to.
+        identity = router._receive_files.await_args.args[3]
+        assert router._transcribe.await_args.kwargs["requested_by"] == identity.user_id
+
+    async def test_a_departed_members_voice_note_in_a_room_names_nobody(self):
+        """A room admits a sender whose membership is gone, as it admits an
+        unlinked one - but the usage row must not put the call on the record of
+        somebody who no longer belongs to the organization."""
+        router, _replies, _rows = _router()
+        router._receive_files = AsyncMock(return_value=([], []))  # type: ignore[method-assign]
+        router._transcribe = AsyncMock(return_value=([], []))  # type: ignore[method-assign]
+        router._answer_mention = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        router._load_history = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        router._deliver = AsyncMock()  # type: ignore[method-assign]
+
+        incoming = IncomingMessage(
+            platform="slack",
+            bot_id=str(uuid.uuid4()),
+            platform_user_id="U1",
+            platform_chat_id="C1",
+            chat_type="group",
+            text="please handle this",
+            attachments=[_attachment(mime_type="audio/ogg", filename="voice.ogg")],
+        )
+
+        with (
+            _channel(_agent_router(answer_default=None), []),
+            patch(
+                "app.services.channels.router.member_repo.get_active",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            await router._route_inner(incoming, MagicMock())
+
+        router._transcribe.assert_awaited_once()
+        assert router._transcribe.await_args.kwargs["requested_by"] is None
+
+
+class TestATypedAnswerIsNotATurn:
+    async def test_a_message_answering_a_parked_question_runs_nothing_else(self):
+        """Codex on #2062: a question that takes words is answered by the next message."""
+        router, _replies, rows = _router()
+        router._receive_files = AsyncMock()  # type: ignore[method-assign]
+        router._answer_mention = AsyncMock()  # type: ignore[method-assign]
+        agents = _agent_router()
+        incoming = IncomingMessage(
+            platform="slack",
+            bot_id=str(uuid.uuid4()),
+            platform_user_id="U1",
+            platform_chat_id="C1",
+            chat_type="private",
+            text="Kraków, please",
+            attachments=[_attachment()],
+        )
+
+        with (
+            _channel(agents, rows),
+            patch(
+                "app.services.channels.router.member_repo.get_active",
+                AsyncMock(return_value=MagicMock()),
+            ),
+            patch(
+                "app.services.channels.router.ChannelPrompts.reply",
+                AsyncMock(return_value=True),
+            ) as reply,
+        ):
+            await router._route_inner(incoming, MagicMock())
+
+        assert reply.await_args.kwargs == {
+            "platform": "slack",
+            "platform_chat_id": "C1",
+            "platform_user_id": "U1",
+            "text": "Kraków, please",
+        }
+        router._receive_files.assert_not_awaited()
+        router._answer_mention.assert_not_awaited()
+        assert rows == []
+
+
+class TestAWorkflowListeningToTheBot:
+    """A workflow whose Channel message trigger listens to the bot takes the
+    message in the agent's place; what it leaves, the agent answers as before."""
+
+    async def test_a_message_the_workflow_takes_runs_no_agent_and_keeps_no_file(self):
+        router, replies, rows = _router()
+        router._answer_mention = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        agents = _agent_router()
+        listener = AsyncMock(return_value=True)
+
+        with (
+            _channel(agents, rows),
+            patch(
+                "app.services.channels.router.WorkflowExposureService.receive_channel_message",
+                listener,
+            ),
+        ):
+            await router._route_inner(_incoming("refund order 42"), MagicMock())
+
+        agents.return_value.answer_default.assert_not_awaited()
+        assert listener.await_args.kwargs["sender_user_id"] is not None
+        assert rows == []
+        replies.assert_not_awaited()
+
+    async def test_a_run_it_cannot_admit_is_said_in_the_chat(self):
+        router, replies, rows = _router()
+        router._answer_mention = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        agents = _agent_router()
+        refused = WorkflowAdmissionQuotaError(
+            scope="organization", limit=1, outstanding=1, requested=1
+        )
+
+        with (
+            _channel(agents, rows),
+            patch(
+                "app.services.channels.router.WorkflowExposureService.receive_channel_message",
+                AsyncMock(side_effect=refused),
+            ),
+        ):
+            await router._route_inner(_incoming("refund order 42"), MagicMock())
+
+        agents.return_value.answer_default.assert_not_awaited()
+        assert "Too much workflow work" in replies.await_args.args[2]
+        assert rows == []
+
+
+class TestExplicitFileDelivery:
+    async def test_only_requested_file_is_queued_including_an_existing_file(self):
+        from app.services.channels.attachments import queue_channel_file
+
+        workspace = document_workspace()
+        await workspace.write_bytes("/main.py", b'print("Hello, world!")')
+        await workspace.write_bytes("/notes.txt", b"private working notes")
+        outbound = []
+        result = await queue_channel_file(workspace, outbound, "/main.py")
+        assert "Queued" in result and "pending" in result
+        assert [item.filename for item in outbound] == ["main.py"]
+        assert outbound[0].content == b'print("Hello, world!")'
+
+    @pytest.mark.parametrize(
+        "path", ["../secret", "/etc/passwd", "uploads/a.txt", "skills/a.txt", "missing.txt"]
+    )
+    async def test_refused_paths_are_not_attached(self, path):
+        from app.services.channels.attachments import queue_channel_file
+
+        outbound = []
+        result = await queue_channel_file(document_workspace(), outbound, path)
+        assert "refused" in result
+        assert outbound == []
+
+    async def test_oversized_files_and_too_many_files_are_refused(self):
+        from app.services.channels.attachments import queue_channel_file
+
+        workspace = document_workspace()
+        await workspace.write_bytes("/big.txt", b"x" * (MAX_OUTBOUND_BYTES + 1))
+        outbound = []
+        assert "too large" in await queue_channel_file(workspace, outbound, "big.txt")
+        assert outbound == []
+        outbound = [MagicMock()] * MAX_OUTBOUND_FILES
+        assert "at most" in await queue_channel_file(workspace, outbound, "big.txt")
+
+    async def test_workspace_failure_is_reported_without_provider_details(self):
+        from app.services.channels.attachments import queue_channel_file
+
+        workspace = document_workspace()
+        await workspace.write_bytes("/main.py", b"ok")
+        with patch.object(
+            workspace, "read_bytes", AsyncMock(side_effect=RuntimeError("secret endpoint"))
+        ):
+            outbound = []
+            result = await queue_channel_file(workspace, outbound, "main.py")
+        assert "failed" in result and "secret" not in result
+        assert outbound == []
+
+
+async def test_send_action_reports_confirmation_and_provider_failure():
+    from app.services.channels.attachments import channel_file_sender
+
+    workspace = document_workspace()
+    await workspace.write_bytes("/main.py", b"hello")
+    directory = MagicMock()
+    directory.send_file = AsyncMock(return_value="Submitted")
+    send = channel_file_sender(workspace, directory)
+    assert "Submitted" in await send("main.py")
+    directory.send_file.assert_awaited_once_with(
+        filename="main.py", content=b"hello", mime_type="text/x-python"
+    )
+    directory.send_file.side_effect = RuntimeError("secret endpoint")
+    result = await send("main.py")
+    assert "failed" in result and "secret" not in result
+    assert "refused" in await send("missing.py")
+    assert "limit" in await send("main.py")
+    assert "no workspace" in await channel_file_sender(None, directory)("main.py")
+
+
+async def test_unlinked_thread_files_are_detected_without_download_and_remain_retryable():
+    incoming = _incoming("what do you see")
+    incoming.platform_chat_id = "C1:T1"
+    incoming.message_id = "P2"
+    bot = MagicMock()
+    identity = MagicMock(user_id=None)
+    adapter = _adapter()
+    adapter.thread_attachments = AsyncMock(
+        return_value=[_attachment(filename="screen.png", mime_type="image/png")]
+    )
+    with (
+        patch("app.services.channels.router.get_adapter", return_value=adapter),
+        patch("app.services.channels.router.unseal_bot_token", return_value="tok"),
+        patch("app.services.channels.router.ChannelAttachmentService") as service,
+    ):
+        files, notices, complete = await ChannelMessageRouter()._thread_files(
+            MagicMock(), bot, incoming, identity
+        )
+    assert files == [] and complete is False
+    assert "direct message" in notices[0] and "without a slash" in notices[0]
+    service.assert_not_called()
+    adapter.download_attachment.assert_not_awaited()
+
+
+async def test_a_thread_file_from_somebody_the_policy_excludes_is_not_fetched():
+    incoming = _incoming("what do you see")
+    incoming.platform_chat_id = "C1:T1"
+    incoming.message_id = "P2"
+    bot = MagicMock(access_policy={"mode": "whitelist", "whitelist": ["allowed"]})
+    identity = MagicMock(user_id=uuid.uuid4())
+    adapter = _adapter()
+    adapter.thread_attachments = AsyncMock(
+        return_value=[
+            _attachment(filename="theirs.pdf", author_id="denied"),
+            _attachment(filename="ours.pdf", author_id="allowed"),
+            _attachment(filename="platform.pdf"),
+        ]
+    )
+    with (
+        patch("app.services.channels.router.get_adapter", return_value=adapter),
+        patch("app.services.channels.router.unseal_bot_token", return_value="tok"),
+        patch("app.services.channels.router.ChannelAttachmentService") as service,
+    ):
+        service.return_value.receive = AsyncMock(return_value=([], []))
+        await ChannelMessageRouter()._thread_files(MagicMock(), bot, incoming, identity)
+
+    fetched = service.return_value.receive.await_args.args[2]
+    assert [item.filename for item in fetched] == ["ours.pdf", "platform.pdf"]
+
+
+@pytest.mark.parametrize(
+    "path", [".env", "sub/.env", "credentials.txt", "deploy/id_rsa.pem", "x/.ssh/config"]
+)
+async def test_sending_a_protected_file_is_refused_before_reading_bytes(path):
+    from app.services.channels.attachments import queue_channel_file
+
+    workspace = document_workspace()
+    await workspace.write_bytes("/" + path, b"protected")
+    with patch.object(workspace, "read_bytes", AsyncMock()) as read:
+        pending = []
+        answer = await queue_channel_file(workspace, pending, path)
+    assert "permissions protect" in answer
+    read.assert_not_awaited()
+    assert pending == []
+
+
+async def test_file_size_is_checked_before_download_and_after_a_changed_file():
+    from app.services.channels.attachments import queue_channel_file
+
+    workspace = document_workspace()
+    await workspace.write_bytes("/large.txt", b"x" * (MAX_OUTBOUND_BYTES + 1))
+    with patch.object(workspace, "read_bytes", AsyncMock()) as read:
+        assert "too large" in await queue_channel_file(workspace, [], "large.txt")
+        read.assert_not_awaited()
+    with patch.object(workspace, "stat", AsyncMock(return_value=MagicMock(size=None))):
+        assert "could not be verified" in await queue_channel_file(workspace, [], "large.txt")
+    with patch.object(workspace, "stat", AsyncMock(return_value=MagicMock(size=1))):
+        assert "size limit" in await queue_channel_file(workspace, [], "large.txt")
+
+
+@pytest.mark.security
+async def test_attachment_attempt_budget_survives_sender_reassembly():
+    from app.services.channels.attachments import ChannelFileBudget, channel_file_sender
+
+    workspace = document_workspace()
+    await workspace.write_bytes("/main.py", b"hello")
+    directory = MagicMock(send_file=AsyncMock(return_value="Submitted"))
+    budget = ChannelFileBudget()
+    for _ in range(3):
+        assert await channel_file_sender(workspace, directory, budget)("main.py") == "Submitted"
+        budget = ChannelFileBudget(budget.attempts)
+    assert "limit" in await channel_file_sender(workspace, directory, budget)("main.py")
+    assert directory.send_file.await_count == 3
+
+
+@pytest.mark.parametrize("text", ["@support improve the map", "improve the map"])
+async def test_mentions_and_default_turns_both_receive_the_saved_thread_history(text: str) -> None:
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    earlier = ModelRequest(parts=[UserPromptPart(content="Alice asked for the town-hall app.")])
+    backfill = ModelRequest(parts=[UserPromptPart(content="Earlier channel discussion.")])
+    with (
+        patch.object(
+            ChannelMessageRouter, "_load_history", new=AsyncMock(return_value=[earlier])
+        ) as load,
+        patch.object(
+            ChannelMessageRouter,
+            "_thread_context",
+            new=AsyncMock(return_value=([backfill], [], [])),
+        ),
+    ):
+        _, agents, _ = await _route_one_file(text)
+    answer = agents.answer if text.startswith("@") else agents.answer_default
+    assert answer.await_args.kwargs["message_history"] == [backfill, earlier]
+    load.assert_awaited_once()

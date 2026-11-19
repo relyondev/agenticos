@@ -1,0 +1,651 @@
+"""Conversation schemas for AI chat persistence.
+
+This module contains Pydantic schemas for Conversation, Message, and ToolCall entities.
+"""
+
+from datetime import datetime
+from decimal import Decimal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+from uuid import UUID
+
+from pydantic import ConfigDict, Field, field_validator
+
+from app.schemas.base import BaseSchema, TimestampSchema
+from app.schemas.mention import MentionKind
+
+if TYPE_CHECKING:
+    from app.db.models.user import User
+
+
+class LocalMessageFileSource(BaseSchema):
+    """Opaque turn origin; its folder mapping stays on the initiating desktop."""
+
+    kind: Literal["local"] = "local"
+    id: UUID
+
+
+class ConversationMessageFileSource(BaseSchema):
+    """The conversation file endpoint, with its existing sharing authorization."""
+
+    kind: Literal["conversation"] = "conversation"
+    id: UUID
+
+
+MessageFileSource = Annotated[
+    LocalMessageFileSource | ConversationMessageFileSource, Field(discriminator="kind")
+]
+
+
+class MessagePart(BaseSchema):
+    """One entry in an assistant turn's timeline, in the order it happened.
+
+    A turn is a sequence, not three buckets. The row's `content`, `thinking` and
+    `tool_calls` say *what* a turn contained and cannot say *when* - so a client
+    replaying one had to invent an order, and the only order it could invent was
+    reasoning, then every tool, then the answer. A turn that says "here are the
+    charts", draws three, and then summarises them reassembles as three charts
+    with the summary on top and the introduction missing entirely, because a
+    second block of text has nowhere to live in a single `content` column.
+
+    So the sequence that was streamed is the sequence that is stored, and both
+    surfaces render the same array rather than agreeing by coincidence. `content`
+    and `thinking` stay exactly as they were: they are what search, the model's
+    own history and every earlier row are built on, and this is what the
+    transcript is drawn from.
+
+    `tool_call_id` refers to the `tool_calls` row carrying the arguments and the
+    result. It is not repeated here - a tool call is written once, and a copy in
+    JSONB is a copy that disagrees the first time one is re-run or redacted.
+
+    An `ask_user` entry is the exception that stores its own payload: a mid-turn
+    question and the person's answer have no column of their own - unlike text
+    (`content`), reasoning (`thinking`) or a tool call (its `tool_calls` row) - so
+    without this entry a reopened conversation shows neither the question the agent
+    put nor the answer it acted on (#502). `asked_by` names the delegate a question
+    came from, because a question from a specialist reads differently from one the
+    main agent put itself (#1042).
+
+    A `workflow_run` entry is a workflow's answer to a chat turn (#1792): the run
+    it was, the status it ended with and, if it failed, why. The run's own text
+    answer is the row's `content`.
+
+    A `steer` entry is what the person added while the agent was working, stored
+    where it reached the model (#2087): the transcript says when the course changed.
+
+    A `mention` entry is on a *user* turn: something the person pointed the agent at
+    with `@` (#2189), stored by kind, id and name so the transcript draws the chip
+    they picked rather than text that only looks like one.
+    """
+
+    # The one schema in this module that must not strip its strings. `BaseSchema`
+    # strips every string field, which is right for a name somebody typed into a
+    # form and wrong for a fragment of a transcript: a part is *accumulated* from
+    # streamed deltas, so trimming each one deletes the space between the words
+    # they meet at - "Two " and "are open." stored as "Twoare open." - and it
+    # would take the indentation off a fenced code block the model wrote.
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True,
+        str_strip_whitespace=False,
+    )
+
+    type: Literal["text", "thinking", "tool", "ask_user", "workflow_run", "steer", "mention"] = (
+        Field(description="What this entry is.")
+    )
+    text: str | None = Field(
+        default=None,
+        description="The words, for a `text` or `thinking` entry, or what the person added for a `steer`.",
+    )
+    file_source: MessageFileSource | None = Field(
+        default=None,
+        description="The turn's file origin, recorded with its timeline so later workspace changes cannot retarget its links.",
+    )
+
+    @field_validator("file_source", mode="before")
+    @classmethod
+    def discard_legacy_local_paths(cls, value: object) -> object:
+        """Old previews lose their link rather than expose a private folder path."""
+        if isinstance(value, dict) and value.get("kind") == "local" and "root" in value:
+            return None
+        return value
+
+    tool_call_id: str | None = Field(
+        default=None, description="Which tool call this entry is, for a `tool` entry."
+    )
+    question: str | None = Field(
+        default=None, description="What the agent asked, for an `ask_user` entry."
+    )
+    answer: str | None = Field(
+        default=None, description="What the person answered, for an `ask_user` entry."
+    )
+    asked_by: str | None = Field(
+        default=None,
+        description=(
+            "Which delegate asked, for an `ask_user` entry. `None` where the main "
+            "agent asked it itself, and on every question stored before this field "
+            "existed."
+        ),
+    )
+    run_id: str | None = Field(
+        default=None, description="Which workflow run answered, for a `workflow_run` entry."
+    )
+    workflow_id: str | None = Field(
+        default=None, description="Which workflow that run was of, for a `workflow_run` entry."
+    )
+    workflow_name: str | None = Field(
+        default=None,
+        description="What that workflow was called when it answered, for a `workflow_run` entry.",
+    )
+    status: str | None = Field(
+        default=None, description="How the run ended, for a `workflow_run` entry."
+    )
+    error: str | None = Field(
+        default=None, description="Why the run failed, for a failed `workflow_run` entry."
+    )
+    mention_kind: MentionKind | None = Field(
+        default=None, description="What was mentioned, for a `mention` entry."
+    )
+    mention_id: str | None = Field(
+        default=None, description="Which one, for a `mention` entry; its name is in `text`."
+    )
+
+
+class ToolCallBase(BaseSchema):
+    """Base tool call schema."""
+
+    tool_call_id: str = Field(..., description="External tool call ID from AI framework")
+    tool_name: str = Field(..., max_length=100, description="Name of the tool called")
+    args: dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
+
+
+class ToolCallCreate(ToolCallBase):
+    """Schema for creating a tool call record."""
+
+    started_at: datetime | None = Field(default=None, description="When the tool call started")
+
+
+class ToolCallComplete(BaseSchema):
+    """Schema for completing a tool call."""
+
+    result: str = Field(..., description="Tool execution result")
+    completed_at: datetime | None = Field(default=None, description="When the tool call completed")
+    success: bool = Field(default=True, description="Whether the tool call succeeded")
+
+
+class ToolCallRead(ToolCallBase):
+    """Schema for reading a tool call (API response)."""
+
+    id: UUID
+    message_id: UUID
+    result: str | None = None
+    # Every status a stored step can hold - `awaiting_answer` included, the step
+    # of a run parked on a question (#2064): left out, the whole thread's
+    # transcript failed to read back and the conversation opened empty.
+    status: Literal[
+        "pending", "running", "completed", "failed", "awaiting_approval", "awaiting_answer"
+    ] = "pending"
+    started_at: datetime
+    completed_at: datetime | None = None
+    duration_ms: int | None = None
+
+
+class MessageBase(BaseSchema):
+    """Base message schema."""
+
+    role: Literal["user", "assistant", "system"] = Field(..., description="Message role")
+    content: str = Field(..., description="Message content")
+    client_message_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Submitting tab correlation id; scoped by conversation and author, not an idempotency key",
+    )
+    thinking: str | None = Field(default=None, description="Reasoning trace (assistant turns)")
+
+
+class MessageCreate(MessageBase):
+    """Schema for creating a message.
+
+    Deliberately carries no `run_id`. This schema is a request body -
+    `POST /conversations/{id}/messages` binds it straight from JSON - and a run
+    id accepted from a caller would let anybody append a turn to *another
+    organization's* run transcript: the route scopes the conversation, and there
+    is nothing on a bare id to scope. Which run produced a turn is decided by
+    the runner, so it is a keyword on `ConversationService.add_message`, next to
+    the organization and the user, which are server-derived for the same reason.
+    """
+
+    model_name: str | None = Field(default=None, max_length=100, description="AI model used")
+    reply_to_message_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The earlier message in this conversation this turn answers, where somebody "
+            "replied to one; refused when it is in another conversation."
+        ),
+    )
+    parts: list[MessagePart] | None = Field(
+        default=None,
+        description=(
+            "The turn's timeline, in the order it happened, or a user turn's "
+            "`mention` entries. Null on any turn written before it was recorded."
+        ),
+    )
+    tokens_used: int | None = Field(default=None, ge=0, description="Token count")
+    input_tokens: int | None = Field(
+        default=None, ge=0, description="Prompt tokens this turn consumed"
+    )
+    output_tokens: int | None = Field(
+        default=None, ge=0, description="Completion tokens this turn produced"
+    )
+    cache_read_tokens: int | None = Field(
+        default=None, ge=0, description="Of the prompt tokens, those read from the provider's cache"
+    )
+    cache_write_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description="Of the prompt tokens, those written to the provider's cache",
+    )
+    cost_usd: Decimal | None = Field(
+        default=None, ge=0, description="What this turn cost, at the same scale as a run's"
+    )
+    cost_is_partial: bool | None = Field(
+        default=None,
+        description=(
+            "Whether `cost_usd` is a floor. True when the turn reached a model with no "
+            "price entry, whose request the ledger books at zero. Null means not "
+            "recorded, not exact."
+        ),
+    )
+    context_used_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Tokens the history sent with this turn occupied. Only the count: the window "
+            "it is a share of belongs to whichever model answers next, and that can be "
+            "switched between turns."
+        ),
+    )
+    agent_id: UUID | None = Field(
+        default=None, description="The configured agent that answered, when one did"
+    )
+    agent_version_id: UUID | None = Field(
+        default=None, description="The frozen spec that produced the answer"
+    )
+
+
+class MessageFileRead(BaseSchema):
+    """Schema for file attached to a message."""
+
+    id: UUID
+    filename: str
+    mime_type: str
+    file_type: str
+
+
+class MessageAuthor(BaseSchema):
+    """The chat account a message came from.
+
+    Enough to put a name against a turn in a thread several people spoke in, and
+    nothing more: the platform's own id for them is not here, because a reader
+    rendering a name has no use for it and it is the half that identifies them on
+    somebody else's system.
+
+    `user_id` is present so a client can tell its own turns from everybody else's
+    without a second request. It is null until that chat account is linked, which
+    is most of them.
+    """
+
+    platform: str
+    display_name: str | None = Field(default=None, validation_alias="platform_display_name")
+    username: str | None = Field(default=None, validation_alias="platform_username")
+    user_id: UUID | None = None
+
+
+class ChatPerson(BaseSchema):
+    """A member of the organization, as much as a chat needs to draw them.
+
+    The name falls back to the address, as the members page does, because a
+    person who never set one is still somebody to tell apart.
+    """
+
+    user_id: UUID
+    name: str
+    has_avatar: bool = False
+    avatar_color: int | None = None
+
+    @classmethod
+    def of(cls, user: User) -> ChatPerson:
+        return cls(
+            user_id=user.id,
+            name=user.full_name or user.email,
+            has_avatar=bool(user.avatar_url),
+            avatar_color=user.avatar_color,
+        )
+
+
+class MessageReplyRef(BaseSchema):
+    """The message a turn answers, as much of it as a quote above the turn needs."""
+
+    message_id: UUID
+    role: str
+    excerpt: str
+    sender: ChatPerson | None = None
+    agent_id: UUID | None = Field(
+        default=None, description="The agent that wrote it, where it is an answer"
+    )
+
+
+class MessageRead(MessageBase, TimestampSchema):
+    """Schema for reading a message (API response)."""
+
+    id: UUID
+    conversation_id: UUID
+    run_id: UUID | None = Field(
+        default=None,
+        description=(
+            "The agent run that produced this turn. Null for a turn written outside a "
+            "run, which is what lets a client say so rather than draw an empty panel."
+        ),
+    )
+    turn_id: str | None = Field(
+        default=None, description="A spoken turn's id within its call; null for typed turns"
+    )
+    interrupted: bool = Field(
+        default=False,
+        description=(
+            "Whether the caller talked over this answer; its text is trimmed to roughly "
+            "what was heard"
+        ),
+    )
+    model_name: str | None = None
+    parts: list[MessagePart] | None = Field(
+        default=None,
+        description=(
+            "The turn's timeline, in the order it happened - reasoning, the text the "
+            "model wrote, and the tools it called, interleaved as they occurred. Null "
+            "on a user turn and on an assistant turn written before this was recorded, "
+            "which is a client's signal to fall back to reconstructing an order from "
+            "`content`, `thinking` and `tool_calls` rather than to render nothing."
+        ),
+    )
+    tokens_used: int | None = None
+    input_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Prompt tokens, split from the completion because the two are priced an "
+            "order of magnitude apart. Null on a message written before this was "
+            "recorded, or on a turn whose cost could not be read - which means 'not "
+            "recorded' and not 'free'."
+        ),
+    )
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Of `input_tokens`, those served from the provider's cache - priced at a "
+            "fraction of the input rate. Null when not recorded"
+        ),
+    )
+    cache_write_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Of `input_tokens`, those written to the provider's cache - priced above "
+            "the input rate. Null when not recorded"
+        ),
+    )
+    cost_usd: Decimal | None = None
+    cost_is_partial: bool | None = Field(
+        default=None,
+        description=(
+            "Whether `cost_usd` is a floor rather than the whole of it - true when this "
+            "turn reached a model with no price entry. Null means not recorded, which is "
+            "what every message written before this was carried says, and is not the "
+            "same claim as `false`."
+        ),
+    )
+    context_used_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Tokens the history sent with this turn occupied, after any compaction. The "
+            "share of a context window is not stored with it: the window belongs to the "
+            "model answering next, and a share measured against a model somebody has "
+            "since switched away from is wrong in the direction that costs a run."
+        ),
+    )
+    agent_id: UUID | None = None
+    agent_version_id: UUID | None = None
+    agent_version: int | None = Field(
+        default=None,
+        description="The version number behind agent_version_id - a UUID names nothing to a reader",
+    )
+    run_status: str | None = Field(
+        default=None,
+        description=(
+            "How the run that produced this turn ended. Null for a turn written "
+            "outside a run, and for a run that has not finished. It is here so a "
+            "transcript can say a turn was *stopped*: a cancelled run leaves a "
+            "half-written answer that reads exactly like a complete one."
+        ),
+    )
+    run_duration_ms: int | None = Field(
+        default=None,
+        description=(
+            "How long the run that produced this turn was open, in milliseconds - "
+            "from its start to its end, including any wait for an approval. Null for "
+            "a turn written outside a run and for a run that has not ended."
+        ),
+    )
+    sender: ChatPerson | None = Field(
+        default=None,
+        description=(
+            "Who typed a user turn, when they were signed in - in a project's chat "
+            "that is not always the conversation's owner. Null on assistant turns, "
+            "on channel turns (`author` says who) and on turns older than the field."
+        ),
+    )
+    reply_to: MessageReplyRef | None = Field(
+        default=None,
+        description="The message this turn answers, quoted, where it replied to one",
+    )
+    sender_gone: bool = Field(
+        default=False,
+        description=(
+            "A project chat's user turn whose writer's account no longer exists - "
+            "drawn as somebody, never as the reader or the chat's owner."
+        ),
+    )
+    tool_calls: list[ToolCallRead] = Field(default_factory=list)
+    files: list[MessageFileRead] = Field(default_factory=list)
+    user_rating: int | None = Field(
+        default=None,
+        description="Current user's rating (1 or -1)",
+    )
+    rating_count: dict[str, int] | None = Field(
+        default=None,
+        description="Aggregate counts {likes: N, dislikes: N}",
+    )
+    author: MessageAuthor | None = Field(
+        default=None,
+        description=(
+            "Who wrote this turn, when it arrived from a chat account rather than "
+            "from somebody signed in. Null on every assistant turn and on anything "
+            "typed into the dashboard - a thread with no authors anywhere is a "
+            "one-person thread, which is what a client should render as today."
+        ),
+    )
+
+
+class ConversationBase(BaseSchema):
+    """Base conversation schema."""
+
+    title: str | None = Field(default=None, max_length=255, description="Conversation title")
+
+
+class ConversationCreate(ConversationBase):
+    """Schema for creating a conversation."""
+
+    user_id: UUID | None = Field(default=None, description="Owner user ID")
+    organization_id: UUID | None = Field(
+        default=None, description="Organization this conversation belongs to"
+    )
+    project_id: UUID | None = Field(
+        default=None,
+        description="The project to start it in; the caller must be able to work in it",
+    )
+
+
+class ConversationUpdate(BaseSchema):
+    """Schema for updating a conversation."""
+
+    title: str | None = Field(default=None, max_length=255)
+    is_archived: bool | None = None
+
+
+class ConversationAgent(BaseSchema):
+    """An agent that answered in a conversation, as a list view names it."""
+
+    id: UUID
+    slug: str
+    name: str
+    has_avatar: bool = False
+    # The colour its face was given, so a list draws the face its own page does.
+    avatar_color: int | None = None
+
+
+class ConversationRead(ConversationBase, TimestampSchema):
+    """Schema for reading a conversation (API response)."""
+
+    id: UUID
+    user_id: UUID | None = None
+    organization_id: UUID | None = None
+    project_id: UUID | None = Field(
+        default=None, description="The project this chat was started in, if any"
+    )
+    is_archived: bool = False
+    origin: Literal["api", "workflow"] | None = Field(
+        default=None,
+        description="`api` for organization-key runs, `workflow` for private agent-step threads; null otherwise",
+    )
+    is_favourite: bool = Field(
+        default=False,
+        description=(
+            "Whether the **caller** has starred this thread. A property of the reader "
+            "rather than of the row: a conversation can be shared and a channel thread "
+            "has participants, so one person's star must not decide where it sits for "
+            "everybody who can see it."
+        ),
+    )
+    unread: bool = Field(
+        default=False,
+        description=(
+            "Whether this conversation holds an answer the caller has not seen since "
+            "they last had it open. Set on a listing; `POST /conversations/{id}/read` "
+            "clears it."
+        ),
+    )
+    running_since: datetime | None = Field(
+        default=None,
+        description=(
+            "When the run still at work in this conversation began, or null when "
+            "none is. Set on a listing, so a sidebar can show which threads are busy; "
+            "a run parked on an approval is waiting, not working, and is not counted."
+        ),
+    )
+    agents: list[ConversationAgent] = Field(
+        default_factory=list,
+        description=(
+            "Every agent used in this conversation, most recently used first, based on "
+            "its latest message or top-level run. The picker can be changed "
+            "mid-thread."
+        ),
+    )
+
+    coding_agents: list[Literal["claude_code", "codex"]] = Field(
+        default_factory=list,
+        description="Coding harnesses used in this conversation, most recently first, from saved task reports",
+    )
+
+
+class ConversationReadWithMessages(ConversationRead):
+    """Conversation with all messages."""
+
+    messages: list[MessageRead] = Field(default_factory=list)
+
+
+class ConversationList(BaseSchema):
+    """Schema for listing conversations."""
+
+    items: list[ConversationRead]
+    total: int
+
+
+class ChatReader(ChatPerson):
+    """Somebody who has had a chat open, and when they last did."""
+
+    read_at: datetime
+
+
+class ProjectChatRead(ConversationRead):
+    """One of a project's chats, with the people around it.
+
+    A project's chats are everybody's in it, so a row says whose it is, who has
+    seen it and who is at work in it now - the things a person looks for before
+    opening a thread somebody else started.
+    """
+
+    owner: ChatPerson | None = Field(
+        default=None, description="Who started the chat; null when that account is gone"
+    )
+    seen_by: list[ChatReader] = Field(
+        default_factory=list,
+        description="Everyone who has had the chat open, most recently first",
+    )
+    working: ChatPerson | None = Field(
+        default=None,
+        description="Whose run is at work in the chat now; null when none is",
+    )
+    here: list[ChatPerson] = Field(
+        default_factory=list,
+        description="Who has the chat open right now, as of their last heartbeat",
+    )
+
+
+class ProjectChatList(BaseSchema):
+    items: list[ProjectChatRead]
+    total: int
+
+
+class ConversationCost(BaseSchema):
+    """What a whole thread has cost, added up across every turn in it.
+
+    Beside the page of messages rather than computed from it: the transcript is
+    paged, so a client adding up what it was handed answers "the first hundred
+    turns" under a label that says "this conversation".
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cost_usd: Decimal
+    cost_is_partial: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the total is a floor - true when any turn reached a model with no "
+            "price entry. Null where no turn recorded the flag at all, which is 'nobody "
+            "knows' rather than 'exact'."
+        ),
+    )
+
+
+class MessageList(BaseSchema):
+    """Schema for listing messages."""
+
+    items: list[MessageRead]
+    total: int
+    cost: ConversationCost | None = Field(
+        default=None,
+        description=(
+            "What the whole conversation has cost. Null when nothing in it was ever "
+            "measured - a thread older than the columns, or one whose every turn failed "
+            "before a cost could be read. Zeroes would be a claim this has none to make."
+        ),
+    )

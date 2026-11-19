@@ -1,0 +1,69 @@
+"""Log email provider - for development. Prints to stdout, optionally writes HTML to disk."""
+
+import logging
+import tempfile
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+
+from app.services.email.providers.base import EmailMessage, SendResult
+
+logger = logging.getLogger(__name__)
+
+
+class LogProvider:
+    """Development email provider: logs the message instead of sending it.
+
+    When asked to write to disk it uses a per-process temporary directory
+    rather than a fixed path. A predictable path under /tmp is a symlink target
+    on a shared machine, and emails in development still contain real password
+    reset links.
+
+    The file is named after the generated message id, never after the subject.
+    A subject is rendered copy with user-supplied names in it -
+    `[[inviter_name]] invited you to [[org_name]]` - so an organization called
+    `a/b` used to name a directory that does not exist, and the write failed
+    into an `except` that logs a warning while `send` still answered
+    `accepted=True`. Not a traversal: the timestamp prefix means the first path
+    component is never `..`. Just the one mail nobody could find, in the
+    provider whose entire job is to let a developer read it. The id is logged
+    beside the subject, so a reader still maps one to the other.
+    """
+
+    delivers = False
+    """Nothing leaves. Everything here is a message a developer reads locally, so a
+    caller must not report it as delivered - which is what made "invitation sent"
+    true of the log and false of the world (#1484)."""
+
+    def __init__(self, write_to_disk: bool = False, output_dir: str | None = None) -> None:
+        self._write_to_disk = write_to_disk
+        self._output_dir = (
+            Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="emails-"))
+        )
+
+    async def send(self, message: EmailMessage) -> SendResult:
+        msg_id = f"log_{uuid.uuid4()}"
+        logger.info(
+            "email_send_simulated",
+            extra={
+                "message_id": msg_id,
+                "to": message.to,
+                "subject": message.subject,
+                "preview": message.text[:200] if message.text else "",
+            },
+        )
+
+        if self._write_to_disk:
+            try:
+                self._output_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+                fname = self._output_dir / f"{ts}_{msg_id}.html"
+                fname.write_text(message.html, encoding="utf-8")
+                logger.info(
+                    "email_written_to_disk",
+                    extra={"path": str(fname), "subject": message.subject},
+                )
+            except Exception as exc:
+                logger.warning("email_write_failed", extra={"error": str(exc)})
+
+        return SendResult(provider_message_id=msg_id, accepted=True)

@@ -1,0 +1,397 @@
+"use client";
+
+import { useCallback, useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import type { QueryClient } from "@tanstack/react-query";
+import { useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { resetSessionState, useAuthStore } from "@/stores";
+import { apiClient, ApiError } from "@/lib/api-client";
+import type { DirectoryLoginRequest, User, LoginRequest, RegisterRequest } from "@/types";
+import { goToDestination, postSignInDestination } from "@/lib/auth-landing";
+import { ROUTES } from "@/lib/constants";
+import { INVITATION_FLOW_PARAM } from "@/lib/invitation-links";
+import { isNetworkFailure, offlineAvailable } from "@/lib/offline/device-cache";
+
+import { clearNativeAccount } from "@/lib/desktop/account-cleanup";
+
+// Session-level singletons so /auth/me runs ONCE per page load no matter how
+// many components mount useAuth(). Concurrent mounts share the in-flight
+// promise; later mounts skip entirely (the store is persisted across the
+// session). Reset on logout so the next login re-checks.
+let authCheckPromise: Promise<void> | null = null;
+let authChecked = false;
+
+/** What `/auth/me` answers: the account, and the token the chat socket needs. */
+type SessionAnswer = User & { access_token?: string };
+
+// The one `/auth/me` in flight in this tab. The auth guard asks before the
+// dashboard mounts and `useAuth` as it does, and on a cold load both start
+// before the persisted store says anybody is signed in - so each sent its own
+// request on every page load (#2248). Dropped wherever `authCheckPromise` is:
+// a read begun before a sign-in, a sign-out or a re-read is not shared past it.
+let sessionRead: Promise<SessionAnswer> | null = null;
+
+/** Who the session cookie belongs to, sharing a read already on its way. */
+export function readSession(): Promise<SessionAnswer> {
+  if (sessionRead) return sessionRead;
+  const read = apiClient.get<SessionAnswer>("/auth/me");
+  sessionRead = read;
+  // Beside the read rather than chained onto it, so the caller gets the answer
+  // when it lands rather than a tick later.
+  const forget = () => {
+    if (sessionRead === read) sessionRead = null;
+  };
+  read.then(forget, forget);
+  return read;
+}
+
+// Access tokens expire after 15 min. The in-memory token (used by the chat
+// WebSocket and proxied API calls) is set once on load and would otherwise go
+// stale while the tab stays open - causing WS auth failures / "Offline" chat.
+// Refresh it ahead of expiry on a single shared interval. /auth/me
+// transparently mints a fresh access token from the refresh cookie.
+let tokenRefreshTimer: ReturnType<typeof setInterval> | null = null;
+const TOKEN_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+
+// Which identity the reads in flight were started under. A deliberate re-read
+// moves it, and a read that began before the move is discarded when it lands:
+// the session was swapped underneath it - an impersonation started or ended -
+// and it would otherwise install the previous account and its token over the
+// one the cookies now hold, leaving the socket and the page as different people.
+let identityEpoch = 0;
+
+/**
+ * How long a sign-in request may take before the form says so.
+ *
+ * Without a bound a request that never answers - sent over a connection a VPN
+ * reconnect or a sleeping laptop left dead - spins the button until somebody
+ * reloads, and the reload then signs in at once on a fresh connection. Twenty
+ * seconds is far past a slow login and short enough to be told to try again.
+ */
+export const SIGN_IN_TIMEOUT_MS = 20_000;
+
+/** What a sign-in route answers: the account, and the token the chat socket needs. */
+interface SignInResponse {
+  user: User;
+  access_token: string;
+}
+
+function ensureTokenRefresh(adopt: (u: User) => void): void {
+  if (tokenRefreshTimer) return;
+  tokenRefreshTimer = setInterval(() => {
+    if (!useAuthStore.getState().isAuthenticated) return;
+    const epoch = identityEpoch;
+    void (async () => {
+      try {
+        const { access_token, ...userData } = await apiClient.get<User & { access_token?: string }>(
+          "/auth/me",
+        );
+        if (epoch !== identityEpoch) return;
+        // The answer says who the cookie belongs to now, and cookies are shared
+        // across tabs: signing in as somebody else in another tab used to leave
+        // this one rendering the first account while installing the second
+        // one's token, so every request it made authenticated as them. The
+        // identity was in this response all along and was being dropped.
+        adopt(userData as User);
+        if (access_token) useAuthStore.getState().setAccessToken(access_token);
+      } catch {
+        // Ignore - the next real request (or its 401 → refresh) handles failure.
+      }
+    })();
+  }, TOKEN_REFRESH_INTERVAL_MS);
+}
+
+function stopTokenRefresh(): void {
+  if (tokenRefreshTimer) {
+    clearInterval(tokenRefreshTimer);
+    tokenRefreshTimer = null;
+  }
+}
+
+/**
+ * Adopt a signed-in identity, emptying whatever the previous one left behind.
+ *
+ * Keyed on the account rather than on the act of signing in, because signing in
+ * is not one act: a password login, an OAuth callback and a magic link all
+ * establish a session by different routes, and hanging the cleanup off any one
+ * of them leaves the others handing the new account the previous one's data.
+ *
+ * The comparison is against `sessionOwnerId` rather than against `user`,
+ * because `user` goes null for reasons that are not somebody else arriving - a
+ * transient `/auth/me` failure is one - and that must not cost the person still
+ * signed in their cache, their selected organization or their agent. Reloading
+ * a page adopts the same id and likewise changes nothing.
+ *
+ * Any other id clears, including arriving with no owner recorded. A refused
+ * token refresh calls the store's `logout` directly, which leaves no owner and
+ * a full cache behind it, so "nobody owns this" is not the same as "there is
+ * nothing here". On a browser that really is empty the clear costs nothing.
+ */
+function adoptUser(
+  queryClient: QueryClient,
+  setUser: (u: User | null) => void,
+  user: User | null,
+): void {
+  const { sessionOwnerId, setSessionOwnerId } = useAuthStore.getState();
+  if (user && sessionOwnerId !== user.id) {
+    queryClient.clear();
+    resetSessionState();
+    setSessionOwnerId(user.id);
+  }
+  setUser(user);
+}
+
+/**
+ * Adopt a session established outside `login` - today, the OAuth callback.
+ *
+ * That page exchanges its code for a user and a token and had been writing both
+ * straight into the store, which skipped the cleanup and left the previous
+ * account's cache in place. Signing in through Google is still signing in.
+ */
+export function useAdoptSession(): (user: User, accessToken: string | null) => void {
+  const queryClient = useQueryClient();
+  const setUser = useAuthStore((state) => state.setUser);
+  return useCallback(
+    (user: User, accessToken: string | null) => {
+      adoptUser(queryClient, setUser, user);
+      useAuthStore.getState().setAccessToken(accessToken);
+      // What was adopted is the answer the once-per-page check would fetch: the
+      // guard's own `/auth/me` and then `useAuth`'s were two reads of one
+      // identity on every page load.
+      authChecked = true;
+    },
+    [queryClient, setUser],
+  );
+}
+
+/**
+ * Re-read who is signed in, adopting whoever answers.
+ *
+ * For a flow that establishes the session server-side and gets no user back:
+ * the magic link answers with tokens only, so there is nothing for
+ * `useAdoptSession` to adopt. The auth check otherwise runs once per page load,
+ * and a tab that had already asked keeps the account it asked about - so
+ * verifying a link for somebody else left the previous account's cache on
+ * screen while every request authenticated as the new one.
+ *
+ * Awaited before the redirect, so the change of account is settled while the
+ * page still says "verifying" rather than a frame into the next one.
+ */
+export function useReauthenticate(): () => Promise<void> {
+  const queryClient = useQueryClient();
+  const setUser = useAuthStore((state) => state.setUser);
+  return useCallback(async () => {
+    identityEpoch += 1;
+    authChecked = false;
+    authCheckPromise = null;
+    sessionRead = null;
+    await runAuthCheck((u) => adoptUser(queryClient, setUser, u));
+  }, [queryClient, setUser]);
+}
+
+/** A request failure that does not establish whether the session is valid. */
+export function sessionUnavailable(error: unknown): boolean {
+  return (
+    isNetworkFailure(error) ||
+    (error instanceof ApiError && (error.status === 429 || error.status >= 500))
+  );
+}
+
+/**
+ * Whether a temporary session-check failure leaves the person signed in as they were.
+ *
+ * In the apps it does: they keep the recent conversations on the device to read
+ * without a network (#2097), and a phone opened on a train is not a sign-out.
+ * The account is the one the store kept; network/server failures and rate limits
+ * keep it. The check runs again on reconnect or focus; a token refusal signs out.
+ * A browser tab keeps no copy, so it is sent to sign in as before.
+ */
+export function stayOffline(error: unknown): boolean {
+  return sessionUnavailable(error) && offlineAvailable() && useAuthStore.getState().user !== null;
+}
+
+function runAuthCheck(setUser: (u: User | null) => void): Promise<void> {
+  if (authChecked) return Promise.resolve();
+  if (authCheckPromise) return authCheckPromise;
+  const epoch = identityEpoch;
+  authCheckPromise = (async () => {
+    let answer: SessionAnswer | null;
+    try {
+      answer = await readSession();
+    } catch (error) {
+      if (epoch !== identityEpoch) return;
+      if (stayOffline(error)) {
+        useAuthStore.getState().setLoading(false);
+        authCheckPromise = null;
+        return;
+      }
+      answer = null;
+    }
+    if (epoch !== identityEpoch) return;
+    if (answer) {
+      const { access_token, ...userData } = answer;
+      setUser(userData as User);
+      useAuthStore.getState().setAccessToken(access_token ?? null);
+    } else {
+      setUser(null);
+      useAuthStore.getState().setAccessToken(null);
+    }
+    authChecked = true;
+    authCheckPromise = null;
+  })();
+  return authCheckPromise;
+}
+
+export function useAuth() {
+  const router = useRouter();
+  const t = useTranslations("auth");
+  const queryClient = useQueryClient();
+  const { user, isAuthenticated, isLoading, setUser, setLoading, logout } = useAuthStore();
+
+  // Check auth status once per session. /auth/me returns the access_token in
+  // the body (httpOnly cookie isn't JS-readable) for WebSocket auth.
+  useEffect(() => {
+    const adopt = (u: User | null) => adoptUser(queryClient, setUser, u);
+    void runAuthCheck(adopt);
+    ensureTokenRefresh(adopt);
+    const retry = () => {
+      if (!authChecked) void runAuthCheck(adopt);
+    };
+    window.addEventListener("online", retry);
+    window.addEventListener("focus", retry);
+    return () => {
+      window.removeEventListener("online", retry);
+      window.removeEventListener("focus", retry);
+    };
+  }, [setUser, queryClient]);
+
+  // Both sign-in forms end the same way - a user and a token in the answer - so
+  // they differ only in the request that gets them there.
+  const signIn = useCallback(
+    async (request: () => Promise<SignInResponse>, returnTo?: string | null) => {
+      setLoading(true);
+      try {
+        const response = await request();
+        // A check that set out before this sign-in - the page's own /auth/me,
+        // answering late over a slow network - must not land afterwards and
+        // sign out the account that just arrived.
+        identityEpoch += 1;
+        authCheckPromise = null;
+        sessionRead = null;
+        adoptUser(queryClient, setUser, response.user);
+        useAuthStore.getState().setAccessToken(response.access_token);
+        authChecked = true; // login already populated user + token; skip /auth/me
+        goToDestination(postSignInDestination(returnTo), (href) => router.push(href));
+        return response;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [router, setUser, setLoading, queryClient],
+  );
+
+  const login = useCallback(
+    (credentials: LoginRequest, returnTo?: string | null) =>
+      signIn(
+        () =>
+          apiClient.post<SignInResponse>("/auth/login", credentials, {
+            signal: AbortSignal.timeout(SIGN_IN_TIMEOUT_MS),
+          }),
+        returnTo,
+      ),
+    [signIn],
+  );
+
+  // A directory account is created on its first sign-in, so the flow names which
+  // staged invitation's cookie the proxy forwards for the sign-up admission, the
+  // way `register` does (#1414).
+  const loginWithDirectory = useCallback(
+    (
+      credentials: DirectoryLoginRequest,
+      returnTo?: string | null,
+      invitationFlow?: string | null,
+    ) => {
+      const path = invitationFlow
+        ? `/auth/ldap/login?${INVITATION_FLOW_PARAM}=${invitationFlow}`
+        : "/auth/ldap/login";
+      return signIn(
+        () =>
+          apiClient.post<SignInResponse>(path, credentials, {
+            signal: AbortSignal.timeout(SIGN_IN_TIMEOUT_MS),
+          }),
+        returnTo,
+      );
+    },
+    [signIn],
+  );
+
+  // The flow names which staged invitation's cookie the register proxy forwards for
+  // the sign-up admission (#1414); a registration reached with none forwards none.
+  const register = useCallback(async (data: RegisterRequest, invitationFlow?: string | null) => {
+    const path = invitationFlow
+      ? `/auth/register?${INVITATION_FLOW_PARAM}=${invitationFlow}`
+      : "/auth/register";
+    const response = await apiClient.post<{ id: string; email: string }>(path, data);
+    return response;
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await apiClient.post("/auth/logout");
+    } catch {
+      // Ignore logout errors
+    } finally {
+      // A read that set out before this sign-out must not land after it and
+      // sign the person who just left back in.
+      identityEpoch += 1;
+      authChecked = false; // re-check on next login
+      authCheckPromise = null;
+      sessionRead = null;
+      stopTokenRefresh();
+      // The cache and the stores belong to a session, not to the browser tab.
+      // Emptied here as well as on the next sign-in, so nothing of somebody's
+      // account is left sitting in memory after they have asked to leave.
+      queryClient.clear();
+      resetSessionState();
+      logout();
+      let cleanupFailed = false;
+      try {
+        await clearNativeAccount();
+      } catch {
+        cleanupFailed = true;
+        toast.error(t("nativeLogoutFailed"));
+      }
+      if (!cleanupFailed) toast.success(t("loggedOut"));
+      router.push(ROUTES.LOGIN);
+    }
+  }, [logout, router, queryClient, t]);
+
+  const refreshToken = useCallback(async () => {
+    try {
+      const refreshResponse = await apiClient.post<{ access_token: string }>("/auth/refresh");
+      useAuthStore.getState().setAccessToken(refreshResponse.access_token);
+      const userData = await apiClient.get<User>("/auth/me");
+      adoptUser(queryClient, setUser, userData);
+      return true;
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        logout();
+        router.push(ROUTES.LOGIN);
+      }
+      return false;
+    }
+  }, [logout, router, setUser, queryClient]);
+
+  return {
+    user,
+    isAuthenticated,
+    isLoading,
+    login,
+    loginWithDirectory,
+    register,
+    logout: handleLogout,
+    refreshToken,
+  };
+}

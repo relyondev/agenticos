@@ -1,0 +1,264 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useTranslations } from "next-intl";
+import { toast } from "sonner";
+import { ArrowRight, Check, X } from "lucide-react";
+
+import { getErrorMessage } from "@/lib/api-error";
+import { useBranding } from "@/components/branding/branding-provider";
+import { OAuthBlock } from "@/components/auth/oauth-buttons";
+import { SignupClosed } from "@/components/auth/signup-closed";
+import { SignupPolicyNotice } from "@/components/auth/signup-policy-notice";
+import { LegalAnchor } from "@/components/legal/legal-anchor";
+import { Button, Input, Label } from "@/components/ui";
+import { useAuth } from "@/hooks";
+import { ApiError } from "@/lib/api-client";
+import { ROUTES } from "@/lib/constants";
+import { invitationFlowFrom } from "@/lib/invitation-links";
+import { privacyLink, termsLink } from "@/lib/legal-links";
+import { EMAIL_RE, getPasswordStrength } from "@/lib/utils";
+
+export function RegisterForm() {
+  const tErrors = useTranslations("errors");
+
+  const t = useTranslations("auth");
+  const router = useRouter();
+  const { register } = useAuth();
+  const search = useSearchParams();
+  const returnTo = search.get("returnTo");
+  // Reached from an invitation when the landing it carries is the staged pending
+  // page for a flow. The token itself is no longer here - it was exchanged for an
+  // httpOnly handle before login (#1414) - so that flow's cookie, forwarded by the
+  // register proxy, is what admits an address the sign-up policy would otherwise
+  // refuse, and what admits a shareable link constraining no address at all (#916).
+  const invitationFlow = invitationFlowFrom(returnTo);
+  const invited = invitationFlow !== null;
+  const branding = useBranding();
+  const terms = termsLink(branding);
+  const privacy = privacyLink(branding);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [emailTouched, setEmailTouched] = useState(false);
+
+  const emailValid = !email || EMAIL_RE.test(email);
+  const strength = useMemo(() => getPasswordStrength(password), [password]);
+  const passwordsMatch = !confirmPassword || password === confirmPassword;
+  const passwordLongEnough = !password || password.length >= 8;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+
+    if (!EMAIL_RE.test(email)) {
+      setError(t("pleaseEnterValidEmail2"));
+      return;
+    }
+    if (password.length < 8) {
+      setError(t("passwordMustBeAt"));
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError(t("passwordsDoNotMatch2"));
+      toast.error(t("passwordsDoNotMatch3"));
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      await register(
+        {
+          email,
+          password,
+          full_name: name || undefined,
+        },
+        invitationFlow,
+      );
+      toast.success(t("registerSuccess"));
+      // The invitation is not accepted by registering - that needs a session - so a
+      // person who arrived through one is sent back to it after signing in.
+      const next = returnTo ? `&returnTo=${encodeURIComponent(returnTo)}` : "";
+      router.push(`${ROUTES.LOGIN}?registered=true${next}`);
+    } catch (err) {
+      const message =
+        err instanceof ApiError ? getErrorMessage(err, tErrors) : t("registrationFailedPleaseTry");
+      setError(message);
+      toast.error(message);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Before the heading, not inside the form: on a closed deployment there is no
+  // form to show, and every hook above has already run so the early return is
+  // still the same component.
+  if (branding.signupMode === "closed") {
+    return <SignupClosed />;
+  }
+
+  return (
+    <div className="space-y-8">
+      <div className="space-y-2">
+        <span className="text-muted-foreground text-sm font-medium">{t("getStarted")}</span>
+        <h1 className="text-foreground text-[2rem] leading-tight font-semibold tracking-tight text-balance [&_em]:not-italic">
+          {t.rich("createHeading", { em: (chunks) => <em>{chunks}</em> })}
+        </h1>
+        <p className="text-foreground/65 text-sm">
+          {t("hasAccount")}{" "}
+          <Link
+            href={ROUTES.LOGIN}
+            className="text-foreground hover:text-foreground/80 font-medium underline-offset-4 hover:underline"
+          >
+            {t("login")}
+          </Link>
+        </p>
+      </div>
+
+      <SignupPolicyNotice invited={invited} />
+
+      <form onSubmit={handleSubmit} className="space-y-5">
+        <div className="space-y-1.5">
+          <Label htmlFor="name" className="text-foreground text-sm font-medium">
+            {t("nameOptional")}
+          </Label>
+          <Input
+            id="name"
+            type="text"
+            placeholder={t("namePlaceholder")}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            disabled={isLoading}
+            autoComplete="name"
+            className="h-11 rounded-lg text-base md:text-[15px]"
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="email" className="text-foreground text-sm font-medium">
+            {t("email")}
+          </Label>
+          <Input
+            id="email"
+            type="email"
+            placeholder={t("emailPlaceholder")}
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            onBlur={() => setEmailTouched(true)}
+            required
+            disabled={isLoading}
+            autoComplete="email"
+            className={`h-11 rounded-lg text-base md:text-[15px] ${emailTouched && email && !emailValid ? "border-destructive" : ""}`}
+          />
+          {emailTouched && email && !emailValid && (
+            <p className="text-destructive text-xs">{t("emailRequired")}</p>
+          )}
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="password" className="text-foreground text-sm font-medium">
+            {t("password")}
+          </Label>
+          <Input
+            id="password"
+            type="password"
+            placeholder={t("atLeast8Characters")}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+            disabled={isLoading}
+            autoComplete="new-password"
+            className={`h-11 rounded-lg text-base md:text-[15px] ${password && !passwordLongEnough ? "border-destructive" : ""}`}
+          />
+          {password && (
+            <div className="space-y-1.5 pt-1">
+              <div className="flex gap-1">
+                {[1, 2, 3, 4].map((i) => (
+                  <div
+                    key={i}
+                    className={`h-1 flex-1 rounded-full transition-colors ${
+                      i <= strength.score ? strength.color : "bg-foreground/10"
+                    }`}
+                  />
+                ))}
+              </div>
+              <div className="flex items-center justify-between">
+                <p className="text-muted-foreground text-xs font-medium">{strength.label}</p>
+                <div className="flex items-center gap-1.5 text-xs">
+                  {password.length >= 8 ? (
+                    <span className="text-brand inline-flex items-center gap-1">
+                      <Check className="h-3 w-3" />
+                      {t("n8Chars")}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground inline-flex items-center gap-1">
+                      <X className="h-3 w-3" />
+                      {t("n8Chars2")}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-1.5">
+          <Label htmlFor="confirmPassword" className="text-foreground text-sm font-medium">
+            {t("confirmPassword")}
+          </Label>
+          <Input
+            id="confirmPassword"
+            type="password"
+            placeholder={t("repeatPassword")}
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            required
+            disabled={isLoading}
+            autoComplete="new-password"
+            className={`h-11 rounded-lg text-base md:text-[15px] ${confirmPassword && !passwordsMatch ? "border-destructive" : ""}`}
+          />
+          {confirmPassword && !passwordsMatch && (
+            <p className="text-destructive inline-flex items-center gap-1 text-xs">
+              <X className="h-3 w-3" />
+              {t("passwordMismatch")}
+            </p>
+          )}
+        </div>
+
+        {error && (
+          <p className="border-destructive/35 bg-destructive/[0.07] text-foreground rounded-lg border px-3 py-2 text-sm">
+            {error}
+          </p>
+        )}
+
+        <Button type="submit" disabled={isLoading} className="h-11 w-full text-[15px]">
+          {isLoading ? (
+            t("creatingAccount")
+          ) : (
+            <>
+              {t("register")}
+              <ArrowRight className="ml-2 h-4 w-4" />
+            </>
+          )}
+        </Button>
+
+        <p className="text-muted-foreground text-center text-xs">
+          {t.rich("agreeToTerms", {
+            terms: (chunks) => <LegalAnchor link={terms}>{chunks}</LegalAnchor>,
+            privacy: (chunks) => <LegalAnchor link={privacy}>{chunks}</LegalAnchor>,
+          })}
+        </p>
+      </form>
+
+      {/* The staged invitation travels with the provider too, as its httpOnly
+          handle attached same-origin (#1414): an `invite_only` deployment otherwise
+          refuses the button beside a form that accepts the same person. */}
+      <OAuthBlock label={t("orSignUpWith")} variant="signup" returnTo={returnTo} />
+    </div>
+  );
+}

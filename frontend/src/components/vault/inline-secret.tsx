@@ -1,0 +1,243 @@
+"use client";
+
+import { useState } from "react";
+import { ExternalLink, Eye, EyeOff, KeyRound, Plus } from "lucide-react";
+
+import { Button, Input, Label } from "@/components/ui";
+import { usePermissions, useSecrets } from "@/hooks";
+import { ROUTES } from "@/lib/constants";
+import { Perm } from "@/types/permissions";
+import type { StorableSecretKind } from "@/types/secrets";
+import { useTranslations } from "next-intl";
+
+interface InlineSecretProps {
+  /** What shape the caller needs. Almost always `api_key`. */
+  kind: StorableSecretKind;
+  /**
+   * What the key is for - a provider or service id.
+   *
+   * Recorded because it is what makes the key findable afterwards: a model
+   * picker offers the providers you hold keys for, and a web-search binding
+   * offers the Tavily ones. A key stored without it is a key only the person
+   * who added it can place.
+   */
+  purpose: string;
+  /**
+   * What this key is called - "Tavily", "OpenAI", "OpenRouter (embeddings)".
+   *
+   * It fills the name field, so nobody has to invent one, and it names the
+   * button that opens the form. Both, because one page can render two of these:
+   * Create knowledge base offers an embedding key and a model-provider key four
+   * inches apart, and a button labelled "Add a key" twice is two writes a screen
+   * reader cannot tell apart and a test can only distinguish by DOM position.
+   *
+   * The button appends rather than inflects it - "Add a key: Daytona API key",
+   * not "Add Daytona API key key". Callers name their key in whatever words
+   * their own surface uses, some of them ending in "key" or "token" already, and
+   * a label built by inflection is only grammatical for the ones that do not.
+   */
+  suggestedName: string;
+  /** Where to get the key, when there is an obvious answer. */
+  helpUrl?: string;
+  /** Called with the new secret's id once it is stored. */
+  onCreated: (secretId: string) => void;
+  disabled?: boolean;
+}
+
+/**
+ * Add a key without leaving the page that needs it.
+ *
+ * The flow this replaces: pick a service, be told it needs a key, open the
+ * vault in another tab, add the key, come back, re-pick the service, then find
+ * the picker did not refresh. Four steps and a context switch to answer one
+ * question the form had already asked.
+ *
+ * It still writes to the same vault as the Vault page - this is a shortcut to
+ * it, not a second store. The value goes straight out and is never read back,
+ * which is why the field is cleared the moment it is submitted rather than left
+ * sitting in a React state somewhere.
+ *
+ * Only `api_key` is offered here. The other shapes - an AWS pair, a Google
+ * service-account JSON, an Azure deployment - are multi-field forms with their own
+ * validation, and the honest place for those is the Vault. Which is why the link to
+ * it is not conditional: a picker that offers only the keys already stored, with
+ * nowhere to go when the shape needed is not an opaque token, is a dead end. It
+ * opens in a new tab so the half-filled form behind it survives.
+ *
+ * **It checks `secrets:edit` itself.** The permission belongs to the write, not to
+ * the surface: every one of these seven call sites posts the same `POST /secrets`,
+ * which is gated on `Perm.SECRETS_EDIT` and on nothing else. A gate at each caller
+ * is the same condition written seven times and forgotten six of them - which is
+ * exactly what happened, and is #361. The counter-argument was that a caller's own
+ * lead-in sentence goes wrong once the form disappears; that is true of one caller,
+ * `AddModel`, which already chooses its sentence on the same permission and so
+ * decides for itself whether to render this at all. The other six say something
+ * that stays true either way ("this key bills embeddings", "stored in the vault
+ * under Tracing"), so a refusal here is a line replacing a button rather than a
+ * panel going quiet.
+ */
+export function InlineSecret({
+  kind,
+  purpose,
+  suggestedName,
+  helpUrl,
+  onCreated,
+  disabled,
+}: InlineSecretProps) {
+  const t = useTranslations("vault");
+  const { create } = useSecrets();
+  const { can } = usePermissions();
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState(suggestedName);
+  const [value, setValue] = useState("");
+  const [revealed, setRevealed] = useState(false);
+
+  // Before the button, not on it: a disabled control still says "you could do
+  // this", and the answer here is that somebody else has to. Said rather than
+  // rendered blank, because the picker above it is empty for the same reason and
+  // a silent gap is the state this component was written to remove.
+  if (!can(Perm.secretsEdit)) {
+    return <p className="text-muted-foreground text-xs">{t("storingNeedsPermission")}</p>;
+  }
+
+  if (!open) {
+    return (
+      <div className="flex flex-wrap items-center gap-3">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={disabled}
+          onClick={() => {
+            setName(suggestedName);
+            setOpen(true);
+          }}
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {t("addKeyNamed", { name: suggestedName })}
+        </Button>
+        {/* Beside it, always. This form takes one shape - an opaque `api_key` -
+            and the vault takes every other: an AWS pair, a service-account JSON,
+            an Azure deployment. A picker offering only what is already stored,
+            with nowhere to go when the needed shape is not one of them, is a dead
+            end; a new tab is what keeps the half-filled form on this page. */}
+        <a
+          href={ROUTES.VAULT}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 text-xs underline underline-offset-4"
+        >
+          <ExternalLink className="h-3 w-3" aria-hidden />
+          {t("openVault")}
+        </a>
+      </div>
+    );
+  }
+
+  const submit = () => {
+    create.mutate(
+      { name: name.trim(), value: { kind, api_key: value }, purpose },
+      {
+        onSuccess: (secret) => {
+          onCreated(secret.id);
+          setRevealed(false);
+          // Cleared immediately: the value has left, and nothing on this page
+          // has any further use for it.
+          setValue("");
+          setOpen(false);
+        },
+      },
+    );
+  };
+
+  return (
+    <div className="border-border space-y-3 rounded-lg border border-dashed p-3">
+      <p className="text-muted-foreground flex items-center gap-1.5 text-xs">
+        <KeyRound className="h-3.5 w-3.5 shrink-0" />
+        {t("storedOrganizationAposS")}
+      </p>
+
+      <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)]">
+        <div className="space-y-1.5">
+          <Label htmlFor="inline-secret-name" className="text-xs">
+            {t("name")}
+          </Label>
+          <Input
+            id="inline-secret-name"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder={suggestedName}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="inline-secret-value" className="text-xs">
+            {t("key")}
+          </Label>
+          <div className="relative">
+            <Input
+              id="inline-secret-value"
+              type={revealed ? "text" : "password"}
+              value={value}
+              onChange={(event) => setValue(event.target.value)}
+              placeholder={t("pasteHere")}
+              autoComplete="off"
+              className="pr-10 font-mono"
+            />
+            {/* The one moment this value can be checked: it is written once and
+                never shown again, and a paste that picked up a newline or half
+                a key looks exactly like a correct one behind dots. */}
+            <button
+              type="button"
+              onClick={() => setRevealed((shown) => !shown)}
+              aria-label={revealed ? t("hideKey") : t("showKey")}
+              aria-pressed={revealed}
+              className="text-muted-foreground hover:text-foreground absolute top-1/2 right-1 -translate-y-1/2 rounded-md p-2"
+            >
+              {revealed ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        {/* `disabled` again, not only on the button that opened this. A caller
+            passes it when its own surface may no longer be written to - a dialog
+            mid-save, a panel somebody may only read - and gating only the way in
+            left a form already open with a live Save, storing an
+            organization-wide secret out from under the surface that had just
+            said no. Same rule as the permission above: the check belongs on the
+            write. */}
+        <Button
+          type="button"
+          size="sm"
+          disabled={disabled || create.isPending || !name.trim() || !value.trim()}
+          onClick={submit}
+        >
+          {t("saveKey")}
+        </Button>
+        <Button type="button" size="sm" variant="ghost" onClick={() => setOpen(false)}>
+          {t("cancel")}
+        </Button>
+        <a
+          href={ROUTES.VAULT}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 text-xs underline underline-offset-4"
+        >
+          <ExternalLink className="h-3 w-3" aria-hidden />
+          {t("openVault2")}
+        </a>
+        {helpUrl && (
+          <a
+            href={helpUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="text-muted-foreground ml-auto text-xs underline underline-offset-4"
+          >
+            {t("whereDoIGet")}
+          </a>
+        )}
+      </div>
+    </div>
+  );
+}

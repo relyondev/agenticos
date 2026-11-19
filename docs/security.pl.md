@@ -1,0 +1,467 @@
+---
+source_sha: "28251d1c4760"
+---
+
+# Bezpieczeństwo { #security }
+
+Ta strona jest tym, co przegląd bezpieczeństwa w kształcie HIPAA albo SOC 2
+dostaje do ręki: granice zaufania, jakie dane opuszczają wdrożenie i do kogo, co
+jest gdzie szyfrowane, oraz macierz kontroli, która dla każdej kontroli nazywa
+mechanizm w tym kodzie, który ją realizuje, i test, który trzyma ją w mocy.
+
+Opisuje to, co **jest**, a nie to, co byłoby miłe. Wiersz bez mechanizmu mówi to
+wprost i linkuje issue, które by go zbudowało. Jak zgłosić podatność i jaka jest
+produkcyjna lista kontrolna hardeningu — zobacz [`SECURITY.md`](https://github.com/vstorm-co/agenticos/blob/main/SECURITY.md)
+w korzeniu repozytorium; ta strona to cała reszta, w jednej kopii.
+
+Dwie sąsiednie strony odpowiadają na pytania, które przegląd zadaje zaraz potem,
+i nie są tu powtarzane: [Ochrona danych](data-protection.md) — gdzie leżą dane
+osobowe, co faktycznie obejmuje usunięcie i które luki są wciąż otwarte, oraz
+[Licencje](licenses.md) — każdy komponent trzeciej strony, który wiozą obrazy.
+
+## Model zagrożeń { #threat-model }
+
+Platforma jest self-hostowana i wielotenantowa. Założeniem projektowym jest, że
+infrastruktura operatora jest zaufana, a każde żądanie do niej nie jest — więc
+granicami, które mają znaczenie, są te, które żądanie przekracza w drodze do
+danych.
+
+| Granica | Co ją przekracza | Zaufana po drugiej stronie? |
+|---|---|---|
+| Przeglądarka → BFF (route handlery Next.js) | Ciasteczko sesji, nagłówek organizacji, dane z formularza | Nie — ale BFF nie weryfikuje ciasteczka: czyta `httpOnly` `agenticos_access_token` i przekazuje go jako nagłówek bearer (`frontend/src/lib/platform-proxy.ts`). To granica przekazywania poświadczenia; weryfikacja jest zadaniem API |
+| BFF → API (FastAPI) | JWT związany z sesją w bazie, nagłówek `X-Organization-Id` | Nie — token jest weryfikowany przy każdym żądaniu, sesja sprawdzana pod kątem unieważnienia, a organizacja rozstrzygana z tokena |
+| API → PostgreSQL / Redis | Zapytania i odczyty z cache, po TLS, gdy jest skonfigurowany | Tak — magazyn należy do operatora; co chroni w spoczynku, jest pod „Co jest gdzie szyfrowane” |
+| API / worker → providerzy modeli, kanały, serwery MCP, dostawcy wyszukiwania, Logfire | Prompty, wywołania narzędzi, zapytania, odpowiedzi, trace'y | Nie — to strony trzecie; co do nich trafia, jest decyzją per agent, z wyjątkiem tracingu na poziomie całego wdrożenia (poniżej) |
+| Przeglądarka ↔ provider realtime ([rozmowa głosowa](voice.md) przez WebRTC) | Dźwięk z mikrofonu rozmówcy i wypowiedziana odpowiedź agenta | Nie — przeglądarka nie trzyma żadnego poświadczenia providera: serwer odpowiada na jej ofertę SDP, oferta otwierająca kanał danych jest odrzucana, a sekret klienta nigdy nie jest wydawany. Narzędzia, zatwierdzenia i transkrypcje działają na połączeniu sideband serwera |
+| Worker → konektory (Google Drive, S3, …) | Poświadczenia odpieczętowane z vaultu, pobrane dokumenty | Nie — poświadczenie konektora to sekret w vault wskazywany po id |
+| Wizualizacja albo aplikacja → konsola | Prośba o otwarcie linku albo o wysłanie wiadomości follow-up w imieniu osoby | Nie — strona to skrypt napisany przez model, który mógł przeczytać wrogie treści. Link otwiera się, a follow-up jest wysyłany, dopiero gdy człowiek go przeczyta i kliknie, we własnym DOM konsoli; follow-up, za którym nie stoi interakcja użytkownika, jest odrzucany |
+| Worker → publiczne strony internetowe (konektor `web`) | Żądania GET o strony, sitemapy i robots.txt; bez poświadczenia | Nie — początkowy adres URL wpisuje tenant, a każdy kolejny link wybiera strona, więc każde żądanie i przekierowanie przechodzi sprawdzenie SSRF, jest wysyłane na sprawdzony adres (`app/core/pinned_http.py`) i pozostaje na jednym hoście. Startowy URL na hoście, który operator wpisał do `OUTBOUND_PRIVATE_ALLOWLIST`, może sięgnąć do tego hosta z listy; publiczny startowy URL nigdy |
+
+Władza wewnątrz tenanta nigdy nie jest nazwą roli na route'cie: to wiersz
+członkostwa plus katalog uprawnień (`app/core/permissions.py`), rozstrzygany per
+zasób. Dwóch wywołujących z tą samą rolą może sięgnąć do różnych wierszy, bo
+grant na jednym zasobie poszerza to, na co rola pozwala, nie awansując członka.
+
+## Co opuszcza wdrożenie { #what-leaves-the-deployment }
+
+Poza [diagnostyką wdrożenia](configuration.md#diagnostics), która jest domyślnie
+włączona, każde wywołanie na zewnątrz jest tym, które wdrożenie skonfigurowało,
+i każde jest granicą, o którą przegląd u klienta zapyta.
+
+| Do | Co | Kiedy |
+|---|---|---|
+| Skonfigurowany provider modelu | Prompt, wyjście modelu, argumenty i wyniki narzędzi | Każdy run — chyba że model działa na własnej infrastrukturze operatora, wtedy nic nie wychodzi |
+| Skonfigurowany kanał (Slack, Teams, Telegram, Mattermost) | Wygenerowane odpowiedzi agenta — tekst, obrazy i załączniki | Zawsze, gdy agent jest wystawiony przez ten kanał; każde `send_message` publikuje u providera (`app/services/channels/`) |
+| Logfire | Trace'y, które niosą prompty i wyjścia, chyba że agent mówi inaczej | Dwie niezależne ścieżki. Token observability per agent trace'uje tego agenta, a jego tryb `content` decyduje, ile niesie span - `none` sprowadza go do czasu, tokenów, kosztu i nazw narzędzi (#1413). `LOGFIRE_TOKEN` na poziomie wdrożenia instrumentuje **każdy** run, tak samo w API jak w workerze (`app/core/logfire_setup.py`), więc przy nim ustawionym wychodzi treść każdego agenta, który nie poprosił o `none`; agent, który poprosił, jest przypięty do instrumentacji bez treści również na tym tracerze (`suppress_content`), więc tryb trzyma na obu ścieżkach, a specjalista tego agenta go dziedziczy - napisany inline albo wymyślony w trakcie runu. Jedna luka, której nie obejmuje: nieudane podpięcie, które jest logowane i zostawione. Żadna ze ścieżek nie jest domyślnie włączona. Stanu pośredniego z filtrem świadomie nie ma - częściowo wyczyszczony eksport to gwarancja, której nikt nie zaudytuje ([#1616](https://github.com/vstorm-co/agenticos/issues/1616)) |
+| Serwery MCP | Wywołania narzędzi i ich argumenty | Tylko dla narzędzi, do których agent jest podpięty |
+| Dostawca web search (Tavily, DuckDuckGo) | Zapytanie wyszukiwania | Tylko gdy przyznana jest capability wyszukiwania |
+| Provider embeddingów | Tekst dokumentu, przy ingest | Tylko dla bazy wiedzy, której provider jest zdalny |
+| Serwer kafelków map wskazany przez `VISUAL_MAP_TILES` | Z tego deploymentu, nigdy ze strony: współrzędne każdego kafelka pokazywanego na mapie, którego nie ma jeszcze w pamięci podręcznej | Tylko gdy ustawienie jest włączone i ktoś otwiera mapę. Strona wysyła deploymentowi trzy liczby, każdą sprawdzoną względem przybliżenia; adres i klucz serwera zostają na serwerze ([Aplikacje](artifacts.md#how-the-page-is-isolated)) |
+| Provider głosu realtime (OpenAI, Azure OpenAI, Google, xAI) | W trakcie [rozmowy głosowej](voice.md): dźwięk rozmówcy, instrukcje agenta, definicje i wyniki narzędzi oraz wcześniejsze tury rozmowy jako tekst, gdy rozmowa się zaczyna albo łączy ponownie | Tylko dla agenta, którego sekcja Głos nazywa tego providera, i tylko póki rozmowa jest otwarta. Dźwięk nie jest tu przechowywany; to, co zatrzymuje provider, reguluje twoja umowa z nim |
+| Provider speech-to-text | Nagranie: notatka głosowa z kanału, dyktowanie w `/chat` albo nagranie odwiedzającego na hostowanej stronie lub w widgecie ustawionych na `server` | Zawsze, gdy któreś jest transkrybowane. Dyktowanie odwiedzającego jest anonimowe i poza każdym budżetem modelu, więc ogranicza je rate limit linku razy najdłuższe dyktowanie. Domyślnie dyktowanie to surowy PCM, którego próbki są liczone, a nagranie ponad limit odrzucane przed wysłaniem, więc to ograniczenie jest dokładne; wdrożenie, które [przyjmuje skompresowany dźwięk](deployment.md#what-a-dictation-may-be-uploaded-as), odczytuje zamiast tego długość z nagłówka pliku, który ręcznie zbudowany plik może zaniżyć - [kanały](channels.md#dictation-on-a-widget-or-a-hosted-page) rozpisują najgorszy przypadek w obu wariantach. Przy `browser` przeglądarka odwiedzającego wysyła zamiast tego dźwięk do własnego dostawcy i nic nie przechodzi tędy |
+| Kolektor diagnostyki | Wersja, stan bazy i workera, zgrubne liczniki użycia, liczby nieudanych runów, zadań i ingestii według zamkniętej kategorii oraz pseudonimowy sygnał aktywności; nigdy prompty, rozmowy, nazwy plików, nazwy kont, adresy e-mail, klucze providerów ani komunikaty wyjątków | Co godzinę z workera oraz, z każdej przeglądarki lub aplikacji, gdy ktoś jest aktywny; wyłączana przez `DIAGNOSTICS_ENABLED=false` albo kierowana do kolektora, który prowadzisz, przez `DIAGNOSTICS_COLLECTOR_URL` ([konfiguracja](configuration.md#diagnostics)) |
+
+## Co jest gdzie szyfrowane { #what-is-encrypted-where }
+
+Jest jeden mechanizm szyfrowania na poziomie aplikacji i celowo jest jedyny:
+vault (`app/core/vault.py`). Każde **poświadczenie konektora i API** w spoczynku
+jest zapieczętowane w kopercie per właściciel, której klucz opakowujący jest
+wyprowadzany przez HKDF z organizacji (albo użytkownika), do której należy — więc
+szyfrogram skopiowany do wiersza innej organizacji nie da się odpieczętować.
+Klucz główny jest rotowalny bez ponownego szyfrowania ładunków.
+
+Nie wszystko, co platforma przechowuje, jest poświadczeniem w vault, i mówimy to
+wprost, bo przegląd i tak to znajdzie:
+
+- **Krótkożyjące tokeny bearer** — zaproszenia do organizacji
+  (`OrganizationInvitation.token`), żądania połączenia kanału
+  (`ChannelLinkRequest.token`) i linki do udostępnionych konwersacji
+  (`ConversationShare.share_token`) — to losowe kolumny `String(64)`
+  wyszukiwane po równości, nie pieczętowane w vault. Kto ma wartość, ten może jej
+  użyć, więc chroni je wygaśnięcie i jednorazowość, a nie szyfrowanie. Wyjątkiem
+  są refresh tokeny sesji, haszowane w spoczynku (`sessions.refresh_token_hash`).
+- **Wgrane pliki i pliki z czatu** leżą tam, gdzie umieści je
+  `FILE_STORAGE_BACKEND` (`app/services/file_storage.py`). Przy domyślnym
+  `local` jest to system plików kontenera API otwartym tekstem, chroniony
+  wyłącznie szyfrowaniem wolumenu. Przy `s3` są obiektami w buckecie, który
+  nazywa wdrożenie, a o co prosi każdy zapis, rozstrzyga
+  `FILE_STORAGE_S3_ENCRYPTION`: `sse-s3` domyślnie albo `sse-kms` kluczem
+  kontrolowanym przez klienta — albo `none`, które nie wysyła żadnego nagłówka
+  szyfrowania i istnieje dla magazynu zgodnego z S3 bez KMS za nim. Przy `none`
+  obiekty są zaszyfrowane dokładnie na tyle, na ile zrobi to ten magazyn, i ani
+  trochę bardziej. `agenticos cmd doctor` wypisuje, na którym backendzie stoi
+  działające wdrożenie.
+- **Treści wiadomości, `rag_documents` i ich wektory oraz workspace'y sandboksa**
+  są przechowywane jako kolumny z tekstem jawnym, wiersze pgvector i pliki
+  workspace'u. Vault pieczętuje poświadczenia, nie treść; ochrona tych rzeczy w
+  spoczynku jest na poziomie dysku.
+
+Backend S3 jest wyborem dokonywanym w czasie wdrożenia i nie migruje tego, co
+trzyma już lokalny; ustawienia są w
+[konfiguracji](configuration.md#uploaded-files-at-rest), a uzasadnienie
+w [przetwarzaniu plików](file-processing.md#storage).
+
+## Co jest trzymane o jednej osobie i co się z tym dzieje { #what-is-held-about-one-person-and-what-happens-to-it }
+
+RODO art. 15 pyta, co o kimś trzymasz, a art. 17 każe to usunąć. Na oba odpowiada
+ta tabela, i to celowo: inwentarz, który wymienia tabelę przy eksporcie i zapomina
+o niej przy usuwaniu, jest gorszy niż żaden, bo czyta się jak kompletny.
+
+Linia, którą rysuje, to **o** kimś kontra **stworzone przez** kogoś. To, co jest
+o osobie, idzie razem z nią; to, co stworzyła na rzecz organizacji — agent,
+na którym pracuje zespół, baza wiedzy, zapisane poświadczenie — jest przekazywane
+dalej, bo usunięcie konta kolegi nie może usunąć agenta, od którego zależy zespół.
+
+| Tabela | Przy usunięciu | W eksporcie | Dlaczego |
+|---|---|---|---|
+| `users` | Usuwany | Profil, bez hasha hasła | Samo konto |
+| `conversations`, `messages`, `tool_calls` | Kaskada, poza czatami projektu, które zostają z zespołem | Wątki, które zaczęli, z każdą turą; w czacie projektu, gdziekolwiek pisali, tylko ich tury i odpowiedzi na nie | Ich własne, a transkrypt bez co drugiej tury nie odpowiada na nic. Czat projektu należy do kilku osób, a tury pozostałych członków są ich |
+| `chat_files` | Kaskada; bajty odpinane po commicie | Nie wypisywane | Wiersz kaskaduje od wiadomości, a plik na dysku nie, więc ścieżki są zbierane przed usunięciem i odpinane po jego commicie — inaczej bajty przeżywają żądanie, które kazało im zniknąć: nieosiągalne dla niczego i nieusuwane przez nikogo. Transkrypt w eksporcie nazywa załącznik; bajty są do pobrania dopóki konto istnieje, a nie pakowane do środka |
+| `message_ratings` | Kaskada | Tak | Wyrażona opinia |
+| `sessions` | Kaskada | Urządzenie, adres i czasy — nigdy poświadczenie, bo jest hashem | Gdzie się logowali |
+| `api_keys`, `oauth_grants` | Kaskada, razem z kodami i tokenami, na które wymieniono zgodę | Klucze, które wydali, i klienci, którym pozwolili działać w ich imieniu: nazwa, prefiks, uprawnienia i daty — nigdy klucz, hash ani token | Poświadczenie działające w ich imieniu to ich dane; własne klucze asystenta wydawane przez platformę na jeden przebieg nie są wymieniane |
+| `conversation_favourites`, `dashboard_layouts`, `dashboard_presets`, `user_slash_commands` | Kaskada | Układy i skróty | Ustawienia osobiste, dla nikogo innego bez znaczenia |
+| `agent_memory_files` (`owner_key = person:<id>`) | **Czyszczone jawnie**, pod blokadą, którą bierze też równoległy zapis | Tak | Klucz jako łańcuch znaków bez klucza obcego: nic nie kaskadowało, więc każda notatka przeżywała konto — a run zapisujący notatkę w trakcie usuwania odtworzyłby ją |
+| `agent_workspaces` (`scope = user`) | **Czyszczone jawnie** | Nie | `owner_ref` jest łańcuchem znaków z tego samego powodu co `owner_key`, więc nie podąża za nim żadna kaskada, a workspace oparty o stan trzyma same pliki |
+| `organization_members` | Kaskada | Do których organizacji, jako kto, od kiedy | Wiersz wskazujący wprost na tę osobę, widoczny już dla administratora |
+| `channel_identities` | **Czyszczone jawnie** | Tak | `SET NULL` zostawiał wiersz z id Slacka, nazwą i nazwą wyświetlaną osoby, której już nie ma, powiązany z nikim |
+| `agent_runs` | `SET NULL` — zachowywane | Runy, które uruchomili, i ile kosztowały | Wydatek jest zapisem organizacji; anonimowy run wciąż liczy się do miesiąca |
+| `agents`, `knowledge_bases`, `skills`, `contexts`, `agent_triggers`, `agent_environments`, `agent_exposures`, `local_services` | `SET NULL` — zachowywane | Nie | Stworzone *dla organizacji*. Usunięcie zabrałoby pracę zespołu razem z osobą |
+| `organization_secrets` | `SET NULL`, a sekret prywatny awansuje do organizacji | Nie | Poświadczenie, na którym działa organizacja. Awans jest tym, co nie pozwala bezpańskiemu sekretowi zablokować usunięcia |
+| `organizations` | Org osobista usuwana; współdzielona, którą stworzyli, przechodzi na innego właściciela | Nie | Nikt nie może zostać z organizacją bez właściciela |
+| `resource_grants` | Kaskada po obdarowanym; `SET NULL` po nadającym | Nie | Uprawnienie *dla* nich jest ich; uprawnienie, które *nadali*, jest zapisem organizacji, kto co może |
+| `app_admin_audit_logs` | **Zachowywane**, id aktora zostaje | **Nie** | Zapis organizacji o tym, co się w niej działo. Wpis nazywający usunięte konto jest uczciwy; wpis z wyciętym aktorem jest gorszy niż bezużyteczny, a osoba nie może go zabrać ze sobą |
+| `embed_visitors` | Nietykane | Nie | Odwiedzający to klucz przeglądarki, nigdy konto — nie ma tu nic o osobie z loginem |
+
+!!! warning "Czego usunięcie nie dosięga — i mówią to dokumenty, a nie wdrożenie po fakcie"
+
+    **Skonfigurowany zewnętrzny magazyn pamięci.** `mem0` trzyma to, co agent
+    zapamiętał, w cudzym systemie, a to wdrożenie może poprosić o zapomnienie
+    tylko dopóki ma poświadczenie organizacji. `MemoryService.forget_person`
+    robi to dla osoby, która wciąż jest członkiem; notatki usuniętego konta
+    w zewnętrznym magazynie należą do operatora.
+
+    **Kopie zapasowe.** Usunięcie kasuje wiersze z żywej bazy. Harmonogram kopii,
+    który uruchamia wdrożenie, trzyma je do swojej rotacji i żadne usunięcie na
+    poziomie aplikacji tego nie zmienia.
+
+    **Własna retencja providera modelu.** To, co zostało wysłane, by odpowiedzieć
+    na turę, podlega polityce providera — opisują to [modele](models.md), a to
+    wdrożenie tego nie kontroluje.
+
+### Samoobsługa i to, co dokłada administrator { #self-service-and-what-an-administrator-adds }
+
+Osoba nie potrzebuje administratora w zwykłych przypadkach.
+`GET /me/data/export` to cała powyższa tabela w jednym dokumencie JSON, z limitem
+na godzinę i wpisem w audycie — również wtedy, gdy ktoś eksportuje samego siebie,
+bo eksport ma kształt wycieku, gdy wywołujący nie jest tym, za kogo się podaje.
+
+Dokument powstaje i serializuje się w całości, więc jest ograniczony:
+`PERSONAL_DATA_EXPORT_MAX_CHARS` (domyślnie 16 milionów znaków) to tyle tekstu
+rozmów, ile jeden dokument może unieść, a konto trzymające więcej dostaje odmowę
+z obiema liczbami zamiast po cichu niepełnego dokumentu. Wytworzenie takiego
+jest zadaniem operatora, wprost z bazy.
+`DELETE /conversations/{id}` usuwa jeden wątek, jego tury i pliki, które z nimi
+przyszły, sprawdzone wobec własności wywołującego (FA-015).
+
+Administrator dokłada dwie rzeczy i obie są audytowane:
+`GET /admin/users/{id}/export`, który **wymaga powodu** — czytanie całej historii
+rozmów kolegi jest uzasadnione jakieś dwa razy w roku i za każdym razem poważne —
+oraz `DELETE /admin/users/{id}`, gdzie powód jest opcjonalny, bo offboarding
+zwykle nie ma czego tłumaczyć.
+
+## Dane strony i jej adres { #a-pages-data-and-its-address }
+
+[Opublikowana strona](artifacts.md#live-data) może czytać dane tabel. To jedyne
+miejsce, w którym dane członka docierają do innych członków dzięki pracy agenta,
+więc kontrole są wymienione tu, a nie tylko jako wiersze macierzy.
+
+**Delegowany odczyt.** Każdy oglądający powiązaną stronę czyta te same rekordy,
+przez zamrożone zapytania strony, **z dostępem właściciela strony**. To świadoma
+delegacja dostępu właściciela do tabel na odbiorców strony. Jej kontrole:
+
+- Dane są udostępniane tylko za [zgodą](artifacts.md#consent-the-owner-decides-who-reads-the-data)
+  właściciela, wyrażoną per wersja, po przeczytaniu zapytań słowami i każdej
+  powiązanej tabeli, do której sięgają, oraz związaną z członkostwem właściciela
+  i odciskiem tego, co pokazano. Republikacja, która czyta cokolwiek innego, czeka
+  na nią. Każdy edytor może ją wycofać, co obniża też każdy grant `edit_data` na
+  stronie do `edit`.
+- Właściciel jest sprawdzany od nowa przy każdym serwowaniu: aktywny członek z `read`
+  na każdej tabeli, do której sięgają zapytania. Właściciel, który traci dostęp albo
+  odchodzi, ciemni dane strony.
+- Zapytanie jest rozwiązywane do identyfikatorów przy publikacji i porównywane przy
+  każdym załadowaniu z tabelami takimi, jakie są: kolumna, której znaczenie się zmieniło
+  albo którą zarchiwizowano, zarchiwizowana tabela albo powiązana tabela etykietowana
+  inną kolumną nie serwuje niczego, dopóki strona nie zostanie opublikowana ponownie.
+- Poszerzanie tego, kto otwiera taką stronę, należy do właściciela, albo Ownera lub
+  Admina w jego imieniu; edytor albo agent przez `share_artifact` może tylko złożyć
+  prośbę. Admini są zaufani i działają bezpośrednio; kontrole są wymierzone w agentów,
+  impersonację i osoby z zewnątrz.
+- Auto-zgoda i `edit_data` to dwie stałe zgody. Auto-zgodę włącza tylko właściciel,
+  jako on sam. `edit_data` nadaje właściciel albo Owner lub Admin, jako oni sami.
+  Obie poprzedza okno, którego tekst jest zapisany we wpisie audytu.
+
+**Adres treści.** Strona członka ładuje się z `/artifact-content/<token>`. Token jest
+podpisany, nazywa jedną wersję i niesie odbiorcę, `member` albo `public`; trasa
+przyjmuje oba. `frame-ancestors` każdej odpowiedzi z treścią zawiera konsolę, bo
+konsola ramkuje stronę dla członka i własną stronę publicznego linku (`/a/<key>`),
+która tam mieszka. Origin dokumentu osadzenia i wskazane witryny osadzające linku są
+dodawane tylko dla strony, którą można osadzić: z publicznym linkiem i bez hasła.
+Dane może nieść tylko token `member`. Gdy konsola prosi o dane przy ładowaniu, token
+mówi to także, a trasa czyta bindingi dla oglądającego, którego nazywa, tak jak są
+serwowane teraz: członek jest wyszukiwany od nowa, nadal musi mieć dostęp do strony
+i dostaje dane tylko dla wersji, którą mu serwowano. Miniatury, karty i wersje
+historii nie dostają żadnych. Token `public` też może je nieść, pod
+[bramkami poniżej](#public-data); nigdy nie jest zaufany poza linkiem, który nazywa.
+
+### Adres publiczny { #public-data }
+
+Token publiczny niesie `pk`, skrót klucza linku, który trasa treści musi uznać za
+bieżący klucz linku przy każdym ładowaniu: zmieniony albo usunięty klucz to 404,
+niezależnie od pozostałego czasu życia tokena. Niesie `pw`, skrót hasha hasła linku
+(brak, gdy nie ma hasła), oraz `inj`, prawdziwe tylko wtedy, gdy bramka danych strony
+obowiązywała w chwili wydania.
+
+Dane są wpisywane do strony tylko wtedy, gdy klucz, stan hasła, wygaśnięcie, obsługiwana
+wersja, wyłącznik organizacji `public_live_data`, zgoda strony na dane publiczne, zgoda
+członków i właściciel nadal obowiązują, sprawdzane od nowa przy każdym ładowaniu, przed
+jakimkolwiek odczytem i przed cache. Ładowanie, które zawodzi, renderuje każdy binding
+jako `unavailable` bez powodu. Publiczny wrapper i embed nigdy nie proszą o dane i nie
+mają odświeżania. Zobacz [dane na żywo w publicznym linku](artifacts.md#live-data-on-a-public-link).
+
+**URL to poświadczenie na okaziciela.** Przez swoje życie — domyślnie pięć minut
+(`ARTIFACT_VIEW_TTL_SECONDS`), najwyżej dziesięć załadowań na minutę na adres — każdy,
+kto ma adres strony członka wystawiony dla danych, ładuje ją z wstrzykniętymi rekordami
+tego oglądającego, skądkolwiek, a odpowiedź nigdy nie jest cache'owana. Dlatego jest
+trzymany poza logami, a limit zapytań liczy go po skrócie. Nie wklejaj takiego adresu
+do zgłoszenia ani na czat. Rekordy adresu publicznego to te, które jego link może
+teraz pokazać, a przestaje je nieść, gdy jego klucz zostanie zmieniony, hasło się zmieni
+albo zgoda zostanie wycofana.
+
+**Nie akcja.** `share_artifact` niczego nie udostępnia. Składa prośbę do właściciela,
+który odpowiada w konsoli, zalogowany jako on sam; strona, którą nakłoniono do prośby,
+nie może więc poszerzyć samej siebie.
+
+**Nie logowane.** Wartości rekordu nigdy nie trafiają do logów, śladów ani wpisów
+audytu: ślad audytu zawiera odcisk, wersję, kto wyraził zgodę i jaki tekst potwierdził,
+nigdy wiersz ani wartość filtra.
+
+## Strona, która uruchamia workflowy { #a-page-that-starts-workflows }
+
+Skrypt strony jest niezaufany: pisze go model, który mógł przeczytać coś wrogiego.
+[Akcje](artifacts.md#actions) pozwalają mu poprosić o uruchomienie workflowu, więc to, co
+może zrobić, ograniczają kontrole, których strona nie może zmienić:
+
+- **Allowlista sprawdzona przez publikującego.** Strona deklaruje najwyżej pięć
+  workflowów, każdy powiązany w capability Workflowy agenta, aktywny, startowany ręcznie
+  i możliwy do uruchomienia przez osobę stojącą za publikującym runem. Run bez nikogo za
+  sobą nie może ich deklarować ani zmieniać. Przywrócenie sprawdza je ponownie.
+- **Sformułowanie strony niczego nie rozstrzyga.** Etykieta jest zwykłym tekstem bez
+  ukrytych znaków; konsola tytułuje okno nazwą samego workflowu, a etykietę cytuje.
+- **Człowiek potwierdza każdy run.** Okno pokazuje każdą wartość wejścia jako tekst,
+  z niewidocznymi znakami wypisanymi wprost; Run jest wyłączony przez pół sekundy i nigdy
+  nie dostaje fokusu; otwarte jest jedno pytanie naraz, a trzy odmowy zatrzymują
+  pytania, dopóki strona nie zostanie otwarta ponownie.
+- **Żądanie jest sprawdzane dwa razy.** Konsola przyjmuje wiadomość tylko z własnej ramki
+  strony, z nonce tego załadowania, i tylko dla akcji, którą serwer wymienił dla tego
+  oglądającego i podanej wersji; przed zapytaniem sprawdza wejście z polami workflowu.
+  Route startu powtarza kontrole: wersja musi być tą podaną, workflow zadeklarowany
+  i możliwy do uruchomienia przez wywołującego teraz, a sesja nie może być
+  impersonowana.
+- **Poprosić może tylko oglądający stronę.** Adres niesie claim `acts`, ustawiany tylko
+  dla oglądającego w konsoli. Publiczne linki, embedy, podglądy i miniatury odrzucają
+  wywołanie i nie niosą żadnych akcji.
+- **Run należy do osoby.** Jej uprawnienia, budżet i limit zapytań (domyślnie 10 runów
+  na minutę), zapisany z triggerem `app` i audytowany bez wejścia.
+- **Strona dowiaduje się niewiele.** Status runa, tekst odpowiedzi, odpowiedź
+  strukturalna bez referencji do plików i pierwszy wiersz błędu, najwyżej 200 znaków,
+  tylko dla runa, który ta strona uruchomiła dla tej osoby.
+
+## Macierz kontroli { #controls-matrix }
+
+Jeden wiersz na kontrolę, mechanizm, który ją realizuje, i test, który trzyma ją
+w mocy. Ujęte względem zabezpieczeń technicznych HIPAA §164.312 i SOC 2 CC6–CC8.
+
+### Kontrola dostępu · HIPAA §164.312(a) · SOC 2 CC6 { #access-control-hipaa-164312a-soc-2-cc6 }
+
+| Kontrola | Mechanizm | Trzymane przez |
+|---|---|---|
+| Izolacja tenantów, nawet gdy wywołujący jest właścicielem wiersza | `resolve_access` odmawia zasobowi, którego `organization_id` się różni, zanim sprawdzi własność (`app/services/access.py`) | `test_resource_access.py::TestTenantBoundary`, `test_conversation_tenant_isolation.py`, `test_platform_flows.py` |
+| Bazy wiedzy o tej samej nazwie nie mieszają swoich chunków | Każdy chunk we wspólnej tabeli `rag_<name>` zapisuje swojego tenanta i bazę wiedzy, dla której został zaindeksowany; każdy odczyt, licznik, zastąpienie i usunięcie wektorów bierze `vector_scope` bazy (`app/services/rag/vectorstore.py`). Chunki sprzed aktualizacji, których `0180_stamp_rag_rows_by_base` nie mogła przypisać do jednej bazy, zachowują regułę tenanta | `integration/test_rag_vector_scope_per_base.py`, `integration/test_rag_ingest_tenant_scope.py` |
+| Uprawnienie na każdym route'cie kolekcji | Zależność route'u `require(*perms)` na listowaniu, tworzeniu i route'ach katalogu (`app/api/deps.py`), katalog w `app/core/permissions.py` | `test_platform_routes.py::TestEachRouteDemandsItsOwnPermission` |
+| Route'y per zasób autoryzują w serwisie, nie na route'cie | Route działający na jednym agencie, skillu albo kolekcji nie niesie bramki `require()` — bramka roli odmówiłaby posiadaczowi grantu, zanim grant by zadziałał — i zamiast tego woła `resolve_access` (`app/services/access.py`) | `test_platform_routes.py::TestEveryPlatformRouteIsGuarded` (każdy route jest bramkowany albo rozstrzygany w serwisie) |
+| Grant poszerza dostęp, nie awansując członka | `resolve_access` per zasób bierze `max(zakres roli, grant)` (`app/services/access.py`) | `test_resource_access.py::TestGrantsWidenAccess`, `::TestPermissionsGrantsCannotWiden` |
+| Strona uruchamia workflow tylko jako osoba, która to potwierdza | Allowlista z publikacji (`app/services/artifact_actions.py`), własna lista oglądającego, kontrole origin i nonce w konsoli oraz okno potwierdzenia (`frontend/src/hooks/use-artifact-actions.ts`), claim `acts`, który niesie tylko adres oglądającego (`app/core/security.py`), oraz route startu, który uruchamia workflow jako wywołujący i odmawia innej wersji albo impersonowanej sesji. Zobacz [stronę, która uruchamia workflowy](#a-page-that-starts-workflows) | `tests/integration/test_artifact_actions.py`, `tests/integration/test_artifact_action_runs.py`, `src/components/artifacts/artifact-actions.test.tsx` |
+| Wzmianka w kanale uruchamia run jako nadawca, nie jako bot | Używany jest własny `AuthContext` powiązanego, aktywnego nadawcy (`app/services/channels/mentions.py`) | `test_channel_mentions.py::TestAnswer::test_the_run_carries_the_senders_own_role` |
+
+### Uwierzytelnianie · HIPAA §164.312(d) · SOC 2 CC6 { #authentication-hipaa-164312d-soc-2-cc6 }
+
+| Kontrola | Mechanizm | Trzymane przez |
+|---|---|---|
+| JWT (HS256), hasła przez bcrypt | `app/core/security.py` — `verify_token`, `get_password_hash` | `test_security.py`, `test_auth.py` |
+| Klucze API porównywane w stałym czasie | `secrets.compare_digest` (`app/api/deps.py`) | `test_auth.py`, sprawdzenia HMAC webhooków w adapterach kanałów |
+| Sesje w bazie danych z unieważnianiem | Tabela `sessions` + `SessionService`; token związany z claimem `sid` (`app/services/session.py`, `app/api/routes/v1/sessions.py`) | `test_session_verify.py`, `test_session_revocation.py` |
+| Logowanie jednokrotne przez własnego dostawcę tożsamości wdrożenia | Generyczne OIDC przez discovery — authorization code z PKCE, wymagane `email_verified`, konto kluczowane po `sub` (`app/core/oauth.py`, `app/api/routes/v1/oauth.py`). Entra ID, Okta, Keycloak; konfiguracja w [Logowaniu jednokrotnym](configuration.md#single-sign-on-generic-oidc) | `test_oidc_sign_in.py` |
+| Polityka rejestracji bramkuje SSO tak samo jak formularz | `check_may_register` wewnątrz `get_or_create_oauth_user` — `invite_only` i lista dozwolonych domen odmawiają też logowaniu przez dostawcę (`app/services/user.py`) | `test_oidc_sign_in.py::TestTheRoundTrip`, `test_signup_policy.py` |
+| Logowanie kontem katalogowym | Standardowy dwuetapowy bind LDAP — wyszukanie jako konto serwisowe, potem bind **jako to konto** z wpisanym hasłem; puste hasło nigdy nie dociera do bindu, nazwa użytkownika jest escapowana do filtra, dwa pasujące konta oznaczają odmowę, TLS jest weryfikowany, a `ldap://` bez StartTLS jest odrzucane przy starcie (`app/services/directory/ldap_directory.py`). Zobacz [Logowanie katalogowe](directory.md#signing-in-with-a-directory-account) | `test_ldap_directory.py`, `test_directory_settings.py` |
+| Zintegrowane logowanie Windows | SPNEGO z keytabem tej usługi; akceptowany jest wyłącznie bilet przyjęty w jednym kroku, a jego principal jest rozwiązywany przez katalog do tego samego konta, do którego prowadzi hasło (`app/services/directory/kerberos.py`, `app/api/routes/v1/directory_auth.py`) | `test_kerberos_acceptor.py`, `test_directory_auth_routes.py` |
+| Grupy katalogowe decydują o członkostwach | Mapowania grup katalogowych, stosowane przy każdym logowaniu LDAP, Kerberos albo OIDC. Synchronizacja przepisuje tylko członkostwa, które sama utworzyła, nigdy nie degraduje ani nie usuwa ownera, nigdy nie dołącza do organizacji osobistej i nie potrafi zmapować roli, której jej autor nie mógłby nadać; przekroczenie limitu grup w Entra ID (group overage) jest odrzucane (`app/services/directory/sync.py`, `app/services/directory/mappings.py`, `groups_claim` w `app/core/oauth.py`) | `tests/integration/test_directory_groups.py`, `test_oidc_groups.py` |
+| Granty dla grup | Grant ma dokładnie jeden podmiot, osobę albo grupę (`ck_resource_grant_one_subject`); grant dla grupy sięga do każdego, kto jest w grupie w chwili sprawdzania dostępu, i tylko przez grupy tej samej organizacji (`app/repositories/resource_grant.py`) | `tests/integration/test_directory_groups.py`, `test_resource_grant_repo.py` |
+| SAML, SCIM, ponowne sprawdzanie katalogu między logowaniami | **Jeszcze nie** — otwarta sesja wyłączonego konta katalogowego trwa, dopóki nie wygaśnie jej refresh token, chyba że administrator dezaktywuje konto. Zobacz [Czego to jeszcze nie robi](directory.md#what-this-does-not-do-yet) | — |
+| Limitowanie prób logowania | `enforce_auth_limit` (`app/api/deps.py`) | `test_auth_rate_limit.py` |
+| Zmieniony adres e-mail jest dowodzony, zanim poczta za nim pójdzie | `PATCH /users/me` odkłada adres w `users.pending_email` i wysyła na niego jednorazowy, godzinny link; konto do powrotu tego linku odbiera wszystko pod dotychczasowym adresem, a ten dotychczasowy dostaje informację, że o zmianę poproszono. Link niesie wersję poświadczeń konta, więc zmiana albo reset hasła — to, do czego wzywa tamta informacja — unieważnia go, a naprawa adresu przez administratora czyści odłożoną zmianę. Ponowna prośba o już odłożony adres nie wysyła nic, a liczba różnych adresów na konto jest ograniczona w ciągu godziny. I żądanie, i potwierdzenie trafiają do audytu (`app/services/user.py`, `POST /auth/email-change/confirm`) | `test_email_change.py` |
+| Odtworzony refresh token kończy swój łańcuch i zostaje zapisany | Rotacja zachowuje zastąpiony hash; refresh, który do niego pasuje, to przypadek ponownego użycia z RFC 6819 §5.2.2.3 - zamyka tę sesję i zostawia wpis w audycie (`SessionService.detect_refresh_reuse`). Token przedstawiony w ciągu `REFRESH_REUSE_GRACE_SECONDS` (domyślnie 60) od swojej rotacji to utracona odpowiedź albo jedno z kilku równoczesnych żądań z tym samym cookie, a nie odtworzenie, więc dostaje następcę, którego wiersz już trzyma, odtworzonego ze zużytego tokena - każde żądanie z takiej serii dostaje ten sam token (`SessionService.claim_refresh_grace`, `reissue_within_grace`); to okno jest świadomie przyjętym kosztem | `test_session_revocation.py::TestReusingASpentRefreshToken`, `TestTheReuseGraceWindow` |
+| Klucze API organizacji | Uprawnienia członka zawężone do tych, z którymi klucz wydano, i odczytywane z członkostwa wydającego przy każdym żądaniu; w spoczynku SHA-256, pokazywany raz, opcjonalne wygaśnięcie, unieważnialny, limit per klucz, przyjmowany tylko na trasach publicznych, a we wpisach audytu żądania nazwany prefiksem (`app/services/api_key.py`, `app/api/public_api.py`) | `tests/integration/test_api_keys.py`, `test_api_key_service.py` |
+| OAuth 2.1 dla klientów MCP | Tylko klienci publiczni, wymagane PKCE (S256), redirect URI porównywany dokładnie; zgoda w konsoli odrzuca sesję impersonacji i uprawnienia, których członek nie ma; kody są jednorazowe, refresh tokeny rotują, a ponowne użycie unieważnia grant z każdym wydanym tokenem; token jest zużywany jednym warunkowym update'em, więc dwie równoległe wymiany nie wydadzą obu; otwarta rejestracja jest limitowana per adres, a nieużyci klienci znikają po dobie (`app/services/oauth_server.py`, `app/services/platform_mcp/_oauth.py`) | `tests/integration/test_mcp_oauth.py` |
+| Zdarzenia o zmianach na żywo | Publikowane dopiero po udanym i zatwierdzonym zapisie przez publiczne API; dostęp każdego subskrybenta jest odczytywany od nowa przy każdym zdarzeniu, więc wiersz, którego nie może odczytać, zmiana w innej organizacji ani usunięcie rodzaju, którego jego rola nie widzi w całości, nigdy do niego nie trafia, a gniazdo, którego sesja, klucz lub członkostwo wygasły, zostaje zamknięte (`app/services/change_feed.py`) | `tests/integration/test_change_feed.py` |
+
+### Kontrole audytowe · HIPAA §164.312(b) · SOC 2 CC7 { #audit-controls-hipaa-164312b-soc-2-cc7 }
+
+| Kontrola | Mechanizm | Trzymane przez |
+|---|---|---|
+| Mutacje istotne dla governance zapisywane w transakcji żądania | `record_audit` (`app/core/audit.py`) w mutującym serwisie — rotacja sekretu, podpięcie skilla / synchronizacji / MCP, członkostwo, udostępnianie, zatwierdzenia, eksporty i więcej; zapisywane do `app_admin_audit_logs`. To nie jest pokrycie każdego zapisu (CRUD bazy wiedzy, choćby, nie jest audytowany) | `test_skill_binding_audit.py`, `test_sync_source_audit.py` |
+| Ślad jest czytelny dla audytora | `GET /audit`, bramkowane na `audit:read` (`app/services/audit.py`) | `test_audit_service.py` |
+| Eksport śladu (CSV/JSONL) | `GET /audit/export` w oknie czasu, bramkowany na `audit:read`, zapisujący własny odczyt w śladzie; eksporty runów, zatwierdzeń i wydatków robią to samo (#1422) | `test_exporting.py` (eksport i jego własny wpis audytowy) |
+| Okres audytu, który organizacja może wydłużyć i nigdy skrócić | Podłoga na poziomie wdrożenia (domyślnie sześć lat, HIPAA §164.316(b)(2)); krótszy okres jest odrzucany, a nie podnoszony. Sweep **nie** usuwa wpisów audytowych — łańcuch haszy i jego checkpoint stoją na tym, że wpisy zostają, więc wpisu nie da się wycofać, nie łamiąc dowodu, że reszta jest nienaruszona (`app/core/retention.py`). Zobacz [Retencję](governance.md#retention) | `test_retention.py::TestWhichNumberWins`, `::test_audit_resolves_to_a_period_and_is_still_not_swept` |
+| Osoba może odczytać i usunąć własne dane | `GET /me/data/export` (limit na godzinę, audytowany także przy własnym żądaniu) oraz `DELETE /conversations/{id}` w zakresie własności wywołującego; eksport administratora wymaga powodu (`app/services/personal_data.py`) | `test_personal_data.py` |
+| Dowód nienaruszalności (łańcuch haszy) | Każdy wpis wchodzi w łańcuch haszy swojej organizacji, a każdy łańcuch niesie checkpoint na swoim znaku najwyższej wody, więc przepisany wpis, urwany ogon i skasowany łańcuch są wykrywalne osobno; `agenticos cmd audit-verify` przechodzi je i kończy się kodem niezerowym na przerwaniu (`app/core/audit.py`, `app/commands/audit_verify.py`). Wykrycie, nie zapobieżenie: kto trzyma własne poświadczenia bazy, może przekuć łańcuch albo zrzucić trigger checkpointu | `test_audit_record.py`, `test_audit_chain_backfill.py`, `test_audit_verify_command.py`, `test_audit_checkpoint_migration.py` |
+
+### Integralność · HIPAA §164.312(c) · SOC 2 CC8 (zarządzanie zmianą) { #integrity-hipaa-164312c-soc-2-cc8-change-management }
+
+| Kontrola | Mechanizm | Trzymane przez |
+|---|---|---|
+| Spec jest odrzucany przy publikacji, nigdy w czasie runu | `validate_spec` (`app/services/agent_registry.py`) — nieznana capability, nieprzyznany scope, `secret_id` złego rodzaju albo z innej organizacji, osobiste połączenie MCP | `test_agent_registry.py`, `test_capability_secrets.py::TestPublishValidation` |
+| Budżet jest sprawdzany przed żądaniem do modelu, a koszt zapisywany nawet przy błędzie | `BudgetGuard.wrap_model_request` bramkuje przed wywołaniem (`app/agents/capabilities/budget/`); koszt runu jest zapisywany w terminalnym `finally` (`app/services/agent_runner.py`) | `test_spend.py::TestBudgetGuard`, `test_agent_runner.py::…::test_a_failed_run_still_records_its_cost` |
+| Zatwierdzenie jest rozstrzygane dokładnie raz | `ApprovalService.decide` odmawia wierszowi innemu niż oczekujący, odczytanemu `for_update` (`app/services/approvals.py`) | `test_approvals_queue.py::TestDecidingTwiceIsRefused` |
+| Zatwierdzenie w rozmowie głosowej wykonuje dokładnie pokazane argumenty, raz, i rozstrzyga je tylko rozmówca | Most rozmowy zapisuje wiersz, pokazuje dokładne argumenty, czeka 60 s i przyznaje zgodę po id wywołania narzędzia (`app/services/voice/approvals.py`); route kolejki odrzuca wiersze trwającej rozmowy | `test_voice_approvals.py::test_an_approval_grants_exactly_the_shown_arguments_once`, `tests/integration/test_voice_approvals_queue.py` |
+| Rozmowa głosowa zatrzymuje się, gdy znika dostęp, i jest rozłączana przy każdym wyjściu | Każdy 15-sekundowy heartbeat sprawdza na nowo sesję, członkostwo, stan publikacji agenta i przełącznik organizacji; każde wyjście uruchamia jedno osłonięte sprzątanie, które zapisuje koniec rozmowy, a potem rozłącza ją u providera; przemiatanie co minutę i przy starcie rozłącza rozmowy, których heartbeat się zestarzał (`app/services/voice/session.py`, `app/services/voice/reaper.py`) | `test_voice_session.py::test_a_call_stops_being_allowed_when_access_goes`, `::test_every_exit_path_hangs_up_the_provider_call`, `test_voice_reaper.py::test_a_call_whose_heartbeat_stopped_is_hung_up_and_its_run_closed` |
+| Analiza statyczna dosięga zmiany, która wprowadza znalezisko | CodeQL (`security-extended`) na każdym pull requeście dla Pythona, JavaScriptu/TypeScriptu, Rusta i workflowów, plus cotygodniowy pełny przebieg (`.github/workflows/codeql.yml`). Scalenia odmawia ochrona scalania na podstawie code scanningu w rulesecie `main`, a nie status samego joba — zobacz [gałęzie](branching.md#what-is-enforced-and-by-what) | `test_codeql_workflow.py` |
+| Zależność ze znaną podatnością przerywa pull requesta | `make audit` na `backend/uv.lock` i `make audit-frontend` na `frontend/bun.lock`, oba w zadaniu `Security Scan` i w `make check` | `test_ci_parity.py` |
+| To, co zawiera wydanie, da się odczytać bez budowania | SBOM CycloneDX na obraz, generowany z opublikowanego manifestu i dołączany do wydania; [inwentarz komponentów](reference/components.md) jest czytelnym indeksem | `test_images_workflow.py::TestTheReleaseCarriesAnInventory` |
+
+### Poufność poświadczeń · HIPAA §164.312(a)(2)(iv) { #confidentiality-of-credentials-hipaa-164312a2iv }
+
+| Kontrola | Mechanizm | Trzymane przez |
+|---|---|---|
+| Żaden sekret otwartym tekstem w odpowiedzi API ani we wpisie audytowym | `SealedStr`/`CredentialStr` maskują każdy repr; podpowiedzi to wyłącznie ostatnie 4 znaki (`app/core/secret_kinds.py`, `app/core/vault.py`) | `test_no_secret_escapes.py` (przemiata całą powierzchnię OpenAPI), `test_capability_secrets.py::TestInjection` |
+| Logi nie są częścią tej gwarancji | Zniekształcona odpowiedź tokena MCP OAuth trafia do logów przez `ValidationError` Pydantica, który powtarza swoje wejście — znana luka, [#1626](https://github.com/vstorm-co/agenticos/issues/1626) | `test_mcp_connections.py::test_an_unreadable_token_response_does_not_echo_its_input` (dokumentuje, że token ląduje w `caplog`) |
+| Podpisane linki w logach dostępu | Aplikacja redaguje ścieżki i wartości parametrów zawierające poświadczenia, także w logach dostępu i błędów uvicorna. Dostarczone konfiguracje Nginx i Traefika pomijają ścieżkę, parametry zapytania i Referer w logach dostępu. Operatorzy innych proxy muszą skonfigurować równoważną ochronę. | `test_logging.py::test_a_signed_link_in_the_access_log_is_redacted` |
+| Żadne poświadczenie providera nie trafia do przeglądarki rozmowy głosowej | Serwer odpowiada na ofertę SDP i trzyma połączenie sideband; oferta z kanałem danych jest odrzucana; sekrety klienta nigdy nie są wydawane; klucz jest odpieczętowywany na rozmowę, a na rozłączenie tylko przez `OrganizationSecretService.voice_call_key`, którego otwarty tekst trafia do endpointu rozłączania providera i nigdzie indziej (`app/services/voice/transport.py`, `app/services/voice/hangup.py`) | `test_voice_session.py::test_no_frame_carries_the_provider_key`, `test_voice_transport.py::test_an_offer_with_a_data_channel_is_refused` |
+| Poświadczenie jest w spoczynku związane ze swoją organizacją | Koperta HKDF per właściciel (`app/core/vault.py`); zakres to poświadczenia konektorów i API — o tokenach bearer, których nie obejmuje, mówi „Co jest gdzie szyfrowane” | `test_secret_tenant_isolation.py`, `test_vault.py` |
+
+### Bezpieczeństwo transmisji · HIPAA §164.312(e) · SOC 2 CC6 { #transmission-security-hipaa-164312e-soc-2-cc6 }
+
+| Kontrola | Mechanizm | Trzymane przez |
+|---|---|---|
+| TLS do PostgreSQL i Redisa | `POSTGRES_SSLMODE`, `REDIS_SSL` (`app/core/config.py`); `doctor` raportuje żywy stan Postgresa z `pg_stat_ssl` | Postgres, na żywym połączeniu: `test_store_tls.py`; Redis, przy budowie URL-a i w `doctor`: `test_config.py`, `test_doctor_sandbox.py` |
+| Nagłówki ramkowania i MIME na każdej odpowiedzi; CSP na wszystkich poza endpointami referencji API | `SecurityHeadersMiddleware` (`app/core/middleware.py`), którego `exclude_paths` zdejmują CSP — nie ramkowanie ani MIME — dla OpenAPI, Swaggera i ReDoc; plus CSP frontendu per wdrożenie (`frontend/src/middleware.ts`), którego `script-src` niesie nonce per żądanie i `'strict-dynamic'` zamiast `'unsafe-inline'` | `test_security_headers.py`, w tym `test_an_excluded_path_keeps_its_framing_but_drops_the_csp`; `csp.test.ts`, `middleware.test.ts` |
+| HTTPS i HSTS | Terminowane na reverse proxy — dołączony `nginx/nginx.conf` ustawia HSTS; aplikacja z założenia nie | Sprawa wdrożenia; zobacz listę kontrolną hardeningu |
+| Adres prywatny jest odrzucany, chyba że operator go wpisał | Kroki HTTP workflow, konektory `git` i `web`, klient A2A i przepływ OAuth MCP rozwiązują każdą nazwę, sprawdzają każdą odpowiedź i łączą się z adresem, który sprawdziły. Endpoint konektora `s3` i własny URL połączenia MCP są sprawdzane przy zapisie i rozwiązywane ponownie przy użyciu, więc żaden adres nie jest dla nich przypinany, a nazwę z listy, która jeszcze się nie rozwiązuje, nadal można zapisać ([pozostałe krawędzie](mcp.md#every-url-in-that-flow-is-checked-not-just-the-one-you-typed)). `OUTBOUND_PRIVATE_ALLOWLIST` (domyślnie pusta) dopuszcza wskazane prywatne hosty i sieci, ale tylko dla łańcucha żądań, którego pierwszy URL jej potrzebuje, więc przekierowanie, metadane OAuth, karta A2A ani crawl publicznej strony nie wycelują żądania w host z listy. Adresy loopback, link-local, multicast i metadanych chmury pozostają odrzucane niezależnie od listy, odrzucana jest też nazwa z jedną odpowiedzią prywatną spoza listy, a start odrzuca wpis sięgający tych adresów albo wskazujący nazwą lub adresem bazę danych, Redis lub samo API. Każde konto każdej organizacji sięga do każdego portu dopuszczonego hosta, więc usługa z listy musi sama sprawdzać swoje poświadczenie, a URL podpięty z publicznego wyzwalacza albo z argumentów narzędzia agenta może wskazać dowolny host z listy | `test_private_allowlist.py`, `test_workflow_http_private_allowlist.py`, `test_ssrf.py`, `test_pinned_http.py`, `test_config.py`, `test_doctor_private_network.py` |
+| Strony pisane przez agentów nie mogą dosięgnąć konsoli | Opublikowana [aplikacja](artifacts.md) jest serwowana z trasy bez ciasteczek, za krótkożyjącym podpisanym tokenem, pod `Content-Security-Policy: sandbox` bez `allow-same-origin` — nieprzezroczysty origin — i bez `allow-popups`, plus `connect-src 'none'`, bez zdalnego źródła poza własną ścieżką bibliotek wdrożenia, i `frame-ancestors` wymieniające tylko konsolę (a dla publicznej strony, którą można osadzić, dokument osadzenia i wskazane witryny); link na stronie otwiera się dopiero, gdy człowiek potwierdzi jego adres, a follow-up, o który prosi, jest wysyłany dopiero, gdy człowiek go przeczyta i kliknie *Wyślij*; jedynym wyjątkiem dla obrazów jest własna ścieżka kafelków deploymentu, która przyjmuje trzy sprawdzone liczby i sama pobiera kafelek z serwera wskazanego przez `VISUAL_MAP_TILES`, więc strona nigdy do tego serwera nie sięga; opcjonalnie z własnej domeny rejestrowalnej (`ARTIFACT_ORIGIN`); adres publiczny niesie rekordy strony tylko [tak, jak niżej](#public-data), a adres członka niesie rekordy strony tylko tak, jak opisuje [sekcja poniżej](#a-pages-data-and-its-address); odświeżenie pobiera konsola z trasy danych za własną sesją oglądającego i przekazuje je stronie, z nonce, który dopasowuje każdą odpowiedź do jej załadowania strony (korelacja, nie kontrola dostępu) | `test_artifact_routes.py::TestTheContentRoute`, `test_artifact_service.py::TestThePolicy`, `test_artifact_pages.py`, `test_map_tiles.py`, `test_tile_proxy.py`, `artifacts.test.tsx`, `visual-frame.test.tsx`, `visual-panel.test.tsx`, `csp.test.ts`, `test_artifact_data.py`, `test_artifact_bindings.py` |
+| Limity zapytań na publicznych powierzchniach | Limity oparte o Redis na API runów, widgecie embed, stronach hostowanych, publicznych linkach aplikacji i ich podpisanych adresach treści oraz na trasie danych na żywo strony i jej wstrzykniętych załadowaniach — 30 załadowań na minutę na oglądającego, jedno w toku na oglądającego i limit na proces; prośby o udostępnienie strony — 10 na godzinę na osobę na organizację (`app/services/rate_limit.py`); gdy Redis nie działa, dolny próg limitu zapytań i limit żądań w toku liczą się per worker API, a limit na proces nadal ogranicza każdy worker; limity per nadawca na botach kanałów (`app/services/channels/router.py`) Podpisane linki do wygenerowanych mediów dla odwiedzających stronę hostowaną też mają limit per link. | `test_rate_limited_surfaces.py`, `test_artifact_data.py`; limit bota kanału jest zaimplementowany, ale cienko przetestowany |
+| Dane w publicznym linku wymagają organizacji i właściciela | Anonimowi odwiedzający linku albo embedu dostają rekordy strony tylko wtedy, gdy obowiązują wyłącznik organizacji `public_live_data` (domyślnie wyłączony, zmieniany przez Ownera albo Admina jako on sam, audytowany) i publiczna zgoda strony (właściciela albo Ownera lub Admina, jako on sam, związana z odciskiem zapytań i skrótem kręgu odbiorców), a także zgoda członków i dostęp właściciela; każde ładowanie sprawdza przed cache klucz linku (`pk`), wygaśnięcie, skrót hasła (`pw`) i obsługiwaną wersję; zgodę czyści wyłączenie linku, usunięte hasło, nowa witryna osadzająca, nowy właściciel, wycofana zgoda członka i archiwizacja; żadne narzędzie agenta nie sięga do wyłącznika ani zgody | `test_artifact_public_data.py`, `test_artifact_public_serving.py`, `test_artifact_routes.py`, `test_services_organizations.py` |
+| Dane publiczne są czytane w ograniczonym cache w procesie | Odczyty dla strony publicznej są trzymane 30 s w pamięci procesu API, nigdy w Redisie, w granicach `ARTIFACT_PUBLIC_DATA_CACHE_BYTES`; tylko ładowanie, które musi czytać z tabel, liczy się raz do `RATE_LIMIT_ARTIFACT_PUBLIC_DATA_PER_MINUTE` per strona; niedostępny odczyt nigdy nie jest zachowywany | `test_artifact_public_serving.py`, `test_artifact_public_data.py` |
+| Dane powiązanej strony są czytane z upoważnienia właściciela i udostępniane tylko przez niego | Każdy oglądający dostaje rekordy strony przez jej zapytania strony, czytane z dostępem **właściciela** strony i nigdy nie przechowywane w stronie. Właściciel musi być aktywnym członkiem czytającym każdą tabelę, do której sięga zapytanie, przy każdym załadowaniu (`creator_gone`, `creator_lost_access`); publikujący podlega temu samemu przy publikacji; kolumna albo tabela, która zmieniła się od publikacji, nie serwuje niczego (`source_changed`). Rekordy docierają do kogokolwiek poza właścicielem i rolami czytającymi każdą tabelę tylko dopóki obowiązuje zgoda właściciela per wersja; odbiorcom nigdy nie serwuje się wersji bez zgody | `test_artifact_consent.py`, `test_artifact_consent_actions.py`, `test_artifact_bindings.py`, `test_artifact_service.py`, `test_artifact_data.py` |
+| Zgoda jest własnym aktem właściciela | Potwierdzenie danych, włączenie auto-zgody, nadanie `edit_data` i przekazanie strony dzieją się po zalogowaniu jako ta osoba, nigdy podczas impersonacji i nigdy przez narzędzie agenta; Owner albo Admin może potwierdzić za właściciela i jest audytowany jako ten, który to robi; potwierdzenie niesie odcisk tego, co osobie pokazano, i jest odrzucane, jeśli zapytania się zmieniły | `test_artifact_consent_actions.py`, `test_artifact_consent.py` |
+| Poszerzanie powiązanej strony jest strzeżone | Szersza widoczność, nowy grant albo wyższy poziom na stronie czytającej dane wymaga właściciela (albo Ownera lub Admina) i obowiązującej zgody; próba każdego innego edytora i wywołanie `share_artifact` są składane jako prośba i niczego nie stosują | `test_sharing.py`, `test_artifact_service.py`, `test_artifacts_capability.py` |
+| Run, za którym nie stoi żadna osoba, niczego nie wiąże i niczego nie uruchamia | Binding strony może opublikować tylko run działający w imieniu członka: zalogowanego członka (czat webowy, HTTP API), powiązanego nadawcy z kanału albo twórcy harmonogramu. Odwiedzający widget, embed albo hostowaną stronę, niepowiązany nadawca z kanału, dostarczenie triggera zdarzeniowego agenta (GitHub, e-mail, przekaźnik webhooków) i run workflow przyjęty przez publiczne wejście się nie liczą. Publiczne wejścia to webhook, publiczny formularz, wiadomość z kanału, wiadomość z Gmaila i zdarzenie z GitHuba. Pochodzenie idzie za łańcuchem: wywołany workflow, run uruchomiony przez tabelę albo przez niepowodzenie pod publicznym runem, ponowienie któregokolwiek z nich i run uruchomiony przez tabelę z rekordu, który zapisał run bez członka, działają wszystkie bez osoby. `run_workflow` i narzędzia zapisanych widoków odmawiają w takim runie | `test_artifact_bindings.py`, `test_workflow_calls.py`, `test_table_triggers.py` |
+| Wyciekły link embeda ogranicza, ile mogą kosztować rozmowy | Starty rozmów głosowych są limitowane per adres, per link i per podmiot `jwt`, na jednym embedzie otwartych jest najwyżej `VOICE_MAX_CALLS_PER_EMBED` rozmów, a każdą ogranicza limit długości rozmowy i budżet (`app/services/rate_limit.py`, `app/services/voice/starter.py`) | `test_rate_limit.py`, `test_voice_starter.py`, `tests/integration/test_voice_call_slot.py` |
+| Dyktowanie kosztuje najwyżej tyle, ile jego najdłuższa długość | Domyślnie tylko WAV z 16-bitowym PCM 16 kHz mono: parsowany ściśle, z policzonymi próbkami, odrzucany ponad `dictation_max_seconds`, zanim dostawca zostanie wywołany, i wysyłany za nagłówkiem zbudowanym przez serwer (`app/services/ml/pcm_wav.py`, `MLService.transcribe_dictation`). WebM, Ogg i MP4 dopiero wtedy, gdy app admin włączy `dictation_compressed_audio`, za oknem dialogowym, które nazywa ryzyko | `test_pcm_wav.py`, `test_ml_service.py`, `dictation-audio-card.integration.test.tsx` |
+
+### Odmowy jako zbiór { #the-refusals-as-a-set }
+
+Testy odmów powyżej niosą marker `security`. `make test-security` uruchamia cały
+zbiór, a CI publikuje zebraną listę jako artefakt `security-tests.txt` przy każdym
+przebiegu backendu (#1417) — więc odmowy da się policzyć i przeczytać, a nie tylko
+przyjąć na wiarę. Test, którego nazwa albo moduł wspomina tenanta, uprawnienie,
+budżet, zatwierdzenie, sekret albo tekst jawny, a nie ma markera, wywala
+`tests/test_security_marker.py`, co trzyma listę kompletną w miarę rozrostu suite.
+
+## Profil HIPAA i czego nie twierdzi { #the-hipaa-profile-and-what-it-does-not-claim }
+
+Przegląd bezpieczeństwa nie pyta „czy to oprogramowanie jest zgodne”. HHS nie
+certyfikuje żadnego oprogramowania, a OCR nie uznaje prywatnych certyfikacji.
+Pyta **czy możemy to uruchomić wewnątrz naszego zgodnego środowiska i czy da się
+to udowodnić** — a odpowiedzią jest konfiguracja dostarczona z produktem plus
+komenda sprawdzająca działające wdrożenie względem niej (#1448).
+
+```bash
+uv run agenticos cmd doctor --profile hipaa
+```
+
+Jeden wiersz na kontrolę, każdy nazywający ustawienie, które ją spełnia, albo to,
+które jej nie spełnia, i niezerowy exit przy jakiejkolwiek porażce, żeby dało się
+to odpalić w CI klienta. Konfiguracja to `deploy/profiles/hipaa/`: overlay compose
+odmawiający startu bez ustawień, których nie może domyślnie przyjąć, i opisany
+plik env.
+
+**Ten akapit czytaj jednym tchem z profilem.** Odpowiada on na **techniczne**
+zabezpieczenia, §164.312, i tylko na nie. Zabezpieczenia administracyjne
+(§164.308 — analiza ryzyka, szkolenia, polityka sankcji, plan ciągłości, umowy z
+business associate) i fizyczne (§164.310) należą do operatora i zawsze będą.
+Profil sugerujący inaczej byłby twierdzeniem, którego nikt nie obroni.
+
+### Arkusz { #the-sheet }
+
+| Kontrola | Zabezpieczenie | Spełnia ją |
+|---|---|---|
+| `postgres-tls` | §164.312(e)(1) | `POSTGRES_SSLMODE=verify-full`. `require` szyfruje i nie weryfikuje żadnego certyfikatu, więc profil go nie przyjmuje |
+| `redis-tls` | §164.312(e)(1) | `REDIS_SSL=true`. Oba magazyny muszą być twoje: dołączone w repozytorium `db` i `redis` nie mają listenera TLS, więc overlay odmawia startu bez `POSTGRES_HOST` i `REDIS_HOST` |
+| `browser-tls` | §164.312(e)(1) | `FRONTEND_URL` i `PUBLIC_BASE_URL` po https, z twoim reverse proxy je terminującym. Poświadczane, a adres http jest tu **odrzucany**: każda inna kontrola może przejść, podczas gdy logowanie przechodzi granicę klienta otwartym tekstem |
+| `vault-key` | §164.312(a)(2)(iv) | Klucz główny vaulta o długości co najmniej 64 znaków. HKDF wyprowadza z czegokolwiek klucz opakowujący właściwej długości i nie doda entropii do zgadywalnego sekretu |
+| `content-at-rest` | §164.312(a)(2)(iv) | **Operatora.** Dane Postgresa, wolumen mediów i katalog workspace'ów sandboxa szyfruje wolumen albo dysk, nie ta aplikacja |
+| `local-model` | §164.312(e)(1) | Każdy profil modelu serwowany z twojej sieci. Parsowana jest **nazwa hosta** — adres prywatny, `localhost`, gołe `ollama`/`litellm`/`vllm` albo nazwa `.internal`/`.local`/`.svc` — więc `https://ollama.vendor.example` nie jest lokalny, a ten bez `base_url` to z definicji publiczne API dostawcy |
+| `traces-local` | §164.312(e)(1) | Nieustawiony `LOGFIRE_TOKEN` **i** żaden opublikowany agent ani nazwane środowisko nie niesie własnego tokenu tracingu — każdy podpina własny eksporter, a `observability.content` domyślnie to `full` |
+| `private-network` | §164.312(e)(1) | `OUTBOUND_PRIVATE_ALLOWLIST` i `MCP_ALLOWED_HOSTS` puste. Spełniona, gdy są puste: żaden krok HTTP workflow, źródło git, web ani S3, wywołanie A2A ani połączenie MCP nie sięgnie do adresu prywatnego. Przy wpisach na którejkolwiek z list jest poświadczana, a arkusz wymienia każdą listę z jej wpisami i zasięgiem: każdy członek każdej organizacji może sięgnąć do tych hostów, a to, że każdy z nich sprawdza własne poświadczenie, operator musi udokumentować sam |
+| `sso` | §164.312(d) | `OIDC_ISSUER`, konfigurowany samym discovery — issuer to jedyny URL, a endpointy autoryzacji, tokenu i JWKS biorą się z jego `.well-known/openid-configuration` — albo `KERBEROS_ENABLED`, logowanie własnym biletem domeny. Gdy żadne nie jest ustawione, kontrola jest niespełniona i arkusz to mówi: przy samym `LDAP_URL` mówi, że hasła należą do katalogu, ale są wpisywane tutaj, bez logowania jednokrotnego, a w przeciwnym razie, że ludzie logują się hasłami, które to wdrożenie przechowuje. Uwierzytelnianie wieloskładnikowe należy do dostawcy tożsamości, a arkusz nie przypisuje go sobie w żadną stronę |
+| `signup` | §164.312(a)(1) | `invite_only` albo `closed` |
+| `audit-retention` | §164.312(b) | Podłoga audytu co najmniej 2190 dni — sześć lat z §164.316(b)(2) |
+| `audit-chain` | §164.312(c)(1) | Łańcuch haszy i jego checkpoint. Wykrywanie, nie zapobieganie — zobacz [Kontrole audytu](#audit-controls-hipaa-164312b-soc-2-cc7) |
+
+Trzy wyniki i to środkowy waży. `ok` i `!!` to odpowiedzi tego kodu. `--` to
+kontrola, która naprawdę należy do operatora, **nazwana**, a nie po cichu
+zaliczona — arkusz pomijający to, czego nie widzi, czytałby się jako kompletny i
+nie byłby — i nie wywala komendy, bo kontrola, której stąd nikt nie udowodni, to
+kontrola, której nikt nigdy by nie przeszedł.
+
+### Kto jest business associate { #who-is-the-business-associate }
+
+Klient uruchamiający to na własnej infrastrukturze dostaje oprogramowanie. Nikt
+tutaj nie dotyka jego PHI i żadna umowa nie jest potrzebna. Wdrożenie prowadzone
+dla niego przez kogoś innego czyni tego kogoś business associate, a to umowa, nie
+flaga w konfiguracji.
+
+### Dlaczego profil domyślnie bierze model lokalny { #why-the-profile-defaults-to-a-local-model }
+
+Hostowany model zabiera ze sobą treść każdego uruchomienia, więc jego użycie
+oznacza umowę z tym dostawcą — a te umowy są węższe, niż ludzie zakładają.
+Organizacja z włączonym HIPAA u dużego dostawcy zwykle wyklucza wykonywanie kodu
+i pobieranie z sieci, czyli dokładnie kształt capability `sandbox`,
+`code_execution` i `web_fetch`. Klient, który taką umowę podpisze, a potem
+zbuduje agenta na tych capability, dowiaduje się o tym w trakcie incydentu.
+
+Lokalna inferencja usuwa to pytanie i dlatego jest domyślną wartością profilu, a
+nie sugestią.
+
+## Podsumowanie { #recap }
+
+- Ufaj infrastrukturze operatora; nie ufaj żadnemu żądaniu do niej. Granicami,
+  które mają znaczenie, są przeglądarka → BFF → API → magazyn oraz API/worker →
+  strony trzecie. BFF przekazuje ciasteczko sesji; API jest tym miejscem, gdzie
+  żądanie jest weryfikowane.
+- Jedyne dane, które wychodzą, to te, o których wyjściu zdecydowało wdrożenie —
+  providerzy modeli, kanały, serwery MCP, dostawcy wyszukiwania i embeddingów
+  oraz Logfire — który jest opcjonalny, a gdy token na poziomie wdrożenia jest
+  ustawiony, trace'uje każdy run obsłużony przez proces API, z treścią każdego
+  agenta, który nie poprosił o `none`.
+- Poświadczenia konektorów i API są zapieczętowane per organizacja w jednym
+  vaulcie; krótkożyjące tokeny bearer i reszta treści w spoczynku (wiadomości,
+  RAG, sandboksy) nie są. Wgrane pliki są tym, co się zmieniło:
+  `FILE_STORAGE_BACKEND=s3` umieszcza je w object storage, który szyfruje każdy
+  zapis.
+- Każda kontrola w macierzy nazywa mechanizm i test, i tym samym tchem nazywa
+  swoje luki — dowód nienaruszalności linkuje issue, które by go zbudowało.
+- Podatności zgłaszaj i listę kontrolną hardeningu uruchamiaj z
+  [`SECURITY.md`](https://github.com/vstorm-co/agenticos/blob/main/SECURITY.md);
+  obok tej strony czytaj [Ochronę danych](data-protection.md) i
+  [Licencje](licenses.md).

@@ -1,0 +1,136 @@
+"""ResourceGrant - per-row sharing, on top of role scopes."""
+
+import enum
+import uuid
+from typing import Literal
+
+from sqlalchemy import CheckConstraint, ForeignKey, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base, TimestampMixin
+
+
+class Visibility(enum.StrEnum):
+    """How widely a resource is exposed inside its organization."""
+
+    PRIVATE = "private"
+    TEAM = "team"
+    ORG = "org"
+
+
+class GrantLevel(enum.StrEnum):
+    """What a grant lets the subject do with one resource.
+
+    Ordered `READ < USE < EDIT < EDIT_DATA`: *read* sees the configuration, *use*
+    also runs or attaches it, *edit* also changes it. *edit_data* is for pages only
+    ("Can edit, including data"): an edit whose republishes the page's owner has
+    consented to in advance, so changing what data the page reads reaches everyone who
+    opens it. Being above *edit* it satisfies every check that asks for *edit*.
+    """
+
+    READ = "read"
+    USE = "use"
+    EDIT = "edit"
+    EDIT_DATA = "edit_data"
+
+
+GrantLevelLiteral = Literal["read", "use", "edit", "edit_data"]
+"""The stored levels, as a type the API schemas can also be written in.
+
+Declared here rather than in :mod:`app.schemas.resource_grant` because this is
+the module that makes it true: `ck_resource_grant_level` below is what stops an
+unknown value reaching the column, and a response model promising these
+should be typed from the same place. Without it the ORM column is a plain
+`str`, and handing one to a schema field that says `Literal` type-checks
+nowhere and raises at response time.
+"""
+
+
+GRANT_ORDER: dict[GrantLevel, int] = {
+    GrantLevel.READ: 0,
+    GrantLevel.USE: 1,
+    GrantLevel.EDIT: 2,
+    GrantLevel.EDIT_DATA: 3,
+}
+
+
+class ResourceGrant(Base, TimestampMixin):
+    """One share of one resource with one member, or with one group.
+
+    Deliberately generic (`resource_type` + `resource_id`, no foreign key
+    to the target): agents, collections and skills all share the same sharing
+    UI and rules, and the alternative is a near-identical grant table per
+    resource type. The trade-off is that the database cannot cascade-delete a
+    grant when its target goes away, so services delete grants alongside the
+    resource.
+
+    The subject is a person or a group, never both and never neither -
+    `ck_resource_grant_one_subject` says so where no code path can forget it. A
+    group grant reaches whoever is in the group when access is resolved, so
+    leaving the group is losing the access, with nothing to revoke (#1773).
+    """
+
+    __tablename__ = "resource_grants"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    subject_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    subject_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("groups.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    resource_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    level: Mapped[GrantLevelLiteral] = mapped_column(
+        String(16), nullable=False, default=GrantLevel.READ.value
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "resource_type",
+            "resource_id",
+            "subject_user_id",
+            name="uq_resource_grant_subject",
+        ),
+        UniqueConstraint(
+            "resource_type",
+            "resource_id",
+            "subject_group_id",
+            name="uq_resource_grant_group",
+        ),
+        CheckConstraint(
+            "level IN ('read', 'use', 'edit', 'edit_data')", name="ck_resource_grant_level"
+        ),
+        CheckConstraint(
+            "level <> 'edit_data' OR resource_type = 'artifact'",
+            name="ck_resource_grant_edit_data_artifact",
+        ),
+        CheckConstraint(
+            "(subject_user_id IS NULL) <> (subject_group_id IS NULL)",
+            name="ck_resource_grant_one_subject",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        subject = self.subject_user_id or f"group:{self.subject_group_id}"
+        return (
+            f"<ResourceGrant({self.resource_type}:{self.resource_id} -> {subject} = {self.level})>"
+        )

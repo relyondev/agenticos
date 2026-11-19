@@ -1,0 +1,63 @@
+"""Telegram webhook receiver endpoint."""
+
+import logging
+from typing import Any
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Request, Response
+
+from app.api.deps import ChannelBotSvc
+from app.core.background import spawn
+from app.services.channel_bot import unseal_webhook_secret
+from app.services.channels import get_adapter
+from app.services.channels.telegram_press import parse_press
+from app.worker.background.channel import process_channel_event, process_channel_press
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+@router.post("/{bot_id}/webhook", status_code=200, response_model=None)
+async def telegram_webhook(
+    bot_id: UUID,
+    request: Request,
+    bot_service: ChannelBotSvc,
+) -> Response:
+    """Receive Telegram webhook updates.
+
+    Immediately returns HTTP 200 to Telegram, then processes the update
+    asynchronously in the background so Telegram does not time out.
+    """
+    adapter = get_adapter("telegram")
+    headers: dict[str, str] = dict(request.headers)
+    payload: dict[str, Any] = await request.json()
+
+    bot = await bot_service.find_active(bot_id)
+    if bot is None:
+        return Response(status_code=200)
+
+    # A bot with no secret is not a bot that skips verification - it is an
+    # unauthenticated endpoint that runs an agent on somebody's budget, which is
+    # what `if secret and not verify(...)` meant here until #4. Mattermost, five
+    # files away, has always refused. The two now agree.
+    secret = unseal_webhook_secret(bot)
+    if secret is None:
+        logger.warning(
+            "Telegram bot %s has no webhook secret; refusing. Re-register its webhook to mint one.",
+            bot_id,
+        )
+    if secret is None or not adapter.verify_webhook_signature(headers, secret):
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+
+    press = parse_press(payload, str(bot_id))
+    if press is not None:
+        spawn(process_channel_press(press), name=f"telegram_press:{bot_id}")
+        return Response(status_code=200)
+
+    incoming = adapter.parse_incoming(payload, str(bot_id))
+    if incoming is None:
+        return Response(status_code=200)
+
+    spawn(process_channel_event(incoming), name=f"telegram_event:{bot_id}")
+    return Response(status_code=200)

@@ -1,0 +1,1597 @@
+# Configuration
+
+All configuration is managed via environment variables, loaded from
+`backend/.env` using [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/).
+
+Settings are defined in `app/core/config.py` and accessed via the global
+`settings` object:
+
+```python
+from app.core.config import settings
+
+print(settings.MAX_UPLOAD_SIZE_MB)
+print(settings.DEBUG)
+```
+
+## Getting started
+
+`make install` creates `backend/.env` from `backend/.env.example` when there is
+none, and never touches it again — so on a fresh checkout there is nothing to
+copy, and on an existing one nothing to lose.
+
+Before anything reaches a network anybody else is on, set the values the example
+ships as placeholders:
+
+```bash
+openssl rand -hex 32   # SECRET_KEY — signs every access token
+openssl rand -hex 32   # VAULT_MASTER_KEY — unwraps every credential stored at rest
+```
+
+!!! danger "`SECRET_KEY` ships as a published string"
+
+    An empty `VAULT_MASTER_KEY` falls back to it so a fresh checkout runs at all.
+    Both are fine on a laptop and are the whole security of a deployment anywhere
+    else. Setting `VAULT_MASTER_KEY` explicitly is also what lets stored secrets
+    survive a `SECRET_KEY` rotation.
+
+The config refuses an unset `VAULT_MASTER_KEY` outside `local`/`development`.
+
+## Project settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROJECT_NAME` | `agenticos` | Display name for the project |
+| `API_V1_STR` | `/api/v1` | API version prefix |
+| `DEBUG` | `false` | Enable debug mode (verbose errors, auto-reload) |
+| `ENVIRONMENT` | `local` | One of: `development`, `local`, `staging`, `production` |
+| `TIMEZONE` | `UTC` | IANA timezone (e.g. `UTC`, `Europe/Warsaw`, `America/New_York`) |
+| `MODELS_CACHE_DIR` | `./models_cache` | Directory for cached ML models |
+| `MEDIA_DIR` | `./media` | Directory for uploaded files |
+| `MAX_UPLOAD_SIZE_MB` | `50` | Knowledge-base document cap, and the number the whole-request ceiling below is derived from. A document at this size is chunked and embedded, not held in one piece |
+| `CHAT_MAX_UPLOAD_SIZE_MB` | `10` | What may be attached in chat. Its own setting rather than the one above, because an attachment to an agent with no workspace is pasted whole into the prompt — so the two surfaces fail differently at the same size. Was a hardcoded 10 MiB no operator could raise ([#498](https://github.com/vstorm-co/agenticos/issues/498)); the frontend container reads the same `CHAT_MAX_UPLOAD_SIZE_MB` at runtime, so give both containers one value or the composer refuses a file the server would take |
+| `EMBED_MAX_UPLOAD_SIZE_MB` | `5` | What a **stranger** may upload to a hosted page. A ceiling on top of `CHAT_MAX_UPLOAD_SIZE_MB`, never a way past it |
+| `ML_MAX_UPLOAD_SIZE_MB` | `25` | What one call to the [ML services](ml-services.md) may submit — a document to parse, a scan to recognise, a recording to transcribe. Its own setting because the bytes are parsed or sent to an engine inside one request rather than written down, so the ceiling is about what a single synchronous call may occupy. It sits at the transcription client's own 25 MB, the smallest engine ceiling behind that surface |
+| `ML_MAX_CONCURRENT_PARSES` | `4` | How many documents one worker parses at once for the [ML services](ml-services.md). A rate limit counts starts and cannot see what is still running, so without this a minute's allowance of OCR calls is that many recognitions in flight. Over it a caller is refused with a `Retry-After` rather than queued |
+| `MEM0_ALLOWED_HOSTS` | `[]` (empty) | Hostnames a self-hosted mem0 memory service may point at. A `base_url` comes from an agent spec, so without an allowlist a Builder who can bind (but not read) a shared mem0 key could aim it at their own server and capture the key from the request header. Empty refuses self-hosted mem0 and allows only the managed cloud; add a trusted hostname to enable a self-hosted deployment. See [secrets](secrets.md) |
+| `BROWSER_CDP_ALLOWED_HOSTS` | `[]` (empty) | Hostnames a browsing agent may drive a Chromium at. A `cdp_url` comes from an agent spec, which anyone holding `edit` on that agent writes, so the address is tenant-controlled and the request is this deployment's - the same shape `MEM0_ALLOWED_HOSTS` exists for, and the reason this is an allowlist rather than the SSRF guard every other tenant-supplied URL goes through. That guard admits only *public* addresses, so it refuses the isolated browser service on the deployment's own network that [the capability](reference/capabilities.md#browser-automation) tells you to run, and accepts a CDP debugger exposed to the internet, which is worse. Matching is exact and case-folded, with no globs. Empty refuses browser automation outright |
+| `COMPUTER_DAEMON_ALLOWED_HOSTS` | `[]` (empty) | Hostnames a [computer-use](reference/capabilities.md#computer-use) agent may drive a `computerd` desktop at. `daemon_url` is in the agent spec and a run sends the daemon's token to whatever it names, so this is the same allowlist as `BROWSER_CDP_ALLOWED_HOSTS`: exact and case-folded, with no globs. Checked at publish and again whenever a run opens the daemon, so removing a host stops agents already published. The token is not a setting: it is the organization's, in its vault, so every organization can name an allowed host and only the one holding that desktop's token gets in. Empty refuses the daemon backend; a desktop in the agent's sandbox needs no entry |
+| `BROWSER_SIGN_IN_CDP_URL` | `""` (empty) | The browser a person signs in to a site with from **Settings → Sign-ins**, where no agent names one - the compose `browser` service is `http://browser:9222`. Its host must be in `BROWSER_CDP_ALLOWED_HOSTS`. The site has to be a public address, and only the person who opened it may watch it. Empty hides the option |
+| `VISUAL_RENDER_CDP_URL` | `""` (empty) | The browser a [visual](reference/capabilities.md#visuals) is drawn to a picture with where no frame can run it - a reply in Slack, Telegram or Mattermost, and the dashboard thumbnail of a page. The compose `browser` service is `http://browser:9222`; its host must be in `BROWSER_CDP_ALLOWED_HOSTS`. The drawing reaches nothing from there: every request it makes is answered by the deployment or refused. Empty sends a chat app the answer without the picture |
+| `BROWSER_EGRESS_PROXY` | `""` (empty); compose sets `http://browser-egress:3128` | The proxy the deployment's own browser reaches every site through. The compose `browser-egress` service is `http://browser-egress:3128` (`docker compose --profile browser up -d browser-egress`): it resolves each host itself, refuses private, loopback, link-local and metadata addresses and connects to the address it checked, so neither a redirect nor DNS rebinding takes a page inside the network. Used by every browse without an organization proxy and not on a hosted browser. An internal tool an agent should browse needs an exception in `docker/browser-egress/squid.conf`. Empty sends the browser straight out: set `BROWSER_EGRESS_PROXY=` in the root `.env` only for a browser outside compose that cannot reach the proxy. Without a proxy each site is checked on its first request in a tab and the browser resolves its name itself afterwards, so a name that rebinds to a private address later in the same tab is not caught |
+| `OUTBOUND_PRIVATE_ALLOWLIST` | `[]` (empty) | Hosts and networks on your own network that a request may reach although they resolve to a private address, such as a wiki, a Git server or an MCP server: `["wiki", ".corp.example", "10.1.2.0/24"]`. An entry is an exact host (`wiki`, ignoring case), a suffix with a leading dot (`.corp.example` matches `mcp.corp.example` and `a.b.corp.example`, not `corp.example` itself), an IP address (`10.0.0.5`, `fd00::1`) or a CIDR range (`10.1.2.0/24`). One trailing dot is dropped, so `wiki.` is `wiki`. Read by the workflow `http.request`, `http.download` and `http.upload` steps, the `git`, `web` and `s3` connectors, the A2A client and MCP connections. A request chain gets the list only when its first URL, the one a person typed or bound, needs it: a chain that starts at a public host never does, so a public site's redirect, OAuth metadata, A2A card or crawl cannot reach a listed host. Every account of every organization can reach every port on an admitted host, so list only services that check their own credential: a URL bound from a public trigger (a webhook, a form, an email) or from an agent's tool arguments can name any listed host. Loopback, link-local, multicast and cloud metadata addresses are refused whatever is listed: a listed name that answers one is refused wherever the name is resolved (workflow HTTP steps, git, web, S3, A2A, the MCP OAuth flow and an MCP connection's own URL; a listed name that does not resolve yet can still be saved), and so is a name with one unlisted private answer, naming that address. Startup refuses an entry that is malformed, that reaches those addresses (`localhost`, `.internal`, `169.254.169.254`, `127.0.0.0/8`, or the same addresses written through the NAT64 well-known prefix or 6to4 such as `64:ff9b::/96` and `2002::/16`; another network's own NAT64 prefix cannot be recognised, so do not list it if it translates to those addresses), or that names the database host, the Redis host or the API's own host, by name or address (a suffix that covers the API's name is allowed; `doctor` catches a range that covers a store's resolved address). `agenticos cmd doctor` reports it as `private network`: a warning for a range wider than /16 (IPv4) or /48 (IPv6), a failure when a range covers the database or Redis. The [HIPAA sheet](security.md#the-sheet) lists it as `private-network`. Empty refuses every private address. See [Services on your own network](deploy.md#services-on-your-own-network) and [a connection](mcp.md#a-connection) |
+| `MCP_ALLOWED_HOSTS` | `[]` (empty) | Hosts that an MCP connection's URL alone can name although they resolve to a private address, for example a compose service: `["postgres-mcp"]`. It is kept from before `OUTBOUND_PRIVATE_ALLOWLIST`, which covers MCP too, and it is not an alias: a host listed only here is not reachable by workflow HTTP steps, connectors or A2A. Use it when only MCP should reach the host. It is read by the same parser, so it takes the same forms (a suffix such as `.corp.example`, an IP address, a CIDR range), one trailing dot is dropped (`name.` is `name`), and a listed name that answers a loopback, link-local or cloud metadata address is refused wherever it is resolved, an MCP connection's own URL included; a listed name that does not resolve yet can still be saved. A listed host may resolve to a private address, but a loopback, link-local or metadata answer is still refused: the URL still needs `http` or `https`. People can sign in to a listed server with OAuth: its discovery, registration and token requests may reach the listed hosts, pinned, and a public server's sign-in reaches none. Every account on the deployment can reach every port on a listed host, so list only a server that checks a token. An entry that reaches cloud metadata, link-local or loopback addresses, such as `169.254.169.254` or `localhost`, or names the database, Redis or the API itself, by name or address, is refused at startup. Empty refuses every internal address. See [a connection](mcp.md#a-connection) |
+| `FILE_IO_MAX_WORKERS` | `8` | Size of the dedicated thread pool that runs blocking file work — parsing an upload and reading or writing its bytes. Kept off `asyncio`'s shared default executor, which also runs `bcrypt` and pinned-host DNS, so a burst of uploads cannot leave sign-in and outbound requests queued behind them ([#1108](https://github.com/vstorm-co/agenticos/issues/1108)). Raise it on a host that parses many uploads at once. Must be a positive integer — a `0` or negative value is refused at startup |
+| `CHAT_CONVERT_TIMEOUT_SECONDS` | `60` | How long a single DOC → text LibreOffice conversion may run before it is killed. Far below the knowledge base's 600s because this is an interactive upload |
+| `CHAT_CONVERT_MAX_CONCURRENCY` | `2` | How many LibreOffice conversions may run at once. The subprocess bypasses `FILE_IO_MAX_WORKERS`, so this bounds it separately |
+| `CHAT_CONVERT_KILL_GRACE_SECONDS` | `5` | The wait between `TERM` and `KILL` when a conversion is force-stopped |
+| `CHAT_CONVERT_OUTPUT_MAX_BYTES` | `20971520` (20 MiB) | Ceiling on a conversion's output file, checked before it is read back |
+| `CHAT_TIFF_MAX_INLINE_PAGES` | `10` | How many pages of a multi-page TIFF are converted to PNG and shown to the model |
+| `CHAT_IMAGE_MAX_PIXELS` | `40000000` (~40 MP) | Per-image pixel bound checked before a TIFF page is decoded — a decompression-bomb guard |
+| `CHAT_ARCHIVE_MEMBER_MAX_BYTES` | `52428800` (50 MiB) | Decompressed-size cap per member of a ZIP-backed office file (ODF, PPTX) |
+| `CHAT_ARCHIVE_TOTAL_MAX_BYTES` | `104857600` (100 MiB) | Total decompressed-size cap across a ZIP-backed office file |
+| `CHAT_ARCHIVE_MAX_MEMBERS` | `2000` | Member-count cap for a ZIP-backed office file |
+| `CHAT_PARSED_TEXT_MAX_CHARS` | `1000000` | Cap on stored extracted text, so a small ZIP/OLE cannot expand the row |
+| `CHAT_PROMPT_TEXT_MAX_CHARS` | `200000` | Per-file cap on the parsed text pasted into a no-workspace prompt |
+| `CHAT_TURN_TEXT_MAX_CHARS` | `500000` | Aggregate cap on attachment text across one turn |
+| `DEFAULT_ORG_MONTHLY_BUDGET_USD` | `100` | The monthly spend ceiling a **new** organization starts with, in USD, so it is not one runaway agent away from a surprise bill. Applies at creation only; existing organizations are untouched and any organization can be cleared back to no cap afterwards. Must be positive; leave **empty** to start organizations uncapped (the older opt-in posture) |
+
+For production channel pictures, set `VISUAL_RENDER_CDP_URL=http://visual-render:9222` and `BROWSER_CDP_ALLOWED_HOSTS=["visual-render"]` in `backend/.env`. `scripts/deploy.sh` then enables the `visuals` profile in `docker-compose-prod.yml`; for a manual start, add `--profile visuals`.
+
+Interactive public browsing needs a separate browser: set `BROWSER_SIGN_IN_CDP_URL=http://browser:9222`, `BROWSER_EGRESS_PROXY=http://browser-egress:3128` and `BROWSER_CDP_ALLOWED_HOSTS=["browser","visual-render"]`. Deployment enables the `browser` profile. Configure each agent's `browser_use.cdp_url` as `http://browser:9222` and publish its draft. The interactive browser has only proxy egress; Squid refuses private and metadata destinations. Keep `VISUAL_RENDER_CDP_URL=http://visual-render:9222` for isolated drawing. A missing agent domain restriction permits public sites; an explicit domain list still applies.
+
+The renderer has no published port or internet route, is shared by the API and worker, and is capped at 1 CPU and 1 GiB RAM. Published backend images include the `browser` extra; a custom image needs `EXTRAS="--extra browser"`. If rendering fails, the channel reply explicitly says the picture could not be attached. Each render permits at most 256 requests and 32 pending responses; map tiles also share `RATE_LIMIT_MAP_TILES_PER_MINUTE` across renderers.
+
+### The size of a request, as opposed to the size of a file
+
+Every limit above is measured on bytes that have already arrived. FastAPI parses a
+multipart body to resolve the `UploadFile` parameter *before* the handler runs, so
+by the time one of those caps is compared against `len(data)` the body has been
+spooled to a temporary file and read into memory. Behind a session that is not much
+of a risk; on `POST /api/v1/embed/{key}/files`, which a stranger holding a link may
+reach, it is.
+
+So a request declaring a `Content-Length` larger than `MAX_UPLOAD_SIZE_MB` plus a
+5 MiB allowance for the multipart envelope is answered **413** before its body is
+read. There is no setting: it follows `MAX_UPLOAD_SIZE_MB`, because a second number
+to keep in step with the first is a number that ends up below it.
+
+**It is the cheap half of the answer, not the whole one.** `Content-Length` is set
+by the caller, and a chunked request declares none at all — those are let through
+and bounded by the per-route caps, which measure real bytes. A deployment that wants
+the guarantee rather than the courtesy sets `client_max_body_size` (nginx) or the
+equivalent on whatever terminates its connections; the compose files run uvicorn
+with no such limit of its own.
+
+## Authentication
+
+### JWT
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SECRET_KEY` | (insecure default) | JWT signing key. **Must** be changed in production. Generate with: `openssl rand -hex 32` |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | Access token lifetime |
+| `REFRESH_TOKEN_EXPIRE_MINUTES` | `10080` | Refresh token lifetime (7 days) |
+| `REFRESH_REUSE_GRACE_SECONDS` | `60` | How long after a rotation the spent refresh token is still answered, with the same successor token each time, so a lost response or a burst of refreshes does not end the session; `0` turns it off |
+| `ALGORITHM` | `HS256` | JWT signing algorithm |
+
+Production validation: `SECRET_KEY` must be at least 32 characters and cannot
+use the default value in `ENVIRONMENT=production`.
+
+### Secret vault
+
+Every credential the platform stores at rest — provider keys, channel bot
+tokens, MCP credentials and organization secrets — is sealed by
+`app/core/vault.py`, whose envelope is derived from the master key **and the
+owner** (an organization, or the member a personal connection belongs to). A
+ciphertext is therefore useless outside the tenant it was sealed for.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VAULT_MASTER_KEY` | (empty, falls back to `SECRET_KEY`) | Master key for the secret vault — shorthand for version 1 of `VAULT_MASTER_KEYS`. Required outside `local`/`development` (unless the map below is set), so a staging vault cannot boot sealed under the published `SECRET_KEY` default. Generate with: `openssl rand -hex 32` |
+| `VAULT_MASTER_KEYS` | `{}` | Every master key still in use, by version, as JSON — `{"1": "<old>", "2": "<new>"}`. The highest version seals new secrets; older ones keep existing rows readable until `agenticos cmd vault-rotate` re-wraps them. When set it is the whole truth: `VAULT_MASTER_KEY` must then be empty. See [Secrets](secrets.md#operations) |
+
+### API key
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `API_KEY` | `change-me-in-production` | Shared API key for programmatic access |
+| `API_KEY_HEADER` | `X-API-Key` | HTTP header name for API key |
+
+Production validation: `API_KEY` cannot use the default value in
+`ENVIRONMENT=production`.
+
+### OAuth2 (Google)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOOGLE_CLIENT_ID` | (empty) | Google OAuth2 client ID — sign-in, **and** the Gmail trigger's consent |
+| `GOOGLE_CLIENT_SECRET` | (empty) | Google OAuth2 client secret |
+| `GOOGLE_REDIRECT_URI` | `http://localhost:8000/api/v1/oauth/google/callback` | OAuth2 callback URL |
+| `FRONTEND_URL` | `http://localhost:3000` | Frontend URL for OAuth2 redirects |
+| `DESKTOP_DEEP_LINK_SCHEME` | `agenticos` | The scheme the desktop shell registers for a sign-in handed to the system browser ([Desktop](desktop.md#signing-in)). The callback builds a redirect out of it, so it is a setting rather than anything a caller can choose |
+
+Getting the pair: [Google Cloud console](https://console.cloud.google.com/) →
+APIs & Services → Credentials → Create OAuth client ID → **Web application**.
+
+The authorized redirect URI is the **backend's** callback, not the frontend's -
+`http://localhost:8000/api/v1/oauth/google/callback` by default, and whatever
+`GOOGLE_REDIRECT_URI` says in a deployment. Google exchanges the code with the
+API, which then sends the browser on to `FRONTEND_URL`. Registering the
+frontend URL instead is the mistake worth naming: the consent screen works, and
+the callback 404s.
+
+The browser is sent on with a single-use, one-minute code, never the session
+tokens themselves: a token in a redirect URL reaches the address bar, the
+frontend server's access log, and the `Referer` of the next same-origin request,
+and the refresh token is good for a week. The frontend swaps the code for the
+token pair server to server at `POST /api/v1/oauth/exchange`, which redeems it
+exactly once.
+
+
+### Single sign-on (generic OIDC)
+
+Any identity provider that publishes a discovery document: Microsoft Entra ID,
+Okta, Keycloak, Auth0, Authentik, Google Workspace through its OIDC endpoint. A
+company self-hosting this runs one already, and will not create local passwords
+for its staff - without this, its MFA and its offboarding are solved twice.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OIDC_ISSUER` | (empty) | The issuer URL. Empty means no SSO, and the callback answers 404 |
+| `OIDC_CLIENT_ID` | (empty) | The client the provider issued for this deployment |
+| `OIDC_CLIENT_SECRET` | (empty) | Its secret |
+| `OIDC_REDIRECT_URI` | `http://localhost:8000/api/v1/oauth/oidc/callback` | The callback, registered at the provider |
+| `OIDC_SCOPES` | `openid email profile` | Space-separated. Add the provider's own scope where it needs one for the claims |
+| `OIDC_VERIFIED_CLAIM` | (empty) | A third claim to accept as "this address is confirmed", for a provider that names it something of its own |
+| `OIDC_GROUPS_CLAIM` | (empty) | The claim listing a person's groups, usually `groups`. Set, each sign-in applies the [directory group mappings](directory.md#directory-group-mappings); empty leaves memberships alone. Refused together with `LDAP_URL` |
+
+The issuer is the only URL. Authorization, token, userinfo and JWKS come from
+`<issuer>/.well-known/openid-configuration`, which the provider keeps correct
+across a key rotation or an endpoint move - so there are no further endpoints to
+get subtly wrong. The flow is authorization-code with PKCE.
+
+The claims are read from the ID token, and from the **UserInfo endpoint** when
+the ID token does not carry them. A provider is entitled to keep `email` and its
+verification claim at UserInfo and put neither in the token, so reading only the
+token would refuse an entirely compliant provider one request short of a valid
+identity.
+
+Two buttons on the frontend, configured there:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OAUTH_PROVIDERS` | `google` | Add `oidc` to show the SSO button; set it to `oidc` alone for SSO only. `ldap` adds the directory form and `kerberos` the Windows sign-in button, below |
+| `OIDC_DISPLAY_NAME` | `SSO` | What the button calls the provider: `Acme SSO`, `Okta` |
+| `OIDC_ICON` | (empty) | `google`, `github` or `microsoft` - the marks the sign-in page already ships. Anything else draws a plain key |
+
+Where each issuer lives, and what to register:
+
+| Provider | Issuer | Register the redirect URI as |
+|----------|--------|------------------------------|
+| **Entra ID** | `https://login.microsoftonline.com/<tenant-id>/v2.0` | A **Web** platform redirect URI on the app registration. Grant `openid`, `email`, `profile` under API permissions |
+| **Okta** | `https://<org>.okta.com` (or a custom authorization server's `/oauth2/<id>`) | A sign-in redirect URI on a **Web** application |
+| **Keycloak** | `https://<host>/realms/<realm>` | A valid redirect URI on a confidential client with standard flow enabled |
+
+Two things the platform requires of whatever provider it is pointed at:
+
+- **The address must be confirmed.** Two claims are accepted: the standard
+  `email_verified`, and Entra ID's `xms_edov`, which is what Entra sends instead
+  - it emits no `email_verified` at all, and it is an **optional claim** you
+  enable on the app registration, so an Entra tenant that has not enabled it
+  sends neither and every sign-in is refused. `OIDC_VERIFIED_CLAIM` names a third
+  for a provider that calls it something else. Absent counts as not verified: an
+  unconfirmed address means anybody at that provider can claim anybody's work
+  address, and the domain allow-list below is built on an address meaning
+  something.
+- **A stable `sub`.** The account is keyed on it, not on the address, so a
+  person who changes their name or whose domain is bought keeps their history -
+  and the next holder of a freed address does not inherit it. It is stored
+  **namespaced by the issuer**, because a `sub` is unique within its issuer and
+  nowhere else: pointing the deployment at a different tenant or realm cannot
+  then sign a new principal into an old one's account.
+
+The sign-up policy applies here exactly as it applies to the registration form:
+an `invite_only` deployment refuses an SSO sign-in from somebody nobody invited,
+and an allowed-domains list refuses an address outside it, with the same
+sentence on the sign-in page. See
+[Who may register](deployment.md#who-may-register).
+
+With `OIDC_GROUPS_CLAIM` set, the provider's groups decide memberships: each
+organization's [directory group mappings](directory.md#directory-group-mappings)
+join people with a role and place them in groups, and a mapped group admits a
+first sign-in on an `invite_only` deployment the way an invitation does. An Entra
+ID group overage is refused rather than read as "no groups" - see
+[The groups claim over OIDC](directory.md#the-groups-claim-over-oidc).
+
+SAML and SCIM are not implemented. Most identity providers a mid-size company
+runs speak OIDC, and these settings are the whole of what they need. A directory
+with no identity provider in front of it can be used directly - see below.
+
+### Directory sign-in (LDAP)
+
+Signing in with an Active Directory, OpenLDAP or FreeIPA account, by binding as
+it. [Directory sign-in and groups](directory.md) explains the sign-in, what it
+refuses and how groups are read. Empty `LDAP_URL` switches it off, and the route
+answers 404.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LDAP_URL` | (empty) | `ldaps://host[:port]`, or `ldap://` with StartTLS |
+| `LDAP_START_TLS` | `false` | Upgrade an `ldap://` connection before binding |
+| `LDAP_ALLOW_PLAINTEXT` | `false` | Accept `ldap://` without StartTLS, which sends passwords in the clear. Refused at startup otherwise |
+| `LDAP_CA_CERT_FILE` | (empty) | A PEM bundle to verify the directory's certificate against, for a company CA |
+| `LDAP_BIND_DN` / `LDAP_BIND_PASSWORD` | (empty) | The service account a sign-in searches with. Both or neither; neither searches anonymously |
+| `LDAP_USER_BASE_DN` | (empty) | Where accounts are searched. Required with `LDAP_URL` |
+| `LDAP_USER_FILTER` | matches `uid`, `sAMAccountName`, `userPrincipalName` or `mail` | Must contain `{username}`, which is escaped before it is put in |
+| `LDAP_EMAIL_ATTRIBUTE` | `mail` | The account's address |
+| `LDAP_NAME_ATTRIBUTE` | `displayName` | The account's display name |
+| `LDAP_ID_ATTRIBUTE` | `entryUUID` | The stable identifier the account is keyed on - `objectGUID` on Active Directory |
+| `LDAP_GROUP_ATTRIBUTE` | `memberOf` | Where the account's groups are read from |
+| `LDAP_GROUP_BASE_DN` | (empty) | Search here for groups instead, for a directory without `memberOf` |
+| `LDAP_GROUP_FILTER` | `(member={dn})` | The group search, with `{dn}` or `{username}` |
+| `LDAP_TIMEOUT_SECONDS` | `10` | Connect and read timeout for each directory request |
+
+The frontend shows the form with `ldap` in `OAUTH_PROVIDERS`, and names it with
+`LDAP_DISPLAY_NAME` (default `LDAP`).
+
+### Kerberos sign-in
+
+Integrated Windows sign-in through SPNEGO, resolving the ticket's principal
+through the directory above - so it needs `LDAP_URL`, and an image built with the
+`kerberos` extra. See [Integrated Windows sign-in](directory.md#integrated-windows-sign-in-kerberos).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KERBEROS_ENABLED` | `false` | Offer Kerberos sign-in. Refused at startup without `LDAP_URL` |
+| `KERBEROS_KEYTAB` | (empty) | The keytab holding the service's key. Empty uses the default keytab (`KRB5_KTNAME`, else `/etc/krb5.keytab`) |
+| `KERBEROS_SERVICE_PRINCIPAL` | (empty) | `HTTP/<api host>@<REALM>`. Empty accepts a ticket for any principal in the keytab |
+| `LDAP_KERBEROS_FILTER` | `(userPrincipalName={principal})` | How the principal is found in the directory: `{principal}` is `user@REALM`, `{username}` the part before `@` |
+
+The frontend shows the button with `kerberos` in `OAUTH_PROVIDERS`, and names it
+with `KERBEROS_DISPLAY_NAME` (default `Kerberos`).
+
+## Database (PostgreSQL)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POSTGRES_HOST` | `localhost` | PostgreSQL host |
+| `POSTGRES_PORT` | `5432` | PostgreSQL port |
+| `POSTGRES_USER` | `postgres` | PostgreSQL user |
+| `POSTGRES_PASSWORD` | (empty) | PostgreSQL password |
+| `POSTGRES_DB` | `agenticos` | Database name |
+| `POSTGRES_SSLMODE` | (empty) | Encrypt the connection: `require`, `verify-ca` or `verify-full`. Empty is plaintext. See [Encrypted connections](#encrypted-connections-tls) |
+| `DB_POOL_SIZE` | `5` | Connection pool size |
+| `DB_MAX_OVERFLOW` | `10` | Max overflow connections |
+| `DB_POOL_TIMEOUT` | `5` | Seconds a request waits for a free connection before it is answered `503` with `Retry-After`. Short on purpose: a request that waited 30 s was lost anyway, and the queue of waiters kept the pool full after a burst had passed |
+
+Computed properties:
+- `DATABASE_URL` -- async connection string (`postgresql+asyncpg://...`)
+- `DATABASE_URL_SYNC` -- sync connection string for Alembic
+
+## Redis
+
+The compose files run **Valkey** (`valkey/valkey:8-alpine`), the BSD-3-Clause fork of
+Redis 7.2, rather than Redis itself, which has been RSALv2 or SSPL-1.0 since 7.4.0 -
+neither an open-source licence ([licences](licenses.md)). It speaks the same protocol
+on the same port, so the settings below, the `redis://` scheme and the `redis` service
+name are unchanged, and a deployment that points these at a managed Redis, Valkey or
+Elasticache instead works exactly as before.
+
+It is run as a cache and nothing else: `--save ''`, no volume, so it starts empty
+after every restart. Everything the platform keeps here - rate-limit buckets,
+channel dedupe claims, membership answers - carries a TTL and rebuilds itself.
+
+A snapshot bought nothing and cost one outage: Valkey 8 forks Redis 7.2 and refuses
+an RDB written by Redis 7.4, so the first deploy onto a host that had run
+`redis:7-alpine` crash-looped and took every service that waits on the cache with
+it. A managed instance that does persist is fine; the platform does not rely on
+it either way.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_HOST` | `localhost` | Redis host |
+| `REDIS_PORT` | `6379` | Redis port |
+| `REDIS_PASSWORD` | (none) | Redis password (optional) |
+| `REDIS_DB` | `0` | Redis database number |
+| `REDIS_SSL` | `false` | Encrypt the connection (`rediss://`). See [Encrypted connections](#encrypted-connections-tls) |
+
+## Encrypted connections (TLS)
+
+Both stores connect in plaintext by default. On a single host with Postgres and
+Redis on the same Docker network that is fine, and it is what the shipped compose
+files run. On a managed Postgres, or a Redis on another node, encrypting the
+connection is the transmission-security control a reviewer asks for first (HIPAA
+§164.312(e), SOC 2 CC6.7).
+
+Setting `POSTGRES_SSLMODE` builds the URL each driver understands — `?ssl=<mode>`
+for the app's asyncpg, `?sslmode=<mode>` for Alembic's psycopg2 — and `REDIS_SSL`
+switches the Redis scheme to `rediss://`. `require` encrypts the connection;
+`verify-ca` and `verify-full` also check the server's certificate.
+
+`REDIS_SSL` also asks for a valid certificate chain and a matching hostname on
+the URL itself, rather than leaving both to redis-py's defaults.
+
+!!! warning "A private CA is a file the drivers read, not the OS trust store"
+
+    Neither driver consults the container's trust store, and the image runs as a
+    non-root user with no entrypoint that could rebuild it. asyncpg and libpq
+    both read the CA file `PGSSLROOTCERT` names; redis-py trusts whatever bundle
+    OpenSSL points at, which `SSL_CERT_FILE` overrides. Mount the CA once and set
+    both variables to it - `verify-ca` and `verify-full` fail without the first,
+    since asyncpg then looks for `~/.postgresql/root.crt` and finds nothing.
+
+!!! note "Every service that opens a store connection needs the change"
+
+    `app`, `migrate` and `worker` each connect to Postgres and Redis, and
+    the shipped compose files pin `POSTGRES_HOST=db` and `REDIS_HOST=redis` in
+    each one's `environment`, which wins over an env file. So a managed store is
+    an override file that reaches all three, not a line in `.env`.
+
+```yaml
+# docker-compose.managed.yml - a managed Postgres and Redis, verified against a
+# private CA. Run with `docker compose -f docker-compose.yml -f docker-compose.managed.yml up -d`.
+x-managed: &managed
+  environment:
+    POSTGRES_HOST: db.internal.example.com
+    POSTGRES_SSLMODE: verify-full
+    PGSSLROOTCERT: /run/tls/managed-ca.crt
+    REDIS_HOST: redis.internal.example.com
+    REDIS_SSL: "true"
+    SSL_CERT_FILE: /run/tls/managed-ca.crt
+  volumes:
+    - ./ca/managed-ca.crt:/run/tls/managed-ca.crt:ro
+
+services:
+  app: *managed
+  migrate: *managed
+  worker: *managed
+```
+
+The bundled `db` and `redis` services keep starting, unused; `agenticos cmd
+doctor` shows which store each connection actually reached and whether it was
+encrypted (`postgres: tls=on/off`, `redis: tls=on/off`, from `pg_stat_ssl` and the
+URL scheme).
+
+## Email (SMTP)
+
+The deployment sends mail through an SMTP server, and one with none configured
+does not fail — it runs, and every mail-dependent flow silently stops, none of
+them announcing itself:
+
+- **passwordless sign-in and password resets** — the magic-link and reset emails
+  are the self-service ways into an account;
+- **invitations** — an invited address is never mailed (the console now says so
+  rather than claiming it sent one, #1484);
+- **notifications** — a budget breach, an approval request, a usage report, the
+  notice sent when an administrator acts as another account.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SMTP_HOST` | `localhost` | SMTP server host |
+| `SMTP_PORT` | `587` | SMTP server port. `587` and `25` negotiate STARTTLS; `465` opens TLS from the start |
+| `SMTP_USER` | (empty) | Username the relay authenticates with, alongside `SMTP_PASSWORD`. Leave empty for an unauthenticated relay |
+| `SMTP_PASSWORD` | (empty) | Password for that username |
+| `SMTP_TLS` | `true` | Whether to encrypt the connection. The port picks the scheme — STARTTLS on `587`, implicit TLS on `465` — unless `SMTP_TLS_MODE` says otherwise. Set `false` only for an unencrypted relay, such as a local server on `25` |
+| `SMTP_TLS_MODE` | `auto` | How the encrypted connection is opened. `auto` lets the port choose; `implicit` opens TLS from the first byte and `starttls` negotiates the upgrade, whatever the port. Ignored when `SMTP_TLS=false` |
+| `EMAIL_FROM` | `noreply@agenticos.com` | The `From` address on every message |
+| `EMAIL_FROM_NAME` | `agenticos` | The display name shown beside that address |
+
+!!! note "How the connection is encrypted"
+
+    `SMTP_TLS` is the on/off switch; the port chooses the scheme. The shipped
+    default — `587` with `SMTP_TLS=true` — negotiates STARTTLS, which is what a
+    standards-compliant submission server expects. Use `465` for a server that
+    wants implicit TLS instead, and `SMTP_TLS=false` on `25` for a plaintext relay.
+
+    A server that speaks implicit TLS on a port other than `465` — `8465`, say —
+    needs `SMTP_TLS_MODE=implicit`, because `auto` would offer it a plaintext
+    handshake and every send would fail. `starttls` is the mirror case.
+
+## Background work
+
+Jobs queue in PostgreSQL and run in a worker, `python -m app.worker`, from the
+same image as the API. There is no server to point it at and no key: the worker
+reaches the database the API does. Every setting below is per worker process.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKER_POOLS` | `agent,ingest,system,workflow` | The pools this process serves. Run a second worker with `ingest` to put parsing on a host of its own. A list set before the `workflow` pool existed needs it added, or no worker runs workflow nodes |
+| `WORKER_AGENT_CONCURRENCY` | `10` | Agent runs and trigger fires at once |
+| `WORKER_WORKFLOW_CONCURRENCY` | `5` | Workflow nodes at once. Size the worker's memory for this many of them at the largest file a node may hold |
+| `WORKER_SYSTEM_CONCURRENCY` | `4` | Sweeps, cleanups and reports at once |
+| `WORKER_INGEST_CHILDREN` | `2` (`1` in the shipped compose files) | Child processes for parsing and embedding, one job each at a time |
+| `WORKER_INGEST_MEMORY_MB` | `1536` | What one child may hold, with whatever it started, before the watchdog stops it |
+| `WORKER_INGEST_MAX_JOBS` | `100` | Jobs a child runs before it is replaced |
+| `WORKER_LEASE_SECONDS` | `60` | How long a claimed job is held without a heartbeat |
+| `WORKER_BREAKER_DEATHS` | `5` | Worker deaths in a row, across one kind's jobs, that pause the kind |
+| `WORKER_HEALTH_FILE` | `/tmp/agenticos-worker-alive` | The file the container probe reads |
+| `WORKER_MEMORY_LIMIT` | `4g`, `2560M` in production compose | The container's own memory limit - a compose variable, not a setting |
+| `BACKGROUND_JOB_RETENTION_DAYS` | `14` | Finished jobs kept for the Background jobs page |
+
+**Size memory from the children, not from the job count.** A worker holds
+about 450 MB for its imported application, and each ingest child as much again
+plus the document it is parsing. `WORKER_INGEST_MEMORY_MB` sits below the
+container's limit on purpose: the watchdog stops a child that outgrows it and
+writes why on the job, where the kernel's out-of-memory killer would only leave
+a dead process. Raise `WORKER_INGEST_CHILDREN` on a host with memory to spare,
+and the container limit with it.
+
+**A job that kills its process cannot loop.** Its attempt is counted when it is
+claimed, so a child the kernel kills mid-parse has spent one, and after
+`max_attempts` the job is dead. A kind whose jobs kill their worker
+`WORKER_BREAKER_DEATHS` times in a row is paused, and every owner of the
+deployment is told; nothing claims it until one of them resumes it on the
+Background jobs page. The count is kept per organization: one tenant whose jobs
+keep killing their worker pauses the kind for itself alone, and jobs that belong
+to no organization share one count for the whole deployment.
+
+**What a job leaves behind is closed even when that fails once.** A job that
+ends for good can leave a document `processing` or a sync log `running`. The
+worker closes them as the job ends, and the rescuer retries a close that failed -
+the database down at the time - for a day.
+
+A worker that dies gives its jobs back within `WORKER_LEASE_SECONDS`: another
+worker's rescue takes the expired lease and writes the job down as a worker
+death. A deploy does not cost a job an attempt - the worker stops claiming,
+lets running jobs finish for 30 seconds, and gives the rest back. The compose
+files allow 45 seconds before they kill it.
+
+The container's health check reads `WORKER_HEALTH_FILE`, which the heartbeat
+touches after every beat that reached the database, so a worker that is alive
+but cut off from Postgres reads `unhealthy`. It is a file rather than an HTTP
+endpoint because the worker serves nothing.
+
+There is no `HEALTHCHECK` in `backend/Dockerfile`. The image is started as
+different processes - the API, the worker and the migrations - and a probe for
+one is a permanent false alarm on another, so each service definition carries
+its own.
+
+### Approval expiry
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APPROVAL_EXPIRY_HOURS` | `72` | How long a parked tool call waits before the hourly sweep denies it by timeout |
+| `QUESTION_EXPIRY_HOURS` | `24` | How long a run waits on an agent's unanswered question before the same sweep ends it |
+
+Three days because it has to span a weekend: the approval that arrives on Friday
+afternoon is the one nobody decides, and expiring it on Saturday would be expiring
+it for having been asked at the wrong hour. Shorten it where a queue is watched
+during the working day and a stale ask is worse than a slow one; lengthen it where
+approvals are a weekly ritual. Expiring a call also **ends its run** — see
+[Governance](governance.md#a-decision-nobody-makes) for what that settles and what
+it deliberately leaves alone.
+
+### Stale-run reaping
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RUN_HEARTBEAT_SECONDS` | `15` | How often the process executing a run stamps it alive while its model works |
+| `STALE_RUN_REAPED_AFTER_SECONDS` | `120` | How long a `running` run may go without a sign of life before the per-minute sweep decides its process died and ends it as `failed`. At least three `RUN_HEARTBEAT_SECONDS`, which startup checks; zero or below switches the sweep off |
+
+A run's row is committed before its model is called, so a worker killed mid-run
+leaves it `running` with nothing left to finish it. The ceiling does not have to
+be exact — a live run the sweep flips anyway is flipped back by its own terminal
+write — so set it well past your longest legitimate run and no closer. See
+[Governance](governance.md#a-run-whose-process-died).
+
+### Workflow runs
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKFLOW_RUN_MAX_INPUT_BYTES` | `262144` | The largest payload a run may be started with, as compact JSON. It is kept on the run for its `core.input` node, so a larger one is refused with `413` before the run is admitted |
+| `WORKFLOW_RUN_MAX_FILE_BYTES` | `1073741824` | The most file bytes one run may store, all its file steps together. A step whose file would pass it fails with `FILE_QUOTA_EXCEEDED` and stores nothing |
+| `WORKFLOW_ORG_MAX_FILE_BYTES` | `21474836480` | The same for one organization, across every run that still holds its files |
+| `WORKFLOW_WEBHOOK_RESPONSE_TIMEOUT_SECONDS` | `30` | How long a webhook delivery whose graph has a Respond to webhook step waits for its answer before it is answered `202` and the run goes on. A proxy in front with a shorter read timeout cuts the wait first |
+| `WORKFLOW_DISPATCH_LEASE_SECONDS` | `120` | How long a worker's claim on a workflow node holds before it is treated as abandoned. The worker renews it every third of a lease while the node runs, so it bounds how long a dead worker goes unnoticed, not how long a node may take |
+| `WORKFLOW_RETRY_CEILING` | `3` | The most failed or interrupted attempts a node gets: attempts that failed, and attempts cut short by a worker dying. An attempt that waits - on an approval, or a backoff the node asked for - does not count, so only the run's deadline, budget or a cancel bounds how often a node waits |
+| `WORKFLOW_RETRY_BACKOFF_BASE_SECONDS` | `5` | The wait before a node's first retry; the wait before each later retry doubles |
+| `WORKFLOW_RETRY_BACKOFF_MAX_SECONDS` | `300` | The longest any one wait may grow to. These three apply to a node whose `policy.retry` sets none |
+| `WORKFLOW_NODE_MAX_OUTPUT_BYTES` | `10485760` | Combined compact UTF-8 JSON of one attempt result, run output and webhook response. Larger outcomes fail with `NODE_OUTPUT_TOO_LARGE` without automatic retry; incurred fees survive. Split out also checks at most 10,000 expanded items and conservative projected bytes before copying them |
+| `WORKFLOW_RUN_MAX_INLINE_RESULT_BYTES` | `67108864` | Retained compact input, draft snapshot, Wait payload and result reservations per run; small terminal control records are exempt |
+| `WORKFLOW_ORG_MAX_INLINE_RESULT_BYTES` | `1073741824` | Inline payload reservations across retained runs of an organization; retention releases reservations through counters |
+| `WORKFLOW_FOREACH_MAX_ITEMS` | `1000` | The longest list a `control.foreach` iterates. A longer one fails the loop with `FOREACH_TOO_MANY_ITEMS` instead of being truncated |
+| `WORKFLOW_FOREACH_MAX_MANIFEST_BYTES` | `1048576` | The largest list a loop freezes, as JSON. A larger one fails the loop with `FOREACH_LIST_TOO_LARGE` |
+| `WORKFLOW_FOREACH_MAX_OUTPUT_BYTES` | `10485760` | Latest yielded results and unhandled errors plus collection overhead, measured before loading their JSON. Larger collections fail with `FOREACH_OUTPUT_TOO_LARGE`; yield smaller values or file references |
+| `WORKFLOW_FOREACH_MAX_DEPTH` | `3` | How deep loops may nest. A graph with deeper loops cannot be published |
+| `WORKFLOW_RUN_MAX_NODE_RUNS` | `10000` | The most node runs one run may create, loop iterations included. An iteration that would pass it fails the run with `NODE_RUN_LIMIT` |
+| `WORKFLOW_MAX_ACTIVE_NODE_RUNS_PER_ORG` | `5000` | The most queued or running node work one organization may hold at once. A start reserves its graph's node count against this, and one over it is refused with `429` until running work drains. Must be at least `WORKFLOW_GRAPH_MAX_NODES` |
+| `WORKFLOW_MAX_ACTIVE_NODE_RUNS_PER_PRINCIPAL` | `2000` | The same ceiling for a single caller, counted across every organization they run in, so a person who can create organizations cannot multiply their allowance by spreading runs across them. Must be at least `WORKFLOW_GRAPH_MAX_NODES` |
+
+The per-caller run limit (`RATE_LIMIT_RUN_PER_MINUTE`) charges one token per
+start, which cannot tell a one-node graph from a five-hundred-node one. These two
+ceilings do: they bound the queued and running node work behind the shared runner
+so one caller cannot start many wide graphs below the rate limit and grow a
+backlog that starves other tenants.
+
+A workflow run is a chain of jobs. Each node attempt is one `workflow-dispatch-node`
+job on the workflow pool, queued in the same transaction as the node's dispatch row,
+so a run never starts without its job and a rolled-back start leaves none. A
+timer or a retry's backoff is the same job with its `run_after` set to the time
+it is due.
+
+The row in the database, not the job, holds the run's position: the
+job runs once, and a worker that dies mid-node is recovered by the sweeps below,
+not by retrying the job.
+
+Five sweeps run on the system pool:
+`workflow-dispatch-poll` (every minute) queues a job for a due node whose own job
+never ran, `workflow-reconcile` (every 30 seconds) recovers the claims and
+attempts a dead worker left behind, `workflow-schedules-check` (every minute)
+fires workflow schedules, `workflow-table-triggers` (every 10 seconds) runs the
+triggers on table records, and `workflow-run-retention` (daily) removes runs past
+their workflow's retention.
+
+Node jobs have a pool of their own, so a fan-out cannot hold the slots agent
+runs wait for, and an agent that calls a workflow and waits for it cannot wait on
+a slot of its own pool. `WORKER_WORKFLOW_CONCURRENCY` caps the nodes in flight on
+each worker. A run someone is waiting on (a webhook answering, a chat, the API)
+goes ahead of one that started itself, and a workflow another one calls takes the
+priority of the run that called it.
+
+A node runs on the worker's own event loop and memory:
+size the worker's memory for `WORKER_WORKFLOW_CONCURRENCY` nodes each holding the
+largest file a node may hold (`WORKFLOW_RUN_MAX_FILE_BYTES`), because a worker the
+kernel kills loses every job it was running. Those deaths are not counted toward
+`WORKER_BREAKER_DEATHS`: one crash ends every node the worker held, and a node
+that keeps killing its worker is stopped by the workflow's own retry ceiling. The Background jobs page shows one job per node attempt,
+and the sweeps add about 14,400 rows a day, kept for
+`BACKGROUND_JOB_RETENTION_DAYS`. Cancelling a queued node job there is not
+offered: cancel the run instead.
+
+### A chat turn left running
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHAT_DETACHED_TURN_MINUTES` | `60` | How long a chat turn goes on after the person who asked it has left - a closed tab, a quit app, a dropped connection - before it is stopped; at most `120`, past which the conversation list no longer shows the turn as at work |
+
+The answer lands in the conversation and its person is notified, so this bounds
+spend on an answer that may never be read rather than switching anything off. It
+needs to cover your longest research or browsing turn; a run is still held to its
+agent's budget either way. See [Console](console.md#chat).
+
+Per-organization file and table quotas do not cap storage across a deployment.
+With `max_organizations_per_user` unset, an account may own unlimited organizations
+and multiply tenant allowances. Set a finite ownership limit in deployment settings,
+provision and monitor shared storage, and account for retained run history. A
+deployment-wide storage budget is not currently enforced.
+
+## AI models — configured in the app, not here
+
+Chat models are not environment variables. Each organization stores its own
+provider keys in the vault (Settings → Models), and every agent's spec names
+the model profile it runs on. `AI_MODEL`, `AI_TEMPERATURE`,
+`AI_THINKING_ENABLED`, `AI_THINKING_EFFORT`, `AI_AVAILABLE_MODELS`,
+`AI_FRAMEWORK` and `LLM_PROVIDER` were removed along with the template's
+general assistant; setting them now does nothing.
+
+The one model credential that stays in the environment is the embeddings key —
+see RAG below.
+
+## Observability (Logfire)
+
+Optional, and off until a token is set. Nothing in this section has to be
+configured: with `LOGFIRE_TOKEN` unset the platform runs in full, and a run still
+records its own trace id locally. What a token buys is the traces, and a trace is
+a copy of the run — the user's message, the model's output and every tool
+argument and result — because recording exactly that is what an observability
+backend is for. Setting the token is therefore a decision about where run content
+may go, not only about dashboards. A deployment over health, legal or HR data
+reads [what leaves the machine](data-protection.md#traces) before setting it.
+
+Three things can point runs at a project, and they stack:
+
+- `LOGFIRE_TOKEN` here instruments Pydantic AI globally, so every run exports
+  into the deployment's own project. Two processes configure it: the API at
+  startup (`app/main.py`), and the worker, once on start
+  (`app/worker/__main__.py`), since it never runs the API's lifespan. The
+  worker's spans carry `<service name>-worker`, so one project can tell a slow
+  scheduled run from a slow chat turn.
+- An [environment](environments.md#tracing-per-environment) can carry its own
+  write token, sealed in the vault, which redirects the runs bound to it.
+- An agent's [`observability`](reference/spec.md#observability) block names a
+  project of its own — a client's, usually.
+
+The agent's `content` mode decides how much each span carries: `full`, the
+default, records the message, the output and every tool call; `none` records
+timing, tokens, cost and tool names only. It is applied where the agent is
+instrumented, so it holds whichever token traces the run — under the
+deployment-wide one the agent is pinned to content-free instrumentation instead,
+and a specialist the agent delegates to — written inline or invented mid-run by
+the model — inherits the mode. One limit
+before relying on it: attaching that instrumentation is best-effort, and a
+failure is logged while the run continues.
+
+With `ENVIRONMENT=production` no span is printed to the console. Logfire's console
+exporter writes one line per SQL and Redis call, about forty per request, into a
+container log nobody can query. So in production a span exists only where the
+token sends it, and with no token a slow request leaves no trace at all.
+`agenticos cmd doctor` reports that as its `tracing` line. Elsewhere the console
+keeps printing spans for whoever is watching the server.
+
+Give each deployment its own `LOGFIRE_ENVIRONMENT`, such as `local` on a laptop
+and `production` on the server. One project can then hold both and still keep
+them apart.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOGFIRE_TOKEN` | (none) | Pydantic Logfire token. Get one at https://logfire.pydantic.dev |
+| `LOGFIRE_SERVICE_NAME` | `agenticos` | Service name in Logfire dashboard |
+| `LOGFIRE_ENVIRONMENT` | `development` | Environment tag |
+| `LOGFIRE_ORGANIZATION` | (none) | Organization slug, for building a link **into** a stored trace. The token is a *write* credential and carries neither slug |
+| `LOGFIRE_PROJECT` | (none) | Project slug, alongside the organization. With either unset a run's `logfire_trace_id` is still recorded and no link is offered |
+| `LOGFIRE_BASE_URL` | `https://logfire-us.pydantic.dev` | Which Logfire deployment those slugs belong to. `logfire-eu` is a different host, and a link built for the wrong one 404s |
+
+## Web search
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+
+## RAG (Retrieval Augmented Generation)
+
+### Vector database
+
+pgvector uses the existing PostgreSQL connection. No additional configuration
+is needed — but the **image** must be `pgvector/pgvector:pg16`, which every
+compose file here pins.
+
+!!! note "\"Vector store: unconfigured\" on a fresh deployment is not a fault"
+
+    The extension is created the first time a collection is written to, so
+    before the first document it is genuinely absent and the admin System page
+    and `agenticos cmd doctor` both say so. It resolves itself on the first
+    ingestion.
+
+    What is a fault is `unhealthy` there, and it names which of three: the image
+    does not ship pgvector; the connecting role may not create it; or the data
+    directory carries the extension row while the image it now runs on has lost
+    the library. All three fail an upload after the bytes have been accepted, and
+    all three used to read the same as a healthy first day
+    ([#1504](https://github.com/vstorm-co/agenticos/issues/1504)).
+
+### Embeddings
+
+Nothing here. Every collection names the provider it embeds through, the model,
+and either the organization vault key that pays for it or - for the keyless
+`ollama` provider - a **local service**, a row under Knowledge → Integrations
+that says where the deployment's or the organization's Ollama answers. See
+[File processing](file-processing.md#embeddings-the-model-whose-endpoint-answers-and-whose-key-pays).
+
+There used to be two variables. `EMBEDDING_MODEL` preselected a model for new
+collections and is gone: the form offers the models the chosen provider serves.
+`EMBEDDING_OLLAMA_BASE_URL` named one Ollama for the whole deployment and is a
+local service now, per organization or deployment-wide.
+
+### Document parsing — configured per collection, not here
+
+Parser, OCR, chunk size, chunk overlap, chunking strategy and the
+image-description model are **not** environment variables. They are stored on
+each knowledge base (`knowledge_bases.ingestion_config`) and edited on `/rag`,
+and any one of them can additionally be overridden for a single upload.
+
+The reason is that one installation-wide value made the same form produce
+different collections on two deployments, with nothing in the product showing
+which — and a scanned contract archive and a folder of Markdown notes want
+different answers on the same deployment. `PDF_PARSER`, `CHAT_PDF_PARSER`,
+`LLAMAPARSE_TIER`, `LITEPARSE_OCR_LANGUAGE`, `LITEPARSE_TIMEOUT_SECONDS`,
+`RAG_ENABLE_OCR`, `RAG_CHUNK_SIZE`, `RAG_CHUNK_OVERLAP` and
+`RAG_CHUNKING_STRATEGY` were removed; setting them now does nothing.
+
+Two things that used to stay here are rows in the product now. A LlamaParse
+key is a vault entry the collection's ingestion configuration names
+(`llamaparse_secret_id`), and a collection on LlamaParse without one is refused
+at the form - `LLAMAPARSE_API_KEY` is gone. An OCR server LiteParse sends pages
+to is a local service of kind `ocr` under Knowledge → Integrations, chosen per
+collection (`ocr_endpoint_id`), registered by an organization operator or, for
+every organization, by the deployment's administrator - `LITEPARSE_OCR_SERVER_URL`
+is gone too. Neither was visible to the tenant whose documents it decided about.
+
+Chat attachments are read with PyMuPDF and are not configurable: an attachment
+belongs to no collection, so there is no stored configuration to read.
+
+### Google Drive sync
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOOGLE_DRIVE_CREDENTIALS_FILE` | `credentials/google-drive-sa.json` | Path to Google service account credentials, for `rag-sync-gdrive` only |
+
+**This is the CLI's credential, not a fallback for a sync source.** A `gdrive`
+sync source names a `gcp_service_account` secret in its organization's vault and
+runs on that or does not run: a deployment-wide key standing in for a missing one
+meant a tenant's `folder_id` chose what was listed under the operator's service
+account. The source's credential is not a setting and not a config field — see
+[Secrets and the vault](secrets.md).
+
+The file is a service account's key: [Cloud console](https://console.cloud.google.com/iam-admin/serviceaccounts)
+→ create a service account → Keys → Add key → JSON. Then **share the Drive
+folder with the service account's own email address** - it is a principal like
+any other, and a folder nobody shared with it lists as empty rather than as
+refused.
+
+## Uploaded files at rest
+
+Where chat attachments, avatars, branding images and the originals of
+knowledge-base documents are stored. One backend per deployment, never per
+organization, and switching it does not move what the other already holds.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FILE_STORAGE_BACKEND` | `local` | `local` writes under `MEDIA_DIR`; `s3` writes to an S3-compatible bucket |
+| `FILE_STORAGE_S3_BUCKET` | (empty) | The bucket. Required when the backend is `s3`; the API refuses to start an upload without it |
+| `FILE_STORAGE_S3_ENDPOINT` | (none) | Empty for AWS. The address of the service for MinIO or another compatible store |
+| `FILE_STORAGE_S3_REGION` | `us-east-1` | AWS region |
+| `FILE_STORAGE_S3_ACCESS_KEY` | (empty) | Leave **empty on AWS**: boto3's own credential chain then answers, which is an instance profile or an IRSA role rather than a long-lived key in an environment file |
+| `FILE_STORAGE_S3_SECRET_KEY` | (empty) | The other half, same |
+| `FILE_STORAGE_S3_PATH_STYLE` | `false` | `true` for MinIO and most compatible stores, which address a bucket by path. A virtual-host request to one fails DNS rather than S3 |
+| `FILE_STORAGE_S3_PREFIX` | (empty) | Every key this deployment writes sits under it, so one bucket can hold more than one deployment without their keys meeting |
+| `FILE_STORAGE_S3_ENCRYPTION` | `sse-s3` | What the store is asked for on every write: `sse-s3` (the bucket's own key), `sse-kms` (the key below), or `none` |
+| `FILE_STORAGE_S3_KMS_KEY_ID` | (none) | The KMS key id or ARN. **Required** when the mode is `sse-kms`: S3 reads an unnamed `aws:kms` as its own AWS-managed `aws/s3` key rather than as the bucket's default, so leaving it empty would encrypt under a key nobody chose |
+
+!!! warning "`none` is for a store with no KMS behind it, and it is not encryption"
+
+    MinIO refuses SSE-S3 unless a KES server is configured, so a compatible store
+    with no KMS needs `none` to work at all — and a deployment running that way
+    has the encryption its volumes give it and nothing more.
+    `agenticos cmd doctor` reports that configuration as unconfigured rather than
+    healthy, and the at-rest row in [security](security.md#what-is-encrypted-where)
+    says the same.
+
+A bucket the deployment writes to needs `s3:PutObject`, `s3:GetObject`,
+`s3:DeleteObject` and `s3:ListBucket` on it, plus `kms:Encrypt`,
+`kms:Decrypt` and `kms:GenerateDataKey` on the key when the mode is `sse-kms`.
+For a local MinIO, `make docker-minio` starts one on `:9000` with
+`minioadmin` / `minioadmin`.
+
+### Generated media
+
+Images, speech and video agents generate are kept in the same store, under
+`generated_<org>/`, and each is recorded against its organization and the
+conversation it was made in. What an organization keeps is bounded twice. See
+[Data protection](data-protection.md#generated-media) for what is deleted when.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GENERATED_MEDIA_QUOTA_MB` | `5120` | Generated media one organization may keep, in MiB. Every file counts, including one made with no conversation - a preview or a test run, a channel `/btw` aside, an API run that names no conversation; the sweep deletes those after 7 days. Checked before each paid generation call: past it, the tool answers that the organization has used its storage and spends nothing. An admitted call holds an estimate of its file against the quota until the file is stored - 16 MiB for an image, 8 KiB per character of speech, 2 MiB per second of video - so a call whose estimate would carry the organization past it is refused, and concurrent runs or parallel calls in one response cannot all pass on the same figure. A file larger than its estimate counts at its real size. `0` is no quota |
+| `GENERATED_MEDIA_RETENTION_DAYS` | `90` | Age at which the daily `sweep-generated-media` job deletes a generated file and its record, whether or not its conversation is still there. `0` keeps them until their conversation or organization is deleted. A file with no conversation goes after 7 days either way |
+
+A file is served by streaming only the byte range a player asks for, from disk
+or by a ranged `GetObject`, so a long clip is never held whole in the API or the
+console's server.
+
+### S3/MinIO sync
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_RAG_ENDPOINT` | (none) | S3/MinIO endpoint URL. A sync source may override it |
+| `S3_RAG_ACCESS_KEY` | (empty) | Access key, for the `rag-sync-s3` CLI command only |
+| `S3_RAG_SECRET_KEY` | (empty) | Secret key, same |
+| `S3_RAG_BUCKET` | `agenticos-rag` | Bucket name |
+| `S3_RAG_REGION` | `us-east-1` | AWS region. A credential's own region wins where it has one |
+
+This is the *sync connector*, which reads a bucket a tenant owns — not the
+deployment's own file storage above. The two are configured separately and
+deliberately: one is infrastructure, the other is a tenant's data.
+
+**The key pair here is the CLI's, not a sync source's.** An `s3` sync source names
+an `aws_credentials` secret in its organization's vault, the same way a `gdrive` one
+names a service account. The endpoint and region still fall back to these settings
+because neither names a principal — they say where the store is, not who is asking.
+
+## Published apps { #published-artifacts }
+
+Pages agents publish with the `artifacts` capability. Their bytes live in the
+file storage above; these bound them and say where they are served from. See
+[Apps](artifacts.md).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ARTIFACT_MAX_BYTES` | 5 MiB | One version of one page. A publication above it is refused with a message the model reads |
+| `ARTIFACT_MAX_VERSIONS` | `20` | Versions kept per app. The oldest is removed when a newer one lands, unless the public link is pinned to it |
+| `ARTIFACT_VIEW_TTL_SECONDS` | `300` | How long a signed content address opens, at most 3600. Also how long an open page outlives a revoked grant or link |
+| `ARTIFACT_PUBLIC_DATA_CACHE_BYTES` | 32 MiB | The most bytes of records one API process keeps, for 30 seconds, for [pages' public links and embeds](artifacts.md#the-cache-and-the-cap). In process memory only, never Redis. The least recently used reads go first, and a read over the budget is not kept. At least 1024 |
+| `ARTIFACT_ORIGIN` | (empty) | Where content is served from - the pages, their [library set](artifacts.md#the-library-set) and the embed document. Empty serves it from `PUBLIC_BASE_URL`, isolated by its `sandbox` policy. Set it to a host on a separate registrable domain, routed to this API, to also put the page on another site |
+| `ARTIFACT_RENDER_CDP_URL` | (empty) | The Chromium DevTools endpoint [`preview_artifact`](artifacts.md#seeing-the-page-preview) draws pages in, such as `http://artifact-render:9222`. Deployment config alone: it is not checked against `BROWSER_CDP_ALLOWED_HOSTS`, which lists what agent authors may drive, and a browsing agent is refused its host even when that list names it. The backend needs the `browser` extra. Empty, a preview returns its report without a picture |
+| `VISUAL_MAP_TILES` | (empty) | The one tile server a [visual](artifacts.md#visuals) or an app may draw a map on: `openstreetmap`, `usgs-topo`, or a `https://` URL template with `{z}`, `{x}` and `{y}` once each. The deployment fetches each tile and serves it to pages from its own tile path; no page talks to the server. Empty draws a map as an outline of its stops. A value that cannot be served is refused at startup |
+| `VISUAL_MAP_TILES_ATTRIBUTION` | (empty) | The credit shown under a map on a tile server of your own, e.g. `© OpenStreetMap contributors`. Required with a URL template; a preset brings its own |
+
+**Map tiles are fetched by the deployment, not by the reader's browser.** A page
+asks `/api/v1/artifact-content/tiles/{z}/{x}/{y}`; the API checks the numbers,
+fetches the tile from the server, keeps the last 2,048 in memory and answers, so
+a key in the template never leaves the server. The route takes no session -
+every page loads it - so it is limited per address
+(`RATE_LIMIT_MAP_TILES_PER_MINUTE`). Mind the provider's terms: OpenStreetMap's
+public tiles are for light use, and a busy deployment should run its own server
+or pay a provider. *Admin → System* shows whether the server answers.
+
+**`ARTIFACT_ORIGIN` is read twice, and both have to see it.** The backend signs
+content addresses on it, and the frontend adds its content route,
+`/api/v1/artifact-content/`, to the console's `frame-src`.
+Set it in the backend's environment and in the frontend's; the compose files
+pass it to both. A value in only one of them shows an empty frame, because the
+browser refuses to load the page from an origin the console did not allow.
+
+**With `ARTIFACT_ORIGIN` empty, the frontend's `PUBLIC_API_URL` must equal the
+backend's `PUBLIC_BASE_URL` exactly, path included.** The backend then signs
+content addresses on `PUBLIC_BASE_URL`, and the console's `frame-src` names the
+content route under `PUBLIC_API_URL`, so `https://example.com/agenticos` on one
+side and `https://example.com` on the other is the same empty frame.
+
+**The renderer is its own browser, with no network.** Compose ships it as the
+opt-in `artifact-render` profile: a pinned headless Chromium on an internal
+network that only the API and the worker join. Every request a render
+makes is answered by the API - the page, its library files and a host document -
+or refused, so the browser needs no route out, and it renders people's records,
+so it must not be the browser a [browsing agent](reference/capabilities.md#browser-automation)
+drives. Start it with `docker compose --profile artifact-render up -d`, then set
+`ARTIFACT_RENDER_CDP_URL=http://artifact-render:9222`. Do not add
+`artifact-render` to `BROWSER_CDP_ALLOWED_HOSTS`: that list is for browsing
+agents, and the renderer needs no entry there. One process draws two pages at a
+time, each within 15 seconds.
+
+## Agent workspaces
+
+The `state` workspace needs nothing here. It is stored in this database, works on
+every deployment, and is what an agent gets by default — so the settings below
+are only for a container-backed one.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SANDBOX_STATE_MAX_BYTES` | 32 MiB | Per **stored** workspace. Past it a write is refused with a message the model reads |
+| `SANDBOX_INLINE_IMAGE_MAX_BYTES` | 5 MiB | Above this an attached image is written to the workspace and not also sent inline |
+
+**The percentage in the chat is two different ceilings, and it says which.** A
+stored workspace fills up against `SANDBOX_STATE_MAX_BYTES` above — bytes, and
+running out *refuses a write*. A container reports resident **memory** against the
+ceiling its host set for that runtime, which is `1g` unless the allowlist says
+otherwise, and running out of that is an OOM kill rather than a refusal. So the
+strip says `workspace 12% full` for the first and `sandbox memory 12% full` for the
+second; reporting either as the other would name a limit that does not apply.
+
+**Where sandboxes run is not a setting.** It is a row per organization — Sandboxes
+in the app, `sandbox_connections` in the database — with the service token in the
+vault. Two reasons, and neither is expressible in an environment variable: a
+deployment can hold more than one host, and one address per deployment gave every
+organization the same one; and the token authorises opening a session, which runs
+commands on the host holding the Docker socket, so it belongs where every other
+credential at rest lives.
+
+An operator registers a connection with a name, an address, and a key from the
+vault. An agent names one by id, exactly as it names a model profile, or names
+none and takes the organization's default — so moving to another host is one edit
+rather than a republish of every agent.
+
+**The service token is worth what the Docker socket is worth.** The service holds
+that socket, the socket is an unauthenticated API for root on the host, and the
+token is what opens a session on it. Never in a browser, never in a log, never
+committed — which is why the operator screen shows only that a credential is
+attached, and why `GET /policy` is proxied through this API rather than fetched by
+the browser. The service's own dashboard (`SANDBOXD_UI_ENABLED`) is off in every
+shipped compose file for the same reason: it asks a human to paste this value into
+a browser.
+
+`SANDBOXD_TOKEN` in `backend/.env` is the *service's* own — what the daemon in the
+compose file will accept.
+
+`make sandbox-token` generates it, and the connection form stores the same value in
+the vault for you. The API reads this setting for exactly one purpose: offering it to
+the vault. Asking somebody to copy a secret out of a file their own stack is already
+reading is friction with nothing behind it.
+
+It is **never** used to reach a host — resolving a connection unseals the vault entry
+that connection names, and that stays the only path. So a deployment that leaves it
+unset loses one button and nothing else, and pastes the token instead.
+
+The same form asks whether a service is already answering, rather than making an
+operator know that a `make dev` sandbox service lives at `http://sandboxd:8080`.
+That address is not configuration and deliberately so — it is a row, because a
+deployment can hold several hosts — so the API probes the unauthenticated
+`/healthz` at the address this project's compose file uses and prefills what
+answered. Nothing is decided by asking: no service means an empty field, and a
+connection already pointing there is named so nobody registers one host twice.
+
+**The address is fetched by this API, so it is validated as one.** Registering or
+probing a connection makes the API container issue an authenticated `GET` and hands
+the JSON body back, which is a request-forgery primitive if the address is taken on
+trust. So `base_url` refuses anything that is not `http(s)` with a host, and refuses
+link-local addresses and the instance-metadata hostnames outright —
+`169.254.169.254` and `metadata.google.internal` are never a sandbox service.
+
+Private addresses stay allowed, and have to: `http://sandboxd:8080` inside compose
+and `http://localhost:8080` for a developer running the API on their host are both
+private, so a private-range denylist would refuse the deployment this page
+describes. That means the validator narrows the hole rather than closing it — a
+hostname that resolves to something internal still resolves. **The boundary that
+actually holds is `connections:manage` plus egress policy on the API container**:
+whoever may register a host is trusted with one, and a deployment on a network
+holding unauthenticated internal APIs should say so at the network rather than here.
+
+### Which environments an agent may ask for
+
+Two runtimes ship. `workbench` (1.93 GB) has Python 3.12, Node 24, LibreOffice, and
+the libraries an agent needs to read, write, convert and plot the files a
+conversation is about, including liteparse with OCR. `desktop` is a Linux desktop,
+XFCE and Firefox, for computer use. Both are defined in
+`backend/app/core/catalog/sandbox_runtimes.json`. Adding one is an edit there and
+`make sandbox-runtimes`, which writes `SANDBOXD_RUNTIMES` into all three compose
+files; that variable is the only channel the service accepts runtimes on, and
+`PUT /policy` deliberately refuses the membership of the list.
+
+`sandbox.md#which-environments-an-agent-may-ask-for` has the field-by-field
+format, the three traps (the first entry is the default, `network_mode` is not
+inherited, a build is paid for at start-up by `prewarm`) and why the generated
+copy in the compose files cannot drift from the catalogue.
+
+### The service's own settings
+
+Every field of the service's configuration is `SANDBOXD_` plus its name, so this is
+a subset rather than a vocabulary. These are the ones the shipped compose files set
+or that decide whether files survive:
+
+| Variable | Shipped | What it decides |
+|---|---|---|
+| `SANDBOXD_WORKSPACE_ROOT` | a host path | Where each session's work directory lives, bind-mounted from the *host*. **Unset, files exist only inside a running container** — an idle reaping discards them and the next request opens an empty workspace, with nothing in a log. It is also what makes browsing possible: reading a workspace never starts a container |
+| `SANDBOXD_SANDBOX_UID` | `10001` | The unprivileged user a sandbox runs as, instead of root — a container escape starts from whoever the container runs as, and every file an agent writes is owned by this uid on the host. **Has to be the service's own uid**: opening a session `chown`s the workspace to this user, which an unprivileged service can only do for itself. Applies to a runtime the deployment *builds*, since a ready-made image has no such account and an agent inside one could install nothing |
+| `SANDBOXD_CONTAINER_TTL` | 86400s | How long a *stopped* persisted container is kept. Reclaims what a session installed — the build, the wheels, `node_modules` — and leaves the workspace untouched, because the files are the work. Unset, they are kept for ever |
+| `SANDBOXD_PERSIST_CONTAINERS` | `true` | A closed session's container is kept rather than removed, so the next session on that workspace starts without a build. Costs a stopped container per workspace; `SANDBOXD_CONTAINER_TTL` bounds it |
+| `SANDBOXD_MAX_SESSIONS_PER_TENANT` | `5` | One organization cannot take the pool. `SANDBOXD_MAX_SESSIONS` (20) is the pool |
+| `SANDBOXD_NETWORK_MODE` | `none` | The default network for a sandbox. `none` is no network at all; a runtime may name `bridge` for itself |
+| `SANDBOXD_UI_ENABLED` | `0` | The service's own dashboard. Off because it asks a human to paste a root-equivalent token into a browser |
+| `SANDBOXD_IDLE_TIMEOUT` | 1800s | How long an idle session lives before it is closed and reaped |
+| `SANDBOXD_MEM_LIMIT` | `1g` | The default memory ceiling, and therefore the number the chat's `sandbox memory` percentage is a share of |
+
+### Running the service on another host
+
+Nothing about a connection assumes a local address — it is a row holding a URL and
+a vault credential, and the form probes whatever it is given. A host somewhere else
+needs three things and no code:
+
+1. **The Docker socket**, because the service starts containers. That is root on
+   that machine, which is why the token below is worth what it is.
+2. **`SANDBOXD_WORKSPACE_ROOT` on real disk, mounted at the same path on both
+   sides.** The service creates the directory and then asks the *daemon* to
+   bind-mount it, and the daemon resolves the path on the host — so a named volume,
+   or a path existing only inside the service's container, is refused with `mounts
+   denied`.
+3. **TLS and a token nobody shares.** Inside compose the address is
+   `http://sandboxd:8080` on a private network; across the internet it is a service
+   that will run commands for whoever holds the token, so it belongs behind HTTPS
+   with its own value.
+
+Then register it in Sandboxes like any other, and point an agent at it by name. The
+compose service is one deployment of the same image.
+
+### When a session is open
+
+The **Running** tab lists the sessions the service holds, refetched every ten
+seconds, and a session is one workspace on one host. Three states, and only the
+first two appear:
+
+- **running** — the container exists and is resident. Opened by an agent's first
+  tool call in a conversation, not when the conversation starts.
+- **hibernated** — the row exists and the container does not. A session idle past
+  `SANDBOXD_EVICT_IDLE_AFTER` is hibernated to free a slot, and its next request
+  wakes it. This needs `WORKSPACE_ROOT`, or waking one would open an empty
+  workspace, and the service refuses the combination rather than doing that.
+- **gone** — past `SANDBOXD_IDLE_TIMEOUT` the session is closed and reaped. With
+  `PERSIST_CONTAINERS` the container survives that, so the next session on the same
+  workspace starts without a build.
+
+So an empty Running tab means no agent has used a shell recently, not that nothing
+is configured — and a workspace with files in it and no session is the normal
+resting state.
+
+The service runs behind the `sandbox` compose profile, which is on by default in
+local dev and off elsewhere until an operator opts in — mounting the Docker socket
+on a shared host is a deliberate act. `COMPOSE_DEV_PROFILES` in the Makefile is
+the one place to change that. `uv run agenticos cmd doctor` probes every registered
+connection: whether it answers, whether it accepts its credential, and whether it
+allows any runtime at all. No connection registered is a warning, not a failure —
+the `state` workspace needs none.
+
+**Browsing what the agents kept.** Workspaces is its own screen — not part of
+Sandboxes, which is about *hosts*.
+
+Each row names the agent, the conversation the files belong to (or how many chats
+reach them, for a workspace no single conversation owns), who can see them, how big
+it is and when it was last used.
+
+**Open** goes to that workspace's own page, in the shape the skills editor uses: the
+tree on the left — folders walked one at a time, with a search box over the whole
+tree rather than the folder on screen — and the file itself rendered beside it. So
+reading three files is three clicks, and the list never closes.
+
+Downloading is on the row rather than beside the reader, because selecting a file
+reads it and a large archive is one somebody wants a copy of without paying for that.
+
+A second view on the listing flattens every file the reader can see into one grid —
+the "who is holding a copy of that CSV" question the per-workspace page cannot
+answer.
+
+**Clicking a file opens it in a viewer, and it is the same viewer in the chat panel.**
+An image is a picture, a PDF is the browser's own PDF view, audio and video play in
+the browser's own player, markdown offers *Preview*
+and *Source* — both are the file, and a `#` that silently became large type is how
+somebody fails to notice their agent is writing markdown into something nothing reads
+as markdown — and anything else is its text. Download is always there, including for
+what cannot be shown at all. One component, because "open this file" meaning two
+different things on two screens is how the second one ends up missing a case.
+
+Bytes come from `GET /sandbox-workspaces/{id}/raw?path=…`, or from
+`GET /conversations/{id}/workspace/raw?path=…` for the panel beside a chat.
+
+Two routes rather than one because they authorise different callers — the
+conversation route is reached by fetching the conversation, so somebody a chat was
+*shared with* keeps access — and one module deciding what may be displayed, so the
+answer cannot differ by surface.
+
+Almost everything is served as an attachment. **Raster images, PDFs, audio and video**
+(MP3, WAV, Ogg, Opus, M4A, MP4, WebM) are served for display: a raster because it
+cannot execute, a PDF because the browser renders it in its own viewer, which never
+gets the page's DOM, and audio and video because the browser hands them to its media
+pipeline, which plays them and runs nothing in the page.
+
+!!! danger "SVG and HTML are downloadable and never displayable"
+
+    An SVG served inline from this origin is stored cross-site scripting written by
+    whatever the agent decided to save, and "the agent wrote it" is not a trust
+    boundary.
+
+Everything else is typed `application/octet-stream` with
+`X-Content-Type-Options: nosniff`, so a browser cannot decide such a body is HTML
+after all. The filename travels as `filename*` only, because a workspace path can
+hold any UTF-8 and the bare form has no way to say so.
+
+Only a **stored** workspace can serve arbitrary bytes. A container-backed one is read
+through the workspace archive, whose only reader is textual, so a text file is served
+by encoding it and anything else is refused rather than quietly mangled — the browser
+offers the download beside the refusal so the answer is never a dead end.
+
+Files are read only when a workspace is opened, or when the flat view is switched
+on: a deployment can hold one per warm conversation, so reading each to render the
+table would be a request per row for a page nobody has asked a question of yet. The
+flat view is bounded for the same reason, and says so — how many workspaces it read,
+how many it could not, and whether more exist. A shorter list is otherwise
+indistinguishable from fewer files.
+
+**Who sees which workspace is decided per reader, in the query.** A caller holding
+`connections:manage` sees the organization's — the honest bar for a listing that
+crosses chats that are not theirs. Everybody else sees the workspaces they are part
+of: their own `user`-scoped files, the workspaces of their own conversations, and
+the shared workspace of an agent they have talked to. "Have talked to" rather than
+"could open", deliberately: `agent` scope shares one workspace across an agent's
+users and the chat panel already shows those files to anybody in a conversation
+with it, so being *able* to open the agent is a wider claim than this listing makes.
+
+`channel` scope is visible to an operator only, which is correct rather than an
+oversight — it is keyed on a Slack or Telegram chat, so the people sharing it are
+identified by that platform and not by a row in `users`.
+
+A workspace fetched by id applies the same three predicates and answers **not
+found** rather than forbidden when they fail: an id must not be usable to discover
+which workspaces exist in a colleague's conversation. Nothing here crosses an
+organization — an app admin browsing another tenant's files would be the one read
+this platform refuses, so they switch organization like anybody else.
+
+**A container-backed workspace is read off the host volume, which needs one.** The
+sandbox service serves those files from `SANDBOXD_WORKSPACE_ROOT`, and that is what
+lets a conversation from last month list its files after its session was reaped —
+no container is started to answer. A service configured *without* one keeps nothing
+on disk, so its files exist only while a sandbox is running and cannot be read
+without starting one: the Files panel could then only say so, for a file the agent
+had demonstrably just written.
+
+Every compose file therefore sets one, overridable with `SANDBOX_WORKSPACE_ROOT` —
+an environment variable where compose interpolates it, so the project root rather
+than `backend/.env`, except on the `dev` and `prod` targets which pass that file
+explicitly.
+
+One host path, bind-mounted at the same location on both sides, because the service
+creates the directory and then asks the *daemon* to mount it — and the daemon
+resolves the path on the host. A named volume, or any path existing only inside the
+service's container, is refused with `mounts denied`.
+
+| | Default | |
+|---|---|---|
+| Local dev | `/tmp/agenticos-sandbox-workspaces` | Docker Desktop shares it and anybody can write to it, so a laptop needs no setup |
+| The server files | `/var/lib/agenticos/sandbox-workspaces` | Has to exist and be writable by uid 10001 — `sudo mkdir -p <path> && sudo chown 10001:10001 <path>`, once. Not `install -d -o 10001`: `install` resolves the owner through the passwd database and refuses a uid no account owns. It belongs on storage somebody backs up |
+
+A reboot sweeps `/tmp`, which is the one reason not to point a real deployment
+there.
+
+That is reported rather than raised. Every listing carries `unreadable_reason`, and a
+client shows it as an explanation instead of an error — because neither cause is a
+fault: a service keeping nothing on disk is a configuration with a one-line fix the
+message names, and a host that is down will be up later.
+
+Raising made it a 500, which a browser could only render as "something went wrong",
+beside an empty list, which reads as "there are no files". Two wrong answers at once.
+
+Reading *one file* from such a host is refused with the same sentence rather than
+reported as "no such file", which would say the file is missing when it is not.
+
+**What is running is read from the service too.**
+
+The Sandboxes screen keeps it on its own tab, apart from the connections table, and
+lists this organization's open sandboxes on the host it names — the default
+connection until the operator picks another.
+
+Each row carries the runtime, what shares that sandbox, its idle time, and its memory
+against its own ceiling when asked. Sortable by idle time and memory. Beside them is
+the activity log per sandbox: which paths were read, which commands ran, and how each
+went.
+
+Neither file contents nor command output is recorded by the service, which is what
+keeps an audit trail from becoming a way to read another agent's work.
+
+The dashboard answers the same three questions in its own section, for a caller
+holding `connections:manage`. Memory is behind a switch there for the same reason it
+is on the screen: the service samples each sandbox individually for it.
+
+**All three ceilings now divide.**
+
+The session listing is filtered to the caller's organization, but it carries
+`SANDBOXD_MAX_SESSIONS` and `SANDBOXD_MAX_OPEN_SESSIONS` through from the service
+untouched — so those two count every tenant on the host while the rows count one.
+`len(sessions)` divides only against `SANDBOXD_MAX_SESSIONS_PER_TENANT`.
+
+So the response carries two host-wide numerators for the other pair, taken from the
+unfiltered list before the filter narrows it:
+
+- `host_session_count` — the resident sandboxes the service marks
+  `state == "running"`, against `limit`;
+- `host_open_count` — every session that exists, resident or hibernated, against
+  `open_limit`.
+
+Now the capacity card can say why a session was refused while this organization is
+short of its own ceiling: the host itself is full of somebody else's work.
+
+That the two are host-wide is a deliberate, narrow disclosure — two aggregate
+integers naming nothing, a long way from the session rows the filter withholds — and
+the listing is gated on `connections:view`, the authority to watch a host rather than
+any member's.
+
+They are `None` on a Daytona connection, which enforces no ceilings of ours to
+divide.
+
+That listing is **filtered, not forwarded**. One `sandboxd` answers for every
+organization that registered a connection at its address, so passing its response
+through would show one tenant another tenant's containers. Sessions are matched on
+the `tenant` label this platform sets when it opens one, and named from
+`agent_workspaces` rather than by decoding the session id — the id encodes the
+scope key, and parsing it back would make that format a schema.
+
+**What the service allows is read from the service.** The runtime allowlist and the
+ceiling behind each alias (`SANDBOXD_RUNTIMES`, `SANDBOXD_MEM_LIMIT`,
+`SANDBOXD_NETWORK_MODE`, `SANDBOXD_MAX_SESSIONS_PER_TENANT` and the rest) are its
+own boot configuration, and there is deliberately no endpoint to write them: a
+browser that could reconfigure the process holding the Docker socket would own the
+host. The Sandboxes screen and the dashboard's runtimes card both *read* them so
+what is in force is visible, and the Builder offers an agent only the aliases the
+service will actually accept.
+
+Neither view asks a Daytona connection any of this. It publishes no allowlist of its
+own and holds none of our sessions to enumerate — what it permits is a setting on
+that account, and what runs there is visible in its own dashboard.
+
+## Messaging channels
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+
+Bot credentials are not configured here: each bot is registered in the app
+with its token sealed in the vault, and a Slack bot additionally carries its
+own app's signing secret and `xapp-` token (`SLACK_BOT_TOKEN`,
+`SLACK_SIGNING_SECRET` and `SLACK_APP_TOKEN` were removed - each bot is its
+own Slack app now). Telegram webhook
+URLs are built from `PUBLIC_BASE_URL` (`TELEGRAM_WEBHOOK_BASE_URL` was
+removed), model profiles may point at local endpoints such as Ollama without
+any flag (`ALLOW_INTERNAL_MODEL_ENDPOINTS` was removed), and the `run_python`
+sandbox limits are per-agent capability configuration
+(`CODE_EXECUTION_TIMEOUT_SECS` / `CODE_EXECUTION_MAX_MEMORY_MB` were removed).
+
+## Voice calls
+
+[Voice calls](voice.md) are switched on in each agent, and bounded by its longest
+call and by the budgets. Two ceilings are the deployment's:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VOICE_MAX_CALLS_PER_USER` | `1` | Calls one person may hold at once. A second tab's call is almost always a mistake, and each is billed; a second start is refused as `busy` |
+| `VOICE_MAX_CALLS_PER_EMBED` | `3` | Calls one widget or hosted page may hold at once, from every visitor together; the next is refused as `line_busy`. Visitors have no account to count against, so this is what stops a leaked link from spending the organization's budget in parallel |
+
+Both count calls whose heartbeat is fresh, so a call whose process died stops
+counting within 45 seconds. Starting calls on an embed is also rate-limited
+(`RATE_LIMIT_EMBED_VOICE_*`, [below](#rate-limiting)). An embed's own
+`rate_limit_per_minute`, set in the Builder, counts a visitor's **messages**, not
+call starts, so it does not bound calls.
+
+The rest is fixed in code rather than configured: a call is never longer than
+50 minutes, heartbeats run every 15 seconds, and the voice sweep runs every
+minute, as the worker's `reap-voice-calls` schedule.
+
+## CORS
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CORS_ORIGINS` | `["http://localhost:3000","http://localhost:8080"]` | Allowed origins (JSON array) |
+| `CORS_ALLOW_CREDENTIALS` | `true` | Allow credentials (cookies) |
+| `CORS_ALLOW_METHODS` | `["*"]` | Allowed HTTP methods |
+| `CORS_ALLOW_HEADERS` | `["*"]` | Allowed HTTP headers |
+
+Production validation: `CORS_ORIGINS` cannot contain `"*"` in
+`ENVIRONMENT=production`.
+
+## Rate limiting
+
+Applied to the surfaces a stranger can reach, and only those: the public run API,
+the widget's script, its config, either surface's socket handshake, a hosted
+page's config and logo, and a visitor's upload, dictation and voice call. The console's own routes are
+behind a session and are not metered, with one exception: writes to
+[Virtual Tables](virtual-tables.md), which store a snapshot per change. Whether the
+whole API should carry a ceiling is a separate decision, not this one.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RATE_LIMIT_RUN_PER_MINUTE` | `30` | `POST /api/v1/agents/{id}/run`, per caller |
+| `RATE_LIMIT_AUTH_PER_MINUTE` | `10` | Every `auth.py` route — login, register, refresh, the reset/magic-link request and verify routes. Counted **per IP and, where the body carries one, per submitted address**. See below |
+| `RATE_LIMIT_EMBED_PER_MINUTE` | `20` | Per address, and **two separate counters of this size**: one for `widget.js`, one for admission — the widget's `/config` plus either surface's socket handshake. See below |
+| `RATE_LIMIT_HOSTED_PAGE_PER_MINUTE` | `240` | A hosted page's config, **per page** — and its logo, on a counter of its own. A workflow's [form](workflows.md#from-a-form) is read on a counter of this size per form. See below |
+| `RATE_LIMIT_FORM_SUBMISSIONS_PER_MINUTE` | `20` | Answers one workflow [form](workflows.md#from-a-form) takes, **per form**: each one is a run its publisher pays for, and the console's server forwards them all, so an address would count nobody |
+| `RATE_LIMIT_WORKFLOW_WEBHOOK_PER_MINUTE` | `60` | Deliveries one workflow [webhook](workflows.md) or GitHub trigger takes, **per webhook**, counted once the signature has verified and the delivery would start a run, so strangers and skipped deliveries spend nothing of it: each one is a run |
+| `RATE_LIMIT_WORKFLOW_WEBHOOK_IP_PER_MINUTE` | `600` | Requests one address may send the workflow webhook and GitHub trigger addresses in a minute, whatever they carry, counted before anything is read. Wide, because senders such as GitHub deliver for many hooks from a few addresses |
+| `WORKFLOW_EMAIL_MAX_PER_PRINCIPAL_PER_HOUR` | `100` | Unique workflow email recipients per issuer, across keys and organizations; [email.send](reference/workflow-nodes.md#email-send) |
+| `WORKFLOW_EMAIL_MAX_PER_ORG_PER_HOUR` | `500` | Unique workflow email recipients per organization; [email.send](reference/workflow-nodes.md#email-send) |
+| `WORKFLOW_EMAIL_MAX_PER_DEPLOYMENT_PER_HOUR` | `1000` | Unique workflow email recipients across the deployment; [email.send](reference/workflow-nodes.md#email-send) |
+| `RATE_LIMIT_MAP_TILES_PER_MINUTE` | `600` | Map tiles one address may fetch through the deployment's [tile path](artifacts.md#visuals), **per address**. A map is a few dozen tiles and panning adds more; the bound keeps the deployment from being anybody's free proxy to its tile server |
+| `RATE_LIMIT_EMBED_UPLOAD_PER_MINUTE` | `5` | Files a visitor may store on a hosted page. Counted **per address and per visitor key**, and both have to allow it — the key is minted by the browser, so counting only that bounds nothing |
+| `RATE_LIMIT_ML_PER_MINUTE` | `30` | The [ML services](ml-services.md), per caller. These endpoints do their work synchronously, so an unbounded caller occupies the parsing pool rather than a budget |
+| `RATE_LIMIT_DICTATION_PER_MINUTE` | `10` | [Dictation in chat](ml-services.md#dictation-in-chat), per person, on its own counter so dictating and an integration calling the ML services do not spend each other's allowance. Each one is a call to the organization's paid provider |
+| `RATE_LIMIT_VOICE_PREVIEW_PER_MINUTE` | `6` | [Hearing a voice](voice.md#turn-it-on) in the Builder, per person. Each uncached preview is a short paid session on the agent's realtime provider, outside every model budget; a voice heard once is cached for a week |
+| `RATE_LIMIT_EMBED_DICTATION_PER_MINUTE` | `6` | [Dictation on a widget or a hosted page](channels.md#dictation-on-a-widget-or-a-hosted-page), per address, and per visitor on a `jwt` widget. Each one is a call to the organization's paid provider, outside every model budget |
+| `RATE_LIMIT_EMBED_DICTATION_PER_LINK_PER_MINUTE` | `10` | The same, per page or widget, from every visitor together - the ceiling on what a leaked link costs: this many recordings a minute, each up to the organization's longest dictation. Spent only once a visitor is admitted |
+| `RATE_LIMIT_EMBED_VOICE_PER_MINUTE` | `3` | [Voice calls](channels.md#voice-calls-on-a-widget-or-a-hosted-page) started on a widget or a hosted page, per address, and per visitor's token subject on a `jwt` widget. The address is counted before the key is looked up; each call is a paid realtime session |
+| `RATE_LIMIT_EMBED_VOICE_PER_LINK_PER_MINUTE` | `6` | The same, per page or widget, from every visitor together, spent only once a visitor is admitted. With `VOICE_MAX_CALLS_PER_EMBED` above, the ceiling on what a leaked link costs |
+| `RATE_LIMIT_ARTIFACT_PUBLIC_DATA_PER_MINUTE` | `60` | Times one page's data may be read from its tables for visitors of its public link or embeds, **per page across all visitors**. A load that has to read from the tables counts once, and one served from the 30-second [cache](artifacts.md#the-cache-and-the-cap) does not; past the limit, the page loads with that data unavailable |
+| `RATE_LIMIT_ARTIFACT_ACTIONS_PER_MINUTE` | `10` | Runs one member may start from one page's [actions](artifacts.md#actions) per minute, **per member, organization and page**. Each run is confirmed by the member first; this bounds a page that asks in a loop. Past it the page's call is rejected as `rate_limited` |
+| `RATE_LIMIT_TABLE_WRITES_PER_MINUTE` | `300` | Writes to [Virtual Tables](virtual-tables.md), **per member and organization**: a record create, update, upsert or delete, a table create, rename, archive or schema change, and saving, changing or deleting a saved view. Applies to the console as much as to a script. Reads are not counted |
+| `RATE_LIMIT_TRUST_FORWARDED_FOR` | `false` | Whether `X-Forwarded-For` names the caller |
+
+**What a refused caller gets** is this API's own error envelope with
+`code: "RATE_LIMIT_EXCEEDED"`, the interval in
+`error.details.retry_after_seconds`, and the same interval in the `Retry-After`
+header — which is the one a fetch wrapper or a CDN actually backs off on. The
+socket handshake is the exception, because a WebSocket has no status to answer
+with: it closes with `4029` (see [channels](channels.md#the-raw-websocket)).
+
+**Two counters, not one, and the reason is arithmetic.**
+
+Loading a page with a widget on it costs three requests to this API: the script, the
+config, and the socket. Counted together, `20` bought about seven page loads for a
+cold browser rather than twenty admissions — and a limit wrong by a factor of three
+is worse than no limit, because it reads as the number you set.
+
+So `widget.js` has its own bucket. It is cacheable, and a refusal there breaks the
+widget outright instead of delaying one message.
+
+The config and the handshake stay together, because together they *are* one
+admission: a browser that read a config and opened no socket did not get in.
+
+The counts live in the deployment's Redis, so they hold across workers —
+production runs four, and a count kept per process would let through four times
+what it says. If Redis cannot be reached the limit is not applied and a warning
+is logged: refusing a visitor their answer because a cache blipped is the worse
+failure of the two.
+
+What a visitor may *say* once admitted is a different number, set per widget in
+the Builder (`rate_limit_per_minute`) and counted per visitor. These two are the
+ceiling on getting in.
+
+### `RATE_LIMIT_HOSTED_PAGE_PER_MINUTE`, and why it is not per address
+
+A hosted page's config is fetched **server-side**, by the frontend, so the page
+paints branded on the first frame. That means the address on the request is the
+frontend container's and not the visitor's — so counting it put every hosted page
+load in the deployment in a single bucket, and the visitor who tripped it was
+served a 404 with nothing saying why. `RATE_LIMIT_TRUST_FORWARDED_FOR` cannot
+help: a server-side `fetch` sends no such header for anyone to trust.
+
+So this one is counted per public key. It bounds a single page rather than
+rationing a visitor, which is why the default is wide — **it is not what limits
+spend.** Spend starts at the socket the page opens next, which the browser makes,
+which is counted per address under `RATE_LIMIT_EMBED_PER_MINUTE`. And guessing a
+key is not a strategy against 192 bits of `secrets.token_urlsafe`.
+
+### `RATE_LIMIT_AUTH_PER_MINUTE`, and why the auth surface has its own
+
+Every route in `auth.py` carries this limit, counted **per IP** and — where the
+body carries an address (login, register, the reset and magic-link requests) —
+**per submitted address too**, both against this allowance. The two stop
+different attacks: the IP bounds a flood from one source, the address bounds a
+brute force against one account.
+
+It is separate from, and lower than, the run allowance because the cost of a
+**single attempt** is what it defends. `verify_password` is bcrypt, ~170ms with no
+suspension point, so an unmetered `/login` flood for any address that has an account
+saturates a worker's event loop with no credentials at all.
+
+Two more things close the rest of that surface, and need no configuration:
+
+- bcrypt runs in a thread, so it never blocks the loop;
+- an address with **no** account is verified against a dummy hash rather than
+  skipped, so a known and an unknown address take the same time to refuse and the
+  timing no longer says which addresses exist.
+
+### `RATE_LIMIT_TRUST_FORWARDED_FOR`, and why it is off
+
+Per-address limits count `request.client.host`. **Behind a proxy or a CDN that
+is the proxy's address, not the visitor's** — every visitor shares one bucket, so
+a busy site behind Cloudflare exhausts the widget's twenty admissions a minute
+for everybody at once. Turning this on reads the **rightmost** `X-Forwarded-For`
+hop instead — the address the trusted proxy itself appended.
+
+It is off by default because the header is set by whoever is calling. Trusted
+unconditionally, a per-address limit becomes a per-header limit that anybody bypasses
+by varying one string.
+
+The **rightmost** hop is read rather than the leftmost for the same reason:
+`X-Forwarded-For` is a list the client starts and each proxy appends to, so the head
+is what the client typed and only the tail is what a proxy you control wrote.
+
+**The auth surface needs this too, and the frontend now makes it possible.** Auth
+requests reach the API server-side through the frontend's own `/api/auth/*` routes,
+so without help the address on them is the frontend container's and
+`RATE_LIMIT_AUTH_PER_MINUTE`'s per-IP half puts the whole deployment in one bucket —
+about eleven logins then lock everyone out for a minute, and an exhausted refresh
+bucket signs sessions out. Unlike a hosted page's config fetch, those routes
+**forward the caller's `X-Forwarded-For`**
+([#1047](https://github.com/vstorm-co/agenticos/issues/1047)), so with this setting on
+the limit keys on the real client. Turn it on for the auth limit under the same rule
+as everything else — one proxy you control in front, appending the client as the
+rightmost hop — which is the deployment decision this setting is; left off, the limit
+stays safe but shared.
+
+!!! danger "Turn it on only when a single proxy you control is the only thing that can reach the API"
+
+    If the container's port is published as well, a caller can set the header
+    themselves and the limit stops meaning anything.
+
+    **The frontend's port counts as the API's here.** Its `/api/auth/*` routes
+    forward whatever `X-Forwarded-For` they were handed, so a caller who can
+    reach port 3000 past the proxy chooses the address their login attempts are
+    counted against just as surely as one who can reach port 8000 — and every
+    accepted attempt against an address nobody holds still costs a bcrypt. Both
+    `docker-compose-prod.yml` and `docker-compose-prod.frontend.yml` therefore
+    publish on `127.0.0.1` by default, where the host's reverse proxy reaches
+    them and nothing else does. `BIND_HOST=0.0.0.0` opens them again, for a
+    proxy that genuinely runs elsewhere — with that proxy's own network as the
+    thing keeping the promise.
+
+    With two proxies in front, collapse the header to one hop at your edge — only
+    the last hop is trustworthy.
+
+## Virtual Tables limits and retention { #virtual-tables-limits-and-retention }
+
+What one organization may store in [Virtual Tables](virtual-tables.md#limits-and-retention),
+and how long the copies a write leaves behind are kept. A write over a limit is refused
+with `QUOTA_EXCEEDED` (402) and an audit entry that names the quota, never the content.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TABLES_MAX_PER_ORGANIZATION` | `200` | Tables per organization. Archived ones count, because nothing deletes a table |
+| `TABLES_MAX_RECORDS_PER_TABLE` | `100000` | Records in one table |
+| `TABLES_MAX_RECORD_BYTES` | `1000000` | Serialized size of one record's values, in bytes. Minimum `1`. It also bounds what a create's and a delete's history row and a receipt hold; a record already over the limit still deletes, keeping a byte-count marker instead of its values |
+| `TABLES_MAX_STORAGE_BYTES_PER_ORGANIZATION` | `1073741824` | Stored PostgreSQL JSONB payload bytes per organization across records, history, receipts and outbox; physical table/index overhead is separate |
+| `TABLES_RECEIPT_TTL_HOURS` | `24` | How long an idempotency receipt answers a retry. Afterwards the same key is a new write |
+| `TABLES_OUTBOX_RETENTION_DAYS` | `3` | How long a dispatched outbox row is kept |
+| `TABLES_OUTBOX_UNDISPATCHED_RETENTION_DAYS` | `30` | How long an undispatched outbox row is kept. The [table-trigger](virtual-tables.md#triggers) heartbeat marks each row it judges, so a row this old means the worker has been down that long. This is a dead-letter cutoff, not a claim the event was delivered - past it, the row is gone and no trigger starts for that record |
+| `TABLES_HISTORY_RETENTION_DAYS` | `365` | How long a record's history is kept, counted from the change, for a deleted record as well |
+| `TABLES_MAX_CONCURRENT_QUOTA_AUDITS` | `4` | How many quota-refusal audit entries this process writes at once, so a burst of refusals cannot open an unbounded number of database connections. The rest of a burst waits on this bound instead |
+
+The three retention periods are applied by the daily
+[retention sweep](governance.md#retention), for every organization, and are not
+per-organization settings.
+
+The sweep's per-pass budget for these three classes scales with
+`RATE_LIMIT_TABLE_WRITES_PER_MINUTE` rather than a fixed number of batches - but that limit is
+per *member* (`limit_table_write` counts each member's writes on their own allowance), so the
+budget also scales with how many active members the organization has: up to
+`RATE_LIMIT_TABLE_WRITES_PER_MINUTE * 60 * 24` rows per active member per day, in batches of
+500.
+
+That figure is doubled for headroom, so a pre-existing backlog shrinks rather than merely
+holding level, and capped at 50 members' worth so one unusually large organization cannot make
+its own pass grow without bound - it still drains, just over more passes, the same as every
+other retention class once a backlog outgrows its budget.
+
+## A worker whose event loop has stopped turning
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EVENT_LOOP_WEDGED_AFTER` | `15` | Seconds the event loop may stop turning before the worker is killed and replaced. `0` or below switches the check off |
+| `UVICORN_WORKER_HEALTHCHECK_TIMEOUT` | `60` | Seconds uvicorn's supervisor waits for a worker to answer its ping before replacing it, wherever `--workers` is above 1. Read by the compose files, not by the application |
+
+A worker that is *alive but not answering* — deadlocked on a lock, spinning in a
+synchronous call, blocked on a socket that never answers — has no exit code, so
+every recovery path in every stack used to read it as healthy while requests
+timed out. The container goes `unhealthy`, and a status is not a mechanism.
+
+So the worker judges its own event loop. A timer callback stamps the loop once a
+second; a thread reads the stamp, and if the loop has not turned for
+`EVENT_LOOP_WEDGED_AFTER` across two consecutive checks it ends the process —
+`SIGKILL`, or `os._exit(137)` where the worker is PID 1, because the kernel
+delivers no signal to a namespace's init that init has no handler for. Either
+way `docker inspect` reports `137`, and "wedged", which nothing handled, becomes
+"gone", which every stack already handles:
+
+| Stack | What replaces the worker |
+|---|---|
+| `docker-compose.yml` | the reload supervisor, on its next poll |
+| `docker-compose-dev.yml` | PID 1 is the server, so the container exits and `restart: unless-stopped` acts |
+| `docker-compose-prod.yml` | uvicorn's `Multiprocess`, within about half a second; the other three workers keep serving |
+
+Two properties are the reason for the design, and both are worth knowing before
+changing the number:
+
+- **It measures liveness, not readiness.** The stamp is a timer callback, not a
+  request, so a slow database or a model provider that takes twenty seconds is
+  not a wedge — the loop is turning, it is waiting. An HTTP probe would have
+  been fewer moving parts and would restart-loop a healthy server against a
+  broken dependency.
+- **Two checks, not one.** `docker pause`, a frozen cgroup and a laptop waking
+  from sleep stop the watchdog as thoroughly as the loop, so the first check
+  after one reads a stale stamp that says nothing.
+
+The local stack's reload supervisor reads the same variable for the judgement it
+makes from *outside* the worker, so one number covers both.
+
+!!! tip "Set it to `0` while debugging"
+
+    A breakpoint blocks the event loop and nothing can tell that from a deadlock,
+    so a worker sitting on one is otherwise killed under you.
+
+It cannot see a process that is not running at all — `kill -STOP`, a frozen
+cgroup — because a watchdog inside a stopped process is stopped too. That case
+is the one the supervisors already cover: the reload supervisor's beat goes
+stale and production's pipe ping goes unanswered.
+
+That ping waits `UVICORN_WORKER_HEALTHCHECK_TIMEOUT` seconds, 60 by default.
+Uvicorn's own default is 5, and a host short of CPU — steal on a shared VPS, an
+image build, a backlog of flow runs — misses 5 seconds with workers that are
+alive and serving.
+
+The supervisor then kills them and kills their replacements
+before they finish importing the application, and every restart adds an import's
+worth of CPU to the pressure that caused it. The log shows it as
+`Child process [N] died` with no watchdog line above it. Since a blocked loop
+is the watchdog's to judge, the ping only has to notice a stopped process, and a
+minute is soon enough for that.
+
+## Docker / production
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOMAIN` | `example.com` | Production domain (for Traefik) |
+| `ACME_EMAIL` | `admin@example.com` | Let's Encrypt email for SSL certs |
+| `REDIS_PASSWORD` | `change-me-in-production` | Redis password for production |
+
+## Production checklist
+
+!!! danger "Every one of these ships with a default that is wrong in production"
+
+    A deployment reachable from anywhere else has all nine set deliberately.
+
+- [ ] `SECRET_KEY` — a unique 64-character hex key: `openssl rand -hex 32`
+- [ ] `API_KEY` — a unique key: `openssl rand -hex 32`
+- [ ] `VAULT_MASTER_KEY` — a unique key: `openssl rand -hex 32`. The config
+      refuses an empty one outside `local`/`development`
+- [ ] `ENVIRONMENT` — `production`
+- [ ] `DEBUG` — `false`
+- [ ] `POSTGRES_PASSWORD` — a strong, unique password
+- [ ] `REDIS_PASSWORD` — a strong password
+- [ ] `CORS_ORIGINS` — only your actual frontend domain(s)
+
+Email is deliberately **not** on this list: a deployment runs without it. But
+invitations, password resets and notifications all go silently unsent until
+`SMTP_HOST` and the rest of [Email (SMTP)](#email-smtp) point at a real server —
+so a deployment that skips it should be skipping it knowingly.
+
+## Deployment diagnostics { #diagnostics }
+
+`DIAGNOSTICS_ENABLED` defaults to `true`, including upgrades whose existing `.env`
+does not contain it. Set `DIAGNOSTICS_ENABLED=false` in the backend and frontend
+environments and restart the services to disable reporting. The deployment
+settings page shows status and the last successful report; it has no toggle.
+
+`DIAGNOSTICS_COLLECTOR_URL` is the server's collector origin;
+`DIAGNOSTICS_PUBLIC_URL` is the browser-reachable origin, also read by the frontend
+for its Content Security Policy. Both default to `https://analytics-agenticos.testapp.ovh`.
+For a locally running collector reached from Docker Desktop, use
+`http://host.docker.internal:8010` for the server origin and keep the public origin
+at `http://localhost:8010`. Remote origins require HTTPS. Do not include paths,
+credentials or query strings.
+
+The existing durable worker sends hourly. Its Ed25519 seed is sealed by the vault,
+persisted before the first network call, shared by replicas and rewrapped by
+`vault-rotate`. A missing collector does not block sign-in, chat or worker startup.
+Reports contain the version, database/worker health, explicit unknown Redis health,
+30-day run counts and project/skill/document creation counts in buckets. Only
+closed feature names leave the deployment. Errors are grouped failed runs, dead
+jobs and failed ingestion in the preceding complete UTC hour, capped at 1,000 per
+category. Free-form API exceptions are not exported.
+
+Foreground web, desktop and mobile activity uses signed 60-second claims for the
+authenticated account. An installation-specific pseudonym replaces the account ID.
+Visible, focused windows report after interaction and at most every five minutes;
+background or idle tabs do not keep a user online. The browser sends the claim
+directly without cookies or referrers, allowing approximate country/region grouping
+at the collector. No prompts, conversations, filenames, account names, email
+addresses, provider keys or exception messages are sent.
+
+The companion [analytics collector](https://github.com/vstorm-co/agenticos-analytics)
+stores raw events for seven days and daily pseudonymous activity and aggregates
+for 90 days. Online means activity in the last ten minutes; an active installation
+means contact in the last 24 hours. No contact means unknown, not a confirmed
+outage. Collector code stores no IP addresses or GPS positions; proxy access-log
+retention is an operator responsibility. Use its separate demo mode to preview the
+map with synthetic data; AgenticOS never seeds diagnostic production records.
+
+## Updates from the administration panel
+
+The Deployment page links the newest release's changelog and shows update preparation,
+scheduling and recovery status. Updates are opt-in: install the host helper once
+on a supported single-host Linux/systemd Compose deployment, then connect API and
+worker with the updater overlay. See the [operator setup and recovery guide](https://github.com/vstorm-co/agenticos/tree/main/deploy/updater).
+
+Preparation checks configuration and disk space, downloads and pins published
+images, and takes a preliminary backup without restarting the application.
+Apply immediately or schedule within seven days. The helper pauses admission,
+waits for active runs, jobs and calls, stops application writers, takes the final
+PostgreSQL/media/configuration backup, migrates and checks readiness before
+reopening traffic. Progress survives application restarts; the panel reconnects
+when the API becomes available again.
+
+A failure after migration starts leaves maintenance enabled for operator recovery;
+there is no automatic database downgrade. Backups stay on the host until the
+operator removes them and do not replace off-host backups. Test restoration on a
+disposable deployment before enabling production updates. Multiple hosts, custom
+Compose overlays and external storage use your own pipeline instead:
+`UPDATE_PIPELINE_URL` exposes its HTTPS link without triggering a deployment.

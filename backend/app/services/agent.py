@@ -1,0 +1,545 @@
+"""Shared agent service utilities.
+
+Houses framework-agnostic helpers used by every WebSocket agent route:
+  - `AgentConnectionManager` + `send_event` - WebSocket fan-out
+  - `build_message_history` - convert dicts to provider-native messages
+  - `persist_user_turn` / `persist_assistant_turn` - DB persistence
+  - `normalize_tool_args` / `truncate_title` - small utilities
+
+Framework-specific concerns (multimodal input, streaming events) stay in the route.
+"""
+
+import json
+import logging
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID
+
+from fastapi import WebSocket, WebSocketDisconnect
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.exceptions import AppException, AuthorizationError, BadRequestError, NotFoundError
+from app.core.permissions import AuthContext
+from app.db.models.agent_run import RunStatus
+from app.db.models.conversation import Conversation
+from app.db.session import get_db_context
+from app.repositories import agent_run_repo, member_repo
+from app.repositories import conversation as conversation_repo
+from app.schemas.conversation import (
+    ConversationCreate,
+    ConversationUpdate,
+    MessageCreate,
+    MessagePart,
+    MessageReplyRef,
+    ToolCallComplete,
+    ToolCallCreate,
+)
+from app.schemas.mention import Mentionable
+from app.services.conversation import ConversationService
+from app.services.project import ProjectService
+from app.services.transcript import STOPPED_TOOL_RESULT, what_arrived
+from app.services.usage_report import UsageReport
+
+logger = logging.getLogger(__name__)
+
+
+async def send_event(websocket: WebSocket, event_type: str, data: Any) -> bool:
+    """Send a JSON event to a WebSocket client.
+
+    Returns True if sent successfully, False if the connection is already closed.
+    """
+    try:
+        await websocket.send_json({"type": event_type, "data": data})
+        return True
+    except WebSocketDisconnect, RuntimeError:
+        return False
+
+
+class AgentConnectionManager:
+    """WebSocket connection manager for AI agent."""
+
+    def __init__(self) -> None:
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket) -> None:
+        """Accept and store a new WebSocket connection."""
+        # Echo back the application subprotocol chosen during auth (if any)
+        subprotocol = getattr(websocket.state, "accept_subprotocol", None)
+        await websocket.accept(subprotocol=subprotocol)
+        self.active_connections.append(websocket)
+        logger.info(
+            "Agent WebSocket connected. Total connections: %d", len(self.active_connections)
+        )
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        """Remove a WebSocket connection."""
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        logger.info(
+            "Agent WebSocket disconnected. Total connections: %d", len(self.active_connections)
+        )
+
+    async def send_event(self, websocket: WebSocket, event_type: str, data: Any) -> bool:
+        """Forward to the module-level :func:`send_event`."""
+        return await send_event(websocket, event_type, data)
+
+
+def truncate_title(text: str, limit: int = 50) -> str:
+    """Return text truncated to `limit` characters."""
+    return text[:limit] if len(text) > limit else text
+
+
+@dataclass(frozen=True)
+class PersistedPrompt:
+    """What writing the user's turn produced, for the caller to act on.
+
+    Attributes:
+        conversation_id: The thread the turn was written to, resolved or created.
+        newly_created: Whether the conversation was created by this call. The
+            caller emits a `conversation_created` event when it was.
+        message_id: The row the prompt was written to, so the caller can link it
+            to the run once one is open. `None` when the database was briefly
+            unavailable - the one failure that is logged and carried on from,
+            because a lost message must not abort a turn. A refusal is raised
+            instead, and there is no third case: this is never `None` because
+            something was rejected.
+    """
+
+    conversation_id: str | None
+    newly_created: bool
+    message_id: UUID | None = None
+    # How the model reads the turn, where that is more than what was typed: who
+    # said it in a project's chat, and the message it replies to. `None` means
+    # just the text.
+    for_model: str | None = None
+    # The message the turn answers, quoted as the transcript quotes it - for the
+    # teammates following the turn live, who have no transcript to read it from.
+    reply: MessageReplyRef | None = None
+
+
+def _message_uuid(message_id: str) -> UUID:
+    """A replied-to message id off the wire, refusing rather than crashing."""
+    try:
+        return UUID(message_id)
+    except ValueError as exc:
+        raise BadRequestError(
+            message="That is not a message id", details={"reply_to": message_id}
+        ) from exc
+
+
+def _conversation_uuid(conversation_id: str) -> UUID:
+    """Parse a client-supplied conversation id, refusing rather than crashing.
+
+    The value arrives over the socket, so a malformed one is input and not a
+    defect. It used to raise `ValueError` into a bare `except Exception` and
+    disappear with the message it carried.
+    """
+    try:
+        return UUID(conversation_id)
+    except ValueError as exc:
+        raise BadRequestError(
+            message="Not a conversation id",
+            details={"conversation_id": conversation_id},
+        ) from exc
+
+
+async def _resolve_in_org(
+    conv_service: ConversationService,
+    conversation_id: UUID,
+    *,
+    organization_id: UUID,
+    user_id: UUID,
+) -> Conversation:
+    """The conversation, if it is this organization's and this reader's.
+
+    The service reports another tenant's row as missing so ids stay unprobeable,
+    which is right for an HTTP route and wrong to swallow here: from a socket,
+    "gone" and "not yours" are the same refusal and both must stop the turn
+    before anything is written. So one refusal, naming neither.
+    """
+    try:
+        return await conv_service.get_conversation(
+            conversation_id,
+            organization_id=organization_id,
+            user_id=user_id,
+            # Every turn of an existing chat resolves the thread through here and
+            # serializes none of it, so the star would be a query per message.
+            include_favourite=False,
+        )
+    except NotFoundError as exc:
+        raise AuthorizationError(
+            message="Conversation not found in this organization",
+            details={"conversation_id": str(conversation_id)},
+        ) from exc
+
+
+async def _project_to_start_in(
+    db: AsyncSession, user: Any, organization_id: UUID, project_id: str
+) -> UUID:
+    """The project a new chat starts in, when this person may work in it.
+
+    Raises:
+        BadRequestError: For an id that is not one.
+        NotFoundError, AuthorizationError: For a project they cannot see, or see
+            and may not work in.
+    """
+    try:
+        requested = UUID(project_id)
+    except ValueError as exc:
+        raise BadRequestError(
+            message="That is not a project id", details={"project_id": project_id}
+        ) from exc
+    membership = await member_repo.get(db, organization_id=organization_id, user_id=user.id)
+    if membership is None:
+        raise AuthorizationError(
+            message="You are not a member of this organization",
+            details={"org_id": str(organization_id)},
+        )
+    ctx = AuthContext(user_id=user.id, organization_id=organization_id, role=membership.role)
+    return (await ProjectService(db).check_can_start(ctx, requested)).id
+
+
+async def persist_user_turn(
+    user: Any,
+    user_message: str,
+    file_ids: list[Any],
+    requested_conversation_id: str | None,
+    current_conversation_id: str | None,
+    organization_id: UUID,
+    project_id: str | None = None,
+    reply_to: str | None = None,
+    mentions: Sequence[Mentionable] = (),
+    client_message_id: str | None = None,
+) -> PersistedPrompt:
+    """Resolve the conversation, persist the user message, and link any uploaded files.
+
+    `organization_id` is the session's active organization; new conversations are
+    created inside it, and resuming a conversation that belongs to a different org
+    is refused. Ownership by user alone is not enough - a user can belong to several
+    organizations, and a run must not read one org's knowledge while billed to another.
+
+    The prompt is written before a run exists, and so carries no `run_id` yet: a
+    build that refuses - a deleted secret, a model profile removed in a deploy -
+    must not lose what somebody typed. `PersistedPrompt.message_id` is how the
+    caller closes that gap once the run row is open.
+
+    A blank `user_message` beside `file_ids` is written naming what arrived -
+    the body :func:`what_arrived` composes, the same one `TranscriptService.record`
+    writes for every non-streaming surface. The dashboard's composer substitutes
+    its own placeholder before sending, so only a raw client reaches this - and
+    used to leave the one blank user turn left in the product (#750). A typed
+    message is never replaced.
+
+    Raises:
+        BadRequestError: If `requested_conversation_id` is not a UUID, or a
+            file in `file_ids` is not one, or is already attached to a message.
+        NotFoundError: If a file in `file_ids` is not the caller's own -
+            another user's id answers like one that does not exist (#706).
+        AuthorizationError: If the requested conversation is not this
+            organization's. A database failure is logged and swallowed - a lost
+            message must not abort a turn - but a refusal must abort, and a
+            defect in this module must surface rather than read as one.
+    """
+    if client_message_id is not None and (
+        not isinstance(client_message_id, str)
+        or not 1 <= len(client_message_id) <= 128
+        or client_message_id.strip() != client_message_id
+    ):
+        raise BadRequestError(
+            message="Invalid client message id",
+            details={"field": "client_message_id"},
+        )
+    newly_created = False
+    message_id: UUID | None = None
+    for_model: str | None = None
+    reply: MessageReplyRef | None = None
+    replied = _message_uuid(reply_to) if reply_to else None
+    # The thread as resolved or created here; a turn continuing the socket's own
+    # thread names none, and reads to the model as typed.
+    conversation: Conversation | None = None
+    try:
+        async with get_db_context() as db:
+            conv_service = ConversationService(db)
+
+            if requested_conversation_id:
+                current_conversation_id = requested_conversation_id
+                requested = _conversation_uuid(requested_conversation_id)
+                # The tenant is what makes the rest of this function safe, and
+                # it used to be omitted: `get_conversation` takes it keyword-only
+                # and required, so every resumed turn raised `TypeError` into the
+                # `except` below and was logged as a persistence failure. The
+                # guard that followed never ran, and neither did the write - so
+                # every message after the first was silently dropped (#5).
+                conv = conversation = await _resolve_in_org(
+                    conv_service, requested, organization_id=organization_id, user_id=user.id
+                )
+                # The owner's to name: a teammate continuing a project's chat may
+                # add a turn and nothing else.
+                if not conv.title and user_message and conv.user_id == user.id:
+                    await conv_service.update_conversation(
+                        requested,
+                        ConversationUpdate(title=truncate_title(user_message)),
+                        organization_id=organization_id,
+                        user_id=user.id,
+                    )
+            elif not current_conversation_id:
+                project = (
+                    await _project_to_start_in(db, user, organization_id, project_id)
+                    if project_id
+                    else None
+                )
+                conversation = await conv_service.create_conversation(
+                    ConversationCreate(
+                        user_id=user.id,
+                        organization_id=organization_id,
+                        title=truncate_title(user_message),
+                        project_id=project,
+                    )
+                )
+                current_conversation_id = str(conversation.id)
+                newly_created = True
+
+            content = user_message
+            if not content and file_ids:
+                content = what_arrived(
+                    await conv_service.list_attached_files(file_ids, user_id=user.id)
+                )
+            user_msg = await conv_service.add_message(
+                UUID(current_conversation_id),
+                MessageCreate(
+                    role="user",
+                    content=content,
+                    client_message_id=client_message_id,
+                    reply_to_message_id=replied,
+                    parts=[
+                        MessagePart(
+                            type="mention",
+                            mention_kind=mention.kind,
+                            mention_id=mention.id,
+                            text=mention.name,
+                        )
+                        for mention in mentions
+                    ]
+                    or None,
+                ),
+                organization_id=organization_id,
+                user_id=user.id,
+            )
+            message_id = user_msg.id
+            if replied is not None:
+                reply = await conv_service.reply_quoted(user_msg)
+            if conversation is None:
+                # The socket's own thread: still read, because in a project's chat
+                # the model has to be told who is speaking on every turn.
+                conversation = await conv_service.find_conversation(UUID(current_conversation_id))
+            if conversation is not None:
+                spoken = await conv_service.model_text(user_msg, conversation)
+                for_model = spoken if spoken != content else None
+            if file_ids:
+                try:
+                    await conv_service.link_files_to_message(user_msg.id, file_ids, user_id=user.id)
+                except AppException:
+                    # A refusal - an id that is not the caller's own unlinked
+                    # upload - must abort the turn, not read as a transient
+                    # persistence failure (#706).
+                    raise
+                except Exception as e:
+                    logger.warning("Failed to link files: %s", e)
+    except AppException:
+        # A refusal - another organization's conversation, an archived one, an
+        # id that is not a UUID. The caller turns it into an error frame; it is
+        # not something to log and carry on from.
+        raise
+    except SQLAlchemyError as e:
+        # The only thing swallowed here, and the only thing the promise above
+        # was ever about: the database was briefly unavailable. Everything else
+        # - a signature that no longer binds, an attribute that moved - is a
+        # defect in this module, and #5 is what swallowing one costs: it read
+        # as a transient persistence failure for as long as it took to lose
+        # every resumed turn in the deployment.
+        logger.warning("Failed to persist the user's turn: %s", e)
+
+    return PersistedPrompt(
+        conversation_id=current_conversation_id,
+        newly_created=newly_created,
+        message_id=message_id,
+        for_model=for_model,
+        reply=reply,
+    )
+
+
+def normalize_tool_args(args: Any) -> dict[str, Any]:
+    """Coerce a tool-call `args` payload to a dict (handles JSON strings + None)."""
+    if isinstance(args, str):
+        return json.loads(args) if args.strip() else {}
+    if args is None:
+        return {}
+    return args
+
+
+async def persist_assistant_turn(
+    conversation_id: str,
+    output: str,
+    model_name: str | None,
+    collected_tool_calls: list[dict[str, Any]],
+    organization_id: UUID,
+    thinking: str | None = None,
+    parts: list[MessagePart] | None = None,
+    agent_id: UUID | None = None,
+    agent_version_id: UUID | None = None,
+    usage: UsageReport | None = None,
+    run_id: UUID | None = None,
+    parked_tool_call_ids: Collection[str] = (),
+    mcp_origins: Mapping[str, UUID] | None = None,
+) -> str | None:
+    """Persist the assistant message and any tool calls. Returns the saved message id.
+
+    `organization_id` is the session's active organization, and it is checked
+    rather than trusted: `conversation_id` reaches here from the socket, where
+    it started as a client-supplied value. `persist_user_turn` refuses one
+    belonging to another organization, and this refuses to write into one.
+
+    `agent_id` and `agent_version_id` are recorded per message rather than
+    per conversation because the agent can be changed mid-thread, and because
+    an agent is rewritten between turns: attributing the whole conversation to
+    the last one selected - or to the spec it has today - would rewrite who
+    said what, and with which instructions.
+
+    `usage` is stored for the same reason it is streamed: the cost of an answer is
+    asked about after the fact. A turn nobody could measure passes `None`, which
+    reads back as "not recorded" rather than as free.
+
+    `parts` is the order the turn happened in, which `content` and `thinking`
+    cannot carry between them: a turn that writes, calls three tools and then
+    summarises has two blocks of text and one column to put them in. Storing the
+    sequence that was streamed is what makes a reloaded conversation the one
+    somebody watched rather than a client's reconstruction of it. None means "no
+    order recorded" - a single-part turn, or a caller that predates this - and is
+    the signal to fall back to reconstructing one.
+
+    `run_id` is what makes this turn readable from run history rather than only
+    from the conversation. It is written here rather than linked afterwards
+    because by this point the run row exists - unlike the prompt, which is
+    persisted before the run is built. It is passed beside `data` rather than
+    inside it: `MessageCreate` is bound from a request body elsewhere, and a run
+    id a caller could set is one they could aim at another organization's run.
+
+    `parked_tool_call_ids` names the calls the turn stopped on, so their rows are
+    stored `awaiting_approval` rather than `running` - the parked state otherwise
+    lives only on `agent_runs` and the `approvals` rows, and a reloaded
+    conversation read the one call somebody has to decide about as a step that
+    ran (#601). The resume settles the row through the transcript service, and an
+    expiry settles it with the timeout notice.
+
+    `mcp_origins` stores each call to an organization MCP connection against it,
+    as the transcript service does for every other surface (#2072).
+    """
+    try:
+        async with get_db_context() as db:
+            stopped = False
+            if run_id is not None and parked_tool_call_ids:
+                # Hold the same lock as Stop until these call rows commit. If
+                # Stop won, persist their settled outcome instead of stale cards.
+                run = await agent_run_repo.claim_parked_run(
+                    db, run_id, organization_id=organization_id
+                )
+                stopped = run is not None and run.status == RunStatus.CANCELLED.value
+            conv_service = ConversationService(db)
+            spent = (
+                conversation_repo.Attributed()
+                if run_id is None
+                else await conversation_repo.attributed_to_run(db, run_id)
+            )
+            assistant_msg = await conv_service.add_message(
+                UUID(conversation_id),
+                organization_id=organization_id,
+                run_id=run_id,
+                data=MessageCreate(
+                    role="assistant",
+                    content=output,
+                    thinking=thinking,
+                    parts=parts,
+                    model_name=model_name,
+                    agent_id=agent_id,
+                    agent_version_id=agent_version_id,
+                    # Stored, not only streamed. It used to live in the `complete`
+                    # frame alone, so it existed for as long as the tab did and a
+                    # reopened conversation showed no cost anywhere - which is
+                    # exactly when "what did that answer cost" gets asked.
+                    # The *difference* from what this run's earlier turns already
+                    # claim, not the run row's figure: a run that parked and was
+                    # resumed writes two assistant turns - this one and the
+                    # continuation the transcript service writes - and the row is
+                    # cumulative, so stamping both with it counts the parked half
+                    # twice. Nothing is attributed yet on an ordinary turn, where
+                    # the difference is the whole of it.
+                    input_tokens=None if usage is None else usage.input_tokens - spent.input_tokens,
+                    output_tokens=None
+                    if usage is None
+                    else usage.output_tokens - spent.output_tokens,
+                    cache_read_tokens=(
+                        None if usage is None else usage.cache_read_tokens - spent.cache_read_tokens
+                    ),
+                    cache_write_tokens=(
+                        None
+                        if usage is None
+                        else usage.cache_write_tokens - spent.cache_write_tokens
+                    ),
+                    cost_usd=None if usage is None else usage.cost_usd - spent.cost_usd,
+                    # Beside the total, because without it the total lies: a turn
+                    # that reached an unpriced model is booked at zero for that
+                    # request, and rendered identically to one measured exactly
+                    # (#772).
+                    cost_is_partial=None if usage is None else usage.cost_is_partial,
+                    # Only the token count. The window it is a share of belongs to
+                    # whichever model answers next, and the chat lets somebody
+                    # switch that between turns - a share stored against a model
+                    # they have since left is wrong in the one direction that
+                    # costs a run (#774).
+                    context_used_tokens=(
+                        None
+                        if usage is None or usage.context is None
+                        else usage.context.used_tokens
+                    ),
+                ),
+            )
+            for tc in collected_tool_calls:
+                try:
+                    tc_obj = await conv_service.start_tool_call(
+                        assistant_msg.id,
+                        ToolCallCreate(
+                            tool_call_id=tc["tool_call_id"],
+                            tool_name=tc["tool_name"],
+                            args=normalize_tool_args(tc.get("args")),
+                            started_at=datetime.now(UTC),
+                        ),
+                        parked=tc["tool_call_id"] in parked_tool_call_ids and not stopped,
+                        mcp_connection_id=(mcp_origins or {}).get(tc["tool_name"]),
+                    )
+                    result = tc.get("result")
+                    if stopped and tc["tool_call_id"] in parked_tool_call_ids:
+                        result = STOPPED_TOOL_RESULT
+                    if result:
+                        await conv_service.complete_tool_call(
+                            tc_obj.id,
+                            ToolCallComplete(
+                                result=result,
+                                completed_at=datetime.now(UTC),
+                                success=True,
+                            ),
+                        )
+                except Exception as e:
+                    logger.warning("Failed to persist tool call: %s", e)
+            return str(assistant_msg.id)
+    except Exception:
+        # Broad on purpose, unlike its sibling above: by this point the answer
+        # has been streamed and raising cannot un-stream it, so the caller is
+        # told with `None` and the turn completes. `exception` rather than
+        # `warning` because that is the whole of the record - #5 sat behind a
+        # one-line warning here and in `persist_user_turn` for as long as it
+        # took somebody to bind the signature by hand.
+        logger.exception("Failed to persist the assistant's turn")
+        return None

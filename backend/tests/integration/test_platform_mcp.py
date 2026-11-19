@@ -1,0 +1,575 @@
+"""The platform's MCP server, driven by a real MCP client against a real database (#2058).
+
+Every tool is a public API call made with the caller's own token, so what is
+asserted here is the join: the MCP handshake admits a key, the tools reach the
+API as that key, and the key's narrowing and revocation hold through it.
+"""
+
+import json
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+from unittest.mock import MagicMock
+
+import httpx2
+import pytest
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from pydantic_ai import RunContext
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api import deps
+from app.core.permissions import AuthContext, Perm
+from app.db.models.agent import Agent
+from app.db.models.organization import Organization, OrganizationMember
+from app.db.models.user import User
+from app.main import app
+from app.schemas.api_key import ApiKeyCreate
+from app.services.api_key import ApiKeyService
+from app.services.platform_mcp import serve_platform_mcp
+
+
+def _run_context() -> RunContext[None]:
+    """A real one: from Pydantic AI 2.57 a prefixed toolset copies the context it
+    is handed with `dataclasses.replace`, which a `MagicMock` is not."""
+    return RunContext(deps=None, model=TestModel(), usage=RunUsage())
+
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+async def served(db: AsyncSession) -> AsyncIterator[None]:
+    async def session() -> AsyncIterator[AsyncSession]:
+        yield db
+
+    app.dependency_overrides[deps.get_db_session] = session
+    app.dependency_overrides[deps.get_redis] = lambda: MagicMock()
+    async with serve_platform_mcp(app, app.state):
+        yield
+    app.dependency_overrides.clear()
+
+
+async def _owner_key(db: AsyncSession, *scopes: Perm) -> tuple[str, Organization]:
+    owner = User(email=f"{uuid.uuid4()}@example.com", hashed_password="x", is_active=True)
+    db.add(owner)
+    await db.flush()
+    organization = Organization(
+        name="Acme", slug=f"acme-{uuid.uuid4().hex[:8]}", created_by_user_id=owner.id
+    )
+    db.add(organization)
+    await db.flush()
+    db.add(OrganizationMember(organization_id=organization.id, user_id=owner.id, role="owner"))
+    await db.flush()
+    ctx = AuthContext(user_id=owner.id, organization_id=organization.id, role="owner")
+    created = await ApiKeyService(db).create(ctx, ApiKeyCreate(name="mcp", scopes=list(scopes)))
+    # The token verifier opens a session of its own, so the key has to be visible
+    # outside this test's transaction.
+    await db.commit()
+    return created.key, organization
+
+
+@asynccontextmanager
+async def _connected(key: str) -> AsyncIterator[ClientSession]:
+    http = httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    async with (
+        http,
+        streamable_http_client("http://test/mcp", http_client=http) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
+        yield session
+
+
+def _content(result: Any) -> dict[str, Any]:
+    return json.loads(result.content[0].text)
+
+
+async def test_a_key_lists_the_tools_and_creates_an_agent_draft(
+    db: AsyncSession, served: None
+) -> None:
+    key, organization = await _owner_key(db, Perm.AGENTS_VIEW, Perm.AGENTS_EDIT)
+
+    async with _connected(key) as session:
+        tools = {tool.name for tool in (await session.list_tools()).tools}
+        me = _content(await session.call_tool("whoami", {}))
+        created = await session.call_tool(
+            "create_agent_draft", {"name": "Refunds", "instructions": "Answer refund questions."}
+        )
+
+    assert {"whoami", "create_agent_draft", "invite_member", "search_knowledge"} <= tools
+    assert me["organization_id"] == str(organization.id)
+    assert not created.is_error
+    agents = (
+        await db.execute(select(Agent).where(Agent.organization_id == organization.id))
+    ).scalars()
+    assert [agent.name for agent in agents] == ["Refunds"]
+
+
+@pytest.mark.security
+async def test_a_tool_the_key_was_not_issued_for_is_refused_with_the_reason(
+    db: AsyncSession, served: None
+) -> None:
+    key, _organization = await _owner_key(db, Perm.AGENTS_VIEW)
+
+    async with _connected(key) as session:
+        refused = await session.call_tool(
+            "create_agent_draft", {"name": "Refunds", "instructions": "Answer refund questions."}
+        )
+
+    assert refused.is_error
+    assert "403" in refused.content[0].text
+
+
+@pytest.mark.security
+async def test_no_key_and_a_wrong_key_get_no_session(served: None) -> None:
+    for headers in ({}, {"Authorization": "Bearer aos_00000000nothing"}):
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://test"
+        ) as http:
+            response = await http.post(
+                "/mcp",
+                headers={**headers, "Accept": "application/json, text/event-stream"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            )
+        assert response.status_code == 401
+        assert "resource_metadata" in response.headers["www-authenticate"]
+
+
+async def test_the_server_answers_503_when_it_is_not_running() -> None:
+    app.state.platform_mcp = None
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://test"
+    ) as http:
+        response = await http.post("/mcp", json={})
+
+    assert response.status_code == 503
+
+
+async def test_an_agent_bound_to_the_platform_reaches_it_in_process_as_the_asker(
+    db: AsyncSession, served: None
+) -> None:
+    """The AI Architect's binding: the real MCP protocol to this deployment's own
+    `/mcp`, with no network, and its writes marked for approval (#2063, #2060)."""
+    from pydantic_ai import Agent as PydanticAgent
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+    from pydantic_ai.models.function import FunctionModel
+
+    from app.agents.mcp import NEEDS_APPROVAL
+    from app.agents.spec import PlatformMcpServerRef
+    from app.services.mcp_connection import build_toolsets_for_agent
+
+    key, organization = await _owner_key(db, Perm.AGENTS_VIEW, Perm.AGENTS_EDIT)
+    resolved = await build_toolsets_for_agent(
+        db,
+        organization_id=organization.id,
+        refs=[PlatformMcpServerRef(account="platform", approval="writes")],
+        platform_credential=key,
+    )
+    [toolset] = resolved.toolsets
+
+    def asks_whoami(messages: list[Any], _info: Any) -> ModelResponse:
+        returned = [
+            part
+            for message in messages
+            for part in getattr(message, "parts", [])
+            if isinstance(part, ToolReturnPart)
+        ]
+        if not returned:
+            return ModelResponse(parts=[ToolCallPart("agenticos_whoami", {}, tool_call_id="w")])
+        return ModelResponse(parts=[TextPart(json.dumps(returned[0].content))])
+
+    agent = PydanticAgent(FunctionModel(asks_whoami), toolsets=[toolset])
+    async with agent:
+        result = await agent.run("who am I?")
+        tools = await toolset.get_tools(_run_context())
+
+    assert tools["agenticos_create_project"].tool_def.metadata[NEEDS_APPROVAL] is True
+    assert tools["agenticos_list_projects"].tool_def.metadata[NEEDS_APPROVAL] is False
+    assert tools["agenticos_get_project"].tool_def.metadata[NEEDS_APPROVAL] is True
+    assert str(organization.id) in result.output
+    assert tools["agenticos_whoami"].tool_def.metadata[NEEDS_APPROVAL] is False
+    assert tools["agenticos_create_agent_draft"].tool_def.metadata[NEEDS_APPROVAL] is True
+    assert tools["agenticos_update_agent_draft"].tool_def.metadata[NEEDS_APPROVAL] is True
+    assert tools["agenticos_list_sandbox_connections"].tool_def.metadata[NEEDS_APPROVAL] is False
+    assert tools["agenticos_list_org_connections"].tool_def.metadata[NEEDS_APPROVAL] is False
+
+
+@pytest.mark.security
+async def test_a_platform_binding_asking_no_approval_still_holds_its_writes(
+    db: AsyncSession, served: None
+) -> None:
+    """Review on #2062: a Builder's agent with `approval: none` ran an Admin's
+    invite_member with no card - the credential is the asker's own authority."""
+    from pydantic_ai import Agent as PydanticAgent
+    from pydantic_ai.messages import ModelResponse
+    from pydantic_ai.models.function import FunctionModel
+
+    from app.agents.mcp import NEEDS_APPROVAL
+    from app.agents.spec import PlatformMcpServerRef
+    from app.services.mcp_connection import build_toolsets_for_agent
+
+    key, organization = await _owner_key(db, Perm.AGENTS_VIEW, Perm.MEMBERS_MANAGE)
+    resolved = await build_toolsets_for_agent(
+        db,
+        organization_id=organization.id,
+        refs=[PlatformMcpServerRef(account="platform", approval="none")],
+        platform_credential=key,
+    )
+    [toolset] = resolved.toolsets
+    # Opened the way a run opens it - through the agent - as the test above does.
+    agent = PydanticAgent(FunctionModel(lambda _m, _i: ModelResponse(parts=[])), toolsets=[toolset])
+    async with agent:
+        tools = await toolset.get_tools(_run_context())
+
+    assert tools["agenticos_invite_member"].tool_def.metadata[NEEDS_APPROVAL] is True
+    assert tools["agenticos_whoami"].tool_def.metadata[NEEDS_APPROVAL] is False
+
+
+async def test_nobody_to_act_as_leaves_the_platform_out(db: AsyncSession) -> None:
+    from app.agents.spec import PlatformMcpServerRef
+    from app.services.mcp_connection import build_toolsets_for_agent
+
+    resolved = await build_toolsets_for_agent(
+        db,
+        organization_id=uuid.uuid4(),
+        refs=[PlatformMcpServerRef(account="platform", approval="writes")],
+        platform_credential=None,
+    )
+
+    assert resolved.toolsets == []
+
+
+@pytest.mark.parametrize(
+    ("decision", "drafts_after"),
+    [("pending", 0), ("rejected", 0), ("granted", 1)],
+)
+async def test_a_draft_the_assistant_proposes_waits_for_a_person(
+    db: AsyncSession, served: None, decision: str, drafts_after: int
+) -> None:
+    """#2060 end to end: the platform server's write, reached in process, goes
+    through the same gate as a capability's tool. Waiting parks the run, a
+    rejection creates nothing, and approval creates exactly one draft - with the
+    write's own audit entry."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from pydantic_ai import Agent as PydanticAgent
+    from pydantic_ai import DeferredToolRequests
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+    from pydantic_ai.models.function import FunctionModel
+
+    from app.agents.approval import ApprovalGranted, ApprovalPending, ApprovalRejected
+    from app.agents.capabilities.approval import ApprovalGate
+    from app.agents.spec import PlatformMcpServerRef
+    from app.db.models.audit_log import AppAdminAuditLog as AuditLog
+    from app.services.mcp_connection import build_toolsets_for_agent
+
+    key, organization = await _owner_key(db, Perm.AGENTS_VIEW, Perm.AGENTS_EDIT)
+    resolved = await build_toolsets_for_agent(
+        db,
+        organization_id=organization.id,
+        refs=[PlatformMcpServerRef(account="platform", approval="writes")],
+        platform_credential=key,
+    )
+    [toolset] = resolved.toolsets
+    proposed = {"name": "Refund helper", "instructions": "Answer refund questions."}
+
+    def proposes_a_draft(messages: list[Any], _info: Any) -> ModelResponse:
+        if any(
+            isinstance(part, ToolReturnPart)
+            for message in messages
+            for part in getattr(message, "parts", [])
+        ):
+            return ModelResponse(parts=[TextPart("done")])
+        return ModelResponse(
+            parts=[ToolCallPart("agenticos_create_agent_draft", proposed, tool_call_id="d")]
+        )
+
+    answer = {
+        "pending": ApprovalPending(),
+        "rejected": ApprovalRejected(note="not now"),
+        "granted": ApprovalGranted(tool_args=proposed),
+    }[decision]
+    ask = AsyncMock(return_value=answer)
+    deps = SimpleNamespace(request_approval=ask, run_id=uuid.uuid4())
+    agent = PydanticAgent(
+        FunctionModel(proposes_a_draft),
+        toolsets=[toolset],
+        capabilities=[ApprovalGate()],
+        output_type=[str, DeferredToolRequests],
+    )
+
+    async with agent:
+        result = await agent.run("make me a refund helper", deps=deps)
+
+    # Waiting ends the run with the call parked for the approval card, nothing run.
+    parked = result.output.approvals if isinstance(result.output, DeferredToolRequests) else []
+    assert [call.tool_name for call in parked] == (
+        ["agenticos_create_agent_draft"] if decision == "pending" else []
+    )
+
+    [request] = [call.args[0] for call in ask.await_args_list]
+    assert request.tool_name == "agenticos_create_agent_draft"
+    assert request.tool_args == proposed
+    drafts = (
+        (await db.execute(select(Agent).where(Agent.organization_id == organization.id)))
+        .scalars()
+        .all()
+    )
+    assert len(drafts) == drafts_after
+    audited = (
+        (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.organization_id == organization.id,
+                    AuditLog.action == "agent.created",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audited) == drafts_after
+
+
+async def test_configured_draft_round_trips_through_mcp_and_the_public_api(
+    db: AsyncSession, served: None
+) -> None:
+    key, _organization = await _owner_key(db, Perm.AGENTS_VIEW, Perm.AGENTS_EDIT)
+    async with _connected(key) as session:
+        created = await session.call_tool(
+            "create_agent_draft",
+            {
+                "name": "Developer",
+                "instructions": "Run tests.",
+                "capabilities": [
+                    {"id": "sandbox", "config": {"backend": "service", "include_execute": True}}
+                ],
+                "mcp_servers": [{"account": "personal", "catalog_key": "github"}],
+            },
+        )
+        assert not created.is_error
+        agent_id = _content(created)["id"]
+        updated = await session.call_tool(
+            "update_agent_draft",
+            {
+                "agent_id": agent_id,
+                "add_capabilities": [
+                    {
+                        "id": "sandbox",
+                        "config": {
+                            "backend": "service",
+                            "include_execute": True,
+                            "runtime": "python",
+                        },
+                        "approval": "required",
+                    }
+                ],
+            },
+        )
+        assert not updated.is_error
+        read = await session.call_tool("get_agent", {"agent_id": agent_id})
+    spec = _content(read)["draft_spec"]
+    sandbox = next(binding for binding in spec["capabilities"] if binding["id"] == "sandbox")
+    assert sandbox["config"] == {"backend": "service", "include_execute": True, "runtime": "python"}
+    assert sandbox["approval"] == "required"
+    assert spec["mcp_servers"][0]["catalog_key"] == "github"
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "tool,arguments",
+    [
+        ("list_sandbox_connections", {}),
+        ("list_sandbox_runtimes", {}),
+        ("get_sandbox_policy", {"connection_id": "00000000-0000-4000-8000-000000000001"}),
+        ("list_org_connections", {}),
+    ],
+)
+async def test_connection_discovery_cannot_exceed_the_callers_scopes(
+    db: AsyncSession, served: None, tool: str, arguments: dict[str, str]
+) -> None:
+    key, _organization = await _owner_key(db, Perm.AGENTS_VIEW)
+    async with _connected(key) as session:
+        refused = await session.call_tool(tool, arguments)
+    assert refused.is_error
+    assert "403" in refused.content[0].text
+
+
+@pytest.mark.security
+async def test_sandbox_discovery_is_scoped_to_the_callers_organization(
+    db: AsyncSession, served: None
+) -> None:
+    from app.db.models.sandbox_connection import SandboxConnection
+
+    key, organization = await _owner_key(db, Perm.CONNECTIONS_VIEW, Perm.MCP_MANAGE)
+    _other_key, other = await _owner_key(db, Perm.CONNECTIONS_VIEW)
+    foreign = SandboxConnection(
+        organization_id=other.id, name="Other", kind="docker", is_default=True
+    )
+    db.add_all(
+        [
+            SandboxConnection(
+                organization_id=organization.id, name="Mine", kind="docker", is_default=True
+            ),
+            foreign,
+        ]
+    )
+    await db.commit()
+    async with _connected(key) as session:
+        listed = await session.call_tool("list_sandbox_connections", {})
+        runtimes = await session.call_tool("list_sandbox_runtimes", {})
+        org_connections = await session.call_tool("list_org_connections", {})
+        policy = await session.call_tool("get_sandbox_policy", {"connection_id": str(foreign.id)})
+    assert not listed.is_error and not runtimes.is_error
+    assert [item["name"] for item in _content(listed)["items"]] == ["Mine"]
+    assert _content(runtimes)["total"] > 0
+
+    assert not org_connections.is_error
+    assert _content(org_connections)["items"] == []
+    assert policy.is_error and "400" in policy.content[0].text
+    assert "no longer exists" in policy.content[0].text
+
+
+def test_connection_discovery_does_not_publish_connection_writes() -> None:
+    from app.api.public_api import public_operations
+
+    public = public_operations(app.routes)
+    prefix = "/api/v1"
+    for path in (
+        "/sandbox-connections",
+        "/sandbox-connections/runtimes",
+        "/sandbox-connections/{connection_id}/policy",
+        "/mcp-connections",
+    ):
+        assert ("get", prefix + path) in public
+    for path in (
+        "/sandbox-connections",
+        "/sandbox-connections/local/credential",
+        "/sandbox-connections/{connection_id}",
+        "/mcp-connections",
+        "/mcp-connections/{connection_id}",
+    ):
+        for method in ("post", "patch", "delete"):
+            assert (method, prefix + path) not in public
+
+
+async def test_projects_round_trip_through_mcp(db: AsyncSession, served: None) -> None:
+    key, _organization = await _owner_key(db, Perm.PROJECTS_VIEW, Perm.PROJECTS_EDIT)
+    async with _connected(key) as session:
+        created = await session.call_tool(
+            "create_project",
+            {"name": "Research wiki", "instructions": "Read index.md; cite sources."},
+        )
+        assert not created.is_error
+        project = _content(created)
+        loaded = _content(await session.call_tool("get_project", {"project_id": project["id"]}))
+        listing = _content(await session.call_tool("list_projects", {"q": "Research"}))
+
+    assert project["visibility"] == "private"
+    assert loaded["instructions"] == "Read index.md; cite sources."
+    assert loaded["backend"] == "state"
+    assert [item["id"] for item in listing["items"]] == [project["id"]]
+    assert "instructions" not in listing["items"][0]
+
+
+@pytest.mark.security
+async def test_project_tools_keep_key_scopes_and_tenant_isolation(
+    db: AsyncSession, served: None
+) -> None:
+    key, _organization = await _owner_key(db, Perm.PROJECTS_VIEW, Perm.PROJECTS_EDIT)
+    async with _connected(key) as session:
+        project = _content(await session.call_tool("create_project", {"name": "Private wiki"}))
+    other_key, _other = await _owner_key(db, Perm.PROJECTS_VIEW)
+    async with _connected(other_key) as session:
+        refused = await session.call_tool("create_project", {"name": "Not allowed"})
+        hidden = await session.call_tool("get_project", {"project_id": project["id"]})
+        listing = _content(await session.call_tool("list_projects", {}))
+
+    assert refused.is_error
+    assert "403" in refused.content[0].text
+    assert hidden.is_error and "404" in hidden.content[0].text
+    assert listing["items"] == []
+
+
+async def test_preparation_and_structural_check_are_one_write_and_one_read(
+    db: AsyncSession, served: None
+):
+    key, _organization = await _owner_key(
+        db,
+        Perm.WORKFLOWS_CREATE,
+        Perm.WORKFLOWS_EDIT,
+        Perm.WORKFLOWS_VIEW,
+        Perm.TABLES_CREATE,
+        Perm.TABLES_EDIT,
+        Perm.TABLES_VIEW,
+    )
+    node = str(uuid.uuid4())
+    async with _connected(key) as session:
+        prepared = _content(
+            await session.call_tool(
+                "prepare_workflow_draft",
+                {
+                    "preparation": {
+                        "name": "Reviewed skeleton",
+                        "graph": {
+                            "entry_node_id": node,
+                            "nodes": [
+                                {
+                                    "id": node,
+                                    "definition_id": "trigger.manual",
+                                    "definition_version": 1,
+                                    "config": {},
+                                    "layout": {"x": 0, "y": 0},
+                                }
+                            ],
+                        },
+                        "table_placeholder_id": str(uuid.uuid4()),
+                        "table": {
+                            "name": "Leads",
+                            "columns": [{"label": "Contact ID", "type": "text", "nullable": False}],
+                        },
+                    }
+                },
+            )
+        )
+        assert "error" not in prepared
+        checked = _content(
+            await session.call_tool(
+                "check_workflow_draft", {"workflow_id": prepared["workflow"]["id"]}
+            )
+        )
+        assert checked["graph_valid"] is True
+        assert checked["requires_live_test"] is False
+        assert checked["integration_verified"] is False
+        assert checked["execution_performed"] is False
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+        assert tools["check_workflow_draft"].annotations.read_only_hint is True
+        assert tools["prepare_workflow_draft"].annotations.read_only_hint is False
+
+
+async def test_architect_keeps_platform_domain_errors_readable(db: AsyncSession, served: None):
+    from contextlib import AsyncExitStack
+
+    from app.agents.mcp import build_mcp_toolsets, platform_spec
+
+    key, _organization = await _owner_key(db, Perm.AGENTS_VIEW)
+    toolsets = await build_mcp_toolsets([platform_spec(key, allowed_tools=None, approval="writes")])
+    async with AsyncExitStack() as stack:
+        toolset = await stack.enter_async_context(toolsets[0])
+        ctx = _run_context()
+        tools = await toolset.get_tools(ctx)
+        result = await toolset.call_tool(
+            "agenticos_list_workflow_nodes", {}, ctx, tools["agenticos_list_workflow_nodes"]
+        )
+    assert result["error"]["status"] == 403
+    assert result["error"]["code"] == "AUTHORIZATION_ERROR"

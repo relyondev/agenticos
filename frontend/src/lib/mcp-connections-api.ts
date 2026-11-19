@@ -1,0 +1,243 @@
+/**
+ * API client for user-scoped MCP server connections (Settings → Integrations).
+ *
+ * Each record points at a remote MCP server the assistant can pull tools
+ * from. The bearer token is write-only: the backend stores it encrypted and
+ * responses only carry `has_auth_token`.
+ */
+
+import type { AgentUsage } from "@/types/agents";
+import type { AudiencePayload, Visibility } from "@/types/sharing";
+import { apiClient } from "./api-client";
+
+export interface McpConnectionRecord {
+  id: string;
+  name: string;
+  url: string;
+  has_auth_token: boolean;
+  /** null = every tool the server offers is exposed to the agent. */
+  allowed_tools: string[] | null;
+  is_enabled: boolean;
+  /** Whether the server's own instructions join the agent's. Off unless someone opted in. */
+  include_instructions: boolean;
+  /** "bearer" (static token) or "oauth" (authorization-code flow). */
+  auth_type: "bearer" | "oauth";
+  /** OAuth connection that finished consent and has usable tokens. */
+  oauth_authorized: boolean;
+  /**
+   * Whether the stored credential can be used right now, decided by the server so
+   * this matches what a run reports rather than being re-derived here (#1443).
+   * False for an OAuth connection awaiting consent or a token the deployment can
+   * no longer unseal after a key rotation.
+   */
+  authorized: boolean;
+  /** Result of the most recent connectivity check ("ok" / "error"), if any. */
+  last_status: string | null;
+  last_error: string | null;
+  last_checked_at: string | null;
+  /**
+   * Who sees and binds an organization connection: `org`, or `private` - its
+   * creator and the groups and people it was shared with (#2072). Meaningless on
+   * a personal connection, which only its owner reaches.
+   */
+  visibility: Visibility;
+  /** Which catalog entry it points at, where it was connected from one. */
+  catalog_key: string | null;
+  /**
+   * What a person reads. `name` is the tool prefix and is constrained to what a
+   * tool name can carry, which makes it a poor label for two accounts on one
+   * service. Null is not a gap: the slug is what the connection always showed.
+   */
+  label: string | null;
+  /**
+   * Speak as this account where an agent binding asked for the member's own and
+   * they hold several on this service. At most one of theirs per service, kept
+   * so by a partial unique index (#1342).
+   */
+  is_default: boolean;
+  /**
+   * Every tool the server offered when it was last reached. Null means nothing
+   * has asked yet, which is not the same as "offers none".
+   */
+  last_tools: McpToolInfo[] | null;
+  /**
+   * The agents binding an organization server that the reader may see (#2072).
+   * Absent on a personal connection, and null where the listing did not ask.
+   */
+  used_by?: AgentUsage[] | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+/** One call an agent made to an organization server's tool (#2072) - never what was said. */
+export interface McpToolCall {
+  tool: string;
+  status: string;
+  started_at: string;
+  duration_ms: number | null;
+  agent_id: string | null;
+  agent_name: string | null;
+  run_id: string | null;
+}
+
+export interface McpToolInfo {
+  name: string;
+  description: string;
+  /**
+   * The JSON Schema of the tool's arguments, when the server's was small enough
+   * to keep. Absent from a list recorded before it was kept.
+   */
+  input_schema?: Record<string, unknown> | null;
+  /** The server marks it read-only; anything else is treated as a write. */
+  read_only?: boolean;
+}
+
+export interface McpConnectionTestResult {
+  ok: boolean;
+  error: string | null;
+  tools: McpToolInfo[];
+}
+
+interface McpConnectionList {
+  items: McpConnectionRecord[];
+  total: number;
+}
+
+const ROOT = "/me/mcp-connections";
+/** The organization's own router, mounted beside `/me/...` rather than under `/orgs`. */
+const ORG_ROOT = "/mcp-connections";
+
+export async function listMcpConnections(): Promise<McpConnectionRecord[]> {
+  const data = await apiClient.get<McpConnectionList>(ROOT);
+  return data.items;
+}
+
+export async function createMcpConnection(input: {
+  name: string;
+  url: string;
+  auth_token?: string;
+  allowed_tools?: string[] | null;
+  is_enabled?: boolean;
+  label?: string;
+  /** Which catalog server this is an account on - what a binding to each person's own account matches it by. */
+  catalog_key?: string;
+}): Promise<McpConnectionRecord> {
+  return apiClient.post<McpConnectionRecord>(ROOT, input);
+}
+
+export async function updateMcpConnection(
+  id: string,
+  patch: {
+    name?: string;
+    url?: string;
+    /** "" clears the stored token. */
+    auth_token?: string;
+    allowed_tools?: string[];
+    clear_allowed_tools?: boolean;
+    is_enabled?: boolean;
+    include_instructions?: boolean;
+    /** Speak as this one where an agent asked for the member's own account. */
+    is_default?: boolean;
+    /** `""` clears it, back to showing the slug. */
+    label?: string;
+  },
+): Promise<McpConnectionRecord> {
+  return apiClient.patch<McpConnectionRecord>(`${ROOT}/${id}`, patch);
+}
+
+export async function deleteMcpConnection(id: string): Promise<void> {
+  await apiClient.delete(`${ROOT}/${id}`);
+}
+
+export async function testMcpConnection(id: string): Promise<McpConnectionTestResult> {
+  return apiClient.post<McpConnectionTestResult>(`${ROOT}/${id}/test`);
+}
+
+/**
+ * Begin the OAuth flow for a server. Returns the provider consent URL - the
+ * caller redirects the browser there; the provider sends the user back to the
+ * `/oauth/callback` route, which finishes the exchange.
+ *
+ * `client_id` and `client_secret` name a client the operator registered at the
+ * provider by hand. Absent, the backend registers this app dynamically; given,
+ * it uses them instead - which is the only way past a server that publishes no
+ * registration endpoint.
+ */
+export async function startMcpOAuth(
+  input: {
+    name: string;
+    url: string;
+    catalog_key?: string;
+    /** What the person reads; required for a second account on one service. */
+    label?: string;
+    client_id?: string;
+    client_secret?: string;
+  } & Partial<AudiencePayload>,
+  scope: "personal" | "organization" = "personal",
+): Promise<{ authorization_url: string }> {
+  // Two endpoints, one flow. Which one decides who *holds* the connection when
+  // the provider sends the browser back - the person who consented, or the
+  // organization they consented on behalf of.
+  //
+  // The organization's router is mounted at `/mcp-connections`, not under
+  // `/orgs` - that prefix belongs to organizations, members and invitations.
+  // It read `/orgs/mcp-connections` until #1340, so every organization-scoped
+  // consent 404ed before it left the browser.
+  const root = scope === "organization" ? ORG_ROOT : ROOT;
+  return apiClient.post<{ authorization_url: string }>(`${root}/oauth/start`, input);
+}
+
+/**
+ * Begin the GitHub OAuth App flow for a trigger portal, on the organization.
+ *
+ * GitHub does not support the discovery-and-registration flow `startMcpOAuth`
+ * runs, so it has its own endpoint: the backend reads the organization's stored
+ * `github_oauth_app` secret and builds GitHub's consent URL for the portal's
+ * scopes. A 404 ("add a GitHub OAuth App secret first") or a 400 (the portal
+ * does not connect through GitHub) arrives as the backend's own message, which
+ * the caller shows rather than a generic failure.
+ */
+export async function startGithubOrgOAuth(
+  portalKey: string,
+): Promise<{ authorization_url: string }> {
+  return apiClient.post<{ authorization_url: string }>("/mcp-connections/oauth/start/github", {
+    portal_key: portalKey,
+  });
+}
+
+/**
+ * Begin consent for a portal the platform *polls* rather than is posted to.
+ *
+ * Gmail's case: nothing registers a webhook, so the flow's only job is a
+ * refreshable token carrying the portal's read scopes. It uses the deployment's
+ * own Google client rather than a per-organization OAuth App, so a deployment with
+ * none configured answers 404 and the card shows it as a prerequisite.
+ */
+export async function startPolledPortalOAuth(
+  portalKey: string,
+): Promise<{ authorization_url: string }> {
+  return apiClient.post<{ authorization_url: string }>("/mcp-connections/oauth/start/portal", {
+    portal_key: portalKey,
+  });
+}
+
+/** What a server added by its address answered about OAuth sign-in (#2073). */
+export interface McpSignInProbeResult {
+  sign_in: boolean;
+  registers_clients: boolean;
+}
+
+/**
+ * Whether a server added by its address lets people sign in with OAuth.
+ *
+ * The discovery a sign-in would run, registering nothing - so the form offers
+ * Connect-with-sign-in for a server nobody curated instead of asking for a token.
+ */
+export async function probeMcpSignIn(url: string): Promise<McpSignInProbeResult> {
+  return apiClient.post<McpSignInProbeResult>("/me/mcp-connections/probe", { url });
+}
+
+/** Bind the organization's GitHub App installation after verifying its key. */
+export async function connectGithubApp(installationId: string): Promise<void> {
+  await apiClient.post("/mcp-connections/portals/github-app", { installation_id: installationId });
+}

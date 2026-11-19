@@ -1,0 +1,584 @@
+"""Is this deployment actually able to run an agent?
+
+The failures this catches all look the same from a browser - a 500, or a page
+that loads and does nothing - and each has a different cause several layers
+down. The one that has cost this project the most is stock Postgres: RAG issues
+`CREATE EXTENSION vector` the first time a collection is written to, and an
+image without pgvector answers "extension not available" *after* the upload was
+accepted, the row committed and the task dispatched. The document then sits in
+the listing with no explanation.
+
+So this asks, in the order the answers depend on each other: can I reach the
+database, is its schema current, can it hold embeddings, is Redis there, is the
+vault able to unseal, is there a model an agent could actually run on, and is
+scheduled work actually running.
+
+It reuses the same probes the health endpoint publishes rather than asking the
+same questions differently - two implementations of "is this healthy" is how a
+dashboard says green while a terminal says red.
+"""
+
+import asyncio
+import ipaddress
+import socket
+from typing import TYPE_CHECKING
+
+import click
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.commands import command, error, info, success, warning
+from app.core.config import settings
+from app.core.sanitize import deployment_allowlist, mcp_allowlist, parse_private_allowlist
+from app.db.session import get_db_context
+from app.schemas.health import SystemCheck
+from app.services.health import (
+    probe_database,
+    probe_model_access,
+    probe_scheduler,
+    probe_vector_store,
+)
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.db.models.organization_secret import OrganizationSecret
+    from app.db.models.sandbox_connection import SandboxConnection
+
+# What each outcome prints. `unconfigured` is deliberately not a failure: a
+# deployment that never ingests a document and never runs an agent is installed
+# correctly, it is just not finished - and exiting non-zero on that would make
+# this useless in a provisioning script.
+_ASSUMED_CDP_PORT = 9222
+"""Chromium's own default, and an assumption this command says out loud.
+
+The browser allowlist holds hosts rather than addresses on purpose, so there is
+no configured port to read - which is why a silent host is reported here and
+does not fail the command.
+"""
+
+# A listed network wider than this is a warning: it admits more addresses than
+# one site's servers, and every member of every organization can reach them.
+_WIDE_IPV4_PREFIX = 16
+_WIDE_IPV6_PREFIX = 48
+
+_MARK = {
+    "healthy": ("ok", success),
+    "unconfigured": ("--", warning),
+    "not_checked": ("--", warning),
+    "unhealthy": ("!!", error),
+}
+
+
+def _report(key: str, status: str, detail: str) -> bool:
+    """Print one line. Returns whether it counts as a failure."""
+    mark, printer = _MARK.get(status, ("!!", error))
+    printer(f"[{mark}] {key}: {detail}")
+    return status == "unhealthy"
+
+
+async def _migrations_current(db: AsyncSession) -> tuple[str, str]:
+    """Whether the database is at the newest revision on disk.
+
+    Read from `alembic_version` rather than by running Alembic: the point is to
+    answer without mutating anything, and `upgrade head` in a doctor command is
+    exactly the surprise nobody wants from a command that says it only looks.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    try:
+        current = (await db.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+    except Exception:
+        return "unhealthy", "no alembic_version table - run `alembic upgrade head`"
+
+    head = ScriptDirectory.from_config(Config("alembic.ini")).get_current_head()
+    if current == head:
+        return "healthy", f"at {current}"
+    return "unhealthy", f"at {current}, newest on disk is {head} - run `alembic upgrade head`"
+
+
+async def _redis_reachable() -> tuple[str, str]:
+    """A connection of its own: the app's lives in the request lifespan, and
+    this runs from a terminal where there is no request."""
+    from app.clients.redis import RedisClient
+
+    redis = RedisClient()
+    try:
+        await redis.connect()
+        answered = await redis.ping()
+    except Exception as exc:
+        return "unhealthy", f"PING failed: {exc}"
+    finally:
+        await redis.close()
+    return ("healthy", "PING answered") if answered else ("unhealthy", "PING failed")
+
+
+async def _scheduler() -> SystemCheck:
+    """`probe_scheduler`, on a session of its own: it reads the background job tables.
+
+    A database that cannot be reached is reported here as what failed, rather
+    than as a doctor that crashed before saying anything about the rest.
+    """
+    try:
+        async with get_db_context() as db:
+            return await probe_scheduler(db)
+    except (OSError, SQLAlchemyError) as exc:
+        return SystemCheck(
+            key="scheduler", status="unhealthy", detail=f"the database did not answer: {exc}"
+        )
+
+
+async def _postgres_tls(db: AsyncSession) -> tuple[str, str]:
+    """Whether the connection this doctor made to Postgres was encrypted.
+
+    Read from `pg_stat_ssl` for the backend serving this session - the transport
+    itself, not the `POSTGRES_SSLMODE` that asked for it (#1418). Not a failure
+    when off: two stores on one compose network need no TLS, and a provisioning
+    script must not exit non-zero on that.
+    """
+    try:
+        on = (
+            await db.execute(text("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()"))
+        ).scalar()
+    except Exception as exc:
+        return "not_checked", f"could not read pg_stat_ssl: {exc}"
+    return ("healthy", "tls=on") if on else ("unconfigured", "tls=off")
+
+
+def _redis_tls() -> tuple[str, str]:
+    """Whether the Redis URL selects TLS. redis-py reads it off the scheme, so
+    `rediss://` is the encrypted transport and `redis://` is not (#1418)."""
+    return (
+        ("healthy", "tls=on")
+        if settings.REDIS_URL.startswith("rediss://")
+        else ("unconfigured", "tls=off")
+    )
+
+
+async def _query_statistics(db: AsyncSession) -> tuple[str, str]:
+    """Whether Postgres records which statements cost what (#2228).
+
+    Without `pg_stat_statements` a slow query is found by reading logs. Not a
+    failure when absent: it needs the library preloaded at server start, which a
+    managed database may not offer. Read under a savepoint, because the error a
+    missing extension raises would otherwise abort the session the checks after
+    this one share.
+    """
+    try:
+        async with db.begin_nested():
+            await db.execute(text("SELECT 1 FROM pg_stat_statements LIMIT 1"))
+    except Exception as exc:
+        reason = str(getattr(exc, "orig", exc)).splitlines()[0]
+        return "unconfigured", f"pg_stat_statements unavailable - {reason}"
+    return "healthy", "pg_stat_statements is recording"
+
+
+def _tracing() -> tuple[str, str]:
+    """Whether spans leave this process. Production prints none to the console,
+    so with no token a slow request leaves no trace anywhere (#2228)."""
+    if settings.LOGFIRE_TOKEN:
+        return "healthy", f"Logfire, environment {settings.LOGFIRE_ENVIRONMENT}"
+    return "unconfigured", "LOGFIRE_TOKEN is unset - no request, query or run is traced"
+
+
+def _vault_configured() -> tuple[str, str]:
+    """A vault with no key cannot unseal a provider credential, so no agent runs."""
+    if not settings.VAULT_MASTER_KEY and not settings.VAULT_MASTER_KEYS:
+        return "unhealthy", "VAULT_MASTER_KEY is unset - no stored credential can be unsealed"
+    return "healthy", "a key is configured"
+
+
+def _file_storage() -> tuple[str, str]:
+    """Which backend holds uploaded files, and whether it encrypts them (#1423).
+
+    Not a failure either way. `local` is the default and the honest answer for a
+    single host with an encrypted volume - this cannot see the volume, so it
+    reports the backend and leaves the claim to the operator. `s3` with
+    encryption switched off is the one worth saying out loud: a compatible store
+    with no KMS behind it is a legitimate configuration and is not what the
+    at-rest row in `docs/security.md` describes.
+    """
+    if settings.FILE_STORAGE_BACKEND != "s3":
+        return "unconfigured", "backend=local - files are on this host's disk, encrypt the volume"
+    bucket = settings.FILE_STORAGE_S3_BUCKET
+    if not bucket:
+        return (
+            "unhealthy",
+            "backend=s3 but FILE_STORAGE_S3_BUCKET is unset - no upload can be stored",
+        )
+    mode = settings.FILE_STORAGE_S3_ENCRYPTION
+    if mode == "none":
+        return "unconfigured", f"backend=s3 bucket={bucket} encryption=none"
+    return "healthy", f"backend=s3 bucket={bucket} encryption={mode}"
+
+
+async def _private_network() -> tuple[str, str]:
+    """What the private allowlists let every member of every organization reach.
+
+    Both lists count: `OUTBOUND_PRIVATE_ALLOWLIST` and `MCP_ALLOWED_HOSTS`, which
+    reaches MCP connections. A listed network that contains the database's or
+    Redis's resolved address is a failure: boot refuses a store host by name or
+    literal, and cannot resolve one, so this is where a CIDR covering it is
+    found. A store host that does not resolve is skipped - the database and Redis
+    lines already say so.
+    """
+    allowed = mcp_allowlist()
+    described = "; ".join(
+        f"{setting} admits {', '.join(entries)}"
+        for setting, entries in (
+            ("OUTBOUND_PRIVATE_ALLOWLIST", deployment_allowlist().entries),
+            ("MCP_ALLOWED_HOSTS", parse_private_allowlist(settings.MCP_ALLOWED_HOSTS).entries),
+        )
+        if entries
+    )
+    if not allowed:
+        return (
+            "unconfigured",
+            "OUTBOUND_PRIVATE_ALLOWLIST and MCP_ALLOWED_HOSTS are empty - "
+            "private addresses are refused",
+        )
+
+    covered: list[str] = []
+    for setting, host in (
+        ("POSTGRES_HOST", settings.POSTGRES_HOST),
+        ("REDIS_HOST", settings.REDIS_HOST),
+    ):
+        try:
+            answers = await asyncio.to_thread(socket.getaddrinfo, host, None)
+        except OSError, UnicodeError:
+            continue
+        for answer in answers:
+            address = ipaddress.ip_address(str(answer[4][0]))
+            if any(
+                address in network
+                for network in allowed.networks
+                if network.version == address.version
+            ):
+                covered.append(f"{setting} ({address})")
+                break
+    if covered:
+        return (
+            "unhealthy",
+            f"{described}; a listed range covers {', '.join(covered)} - "
+            "every member could aim a request at the store",
+        )
+
+    wide = [
+        str(network)
+        for network in allowed.networks
+        if network.prefixlen < (_WIDE_IPV4_PREFIX if network.version == 4 else _WIDE_IPV6_PREFIX)
+    ]
+    if wide:
+        return (
+            "not_checked",
+            f"{described}; wider than /{_WIDE_IPV4_PREFIX} (IPv4) or "
+            f"/{_WIDE_IPV6_PREFIX} (IPv6): {', '.join(wide)} - list the hosts instead",
+        )
+    return "healthy", described
+
+
+async def _browser_endpoints() -> tuple[str, str]:
+    """Whether the browsers a web-browsing agent may drive are answering.
+
+    `BROWSER_CDP_ALLOWED_HOSTS` is the whole list an author can name, so it is
+    the whole list worth looking at - and looking here is the difference between
+    finding out now and finding out inside somebody's conversation, forty seconds
+    into a browse.
+
+    **A host that does not answer is reported and does not fail the command**,
+    which is the opposite of how `sandbox connections` treats one and is
+    deliberate. The allowlist holds hosts, not addresses - a host is a trust
+    boundary and a port is not - so this has to assume Chromium's own 9222, and
+    an operator running their browser on another port would be told their
+    deployment is broken when it is not. What the line is for is the other case:
+    nothing is listening anywhere, and an agent published against it will fail.
+
+    `/json/version` is Chromium's own unauthenticated endpoint. Nothing is sent
+    to it and only the browser's version is read back.
+    """
+    hosts = [host.strip() for host in settings.BROWSER_CDP_ALLOWED_HOSTS if host.strip()]
+    if not hosts:
+        return "unconfigured", "no browser host allowed - browser automation is refused"
+
+    import httpx
+
+    silent: list[str] = []
+    reached: list[str] = []
+    for host in hosts:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                answer = await client.get(f"http://{host}:{_ASSUMED_CDP_PORT}/json/version")
+                answer.raise_for_status()
+                version = answer.json().get("Browser", "a browser")
+        # Every way this can fail - refused, timed out, not a browser - is the
+        # same answer to the only question being asked.
+        except Exception:
+            silent.append(host)
+        else:
+            reached.append(f"{host} ({version})")
+
+    if reached and silent:
+        return (
+            "not_checked",
+            f"{', '.join(reached)}; no answer from {', '.join(silent)} on "
+            f"{_ASSUMED_CDP_PORT} - fine if it listens elsewhere",
+        )
+    if reached:
+        return "healthy", ", ".join(reached)
+    return (
+        "not_checked",
+        f"{', '.join(hosts)} allowed, none answering on {_ASSUMED_CDP_PORT} - "
+        f"a browse fails unless the browser is on another port",
+    )
+
+
+async def _sandbox_connections(db: AsyncSession) -> tuple[str, str]:
+    """Whether every registered sandbox host can actually be reached.
+
+    Unconfigured is not a failure: the `state` backend needs no service and is
+    what a default install runs on. What *is* a failure is a connection that is
+    registered and does not answer - an agent bound to it then fails on its
+    first tool call, inside somebody's conversation, with a connection error
+    nobody was watching for.
+
+    Every active `docker` connection in the deployment is probed, not one
+    address: an organization may run two hosts, and a deployment hosts many
+    organizations. Daytona is skipped because there is nothing local to reach -
+    the credential is validated by their API on first use.
+
+    So is the version: the service has to serve every route this platform's
+    client calls, read from its index, or each command fails as a lost session.
+
+    The token is checked as well as the address. `/healthz` is deliberately
+    unauthenticated, so a probe that stopped there would report a healthy
+    service to a deployment holding the wrong secret while every session was
+    still refused. The credential is unsealed here for that one request and
+    never printed - a doctor line that leaked a token would be worse than the
+    outage it diagnoses.
+    """
+    from sqlalchemy import select
+
+    from app.db.models.organization_secret import OrganizationSecret
+    from app.db.models.sandbox_connection import SandboxConnection
+
+    rows = (
+        await db.execute(
+            select(SandboxConnection, OrganizationSecret)
+            .outerjoin(OrganizationSecret, OrganizationSecret.id == SandboxConnection.secret_id)
+            .where(SandboxConnection.is_active.is_(True))
+            .where(SandboxConnection.kind == "docker")
+        )
+    ).all()
+    if not rows:
+        return "unconfigured", "no sandbox connection registered - only 'state' workspaces run"
+
+    problems: list[str] = []
+    healthy = 0
+    for connection, secret in rows:
+        detail = await _probe_connection(connection, secret)
+        if detail is None:
+            healthy += 1
+        else:
+            problems.append(f"{connection.name}: {detail}")
+
+    if problems:
+        return "unhealthy", "; ".join(problems)
+    return "healthy", f"{healthy} connection(s) answered /policy with a runtime"
+
+
+async def _probe_connection(
+    connection: SandboxConnection, secret: OrganizationSecret | None
+) -> str | None:
+    """What is wrong with one connection, or `None` if nothing is."""
+    from app.core.secret_kinds import ApiKeySecret, SecretKind, unseal_secret
+    from app.core.vault import VaultScope
+
+    if secret is None:
+        return "no credential in the vault - re-attach one"
+    try:
+        unsealed = unseal_secret(
+            secret.sealed_secret,
+            kind=SecretKind(secret.kind),
+            scope=VaultScope.organization(connection.organization_id),
+            key_version=secret.key_version,
+        )
+    except Exception as exc:
+        return f"its credential could not be unsealed: {exc}"
+    if not isinstance(unsealed, ApiKeySecret):
+        return f"its credential is a {secret.kind}, which cannot authenticate a sandbox service"
+
+    import httpx
+
+    from app.services.sandboxd_compat import mismatch_message, missing_endpoints
+
+    base = (connection.base_url or "").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            (await client.get(f"{base}/healthz")).raise_for_status()
+            try:
+                missing: list[str] | None = await missing_endpoints(client, base)
+            except httpx.HTTPError, ValueError:
+                # `/healthz` answered, so a failure here does not make the
+                # service unreachable, and the credential is still worth checking.
+                missing = None
+            policy = await client.get(
+                f"{base}/policy",
+                headers={"X-Sandbox-Token": unsealed.api_key.get_secret_value()},
+            )
+    except Exception as exc:
+        return f"{base} did not answer: {exc}"
+
+    # Before the credential: a service of another version answers the routes this
+    # platform calls with a 404 that reads as a lost session (#2484), whatever
+    # the token says.
+    if missing:
+        return f"{base}: {mismatch_message(missing)}"
+    if policy.status_code == 401:
+        return "the service answered but refused its credential"
+    if policy.status_code != 200:
+        return f"/policy answered {policy.status_code}"
+    if not policy.json().get("runtimes"):
+        return "the service allows no runtime, so no sandbox can start"
+    if missing is None:
+        return f"{base} answered, but its route index at / could not be read to check its version"
+    return None
+
+
+async def _run(profile: str | None = None) -> int:
+    """Every check, in dependency order, and the profile sheet after them.
+
+    The sheet runs inside this one flow rather than beside it because it is
+    database-backed: opening a second session after the database probe has
+    already failed produces a traceback instead of the command's own summary,
+    and does it in the one case the command exists for (#1448 review).
+    """
+    failures = 0
+    async with get_db_context() as db:
+        database = await probe_database(db)
+        failures += _report("database", database.status, database.detail)
+
+        if database.status != "healthy":
+            error("Nothing else can be checked without a database. Is it running?")
+            if profile:
+                warning(f"The {profile} profile's sheet needs one too, so it is not printed.")
+            return 1
+
+        status, detail = await _postgres_tls(db)
+        failures += _report("postgres", status, detail)
+
+        status, detail = await _migrations_current(db)
+        failures += _report("migrations", status, detail)
+
+        vector = await probe_vector_store(db)
+        failures += _report("vector store", vector.status, vector.detail)
+
+        model = await probe_model_access(db)
+        failures += _report("model access", model.status, model.detail)
+
+        status, detail = await _query_statistics(db)
+        failures += _report("query statistics", status, detail)
+
+    status, detail = await _redis_reachable()
+    failures += _report("redis", status, detail)
+
+    status, detail = _redis_tls()
+    failures += _report("redis", status, detail)
+
+    status, detail = _vault_configured()
+    failures += _report("vault", status, detail)
+
+    status, detail = _file_storage()
+    failures += _report("file storage", status, detail)
+
+    status, detail = _tracing()
+    failures += _report("tracing", status, detail)
+
+    scheduler = await _scheduler()
+    failures += _report("scheduler", scheduler.status, scheduler.detail)
+
+    # A session of its own, after the vault check rather than beside the database
+    # ones above: unsealing a connection's credential is meaningless while the
+    # vault has no key, and reporting "did not answer" for that would name the
+    # wrong cause.
+    async with get_db_context() as db:
+        status, detail = await _sandbox_connections(db)
+    failures += _report("sandbox connections", status, detail)
+
+    status, detail = await _browser_endpoints()
+    failures += _report("browser endpoints", status, detail)
+
+    status, detail = await _private_network()
+    failures += _report("private network", status, detail)
+
+    # Imported here like every probe with a dependency of its own: the renderer
+    # reaches the artifact service, which a doctor without a database never needs.
+    from app.services.artifact_render import probe as probe_artifact_renderer
+
+    status, detail = await probe_artifact_renderer()
+    failures += _report("artifact renderer", status, detail)
+
+    if profile:
+        info(f"\nAgainst the {profile} profile - technical safeguards only:")
+        failures += await _profile_sheet(profile)
+
+    return failures
+
+
+#: How a profile control prints. `--` for a control that is the operator's:
+#: it is named rather than passed, and it does not fail the command, because one
+#: nobody can evidence from here is one nobody could ever pass.
+_PROFILE_MARK = {
+    "met": ("ok", success),
+    "unmet": ("!!", error),
+    "attested": ("--", warning),
+}
+
+
+async def _profile_sheet(profile: str) -> int:
+    """Print one row per control and answer how many were unmet.
+
+    Reached only once the database probe has passed, because every row that asks
+    the database would otherwise raise the connection error rather than being
+    reported.
+    """
+    from app.services.deployment_profile import evaluate
+
+    async with get_db_context() as db:
+        results = await evaluate(db, profile)  # ty: ignore[invalid-argument-type]
+    for result in results:
+        mark, printer = _PROFILE_MARK[result.outcome]
+        printer(f"[{mark}] {result.key} ({result.safeguard}): {result.detail}")
+    return sum(1 for result in results if result.failed)
+
+
+@command("doctor", help="Check that this deployment can actually run an agent")
+@click.option(
+    "--profile",
+    type=click.Choice(["hipaa"]),
+    default=None,
+    help="Also check this deployment against a security profile's controls",
+)
+def doctor(profile: str | None) -> None:
+    """Diagnose a deployment, in dependency order.
+
+    Exits non-zero when something is broken, so it can gate a provisioning
+    script. A subsystem that is merely unconfigured - pgvector not installed on
+    a deployment that has never ingested anything - is a warning, not a failure.
+
+    `--profile` adds a second sheet: one row per control of an opinionated
+    security profile, naming the setting that satisfies it or the one that does
+    not. It is evidence a security officer can read, not a certification - and a
+    control that is genuinely the operator's (volume encryption, a locked rack)
+    prints `--` and is named rather than quietly passed.
+
+    Example:
+        agenticos cmd doctor
+        agenticos cmd doctor --profile hipaa
+    """
+    info(f"Checking {settings.PROJECT_NAME} at {settings.POSTGRES_HOST}...")
+    failures = asyncio.run(_run(profile))
+    if failures:
+        error(f"{failures} check(s) failed.")
+        raise SystemExit(1)
+    success("Everything this can check is working.")

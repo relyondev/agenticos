@@ -1,0 +1,933 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { CapabilitySettings } from "./capability-settings";
+import { ApiError, apiClient } from "@/lib/api-client";
+import type { CapabilityBindingSpec, CapabilityCatalogEntry } from "@/types/agents";
+import { Perm } from "@/types/permissions";
+import type { Permission } from "@/types/permissions";
+import type { Secret } from "@/types/secrets";
+import { providerMarkIn } from "@/test-utils/brand-marks";
+
+vi.mock("@/lib/api-client", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api-client")>("@/lib/api-client");
+  return {
+    ...actual,
+    apiClient: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
+  };
+});
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+// The real one signs in with ChatGPT through a device code. What this form needs
+// from it is the callback, under the label the real one shows.
+vi.mock("@/components/vault/chatgpt-sign-in", () => ({
+  InlineChatGPTSignIn: ({ onCreated }: { onCreated: (id: string) => void }) => (
+    <button type="button" onClick={() => onCreated("sec-chatgpt")}>
+      Sign in with ChatGPT
+    </button>
+  ),
+}));
+
+/**
+ * The capability the secret picker exists for: one that cannot work without a
+ * credential.
+ *
+ * No builtin declares a secret yet, which is exactly why the Builder had no way
+ * to choose one - the gap was invisible until somebody wrote the first custom
+ * capability, and that capability is a weather lookup behind an API key.
+ */
+const WEATHER: CapabilityCatalogEntry = {
+  recommended: null,
+  id: "weather",
+  name: "Weather",
+  category: "utility",
+  description: "Read the forecast for a place.",
+  side_effecting: false,
+  voice: "live",
+  scopes: [],
+  tools: [{ id: "forecast", name: "forecast", description: "Read the forecast for a place." }],
+  config_schema: null,
+  contracts: [],
+  requires_secret: {
+    kind: "api_key",
+    description: "The forecast service's API key. It refuses an unauthenticated request.",
+    required_when: null,
+    purpose: null,
+  },
+};
+
+const API_KEY_SECRET: Secret = {
+  id: "sec-1",
+  name: "Weather API key",
+  description: "Used by the forecast capability.",
+  kind: "api_key",
+  hint: "P7KD",
+};
+
+/** Web search, which needs a key for some methods and none for others. */
+const SEARCH: CapabilityCatalogEntry = {
+  ...WEATHER,
+  requires_secret: {
+    kind: "api_key",
+    description: "The API key for the chosen search service",
+    required_when: { field: "method", equals: ["tavily", "brave", "exa"] },
+    purpose: null,
+  },
+};
+
+const AWS_SECRET: Secret = {
+  id: "sec-2",
+  name: "Ingest role",
+  description: null,
+  kind: "aws_credentials",
+  hint: "AKIA",
+};
+
+const binding = (overrides: Partial<CapabilityBindingSpec> = {}): CapabilityBindingSpec => ({
+  id: "weather",
+  config: {},
+  approval: "default",
+  tool_approval: {},
+  tool_overrides: {},
+  secret_id: null,
+  enabled: true,
+  ...overrides,
+});
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+/** What the caller may do. Storing a key from this card is `secrets:edit`. */
+const state = { permissions: [] as Permission[] };
+
+/** The vault answers with these. */
+function serve(secrets: Secret[]) {
+  vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+    if (path === "/secrets") return { items: secrets, total: secrets.length };
+    if (path === "/secrets/kinds") return { items: [], total: 0 };
+    // A list shape here is not "no permissions", it is a `TypeError` inside
+    // `usePermissions`.
+    if (path === "/me/permissions")
+      return {
+        organization_id: "org-1",
+        role: "builder",
+        is_app_admin: false,
+        permissions: state.permissions.map((permission) => ({ permission, scope: "all" })),
+      };
+    throw new Error(`unexpected GET ${path}`);
+  });
+}
+
+/** The vault refuses, which is what a member editing their own agent gets. */
+function refuse() {
+  vi.mocked(apiClient.get).mockRejectedValue(
+    new ApiError(403, "Missing required permission: connections:manage"),
+  );
+}
+
+function mount(
+  spec: CapabilityBindingSpec,
+  {
+    disabled = false,
+    onChange = vi.fn(),
+    definition = WEATHER,
+  }: {
+    disabled?: boolean;
+    onChange?: (binding: CapabilityBindingSpec) => void;
+    definition?: CapabilityCatalogEntry;
+  } = {},
+) {
+  render(
+    <CapabilitySettings
+      catalog={[definition]}
+      selected={[spec]}
+      onChange={onChange}
+      disabled={disabled}
+    />,
+    { wrapper },
+  );
+}
+
+/** The control itself, named by its label like every other field on this card. */
+const picker = () => screen.getByLabelText("Secret");
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  state.permissions = [Perm.secretsEdit];
+});
+
+/**
+ * The secret picker, against a mocked vault.
+ *
+ * Mostly one direction: a spec arrives and the control shows what it says. The
+ * two places where a choice writes back into the spec - picking a stored secret,
+ * and storing one inline - are asserted here as well, because both are how a
+ * capability that cannot run without a credential gets one.
+ */
+describe("CapabilitySettings secret picker", () => {
+  it("shows the secret the spec stored, by name and by hint", async () => {
+    serve([API_KEY_SECRET]);
+    mount(binding({ secret_id: "sec-1" }));
+
+    // The hint too: two keys for the same service are told apart by nothing
+    // else, and the plaintext is not available to either of them.
+    expect(await screen.findByText("Weather API key")).toBeInTheDocument();
+    expect(picker()).toHaveTextContent("····P7KD");
+  });
+
+  it("shows what the capability's author said the secret is for", async () => {
+    // Written in `register(...)` beside the code that reads it, and the only
+    // explanation the person choosing a credential will ever get.
+    serve([API_KEY_SECRET]);
+    mount(binding({ secret_id: "sec-1" }));
+
+    expect(
+      await screen.findByText(/The forecast service's API key\. It refuses an unauthenticated/),
+    ).toBeInTheDocument();
+  });
+
+  it("says an unselected secret is what stops the agent being published", async () => {
+    // The refusal reached by doing nothing at all. Left to the publish attempt it
+    // arrives as one line in a list of everything else wrong with the agent, on a
+    // screen far from the capability that needs it.
+    serve([API_KEY_SECRET]);
+    mount(binding());
+
+    // Waited for the vault to have arrived, so this is the state with a key
+    // available and nobody having picked it - not the one before the list landed.
+    expect(await screen.findByText("Choose a secret")).toBeInTheDocument();
+    expect(screen.getByText(/cannot be published until something is/)).toBeInTheDocument();
+    expect(picker()).toBeInvalid();
+  });
+
+  it("offers no secret of the wrong kind, and offers to store the right one", async () => {
+    // An AWS credential where an API key is required is a publish refusal with a
+    // delay on it. Nothing else in the vault is offered - and since the list is
+    // a dead end, the way out is *here*: the round trip this replaces was open
+    // the vault, add the key, come back, and re-pick the capability.
+    serve([AWS_SECRET]);
+    mount(binding());
+
+    expect(await screen.findByText("No api_key secret in the vault")).toBeInTheDocument();
+    expect(picker()).toBeDisabled();
+    // Awaited, not read: the form is a vault write, so it waits for the caller's
+    // permissions the way `usePermissions` waits for anything - answering false
+    // until it knows, rather than offering a control it may have to take back.
+    expect(await screen.findByRole("button", { name: "Add a key: Weather" })).toBeInTheDocument();
+  });
+
+  it("offers no such form to a caller who may not write to the vault", async () => {
+    // Binding a capability is `agents:edit`; storing the key it calls with is
+    // `secrets:edit`. A member holding the first and not the second was shown the
+    // form and refused by `POST /secrets` after pasting a key in (#361).
+    state.permissions = [];
+    serve([AWS_SECRET]);
+    mount(binding());
+
+    expect(await screen.findByText("No api_key secret in the vault")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add a key: Weather" })).toBeNull();
+    expect(screen.getByText(/permission you do not hold/)).toBeInTheDocument();
+  });
+
+  it("binds the secret that was chosen, by id", async () => {
+    // The spec records which secret to use and never the secret, so the id is the
+    // whole of what this control writes.
+    serve([API_KEY_SECRET]);
+    const onChange = vi.fn();
+    mount(binding(), { onChange });
+
+    await userEvent.click(await screen.findByLabelText("Secret"));
+    await userEvent.click(screen.getByRole("option", { name: /Weather API key/ }));
+
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ secret_id: "sec-1" }));
+  });
+
+  describe("a key the configuration can use but does not need", () => {
+    // A browser's proxy may sign in with a username and password, or be reached
+    // without one; a hosted browser always needs its key.
+    const BROWSER: CapabilityCatalogEntry = {
+      ...WEATHER,
+      requires_secret: {
+        kind: "api_key",
+        description: "The hosted browser's key, or the proxy's username:password",
+        required_when: { field: "connection", equals: ["hosted"] },
+        optional_when: { field: "connection", equals: ["proxy"] },
+        purpose: null,
+      },
+    };
+
+    it("is offered with a way to choose none, and none is no problem", async () => {
+      serve([API_KEY_SECRET]);
+      const onChange = vi.fn();
+      mount(binding({ config: { connection: "proxy" }, secret_id: "sec-1" }), {
+        definition: BROWSER,
+        onChange,
+      });
+
+      await userEvent.click(await screen.findByLabelText("Secret"));
+      await userEvent.click(screen.getByRole("option", { name: "No secret" }));
+
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ secret_id: null }));
+    });
+
+    it("says nothing is missing while none is chosen", async () => {
+      serve([API_KEY_SECRET]);
+      mount(binding({ config: { connection: "proxy" } }), { definition: BROWSER });
+
+      await waitFor(() => expect(picker()).toHaveTextContent("No secret"));
+      expect(screen.queryByText(/No secret selected/)).not.toBeInTheDocument();
+    });
+
+    it("is not offered where nothing would read it", async () => {
+      serve([API_KEY_SECRET]);
+      mount(binding({ config: {} }), { definition: BROWSER });
+
+      await waitFor(() => expect(screen.queryByLabelText("Secret")).toBeNull());
+    });
+  });
+
+  it("sends somebody to the vault for a secret that is more than one field", async () => {
+    // An inline form takes an API key and nothing else. A shape with several
+    // fields is filled in where it belongs, and the value stays there either
+    // way - an agent records which secret to use, never the secret.
+    serve([]);
+    mount(binding(), {
+      definition: {
+        ...WEATHER,
+        requires_secret: {
+          kind: "aws_credentials",
+          description: "The role this capability assumes.",
+          required_when: null,
+          purpose: null,
+        },
+      },
+    });
+
+    expect(await screen.findByRole("link", { name: "Store one in the vault" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add a key: Weather" })).toBeNull();
+  });
+
+  it("stores a new key in place and selects it, without leaving the page", async () => {
+    // The whole point of the inline form: the four-step round trip through the
+    // vault was the most common thing this control asked people to do.
+    serve([]);
+    const onChange = vi.fn();
+    mount(binding(), { onChange });
+    vi.mocked(apiClient.post).mockResolvedValue({
+      id: "sec-new",
+      name: "Weather",
+      kind: "api_key",
+      hint: "cdef",
+    });
+
+    await userEvent.click(await screen.findByRole("button", { name: "Add a key: Weather" }));
+    await userEvent.type(screen.getByLabelText("Key"), "wx-secret-abcdef");
+    await userEvent.click(screen.getByRole("button", { name: "Save key" }));
+
+    await waitFor(() =>
+      expect(apiClient.post).toHaveBeenCalledWith("/secrets", {
+        name: "Weather",
+        value: { kind: "api_key", api_key: "wx-secret-abcdef" },
+        // What the key is for, taken from the method this binding chose. It is
+        // what lets the picker offer only the right keys next time instead of
+        // every API key in the vault.
+        purpose: "custom",
+      }),
+    );
+    // Selected, not merely created: leaving the binding pointing at nothing
+    // would mean doing the work and still failing to publish.
+    await waitFor(() =>
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ secret_id: "sec-new" })),
+    );
+  });
+
+  it("does not ask for a key at all when this configuration needs none", async () => {
+    // Web search takes one for Tavily and none for DuckDuckGo. Asking for a key
+    // the server will not demand is as wrong as not asking for one it will -
+    // and it is the version that makes the free default look unavailable.
+    serve([]);
+    mount(binding({ config: { method: "duckduckgo" } }), {
+      definition: {
+        ...WEATHER,
+        requires_secret: {
+          kind: "api_key",
+          description: "The API key for the chosen search service",
+          required_when: { field: "method", equals: ["tavily", "brave", "exa"] },
+          purpose: null,
+        },
+      },
+    });
+
+    await waitFor(() => expect(screen.queryByLabelText("Secret")).toBeNull());
+    expect(screen.queryByRole("button", { name: "Add a key: Weather" })).toBeNull();
+  });
+
+  it("does not claim the vault is empty when the vault could not be read", async () => {
+    // `GET /secrets` needs `connections:manage`, which a member editing their own
+    // agent does not have. The list arrives empty either way, and "no api_key
+    // secret in the vault" would be this page inventing a fact about the
+    // organization out of a refusal - and calling a stored secret deleted.
+    refuse();
+    mount(binding({ secret_id: "sec-1" }));
+
+    expect(
+      await screen.findByText(/says nothing about what your organization has stored/),
+    ).toBeInTheDocument();
+    // In the server's own words, because "the vault could not be read" without
+    // the reason leaves a member filing a bug about a permission they never had.
+    expect(screen.getByText(/connections:manage/)).toBeInTheDocument();
+    expect(picker()).toHaveTextContent("The vault could not be read");
+    expect(screen.queryByText("No api_key secret in the vault")).not.toBeInTheDocument();
+    expect(screen.queryByText(/not in this organization's vault/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Store one in the vault" })).not.toBeInTheDocument();
+  });
+
+  it("still says nothing is selected when the vault could not be read", async () => {
+    // Unlike the two refusals about a *stored* secret, this one is a fact about
+    // the spec: it holds whether or not anybody can list the vault, and it is the
+    // one that blocks publishing.
+    refuse();
+    mount(binding());
+
+    // The refusal first, so this is asserted about the settled unreadable state
+    // rather than about the moment before the request came back.
+    expect(
+      await screen.findByText(/says nothing about what your organization has stored/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/cannot be published until something is/)).toBeInTheDocument();
+  });
+
+  it("names a stored secret of the wrong kind rather than silently dropping it", async () => {
+    // The picker cannot produce this, an imported or hand-written spec can, and
+    // filtering by kind is what makes it invisible: the id resolves to a real
+    // secret that is not in the list.
+    serve([API_KEY_SECRET, AWS_SECRET]);
+    mount(binding({ secret_id: "sec-2" }));
+
+    expect(await screen.findByText(/"Ingest role" is of kind aws_credentials/)).toBeInTheDocument();
+  });
+
+  it("says a secret that is gone is refused, rather than showing nothing chosen", async () => {
+    // Deleting a secret leaves every binding that named it pointing at nothing.
+    // "Choose a secret" would read as a decision never made, which is a different
+    // problem with a different fix.
+    serve([API_KEY_SECRET]);
+    mount(binding({ secret_id: "sec-gone" }));
+
+    expect(await screen.findByText(/not in this organization's vault/)).toBeInTheDocument();
+  });
+
+  it("does not offer the choice to a viewer who cannot edit", async () => {
+    serve([API_KEY_SECRET]);
+    mount(binding({ secret_id: "sec-1" }), { disabled: true });
+
+    expect(await screen.findByText("Weather API key")).toBeInTheDocument();
+    expect(picker()).toBeDisabled();
+  });
+
+  it("wires every label to the control it names, this card included", async () => {
+    // The same walk the prop-driven tests do, repeated here because the secret
+    // field only exists in this one: a label with no htmlFor reads as decoration
+    // to a screen reader and leaves the control it describes unnamed.
+    serve([API_KEY_SECRET]);
+    const { container } = render(
+      <CapabilitySettings
+        catalog={[WEATHER]}
+        selected={[binding({ secret_id: "sec-1" })]}
+        onChange={vi.fn()}
+      />,
+      { wrapper },
+    );
+    await screen.findByText("Weather API key");
+
+    const labels = Array.from(container.querySelectorAll<HTMLLabelElement>("label"));
+
+    expect(labels.some((label) => label.textContent === "Secret")).toBe(true);
+    for (const label of labels) {
+      expect(label.htmlFor, `"${label.textContent}" names no control`).not.toBe("");
+      expect(document.getElementById(label.htmlFor)).not.toBeNull();
+    }
+  });
+});
+
+/**
+ * Which keys a slot offers, once a key says what it is for.
+ *
+ * Kind was the only filter, and with eleven `api_key` rows in a real vault that
+ * is a list of indistinguishable options where exactly one works. Picking the
+ * OpenAI key for a Tavily search stores a spec that publishes cleanly and fails
+ * at the first run with an authentication error nobody traces back here.
+ */
+describe("SecretField · narrowing by what a key is for", () => {
+  it("offers the keys for the chosen service and not the others", async () => {
+    serve([
+      { ...API_KEY_SECRET, id: "sec-tavily", name: "Tavily", purpose: "tavily" },
+      { ...API_KEY_SECRET, id: "sec-openai", name: "OpenAI", purpose: "openai" },
+    ]);
+    mount(binding({ config: { method: "tavily" } }), { definition: SEARCH });
+
+    await userEvent.click(await screen.findByLabelText("Secret"));
+
+    expect(screen.getByRole("option", { name: /Tavily/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /OpenAI/ })).toBeNull();
+  });
+
+  it("narrows on a service the requirement names, with no condition to read", async () => {
+    // The regression this covers: a capability that needs its key *unconditionally*
+    // has no `required_when` field to read a service off, so the slot fell back to
+    // "any key of this kind" and offered every API key in the vault (#1470).
+    const UNCONDITIONAL = {
+      ...WEATHER,
+      id: "memory_mem0",
+      requires_secret: {
+        kind: "api_key" as const,
+        description: "The mem0 API key",
+        required_when: null,
+        purpose: "mem0",
+      },
+    };
+    serve([
+      { ...API_KEY_SECRET, id: "sec-mem0", name: "mem0 key", purpose: "mem0" },
+      { ...API_KEY_SECRET, id: "sec-llama", name: "LlamaParse", purpose: "llamaparse" },
+    ]);
+    mount(binding({ id: "memory_mem0" }), { definition: UNCONDITIONAL });
+
+    await userEvent.click(await screen.findByLabelText("Secret"));
+
+    expect(screen.getByRole("option", { name: /mem0 key/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /LlamaParse/ })).toBeNull();
+  });
+
+  it("keeps offering the keys that never said what they were for", async () => {
+    // Every key stored before purposes existed reads as `custom`, and so does
+    // every key for a service this deployment does not name. Filtering those
+    // out would hide a working Tavily key on the day this shipped.
+    serve([{ ...API_KEY_SECRET, id: "sec-old", name: "Search key", purpose: "custom" }]);
+    mount(binding({ config: { method: "tavily" } }), { definition: SEARCH });
+
+    await userEvent.click(await screen.findByLabelText("Secret"));
+
+    expect(screen.getByRole("option", { name: /Search key/ })).toBeInTheDocument();
+  });
+
+  it("keeps the bound key visible even when it is for something else", async () => {
+    // A selection vanishing from its own control, on a spec that was saved and
+    // is still valid, reads as data loss whatever the reason for it.
+    serve([{ ...API_KEY_SECRET, id: "sec-openai", name: "OpenAI", purpose: "openai" }]);
+    mount(binding({ config: { method: "tavily" }, secret_id: "sec-openai" }), {
+      definition: SEARCH,
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("Secret")).toHaveTextContent("OpenAI"));
+  });
+
+  it("draws each key's mark and masked tail, so eleven api_key rows are eleven rows", async () => {
+    // The reason narrowing was added at all: a real vault holds a dozen keys of
+    // this kind. The purpose that filters the list is also what draws the row.
+    serve([
+      { ...API_KEY_SECRET, id: "sec-openai", name: "Prod", purpose: "openai" },
+      // No purpose at all - stored before purposes existed. It is still offered,
+      // and a monogram is what keeps it from being a blank gap.
+      { ...API_KEY_SECRET, id: "sec-old", name: "Search key" },
+    ]);
+    mount(binding());
+
+    await userEvent.click(await screen.findByLabelText("Secret"));
+
+    const marked = screen.getByRole("option", { name: /Prod/ });
+    expect(providerMarkIn(marked)).toBe("openai");
+    expect(marked).toHaveTextContent("····P7KD");
+    expect(providerMarkIn(screen.getByRole("option", { name: /Search key/ }))).toBeNull();
+  });
+
+  it("offers every key of the right kind when nothing names a service", async () => {
+    // An unconditional requirement - the weather capability - has no field to
+    // read a service from, so narrowing would be guessing.
+    serve([{ ...API_KEY_SECRET, id: "sec-openai", name: "OpenAI", purpose: "openai" }]);
+    mount(binding());
+
+    await userEvent.click(await screen.findByLabelText("Secret"));
+
+    expect(screen.getByRole("option", { name: /OpenAI/ })).toBeInTheDocument();
+  });
+});
+/** A capability whose configuration is a generated form, which is where a
+ *  refused setting has an input to be marked on. */
+const KNOWLEDGE: CapabilityCatalogEntry = {
+  ...WEATHER,
+  id: "knowledge",
+  name: "Knowledge",
+  requires_secret: null,
+  config_schema: {
+    type: "object",
+    properties: {
+      default_top_k: {
+        type: "integer",
+        title: "Passages per search",
+        description: "How many chunks a search returns.",
+      },
+    },
+  },
+};
+
+/**
+ * A capability's configuration refused at publish, on the input that broke.
+ *
+ * `validate_spec` aggregates every problem in a spec into sentences, and it
+ * used to keep only the sentence for a refused config - so this reached the
+ * Builder as "Capability 'knowledge': Invalid configuration for capability
+ * 'knowledge'" and no box was ever marked. Saving a draft does not validate a
+ * config schema at all, so publish validation is the only place a mistyped
+ * setting is refused, which made it the only place it could be shown (#882).
+ */
+describe("a capability configuration refused at publish", () => {
+  const refusal = (field: string) => [
+    { field, message: "Input should be less than or equal to 50" },
+  ];
+
+  beforeEach(() => serve([]));
+
+  it("marks the setting the server named", async () => {
+    render(
+      <CapabilitySettings
+        catalog={[KNOWLEDGE]}
+        selected={[binding({ id: "knowledge", config: { default_top_k: 999 } })]}
+        onChange={vi.fn()}
+        configProblems={refusal("capabilities.knowledge.config.default_top_k")}
+      />,
+      { wrapper },
+    );
+
+    const input = await screen.findByLabelText(/Passages per search/);
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input).toHaveAccessibleDescription(
+      expect.stringContaining("Input should be less than or equal to 50"),
+    );
+  });
+
+  it("does not mark a field of the same name on another capability", async () => {
+    // Every capability's problems arrive in one flat list, so the path is what
+    // keeps two forms apart - both of these could hold a `default_top_k`.
+    render(
+      <CapabilitySettings
+        catalog={[KNOWLEDGE]}
+        selected={[binding({ id: "knowledge", config: { default_top_k: 8 } })]}
+        onChange={vi.fn()}
+        configProblems={refusal("capabilities.web_search.config.default_top_k")}
+      />,
+      { wrapper },
+    );
+
+    expect(await screen.findByLabelText(/Passages per search/)).not.toHaveAttribute(
+      "aria-invalid",
+      "true",
+    );
+  });
+
+  it("does not mark the parent's form for a mistake inside a specialist", async () => {
+    // One form per specialist, configuring the same capabilities. The parent's
+    // card renders without a specialist name, so a scoped path is not its own.
+    render(
+      <CapabilitySettings
+        catalog={[KNOWLEDGE]}
+        selected={[binding({ id: "knowledge", config: { default_top_k: 8 } })]}
+        onChange={vi.fn()}
+        configProblems={refusal(
+          "specialists.researcher.capabilities.knowledge.config.default_top_k",
+        )}
+      />,
+      { wrapper },
+    );
+
+    expect(await screen.findByLabelText(/Passages per search/)).not.toHaveAttribute(
+      "aria-invalid",
+      "true",
+    );
+  });
+});
+
+/** The coding agent takes a key or a subscription, and says which of each its harness takes. */
+describe("CapabilitySettings coding agent sign-in", () => {
+  const CODER: CapabilityCatalogEntry = {
+    ...WEATHER,
+    id: "coding_agent",
+    name: "Coding agent",
+    requires_secret: {
+      kind: "api_key",
+      also_accepts: ["openai_codex"],
+      description:
+        "Claude Code: an Anthropic key or token. Codex: an OpenAI key or a ChatGPT sign-in.",
+      required_when: null,
+      purpose: null,
+      purposes_by: {
+        field: "harness",
+        purposes: { claude_code: ["anthropic"], codex: ["openai", "openai_codex"] },
+        open_when_set: { claude_code: "base_url" },
+      },
+    },
+    // The harness's default is what a binding only switched on runs, stored or not.
+    config_schema: {
+      type: "object",
+      properties: {
+        harness: {
+          type: "string",
+          title: "Harness",
+          enum: ["claude_code", "codex"],
+          default: "claude_code",
+        },
+      },
+    },
+  };
+  const SIGN_IN: Secret = {
+    id: "sec-3",
+    name: "My ChatGPT",
+    description: null,
+    kind: "openai_codex",
+    hint: "acc1",
+  };
+
+  it("offers a ChatGPT sign-in to Codex, and one already made among the keys", async () => {
+    serve([API_KEY_SECRET, SIGN_IN, AWS_SECRET]);
+    mount(binding({ id: "coding_agent", config: { harness: "codex" } }), { definition: CODER });
+
+    expect(await screen.findByRole("button", { name: "Sign in with ChatGPT" })).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText("Key or sign-in"));
+    expect(await screen.findByRole("option", { name: /My ChatGPT/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Weather API key/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /Ingest role/ })).toBeNull();
+  });
+
+  it("binds the sign-in it makes", async () => {
+    serve([API_KEY_SECRET]);
+    const onChange = vi.fn();
+    mount(binding({ id: "coding_agent", config: { harness: "codex" } }), {
+      definition: CODER,
+      onChange,
+    });
+
+    await userEvent.click(await screen.findByRole("button", { name: "Sign in with ChatGPT" }));
+
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ secret_id: "sec-chatgpt" }));
+  });
+
+  /**
+   * Every API key in the vault was offered whichever harness was chosen, and
+   * Claude Code with an OpenAI key published and failed at run time (#2485).
+   */
+  const VAULT: Secret[] = [
+    { ...API_KEY_SECRET, id: "sec-anthropic", name: "Anthropic", purpose: "anthropic" },
+    { ...API_KEY_SECRET, id: "sec-openai", name: "OpenAI", purpose: "openai" },
+    { ...API_KEY_SECRET, id: "sec-llama", name: "LlamaParse", purpose: "llamaparse" },
+    { ...API_KEY_SECRET, id: "sec-mine", name: "Gateway", purpose: "custom" },
+    { ...SIGN_IN, purpose: "openai_codex" },
+  ];
+
+  it("offers Claude Code its Anthropic keys and custom ones, not OpenAI's", async () => {
+    serve(VAULT);
+    mount(binding({ id: "coding_agent", config: { harness: "claude_code" } }), {
+      definition: CODER,
+    });
+
+    await userEvent.click(await screen.findByLabelText("Key or sign-in"));
+
+    expect(await screen.findByRole("option", { name: /Anthropic/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Gateway/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /OpenAI/ })).toBeNull();
+    expect(screen.queryByRole("option", { name: /LlamaParse/ })).toBeNull();
+    expect(screen.queryByRole("option", { name: /My ChatGPT/ })).toBeNull();
+  });
+
+  it("offers Codex its OpenAI keys and ChatGPT sign-ins, not Anthropic's", async () => {
+    serve(VAULT);
+    mount(binding({ id: "coding_agent", config: { harness: "codex" } }), { definition: CODER });
+
+    await userEvent.click(await screen.findByLabelText("Key or sign-in"));
+
+    expect(await screen.findByRole("option", { name: /OpenAI/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /My ChatGPT/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Gateway/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /Anthropic/ })).toBeNull();
+    expect(screen.queryByRole("option", { name: /LlamaParse/ })).toBeNull();
+  });
+
+  it("keeps the bound key offered after the harness changes", async () => {
+    serve(VAULT);
+    mount(
+      binding({ id: "coding_agent", config: { harness: "codex" }, secret_id: "sec-anthropic" }),
+      { definition: CODER },
+    );
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("Key or sign-in")).toHaveTextContent("Anthropic"),
+    );
+    expect(screen.getByLabelText("Key or sign-in")).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByLabelText("Key or sign-in")).toHaveAccessibleDescription(
+      expect.stringContaining("Choose a key for this configuration"),
+    );
+  });
+
+  it("opens gateway purposes from the endpoint's schema default", async () => {
+    serve(VAULT);
+    mount(binding({ id: "coding_agent", config: {} }), {
+      definition: {
+        ...CODER,
+        config_schema: {
+          ...CODER.config_schema,
+          properties: {
+            ...CODER.config_schema?.properties,
+            base_url: { type: "string", default: "https://gateway.example/api" },
+          },
+        },
+      },
+    });
+
+    await userEvent.click(await screen.findByLabelText("Key or sign-in"));
+    expect(await screen.findByRole("option", { name: /OpenAI/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /My ChatGPT/ })).toBeNull();
+  });
+
+  it("does not reopen gateway purposes when an explicit null overrides its default", async () => {
+    serve(VAULT);
+    mount(binding({ id: "coding_agent", config: { base_url: null } }), {
+      definition: {
+        ...CODER,
+        config_schema: {
+          ...CODER.config_schema,
+          properties: {
+            ...CODER.config_schema?.properties,
+            base_url: { type: "string", default: "https://gateway.example/api" },
+          },
+        },
+      },
+    });
+
+    await userEvent.click(await screen.findByLabelText("Key or sign-in"));
+    expect(await screen.findByRole("option", { name: /Anthropic/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /OpenAI/ })).toBeNull();
+  });
+
+  it("keeps sign-ins selectable for other capabilities that accept their kind", async () => {
+    serve(VAULT);
+    mount(binding(), {
+      definition: { ...WEATHER, requires_secret: CODER.requires_secret },
+    });
+
+    await userEvent.click(await screen.findByLabelText("Key or sign-in"));
+    expect(await screen.findByRole("option", { name: /My ChatGPT/ })).toBeInTheDocument();
+  });
+
+  it("marks a retained ChatGPT sign-in invalid for Claude Code behind a gateway", async () => {
+    serve(VAULT);
+    mount(
+      binding({
+        id: "coding_agent",
+        config: { harness: "claude_code", base_url: "https://gateway.example/api" },
+        secret_id: SIGN_IN.id,
+      }),
+      { definition: CODER },
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Key or sign-in")).toHaveAttribute("aria-invalid", "true"),
+    );
+    expect(screen.getByLabelText("Key or sign-in")).toHaveAccessibleDescription(
+      expect.stringContaining("Choose a key for this configuration"),
+    );
+  });
+
+  it("narrows a binding that stores no harness to Claude Code's keys", async () => {
+    serve(VAULT);
+    mount(binding({ id: "coding_agent", config: {} }), { definition: CODER });
+
+    await userEvent.click(await screen.findByLabelText("Key or sign-in"));
+
+    expect(await screen.findByRole("option", { name: /Anthropic/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /OpenAI/ })).toBeNull();
+  });
+
+  it("offers every key behind a gateway, whose key the platform cannot name", async () => {
+    serve(VAULT);
+    mount(
+      binding({
+        id: "coding_agent",
+        config: { harness: "claude_code", base_url: "https://openrouter.ai/api" },
+      }),
+      { definition: CODER },
+    );
+
+    await userEvent.click(await screen.findByLabelText("Key or sign-in"));
+
+    expect(await screen.findByRole("option", { name: /LlamaParse/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /OpenAI/ })).toBeInTheDocument();
+    // Publish refuses a ChatGPT sign-in for Claude Code, gateway or not.
+    expect(screen.queryByRole("option", { name: /My ChatGPT/ })).toBeNull();
+  });
+
+  it("keeps Codex narrowed though a Claude Code gateway was left in its config", async () => {
+    serve(VAULT);
+    mount(
+      binding({
+        id: "coding_agent",
+        config: { harness: "codex", base_url: "https://openrouter.ai/api" },
+      }),
+      { definition: CODER },
+    );
+
+    await userEvent.click(await screen.findByLabelText("Key or sign-in"));
+
+    expect(await screen.findByRole("option", { name: /OpenAI/ })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /Anthropic/ })).toBeNull();
+  });
+
+  it("tells Claude Code where its subscription token comes from", async () => {
+    serve([API_KEY_SECRET]);
+    mount(binding({ id: "coding_agent", config: { harness: "claude_code" } }), {
+      definition: CODER,
+    });
+
+    expect(await screen.findByText("claude setup-token")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in with ChatGPT" })).toBeNull();
+    expect(await screen.findByRole("button", { name: /Claude Code key/ })).toBeInTheDocument();
+  });
+
+  /** Adds a key through the inline form and answers with the purpose it was stored under. */
+  async function addInline(config: Record<string, unknown>, name: RegExp): Promise<unknown> {
+    serve([]);
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "sec-new", name: "Key", kind: "api_key" });
+    mount(binding({ id: "coding_agent", config }), { definition: CODER });
+
+    await userEvent.click(await screen.findByRole("button", { name }));
+    await userEvent.type(screen.getByLabelText("Key"), "sk-inline-abcdef");
+    await userEvent.click(screen.getByRole("button", { name: "Save key" }));
+
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    const body = vi.mocked(apiClient.post).mock.calls[0]?.[1];
+    return (body as { purpose?: unknown } | undefined)?.purpose;
+  }
+
+  /**
+   * Stored as `custom`, a Codex key fitted Claude Code after a harness switch,
+   * and published there only to fail at run time (#2485).
+   */
+  it("stores a key added for Codex as an OpenAI key", async () => {
+    expect(await addInline({ harness: "codex" }, /OpenAI key for Codex/)).toBe("openai");
+  });
+
+  it("stores a key added for Claude Code as custom, since it may be a subscription token", async () => {
+    expect(await addInline({ harness: "claude_code" }, /Claude Code key/)).toBe("custom");
+  });
+
+  it("stores a key added behind a gateway as custom, since nothing names its service", async () => {
+    expect(
+      await addInline(
+        { harness: "claude_code", base_url: "https://openrouter.ai/api" },
+        /Claude Code key/,
+      ),
+    ).toBe("custom");
+  });
+});

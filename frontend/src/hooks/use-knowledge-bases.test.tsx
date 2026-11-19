@@ -1,0 +1,1291 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+
+import { useKBDetail, useKnowledgeBaseFor, useKnowledgeBases } from "./use-knowledge-bases";
+import { apiClient, ApiError } from "@/lib/api-client";
+import { parseErrorMessage } from "@/lib/api-error";
+import { qk } from "@/lib/query-keys";
+import { useOrgStore } from "@/stores";
+import { DEFAULT_INGESTION_CONFIG } from "@/lib/ingestion-config";
+import type { SyncSourceList } from "@/lib/rag-api";
+import type { KnowledgeBase } from "@/types";
+
+vi.mock("@/lib/api-client", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api-client")>("@/lib/api-client");
+  return {
+    ...actual,
+    apiClient: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
+  };
+});
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+/** Hoisted so a test can read the cache directly, which is where the leak is. */
+let client: QueryClient;
+
+function wrapper({ children }: { children: ReactNode }) {
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+function document(id: string) {
+  return { id, filename: `${id}.pdf`, status: "done" };
+}
+
+/**
+ * What each of the KB detail page's five parallel reads answers with.
+ *
+ * Three of them are allowed to fail without failing the page - sync sources,
+ * org integrations and connectors are behind their own permissions - so the
+ * routes are matched rather than mocked in order.
+ */
+function serveDetail({
+  documents = [document("d-1")],
+  documentsTotal = 1,
+  sources = [{ id: "s-1", name: "Drive" }],
+  integrations = [{ id: "s-org", name: "Shared Drive" }],
+  connectors = [{ type: "gdrive" }],
+  ingestion = () => ({
+    indexing_status: "complete",
+    processing_count: 0,
+    indexed_count: 1,
+    failed_count: 0,
+  }),
+}: {
+  documents?: unknown[];
+  documentsTotal?: number;
+  sources?: unknown[] | Error;
+  integrations?: unknown[] | Error;
+  connectors?: unknown[] | Error;
+  ingestion?: () => unknown;
+} = {}) {
+  vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+    if (path.includes("/documents")) return { items: documents, total: documentsTotal };
+    if (path.endsWith("/ingestion")) return ingestion();
+    if (path.endsWith("/sync-sources")) {
+      if (sources instanceof Error) throw sources;
+      return { items: sources, total: sources.length };
+    }
+    if (path.endsWith("/org-integrations")) {
+      if (integrations instanceof Error) throw integrations;
+      return { items: integrations, total: integrations.length };
+    }
+    if (path.endsWith("/connectors")) {
+      if (connectors instanceof Error) throw connectors;
+      return { items: connectors };
+    }
+    return { id: "kb-1", name: "Handbook", ingestion_config: DEFAULT_INGESTION_CONFIG };
+  });
+}
+
+/** A fake `XMLHttpRequest`, since the upload reads byte-level progress off one. */
+interface FakeXhr {
+  open: ReturnType<typeof vi.fn>;
+  setRequestHeader: ReturnType<typeof vi.fn>;
+  send: ReturnType<typeof vi.fn>;
+  withCredentials: boolean;
+  status: number;
+  responseText: string;
+  upload: { onprogress?: (event: ProgressEvent) => void; onload?: () => void };
+  onload?: () => void;
+  onerror?: () => void;
+}
+
+/** One entry per upload started, in order: a file can be uploaded twice at once. */
+let xhrs: FakeXhr[];
+
+/** The request the upload under test is using. */
+function xhr(index = 0): FakeXhr {
+  return xhrs[index]!;
+}
+
+function stubXhr() {
+  xhrs = [];
+  // A class, not `vi.fn(() => ({...}))`: the code under test calls
+  // `new XMLHttpRequest()`, and an arrow function cannot be constructed - the
+  // fake returned nothing, so no request was ever recorded.
+  class FakeXhrImpl implements FakeXhr {
+    open = vi.fn();
+    send = vi.fn();
+    setRequestHeader = vi.fn();
+    withCredentials = false;
+    status = 201;
+    responseText = "{}";
+    upload: FakeXhr["upload"] = {};
+
+    constructor() {
+      xhrs.push(this);
+    }
+  }
+  vi.stubGlobal("XMLHttpRequest", FakeXhrImpl);
+}
+
+/** Wait until the upload has actually been sent, so its handlers exist. */
+async function sent(index = 0) {
+  await waitFor(() => expect(xhrs[index]?.send).toHaveBeenCalled());
+  return xhr(index);
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  });
+  // Seeded rather than fetched: both hooks resolve the tenant through the
+  // organizations query now, and several of these tests assert on exactly
+  // which requests went out.
+  client.setQueryData(qk.organizations.list(), []);
+  // The hook reads it, and a test that leaves one behind hands the next one an
+  // organization it never chose - which, for the two switch tests below, is the
+  // difference between asserting something and asserting nothing.
+  useOrgStore.setState({ activeOrgId: null });
+  vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+  vi.mocked(apiClient.post).mockResolvedValue({ id: "x" });
+  vi.mocked(apiClient.patch).mockResolvedValue({ id: "kb-1" });
+  vi.mocked(apiClient.delete).mockResolvedValue(undefined);
+  stubXhr();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+describe("the base a citation's collection belongs to", () => {
+  it("finds the base by its collection, and nothing for one the caller cannot read", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({
+      items: [{ id: "kb-1", name: "Support handbook", collection_name: "support_aa" }],
+      total: 1,
+    });
+
+    const { result } = renderHook(() => useKnowledgeBaseFor(), { wrapper });
+
+    await waitFor(() => expect(result.current("support_aa")?.name).toBe("Support handbook"));
+    expect(result.current("someone_elses")).toBeUndefined();
+    expect(result.current(undefined)).toBeUndefined();
+  });
+});
+
+describe("the list of knowledge bases", () => {
+  it("reads the collections this organization has", async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [{ id: "kb-1" }], total: 1 });
+
+    const { result } = renderHook(() => useKnowledgeBases(), { wrapper });
+
+    await waitFor(() => expect(result.current.kbs).toHaveLength(1));
+    expect(apiClient.get).toHaveBeenCalledWith("/kb");
+  });
+
+  it("keeps a collection created in one organization out of another's list", async () => {
+    // `qk.kb.list()` names no tenant, and `setQueryData` recreates a key the
+    // switch had just dropped - so a creation that finished late put the
+    // previous organization's collection into the list the new one is reading.
+    useOrgStore.setState({ activeOrgId: "org-a" });
+    vi.mocked(apiClient.get).mockResolvedValue({ items: [], total: 0 });
+    const { result } = renderHook(() => useKnowledgeBases(), { wrapper });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.post).mockImplementation(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    let creating: Promise<unknown>;
+    await act(async () => {
+      creating = result.current.createKB({ name: "Org A's handbook", scope: "org" });
+      await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    });
+
+    await act(async () => {
+      useOrgStore.setState({ activeOrgId: "org-b" });
+      answer({ id: "kb-private", name: "Org A's handbook" });
+      await creating!;
+    });
+
+    // Read from the cache, not from the hook: the leak is a key being written,
+    // and a render that has not flushed yet would report it absent either way.
+    const cached = client.getQueryData<Array<{ id: string }>>(["kb", "list"]) ?? [];
+    expect(cached.map((kb) => kb.id)).not.toContain("kb-private");
+  });
+
+  it("lets a refused creation through, because the dialog has fields to blame", async () => {
+    // A name already taken belongs beside the name field.
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("That name is taken"));
+    const { result } = renderHook(() => useKnowledgeBases(), { wrapper });
+
+    await expect(result.current.createKB({ name: "Handbook", scope: "org" })).rejects.toThrow(
+      "That name is taken",
+    );
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("creates a collection and says so", async () => {
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "kb-2", name: "Contracts" });
+    const { result } = renderHook(() => useKnowledgeBases(), { wrapper });
+
+    const created = await result.current.createKB({ name: "Contracts", scope: "org" });
+
+    expect(created).toMatchObject({ id: "kb-2" });
+    expect(apiClient.post).toHaveBeenCalledWith("/kb", { name: "Contracts", scope: "org" });
+    expect(toast.success).toHaveBeenCalledWith("Knowledge base created");
+  });
+
+  it("renames a collection, and raises a refusal for the dialog to place", async () => {
+    // A rename is driven from a dialog that owns the name field, so a refusal is
+    // rethrown rather than toasted here - a name already taken belongs beside
+    // that field, like createKB and updateIngestion.
+    const { result } = renderHook(() => useKnowledgeBases(), { wrapper });
+
+    await act(async () => {
+      await result.current.patchKB("kb-1", { name: "Handbook v2" });
+    });
+    expect(apiClient.patch).toHaveBeenCalledWith("/kb/kb-1", { name: "Handbook v2" });
+    expect(toast.success).toHaveBeenCalledWith("Knowledge base updated");
+
+    vi.mocked(apiClient.patch).mockRejectedValue(new Error("That name is taken"));
+    await expect(result.current.patchKB("kb-1", { name: "x" })).rejects.toThrow(
+      "That name is taken",
+    );
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("puts the renamed collection back in the list, not just a toast", async () => {
+    // The toast says it worked; the cache is what the page renders. These were
+    // asserted separately from each other until the list was seeded, at which
+    // point the rewrite is observable.
+    vi.mocked(apiClient.get).mockResolvedValue({
+      items: [
+        { id: "kb-1", name: "Handbook" },
+        { id: "kb-2", name: "Contracts" },
+      ],
+      total: 2,
+    });
+    vi.mocked(apiClient.patch).mockResolvedValue({ id: "kb-1", name: "Handbook v2" });
+    const { result } = renderHook(() => useKnowledgeBases(), { wrapper });
+    await waitFor(() => expect(result.current.kbs).toHaveLength(2));
+
+    await act(async () => {
+      await result.current.patchKB("kb-1", { name: "Handbook v2" });
+    });
+
+    await waitFor(() =>
+      expect(result.current.kbs.map((kb) => kb.name)).toEqual(["Handbook v2", "Contracts"]),
+    );
+  });
+
+  it("refetches on demand", async () => {
+    const { result } = renderHook(() => useKnowledgeBases(), { wrapper });
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      result.current.fetchKBs();
+    });
+
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledTimes(2));
+  });
+});
+
+/**
+ * One collection's page: the collection, its documents, and the sync sources
+ * feeding it.
+ *
+ * Five reads in parallel, and three of them are allowed to fail. Sync sources,
+ * org integrations and connectors each sit behind their own permission, so a
+ * member who can read the collection but not manage integrations has to get the
+ * page rather than an error - which is why those three swallow and the first two
+ * do not.
+ *
+ * Uploads go through `XMLHttpRequest` rather than `fetch`, because that is the
+ * only way to read byte-level progress, and the refusal handling is hand-rolled
+ * as a result: the backend answers `{"error": {...}}` and this once looked for
+ * `detail`, so every reason an upload can be refused arrived as "Upload failed".
+ */
+describe("one collection's page", () => {
+  it("reads nothing until a collection is open", async () => {
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+
+    await act(async () => {
+      await result.current.refresh();
+    });
+
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("lets no deletion finished after the switch touch the next organization", async () => {
+    // Both are filters, so neither can show the previous tenant's rows - but
+    // the document one also decrements a total, and decrementing the count of
+    // a list belonging to somebody else is the same mistake wearing a number.
+    for (const remove of ["document", "sync source"] as const) {
+      client.clear();
+      useOrgStore.setState({ activeOrgId: "org-a" });
+      serveDetail({ documents: [document("d-1")], documentsTotal: 7 });
+      const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+      await waitFor(() => expect(result.current.documentsTotal).toBe(7));
+
+      let answer: () => void = () => {};
+      vi.mocked(apiClient.delete).mockImplementation(
+        () => new Promise((resolve) => (answer = () => resolve(undefined))),
+      );
+      let removing: Promise<void>;
+      await act(async () => {
+        removing =
+          remove === "document"
+            ? result.current.deleteDocument("d-1")
+            : result.current.deleteSyncSource("s-1");
+        await waitFor(() => expect(apiClient.delete).toHaveBeenCalled());
+      });
+
+      await act(async () => {
+        useOrgStore.setState({ activeOrgId: "org-b" });
+        answer();
+        await removing!;
+      });
+
+      expect(toast.success).not.toHaveBeenCalledWith("Document removed");
+      expect(toast.success).not.toHaveBeenCalledWith("Sync source removed");
+      vi.mocked(apiClient.delete).mockResolvedValue(undefined);
+    }
+  });
+
+  it("moves a collection's embeddings to another provider", async () => {
+    // The model cannot move - the vector column was created at its width - and the
+    // provider can, which is the whole of what this call is for: a rotated key or
+    // an organization's own account, without re-ingesting the collection.
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.kb).toMatchObject({ name: "Handbook" }));
+
+    await act(async () => {
+      await result.current.updateEmbeddings({
+        embedding_provider: "openai",
+        embedding_secret_id: "s-1",
+      });
+    });
+
+    expect(apiClient.patch).toHaveBeenCalledWith("/kb/kb-1", {
+      embedding_provider: "openai",
+      embedding_secret_id: "s-1",
+    });
+    expect(toast.success).toHaveBeenCalledWith("Embedding provider updated");
+  });
+
+  it("raises a refused move for the dialog to place under its own select", async () => {
+    // A provider that cannot serve this model belongs beside the control that
+    // named it, not in a toast about a collection somebody has to re-find.
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.kb).toMatchObject({ name: "Handbook" }));
+    vi.mocked(apiClient.patch).mockRejectedValue(new Error("Cannot serve it at 1536"));
+
+    await expect(result.current.updateEmbeddings({ embedding_provider: "openai" })).rejects.toThrow(
+      "Cannot serve it at 1536",
+    );
+    expect(toast.error).not.toHaveBeenCalled();
+    vi.mocked(apiClient.patch).mockResolvedValue({ id: "kb-1", name: "Handbook" });
+  });
+
+  it("keeps a save that finished late off the next organization's page", async () => {
+    // Save the ingestion settings, close the dialog, switch before the PATCH
+    // returns. The caller still gets its row - it asked, and the save happened
+    // - but it is never written into the cache the next organization reads: the
+    // guard drops the write, so the collection under `qk.kb.detail` is still the
+    // one that was there, not the saved name from the tenant just left.
+    useOrgStore.setState({ activeOrgId: "org-a" });
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.kb).toMatchObject({ name: "Handbook" }));
+
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.patch).mockImplementation(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    let saving: Promise<unknown>;
+    await act(async () => {
+      saving = result.current.updateIngestion(DEFAULT_INGESTION_CONFIG);
+      await waitFor(() => expect(apiClient.patch).toHaveBeenCalled());
+    });
+
+    await act(async () => {
+      useOrgStore.setState({ activeOrgId: "org-b" });
+      answer({ id: "kb-1", name: "Org A's handbook" });
+      await saving!;
+    });
+
+    expect(client.getQueryData<KnowledgeBase>(qk.kb.detail("kb-1"))?.name).toBe("Handbook");
+    expect(toast.success).not.toHaveBeenCalledWith("Ingestion settings saved");
+  });
+
+  it("reads the collection, its documents and its sources together", async () => {
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await waitFor(() => expect(result.current.kb).toMatchObject({ id: "kb-1" }));
+    expect(result.current.documents).toHaveLength(1);
+    expect(result.current.syncSources).toHaveLength(1);
+    expect(result.current.orgIntegrations).toHaveLength(1);
+    expect(result.current.connectors).toHaveLength(1);
+    expect(apiClient.get).toHaveBeenCalledWith("/kb/kb-1/documents?skip=0&limit=20");
+  });
+
+  it("still renders the page for somebody who may not read the integrations", async () => {
+    // Three of the five reads are behind `connections:manage`. Failing the page on
+    // them would hide a collection from the person who owns it.
+    serveDetail({
+      sources: new Error("403"),
+      integrations: new Error("403"),
+      connectors: new Error("403"),
+    });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await waitFor(() => expect(result.current.kb).toMatchObject({ id: "kb-1" }));
+
+    expect(result.current.syncSources).toEqual([]);
+    expect(result.current.error).toBeNull();
+    expect(result.current.sectionFailures.syncSources).toBe(true);
+  });
+
+  it("says what went wrong when the collection itself cannot be read", async () => {
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("Not your collection"));
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await waitFor(() => expect(result.current.error).toBe("Not your collection"));
+    expect(result.current.isLoading).toBe(false);
+  });
+
+  it("falls back to its own sentence for a failure that carries none", async () => {
+    vi.mocked(apiClient.get).mockRejectedValue("boom");
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await waitFor(() => expect(result.current.error).toBe("Failed to load knowledge base"));
+  });
+
+  it("says whether there are more documents than are on screen", async () => {
+    serveDetail({ documents: [document("d-1")], documentsTotal: 40 });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await waitFor(() => expect(result.current.documentsTotal).toBe(40));
+    expect(result.current.hasMoreDocuments).toBe(true);
+  });
+
+  it("appends the next page rather than replacing the list", async () => {
+    serveDetail({ documents: [document("d-1")], documentsTotal: 3 });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.documents).toHaveLength(1));
+
+    serveDetail({ documents: [document("d-2")], documentsTotal: 3 });
+    await act(async () => {
+      await result.current.loadMoreDocuments();
+    });
+
+    await waitFor(() =>
+      expect(result.current.documents.map((doc) => doc.id)).toEqual(["d-1", "d-2"]),
+    );
+    expect(apiClient.get).toHaveBeenCalledWith("/kb/kb-1/documents?skip=1&limit=20");
+  });
+
+  it("does not list a document twice when a poll raced the append", async () => {
+    serveDetail({ documents: [document("d-1")], documentsTotal: 2 });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.documents).toHaveLength(1));
+
+    // The next page comes back holding the same document a poll had already
+    // re-read into the first - two pages, one id, and de-duplication is what
+    // keeps it a list of one rather than the same row twice.
+    await act(async () => {
+      await result.current.loadMoreDocuments();
+    });
+
+    expect(result.current.documents.map((doc) => doc.id)).toEqual(["d-1"]);
+  });
+
+  it("re-reads every loaded page on refresh rather than collapsing the list", async () => {
+    // A refresh that dropped an expanded list back to its first page would lose
+    // the rest every time a poll fired. Each loaded page is re-read at its own
+    // skip instead, so the expansion survives.
+    vi.mocked(apiClient.get).mockImplementation(async (path: string) => {
+      if (path.includes("skip=0")) return { items: [document("d-0")], total: 300 };
+      if (path.includes("skip=1")) return { items: [document("d-1")], total: 300 };
+      if (path.includes("/documents")) return { items: [], total: 300 };
+      return { id: "kb-1", name: "Handbook", ingestion_config: DEFAULT_INGESTION_CONFIG };
+    });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.documents).toHaveLength(1));
+    await act(async () => {
+      await result.current.loadMoreDocuments();
+    });
+    await waitFor(() => expect(result.current.documents).toHaveLength(2));
+
+    vi.mocked(apiClient.get).mockClear();
+    await act(async () => {
+      await result.current.refresh();
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith("/kb/kb-1/documents?skip=0&limit=20");
+    expect(apiClient.get).toHaveBeenCalledWith("/kb/kb-1/documents?skip=1&limit=20");
+    expect(result.current.documents.map((doc) => doc.id)).toEqual(["d-0", "d-1"]);
+  });
+
+  it("reports a refused next page without emptying the list", async () => {
+    serveDetail({ documents: [document("d-1")], documentsTotal: 3 });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.documents).toHaveLength(1));
+
+    vi.mocked(apiClient.get).mockRejectedValue(new Error("Gone"));
+    await act(async () => {
+      await result.current.loadMoreDocuments();
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Gone");
+    expect(result.current.documents).toHaveLength(1);
+    expect(result.current.isLoadingMoreDocs).toBe(false);
+  });
+
+  it("falls back to its own sentence for a next page that failed without one", async () => {
+    serveDetail({ documents: [document("d-1")], documentsTotal: 3 });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.documents).toHaveLength(1));
+
+    vi.mocked(apiClient.get).mockRejectedValue("boom");
+    await act(async () => {
+      await result.current.loadMoreDocuments();
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Failed to load more documents");
+  });
+
+  it("resolves a BFF refusal's code against the catalog, not into English", async () => {
+    // The regression #655 is about. A refusal a BFF route mints carries a code
+    // and no sentence, and `parseErrorMessage` humanizes it so that a reader
+    // showing `.message` says something rather than a sentinel - "Backend
+    // unavailable". The catalog says "Backend **service** unavailable", and it
+    // is the catalog that is translated. The difference is visible in English
+    // only for a code whose copy is not its own name; under `pl` it is every
+    // one of them.
+    serveDetail({ documents: [document("d-1")], documentsTotal: 3 });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.documents).toHaveLength(1));
+
+    const refusal = { code: "BACKEND_UNAVAILABLE" };
+    vi.mocked(apiClient.get).mockRejectedValue(
+      new ApiError(503, parseErrorMessage(refusal), refusal),
+    );
+    await act(async () => {
+      await result.current.loadMoreDocuments();
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Backend service unavailable");
+    expect(toast.error).not.toHaveBeenCalledWith("Backend unavailable");
+  });
+
+  it("loads no more documents when nothing is open", async () => {
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+
+    await act(async () => {
+      await result.current.loadMoreDocuments();
+    });
+
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  it("saves the parsing settings and keeps the collection it was handed back", async () => {
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.kb).toMatchObject({ id: "kb-1" }));
+    vi.mocked(apiClient.patch).mockResolvedValue({ id: "kb-1", name: "Handbook", ocr: true });
+
+    await act(async () => {
+      await result.current.updateIngestion(DEFAULT_INGESTION_CONFIG);
+    });
+
+    expect(apiClient.patch).toHaveBeenCalledWith("/kb/kb-1", {
+      ingestion_config: DEFAULT_INGESTION_CONFIG,
+    });
+    await waitFor(() => expect(result.current.kb).toMatchObject({ ocr: true }));
+    expect(toast.success).toHaveBeenCalledWith("Ingestion settings saved");
+  });
+
+  it("refuses to move embeddings with no collection open", async () => {
+    // Rather than PATCHing `/kb/null`, which answers 404 and reads as a bug.
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+
+    await expect(result.current.updateEmbeddings({ embedding_provider: "openai" })).rejects.toThrow(
+      "No knowledge base is open",
+    );
+    expect(apiClient.patch).not.toHaveBeenCalled();
+  });
+
+  it("reloads nothing for the ingest poll with no collection open", async () => {
+    // Rather than invalidating `["kb", "null", ...]`, which no query is keyed under.
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    await result.current.refreshIngestion();
+
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it("refuses to save parsing settings with no collection open", async () => {
+    // Rather than PATCHing `/kb/null`, which answers 404 and reads as a bug.
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+
+    await expect(result.current.updateIngestion(DEFAULT_INGESTION_CONFIG)).rejects.toThrow(
+      "No knowledge base is open",
+    );
+  });
+
+  it("lets a refused parsing change through to the dialog that owns the fields", async () => {
+    // The dialog decides which input a rejected chunk size belongs under.
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.patch).mockRejectedValue(new Error("chunk_overlap must be smaller"));
+
+    await expect(result.current.updateIngestion(DEFAULT_INGESTION_CONFIG)).rejects.toThrow(
+      "chunk_overlap must be smaller",
+    );
+  });
+
+  it("drops a deleted document and the count with it", async () => {
+    serveDetail({ documents: [document("d-1"), document("d-2")], documentsTotal: 2 });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.documents).toHaveLength(2));
+
+    await act(async () => {
+      await result.current.deleteDocument("d-2");
+    });
+
+    expect(apiClient.delete).toHaveBeenCalledWith("/kb/kb-1/documents/d-2");
+    await waitFor(() => expect(result.current.documents.map((doc) => doc.id)).toEqual(["d-1"]));
+    expect(result.current.documentsTotal).toBe(1);
+  });
+
+  it("re-reads the indexing state after a deletion", async () => {
+    // A settled page has no poll to notice that the failed document is gone.
+    let failed = 1;
+    serveDetail({
+      ingestion: () => ({
+        indexing_status: "complete",
+        processing_count: 0,
+        indexed_count: 1,
+        failed_count: failed,
+      }),
+    });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.ingestion?.failed_count).toBe(1));
+
+    failed = 0;
+    await act(async () => {
+      await result.current.deleteDocument("d-1");
+    });
+
+    await waitFor(() => expect(result.current.ingestion?.failed_count).toBe(0));
+  });
+
+  it("shows no indexing state it could not read, but keeps it pending", async () => {
+    // Pending, so the ingest poll reads it again rather than stopping on a blip.
+    serveDetail({
+      ingestion: () => {
+        throw new Error("Bad gateway");
+      },
+    });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await waitFor(() => expect(result.current.ingestionPending).toBe(true));
+    expect(result.current.ingestion).toBeNull();
+  });
+
+  it("reports a refused deletion", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.delete).mockRejectedValue(new Error("Still indexing"));
+
+    await act(async () => {
+      await result.current.deleteDocument("d-1");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Still indexing");
+  });
+
+  it("falls back to its own sentence for a deletion that failed without one", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.delete).mockRejectedValue("boom");
+
+    await act(async () => {
+      await result.current.deleteDocument("d-1");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Failed to delete document");
+  });
+
+  it("deletes nothing when no collection is open", async () => {
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+
+    await act(async () => {
+      await result.current.deleteDocument("d-1");
+    });
+
+    expect(apiClient.delete).not.toHaveBeenCalled();
+  });
+
+  it("deletes the collection and stales the list the caller returns to", async () => {
+    // The page navigates to `/kb` on success, and that list is a query this
+    // hook does not own. Left cached, the collection that was just destroyed is
+    // the first thing waiting there.
+    client.setQueryData(qk.kb.list(), [{ id: "kb-1", name: "Handbook" }]);
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await act(async () => {
+      await result.current.deleteCollection();
+    });
+
+    expect(apiClient.delete).toHaveBeenCalledWith("/kb/kb-1");
+    expect(client.getQueryState(qk.kb.list())?.isInvalidated).toBe(true);
+    expect(toast.success).toHaveBeenCalledWith("Knowledge base deleted");
+  });
+
+  it("hands a refused collection deletion back rather than letting the page leave", async () => {
+    // Swallowing this is how somebody lands on `/kb` with the collection still
+    // in the list and a toast saying it could not be deleted.
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.delete).mockRejectedValue(new Error("Not yours to delete"));
+
+    await expect(result.current.deleteCollection()).rejects.toThrow("Not yours to delete");
+    expect(toast.error).toHaveBeenCalledWith("Not yours to delete");
+  });
+
+  it("names a collection deletion that failed without a sentence of its own", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.delete).mockRejectedValue("boom");
+
+    await expect(result.current.deleteCollection()).rejects.toBe("boom");
+    expect(toast.error).toHaveBeenCalledWith("Failed to delete knowledge base");
+  });
+
+  it("deletes no collection when none is open", async () => {
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+
+    await act(async () => {
+      await result.current.deleteCollection();
+    });
+
+    expect(apiClient.delete).not.toHaveBeenCalled();
+  });
+});
+
+describe("uploading a document", () => {
+  it("posts the file to this app's own route, with credentials", async () => {
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "a.pdf"));
+      (await sent()).onload!();
+      await upload;
+    });
+
+    expect(xhr().open).toHaveBeenCalledWith("POST", "/api/kb/kb-1/documents");
+    expect(xhr().withCredentials).toBe(true);
+    expect(toast.success).toHaveBeenCalledWith("Uploaded a.pdf");
+  });
+
+  it("uploads into the organization on screen, which XHR does not do for free", async () => {
+    // The reason this is XHR at all is byte-level progress, which `fetch`
+    // cannot report - but going around `apiClient` goes around the header it
+    // attaches, and `/kb` is org-scoped. Without it the backend answers from
+    // the personal organization, where this knowledge base does not exist, and
+    // the upload fails for a reason nothing on screen explains.
+    useOrgStore.setState({ activeOrgId: "org-b" });
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "a.pdf"));
+      (await sent()).onload!();
+      await upload;
+    });
+
+    expect(xhr().setRequestHeader).toHaveBeenCalledWith("X-Organization-Id", "org-b");
+  });
+
+  it("reports progress as bytes go out, and clears it when the upload settles", async () => {
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    let upload: Promise<void>;
+    await act(async () => {
+      upload = result.current.uploadDocument(new File(["x"], "a.pdf"));
+      await sent();
+    });
+    expect(result.current.isUploading).toBe(true);
+    expect(result.current.uploadProgress[0]).toMatchObject({ filename: "a.pdf", percent: 0 });
+
+    await act(async () => {
+      xhr().upload.onprogress!({ lengthComputable: true, loaded: 5, total: 10 } as ProgressEvent);
+    });
+    expect(result.current.uploadProgress[0]?.percent).toBe(50);
+
+    await act(async () => {
+      xhr().upload.onload!();
+      xhr().onload!();
+      await upload!;
+    });
+    expect(result.current.isUploading).toBe(false);
+    expect(result.current.uploadProgress).toEqual([]);
+  });
+
+  it("says nothing about a percentage the browser cannot compute", async () => {
+    // Which is what a chunked body reports; `0%` frozen on screen is worse than
+    // an indeterminate bar.
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    let upload: Promise<void>;
+    await act(async () => {
+      upload = result.current.uploadDocument(new File(["x"], "a.pdf"));
+      await sent();
+    });
+
+    await act(async () => {
+      xhr().upload.onprogress!({ lengthComputable: false } as ProgressEvent);
+    });
+    expect(result.current.uploadProgress[0]?.percent).toBeNull();
+
+    await act(async () => {
+      xhr().onload!();
+      await upload!;
+    });
+  });
+
+  it("sends a per-upload parsing override only when it says something", async () => {
+    // An empty object would mark the document as overridden for no reason.
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "a.pdf"), {});
+      (await sent(0)).onload!();
+      await upload;
+    });
+    expect((xhr(0).send.mock.calls[0]![0] as FormData).get("ingestion")).toBeNull();
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "b.pdf"), { ocr: true });
+      (await sent(1)).onload!();
+      await upload;
+    });
+    expect((xhr(1).send.mock.calls[0]![0] as FormData).get("ingestion")).toBe('{"ocr":true}');
+  });
+
+  it("sends the organizational unit only when one was named", async () => {
+    // Nothing wrote this dimension until #1777, so its filter matched nothing
+    // and its facet was empty. A blank one is not a value: the server reads it
+    // as none, and an absent field says the same without asking it.
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "a.pdf"), {}, "");
+      (await sent(0)).onload!();
+      await upload;
+    });
+    expect((xhr(0).send.mock.calls[0]![0] as FormData).get("organizational_unit")).toBeNull();
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "b.pdf"), {}, "Legal");
+      (await sent(1)).onload!();
+      await upload;
+    });
+    expect((xhr(1).send.mock.calls[0]![0] as FormData).get("organizational_unit")).toBe("Legal");
+  });
+
+  it("reads the refusal out of the envelope the backend actually sends", async () => {
+    // This looked for `detail`, so an unsupported extension, an oversized file and
+    // a malformed override all arrived as "Upload failed".
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "a.heic"));
+      const request = await sent();
+      request.status = 415;
+      request.responseText = JSON.stringify({
+        error: { code: "BAD_REQUEST", message: "PyMuPDF cannot read .heic", details: null },
+      });
+      request.onload!();
+      await expect(upload).rejects.toThrow("PyMuPDF cannot read .heic");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("PyMuPDF cannot read .heic");
+    expect(result.current.uploadProgress).toEqual([]);
+  });
+
+  it("still fails loudly when the refusal is not JSON at all", async () => {
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "a.pdf"));
+      const request = await sent();
+      request.status = 502;
+      request.responseText = "<html>Bad Gateway</html>";
+      request.onload!();
+      await expect(upload).rejects.toThrow("Upload failed");
+    });
+  });
+
+  it("fails loudly when the upload never reached the server", async () => {
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    await act(async () => {
+      const upload = result.current.uploadDocument(new File(["x"], "a.pdf"));
+      (await sent()).onerror!();
+      await expect(upload).rejects.toThrow("Upload failed");
+    });
+
+    expect(result.current.uploadProgress).toEqual([]);
+  });
+
+  it("tells two uploads of the same file apart", async () => {
+    // A file can be uploaded twice; one progress entry for both would make the
+    // second one's percentage overwrite the first's.
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+    const one = result.current.uploadDocument(new File(["x"], "a.pdf"));
+    const two = result.current.uploadDocument(new File(["x"], "a.pdf"));
+    await waitFor(() => expect(result.current.uploadProgress).toHaveLength(2));
+
+    const ids = result.current.uploadProgress.map((entry) => entry.uploadId);
+    expect(new Set(ids).size).toBe(2);
+
+    await act(async () => {
+      (await sent(0)).onload!();
+      (await sent(1)).onload!();
+      await Promise.all([one, two]);
+    });
+    expect(result.current.uploadProgress).toEqual([]);
+  });
+
+  it("uploads nothing when no collection is open", async () => {
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+
+    await act(async () => {
+      await result.current.uploadDocument(new File(["x"], "a.pdf"));
+    });
+
+    expect(xhrs).toEqual([]);
+  });
+});
+
+describe("the sync sources feeding a collection", () => {
+  it("connects a source and shows it at the top", async () => {
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.syncSources).toHaveLength(1));
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "s-new", name: "Dropbox" });
+
+    await act(async () => {
+      await result.current.createSyncSource({
+        name: "Dropbox",
+        connector_type: "dropbox",
+        config: {},
+      });
+    });
+
+    expect(apiClient.post).toHaveBeenCalledWith("/kb/kb-1/sync-sources", expect.any(Object));
+    await waitFor(() => expect(result.current.syncSources[0]).toMatchObject({ id: "s-new" }));
+  });
+
+  it("raises a refused connection without announcing it", async () => {
+    // The refusal names a config field, and the wizard marks the input rather
+    // than showing the sentence over it (#897). It needs the throw to do that.
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("Those credentials were refused"));
+
+    await expect(
+      result.current.createSyncSource({ name: "x", connector_type: "gdrive", config: {} }),
+    ).rejects.toThrow("Those credentials were refused");
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("saves an edit and puts the answer in the source's place", async () => {
+    serveDetail({
+      sources: [
+        { id: "s-1", name: "Drive" },
+        { id: "s-2", name: "Bucket" },
+      ],
+    });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.syncSources).toHaveLength(2));
+    vi.mocked(apiClient.patch).mockResolvedValue({ id: "s-1", name: "Drive v2" });
+
+    await act(async () => {
+      await result.current.updateSyncSource("s-1", { name: "Drive v2" });
+    });
+
+    expect(apiClient.patch).toHaveBeenCalledWith("/kb/kb-1/sync-sources/s-1", {
+      name: "Drive v2",
+    });
+    await waitFor(() =>
+      expect(result.current.syncSources.map((s) => s.name)).toEqual(["Drive v2", "Bucket"]),
+    );
+    expect(toast.success).toHaveBeenCalledWith("Sync source updated");
+  });
+
+  it("raises a refused edit without announcing it", async () => {
+    // Same contract as the create: the wizard marks the field the refusal names.
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.patch).mockRejectedValue(new Error("That folder id is not one"));
+
+    await expect(result.current.updateSyncSource("s-1", { config: {} })).rejects.toThrow(
+      "That folder id is not one",
+    );
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("leaves an unread source list unread after an edit", async () => {
+    // Nothing cached to replace a row in, and inventing a one-row list would
+    // say the collection has one source.
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    client.removeQueries({ queryKey: qk.kb.syncSources("kb-1") });
+    vi.mocked(apiClient.patch).mockResolvedValue({ id: "s-1", name: "Drive v2" });
+
+    await act(async () => {
+      await result.current.updateSyncSource("s-1", { name: "Drive v2" });
+    });
+
+    expect(client.getQueryData(qk.kb.syncSources("kb-1"))).toBeUndefined();
+  });
+
+  it("keeps an edit answered after the switch out of the next organization's list", async () => {
+    useOrgStore.setState({ activeOrgId: "org-a" });
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.syncSources).toHaveLength(1));
+
+    let answer: (value: unknown) => void = () => {};
+    vi.mocked(apiClient.patch).mockImplementation(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    let writing: Promise<unknown>;
+    await act(async () => {
+      writing = result.current.updateSyncSource("s-1", { name: "Late" });
+      await waitFor(() => expect(apiClient.patch).toHaveBeenCalled());
+    });
+
+    await act(async () => {
+      useOrgStore.setState({ activeOrgId: "org-b" });
+      answer({ id: "s-1", name: "Late" });
+      await writing!;
+    });
+
+    const cached = client.getQueryData<SyncSourceList>(qk.kb.syncSources("kb-1"))?.items ?? [];
+    expect(cached.map((s) => s.name)).not.toContain("Late");
+  });
+
+  it("moves a cloned org integration out of the offer list and into the collection's", async () => {
+    // Otherwise it is offered again and cloning it twice produces two sources
+    // pulling the same folder.
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.orgIntegrations).toHaveLength(1));
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "s-clone", name: "Shared Drive" });
+
+    await act(async () => {
+      await result.current.cloneSyncSource("s-org", "handbook", "Shared Drive");
+    });
+
+    expect(apiClient.post).toHaveBeenCalledWith("/kb/kb-1/sync-sources/s-org/clone", {
+      collection_name: "handbook",
+      name: "Shared Drive",
+    });
+    await waitFor(() => expect(result.current.syncSources[0]).toMatchObject({ id: "s-clone" }));
+    expect(result.current.orgIntegrations).toEqual([]);
+  });
+
+  it("reports a refused clone and raises it", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.post).mockRejectedValue("boom");
+
+    await expect(result.current.cloneSyncSource("s-org", "handbook", "x")).rejects.toBeTruthy();
+    expect(toast.error).toHaveBeenCalledWith("Failed to clone integration");
+  });
+
+  it("triggers a sync and comes back for what it pulled in", async () => {
+    // The worker ingests asynchronously, so the page re-reads shortly after
+    // rather than showing an unchanged list.
+    vi.useFakeTimers();
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await act(async () => {
+      await result.current.triggerSyncSource("s-1");
+    });
+    expect(apiClient.post).toHaveBeenCalledWith("/kb/kb-1/sync-sources/s-1/trigger");
+    const before = vi.mocked(apiClient.get).mock.calls.length;
+
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+      await Promise.resolve();
+    });
+
+    expect(vi.mocked(apiClient.get).mock.calls.length).toBeGreaterThan(before);
+  });
+
+  it("reports a refused trigger", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("Already running"));
+
+    await act(async () => {
+      await result.current.triggerSyncSource("s-1");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Already running");
+  });
+
+  it("falls back to its own sentence for a trigger that failed without one", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.post).mockRejectedValue("boom");
+
+    await act(async () => {
+      await result.current.triggerSyncSource("s-1");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Failed to trigger sync");
+  });
+
+  it("removes a source from the list", async () => {
+    serveDetail();
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.syncSources).toHaveLength(1));
+
+    await act(async () => {
+      await result.current.deleteSyncSource("s-1");
+    });
+
+    expect(apiClient.delete).toHaveBeenCalledWith("/kb/kb-1/sync-sources/s-1");
+    await waitFor(() => expect(result.current.syncSources).toEqual([]));
+  });
+
+  it("reports a refused removal", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.delete).mockRejectedValue("boom");
+
+    await act(async () => {
+      await result.current.deleteSyncSource("s-1");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("Failed to remove sync source");
+  });
+
+  it("reports a refused removal with the sentence it came with", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.delete).mockRejectedValue(new Error("That source is still syncing"));
+
+    await act(async () => {
+      await result.current.deleteSyncSource("s-1");
+    });
+
+    expect(toast.error).toHaveBeenCalledWith("That source is still syncing");
+  });
+
+  it("reports a refused clone with the sentence it came with", async () => {
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    vi.mocked(apiClient.post).mockRejectedValue(new Error("That folder is already connected"));
+
+    await expect(result.current.cloneSyncSource("s-org", "handbook", "x")).rejects.toThrow();
+    expect(toast.error).toHaveBeenCalledWith("That folder is already connected");
+  });
+
+  it("shows a first source when the list itself could not be read", async () => {
+    // The three sections sit behind `connections:manage`, so their read can be
+    // refused while the write is allowed - and a refused read leaves nothing
+    // cached. Without the second arm the source is created and the page says
+    // nothing about it until some later refetch happens to run.
+    serveDetail({ sources: new Error("403") });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.sectionFailures.syncSources).toBe(true));
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "s-first", name: "Dropbox" });
+
+    await act(async () => {
+      await result.current.createSyncSource({
+        name: "Dropbox",
+        connector_type: "dropbox",
+        config: {},
+      });
+    });
+
+    expect(client.getQueryData<SyncSourceList>(qk.kb.syncSources("kb-1"))).toEqual({
+      items: [{ id: "s-first", name: "Dropbox" }],
+      total: 1,
+    });
+  });
+
+  it("shows a first clone when neither list could be read", async () => {
+    serveDetail({ sources: new Error("403"), integrations: new Error("403") });
+    const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+    await waitFor(() => expect(result.current.sectionFailures.orgIntegrations).toBe(true));
+    vi.mocked(apiClient.post).mockResolvedValue({ id: "s-clone", name: "Shared Drive" });
+
+    await act(async () => {
+      await result.current.cloneSyncSource("s-org", "handbook", "Shared Drive");
+    });
+
+    expect(client.getQueryData<SyncSourceList>(qk.kb.syncSources("kb-1"))).toEqual({
+      items: [{ id: "s-clone", name: "Shared Drive" }],
+      total: 1,
+    });
+    // Nothing was offered, so there is no offer list to take it out of - and
+    // inventing one would put a row nobody read into the next reader's cache.
+    expect(client.getQueryData(qk.kb.orgIntegrations("kb-1"))).toBeUndefined();
+  });
+
+  it("keeps a source connected after the switch out of the next organization", async () => {
+    // The same guard the deletions carry, on the two writes that add a row: a
+    // late answer must not prepend the previous tenant's source to the list the
+    // next one is looking at.
+    for (const write of ["create", "clone"] as const) {
+      client.clear();
+      vi.mocked(toast.success).mockClear();
+      useOrgStore.setState({ activeOrgId: "org-a" });
+      const { result } = renderHook(() => useKBDetail("kb-1"), { wrapper });
+
+      let answer: (value: unknown) => void = () => {};
+      vi.mocked(apiClient.post).mockImplementation(
+        () => new Promise((resolve) => (answer = resolve)),
+      );
+      let writing: Promise<unknown>;
+      await act(async () => {
+        writing =
+          write === "create"
+            ? result.current.createSyncSource({ name: "x", connector_type: "gdrive", config: {} })
+            : result.current.cloneSyncSource("s-org", "handbook", "x");
+        await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+      });
+
+      await act(async () => {
+        useOrgStore.setState({ activeOrgId: "org-b" });
+        answer({ id: "s-late", name: "Late" });
+        await writing!;
+      });
+
+      expect(client.getQueryData<SyncSourceList>(qk.kb.syncSources("kb-1"))?.items ?? []).toEqual(
+        [],
+      );
+      expect(toast.success).not.toHaveBeenCalledWith("Integration cloned");
+    }
+  });
+
+  it("does nothing to sources when no collection is open", async () => {
+    const { result } = renderHook(() => useKBDetail(null), { wrapper });
+
+    await act(async () => {
+      await result.current.createSyncSource({ name: "x", connector_type: "g", config: {} });
+      await result.current.updateSyncSource("s", { name: "x" });
+      await result.current.cloneSyncSource("s", "c", "n");
+      await result.current.triggerSyncSource("s");
+      await result.current.deleteSyncSource("s");
+    });
+
+    expect(apiClient.post).not.toHaveBeenCalled();
+    expect(apiClient.delete).not.toHaveBeenCalled();
+    expect(apiClient.patch).not.toHaveBeenCalled();
+  });
+});

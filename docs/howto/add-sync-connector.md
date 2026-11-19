@@ -1,0 +1,429 @@
+# Add a sync connector
+
+## Architecture
+
+Sync connectors are pluggable adapters that fetch files from external systems
+(cloud storage, SaaS APIs, etc.) for ingestion into the RAG pipeline.
+
+### Key classes
+
+| Class | Location | Purpose |
+|-------|----------|---------|
+| `BaseSyncConnector` | `app/services/rag/connectors/__init__.py` | Abstract base class for all connectors |
+| `remote_names` | `app/services/rag/remote_names.py` | Where a remote name may be written, and what may reach a query |
+| `RemoteFile` | `app/services/rag/connectors/__init__.py` | Pydantic model describing a remote file |
+| `RemoteListing` | `app/services/rag/connectors/__init__.py` | What `list_files()` answers: the files, and whether that is all of them |
+| `ConfigRefusal` | `app/services/rag/connectors/__init__.py` | Why a config is not acceptable, and which field of it |
+| `CONFIG_MODEL` | the connector's own module | A Pydantic model of its config fields; the listing publishes its JSON Schema and the wizard draws it |
+| `EmptyConfig` | `app/services/rag/connectors/__init__.py` | The base class's default `CONFIG_MODEL`, for a connector with nothing to configure |
+| `ConnectorConfig` | `app/services/rag/connectors/__init__.py` | The source's own config document, as the wizard posted it |
+| `CONNECTOR_REGISTRY` | `app/services/rag/connectors/__init__.py` | Dict mapping connector type strings to classes |
+| `SyncSource` | `app/db/models/sync_source.py` | Database model storing source configurations |
+| `SyncLog` | `app/db/models/sync_log.py` | Database model tracking sync operations |
+
+### Flow
+
+```mermaid
+flowchart TD
+    A[a SyncSource: connector type, config, collection, secret id] --> B[a sync is triggered - API, CLI or schedule]
+    B --> C["the caller unseals the vault secret and hands it in"]
+    C --> D["list_files() -> RemoteListing"]
+    D --> E["download_file() resolves the name and confirms containment"]
+    E --> F["_fetch(dest_path) writes the bytes"]
+    F --> G[the ingestion pipeline parses, chunks, embeds, stores]
+    G --> R["a complete listing: remove what it no longer names"]
+    R --> H[a SyncLog row records the result]
+```
+
+1. User creates a **SyncSource** (connector type + config + collection name +
+   the id of the vault secret that authenticates it)
+2. User triggers a **sync** (via API, CLI, or scheduled task)
+3. Whoever runs the sync unseals that secret and hands it in; the connector's
+   `list_files()` returns a `RemoteListing`
+4. For each file, `BaseSyncConnector.download_file()` decides where it may land
+   and calls the connector's `_fetch()` to write it there
+5. The ingestion pipeline parses, chunks, embeds, and stores each file
+6. If the listing was complete, the documents this source brought in earlier and
+   the listing no longer names are removed from the collection
+7. A **SyncLog** entry records the result
+
+### A connector does not choose the destination
+
+!!! danger "A remote name is attacker-controlled"
+
+    Anyone who can share a file into a synced folder chooses it, and
+    `../../../etc/…` is a legal name on Google Drive. **Write to the `dest_path`
+    you are given, and nothing else** - a connector that picked its own path
+    would be one refusal per connector to remember.
+
+`download_file()` is concrete and is not overridden. It resolves
+`RemoteFile.name` against the sync directory and confirms containment before a
+byte is written, then hands `_fetch()` a `dest_path` to write to.
+
+The same applies to any caller-supplied value a connector puts into a **query**:
+check it where the query is built, against what the remote system can actually
+issue. `app/services/rag/remote_names.py` holds both answers.
+
+### A connector does not hold its own credential either
+
+`CONFIG_MODEL` says how to **find** the documents and nothing more. The
+credential is a vault secret the source references by id, unsealed by whoever
+runs the sync and handed in as `credential` — so a connector declares what kind
+of secret it needs (`SECRET_KIND`) and reads nothing from `config` to
+authenticate with.
+
+!!! danger "A field for a token in `CONFIG_MODEL` is a credential in a JSONB column"
+
+    That is what `0042_sync_source_secret_id` and
+    [#937](https://github.com/vstorm-co/agenticos/issues/937) removed. There is
+    no deployment-wide fallback to reach for either: a source runs on the
+    credential it names or it does not run, because a fallback means one tenant's
+    `folder_id` chooses what is read under the *operator's* identity.
+
+### A listing says whether it is the whole source
+
+A sync removes what the source brought in earlier and no longer lists, so a
+listing is also a claim that everything missing from it is gone.
+`RemoteListing.complete` is that claim. A connector whose listing either
+finishes or raises - Drive, S3 - leaves it at its default, `True`. A connector
+that can stop part-way and still has something worth ingesting - a crawl that hit
+its page ceiling, or could not read one page - returns what it found with
+`complete=False`. That run then removes nothing, rather than removing everything
+it did not reach.
+
+`RemoteListing.problems` carries a sentence for each thing the listing could not
+read. The sync counts each one as a failed file and shows it on the sync log, so
+write it in your own words: a host and a status code, never the remote's text.
+
+### Two optional hooks: change and cleanup
+
+`list_files()` and `_fetch()` are all a connector has to write. Two more
+methods have defaults that keep a connector working the way Drive and S3 do,
+and a connector overrides one when its source can answer the question it asks.
+`GitConnector` in `app/services/rag/connectors/git.py` overrides both, and so does
+`SharePointConnector` in `app/services/rag/connectors/sharepoint.py`, which uses
+`previous`.
+
+| Hook | Default | Override it when |
+|------|---------|------------------|
+| `remote_version(config, credential, previous)` | `None`: every run lists | The source can say cheaply what its whole content is at, such as a commit or a change token. After a run with nothing failed, the sync stores the value with a fingerprint of the configuration. The next run that finds the same pair stops before `list_files()`. The value must change whenever any listed file, or the listing itself, could have changed. `previous` is the value the last clean run stored under the same configuration, or `None`. A source that can only report what changed *since* a point, such as a Graph delta link, answers `previous` back when nothing has changed. |
+| `aclose()` | nothing | The connector keeps something between `list_files()` and the downloads, such as a clone or a session. It is called once the sync is over, whether the sync succeeded or not. |
+
+## Step by step: a Notion connector
+
+This example implements a Notion connector that fetches pages from a Notion
+workspace.
+
+### 1. Create the connector file
+
+```python
+# app/services/rag/connectors/notion.py
+import asyncio
+import logging
+from pathlib import Path
+from typing import ClassVar
+
+from pydantic import BaseModel, Field
+
+from app.core.exceptions import BadRequestError
+from app.core.secret_kinds import ApiKeySecret, SecretKind, StorableSecret
+from app.services.rag.connectors import (
+    BaseSyncConnector,
+    ConfigRefusal,
+    ConnectorConfig,
+    RemoteFile,
+    RemoteListing,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class NotionConfig(BaseModel):
+    """What a Notion source needs to *find* its pages.
+
+    The credential is not here - it is an `ApiKeySecret` the source names in
+    `secret_id`. Both fields have a default, so neither is required.
+    """
+
+    database_id: str | None = Field(
+        default=None,
+        title="Database ID",
+        description="Limit sync to a specific Notion database (optional)",
+    )
+    include_subpages: bool = Field(default=True, title="Include sub-pages")
+
+
+class NotionConnector(BaseSyncConnector):
+    """Sync connector for Notion pages."""
+
+    CONNECTOR_TYPE: ClassVar[str] = "notion"
+    DISPLAY_NAME: ClassVar[str] = "Notion"
+    # Which vault secret authenticates this connector. The wizard offers the
+    # organization's matching secrets and nothing else.
+    SECRET_KIND: ClassVar[SecretKind] = SecretKind.API_KEY
+
+    # The listing publishes this model's JSON Schema and the wizard draws it;
+    # validate_config derives its required-field check from it. It holds no
+    # credential - see "A connector does not hold its own credential either".
+    CONFIG_MODEL: ClassVar[type[BaseModel]] = NotionConfig
+
+    def _client(self, credential: StorableSecret | None):
+        """The Notion client this source's own credential opens.
+
+        Raises:
+            BadRequestError: the source names no credential, its secret has been
+                deleted, or the secret is not an API key.
+        """
+        from notion_client import Client
+
+        if credential is None:
+            raise BadRequestError(
+                message=(
+                    "This Notion source has no credential. Pick an API key in "
+                    "the Vault and point the source at it."
+                )
+            )
+        if not isinstance(credential, ApiKeySecret):
+            raise BadRequestError(
+                message="A Notion source needs an API key, and the one it names is not one."
+            )
+        return Client(auth=credential.api_key.get_secret_value())
+
+    async def list_files(
+        self, config: ConnectorConfig, credential: StorableSecret | None
+    ) -> RemoteListing:
+        """List Notion pages available for sync."""
+        database_id = config.get("database_id", "")
+
+        def _list() -> list[RemoteFile]:
+            notion = self._client(credential)
+            files: list[RemoteFile] = []
+
+            if database_id:
+                # Query a specific database
+                response = notion.databases.query(database_id=database_id)
+                pages = response.get("results", [])
+            else:
+                # Search all accessible pages
+                response = notion.search(filter={"property": "object", "value": "page"})
+                pages = response.get("results", [])
+
+            for page in pages:
+                page_id = page["id"]
+                title = "Untitled"
+                # Extract title from properties
+                for prop in page.get("properties", {}).values():
+                    if prop.get("type") == "title" and prop.get("title"):
+                        title = prop["title"][0].get("plain_text", "Untitled")
+                        break
+
+                files.append(
+                    RemoteFile(
+                        id=page_id,
+                        name=f"{title}.md",
+                        mime_type="text/markdown",
+                        size=None,
+                        modified_at=page.get("last_edited_time"),
+                        source_path=f"notion://{page_id}",
+                    )
+                )
+
+            return files
+
+        # Complete by default: the listing either returned every page or raised.
+        return RemoteListing(files=await asyncio.to_thread(_list))
+
+    async def _fetch(
+        self,
+        file: RemoteFile,
+        dest_path: Path,
+        config: ConnectorConfig,
+        credential: StorableSecret | None,
+    ) -> None:
+        """Export a Notion page as Markdown to the path the base class chose."""
+        def _download() -> None:
+            notion = self._client(credential)
+
+            # `dest_path` is already confirmed to be inside the sync directory.
+            # Do not build a path from `file.name` — see "A connector does not
+            # choose the destination" above.
+
+            # Fetch page blocks and convert to markdown
+            # (simplified — use a library like notion2md in practice)
+            content = f"# {file.name.replace('.md', '')}\n\nPage content here..."
+            dest_path.write_text(content)
+
+            logger.info(f"Exported Notion page {file.id} -> {dest_path}")
+
+        await asyncio.to_thread(_download)
+
+    async def validate_config(self, config: ConnectorConfig) -> ConfigRefusal | None:
+        """Refuse a config the wizard can still fix.
+
+        Connectivity is not checked here: `validate_config` sees the config and
+        not the credential, so "can this key reach Notion" is a question for the
+        first sync. What it can answer is the shape of what was typed.
+        """
+        refusal = await super().validate_config(config)
+        if refusal is not None:
+            return refusal
+
+        database_id = config.get("database_id", "")
+        if database_id and not database_id.replace("-", "").isalnum():
+            # `field=` names one input, and the sync-source wizard marks it.
+            # Name it as `CONFIG_MODEL` does; where it sits in the request body
+            # is not a connector's to know.
+            return ConfigRefusal(
+                message="A Notion database id is letters, digits and dashes",
+                field="database_id",
+            )
+        return None
+```
+
+`validate_config` answers *why not*, or `None` when the config is acceptable.
+`ConfigRefusal(message="…", field="database_id")` names one: `SyncSourceService`
+roots it against the payload (`config.database_id`), raises it with
+`refused_field`, and the wizard marks that input. Name the field as
+`CONFIG_MODEL` does — where it sits in the request body is not a connector's to
+know.
+
+If a connector does check connectivity somewhere, never put the client's own
+exception text in the message — an SDK puts the request it was making in there,
+and that routinely carries a URL with a key in it. Log it and refuse in your own
+words.
+
+### 2. Register in CONNECTOR_REGISTRY
+
+Edit `app/services/rag/connectors/__init__.py` and add:
+
+```python
+from app.services.rag.connectors.notion import NotionConnector
+
+CONNECTOR_REGISTRY["notion"] = NotionConnector
+```
+
+### 3. Add dependency (if needed)
+
+If the connector requires a third-party package, add it to `pyproject.toml`:
+
+```bash
+uv add notion-client
+```
+
+### 4. Test via CLI
+
+```bash
+# Store the credential once, then point a source at it
+uv run agenticos cmd rag-source-add \
+    --name "Engineering Wiki" \
+    --type notion \
+    --org <organization-id> \
+    --secret-id <vault-secret-id> \
+    --config '{"database_id": "abc123"}' \
+    --collection knowledge-base
+```
+
+`--secret-id` names an entry in that organization's vault; the token never
+appears on the command line or in the source's config.
+
+### 5. Test via API
+
+```bash
+# Create sync source
+curl -X POST http://localhost:8000/api/v1/rag/sync/sources \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "name": "Engineering Wiki",
+        "connector_type": "notion",
+        "collection_name": "knowledge-base",
+        "secret_id": "<vault-secret-id>",
+        "config": {
+            "database_id": "abc123",
+            "include_subpages": true
+        }
+    }'
+
+# Trigger sync
+curl -X POST http://localhost:8000/api/v1/rag/sync/sources/{source_id}/sync \
+    -H "Authorization: Bearer $TOKEN"
+
+# Check sync status
+curl http://localhost:8000/api/v1/rag/sync/logs \
+    -H "Authorization: Bearer $TOKEN"
+```
+
+## CONFIG_MODEL reference
+
+The `CONFIG_MODEL` class variable is a Pydantic model of how to **find** a
+source's documents. `GET /api/v1/rag/sync/connectors` publishes its
+`model_json_schema()` as `config_schema` — the same shape a capability's
+`config_schema` carries — and the wizard hands that to `SchemaForm` unadapted.
+`validate_config` reads the model too: a field with no default is required, and
+the refusal names the field's `title`.
+
+A required field is one with no default, so there is no flag to misspell. The
+mapping this replaced was `dict[str, dict[str, Any]]` for a while, and a
+declaration that said `"require": True` disabled that field's check silently —
+the wizard drew a required field as optional (#562).
+
+### Field kinds the wizard draws
+
+`SchemaForm` draws a deliberately small subset of JSON Schema — strings, numbers,
+booleans, enums and a list of strings. A connector needing a richer editor ships
+its own component rather than pushing the form towards a general renderer.
+
+| Python type | UI widget |
+|-------------|-----------|
+| `str` | Text input |
+| `str` with `json_schema_extra={"x-textarea": True}` | Multi-line text |
+| `bool` | Switch |
+| `int` / `float` | Number input |
+| `Literal["a", "b"]` | Select |
+| `list[str]` | Comma-separated list |
+
+An optional field is `T | None = None`. Pydantic emits that as
+`anyOf: [{type: "x"}, {type: "null"}]`, and the form looks past the null branch
+rather than falling through to a text box.
+
+### Field properties
+
+| `Field(...)` argument | What it does |
+|-----------------------|--------------|
+| `title` | The label above the input, and what a required-field refusal names |
+| `description` | Help text under the input |
+| `default` | The value the connector applies when the key is omitted. Nothing is stored until the field is edited |
+| `json_schema_extra={"x-placeholder": "…"}` | A grey hint shown while the field is empty, never stored — for a default resolved server-side, such as an S3 `region` falling back to `S3_RAG_*` |
+
+There is no secret property, and there is nowhere to add one: a credential is
+a vault secret the source references by id, so `SECRET_KIND` is how a connector
+says what it needs.
+
+### Example
+
+```python
+from pydantic import BaseModel, Field
+
+
+class WorkspaceConfig(BaseModel):
+    workspace: str = Field(title="Workspace", description="Which workspace to read")
+    max_files: int = Field(default=100, title="Max files to sync")
+    recursive: bool = Field(default=True, title="Include nested items")
+
+
+class WorkspaceConnector(BaseSyncConnector):
+    CONFIG_MODEL: ClassVar[type[BaseModel]] = WorkspaceConfig
+```
+
+`workspace` has no default, so it is the one required field; the shipped
+connectors (`GoogleDriveConfig`, `S3Config`, `WebConfig`) are the models to copy.
+
+## Tips
+
+- Set `RemoteFile.source_path` to a unique URI (e.g., `notion://page_id`) — this is used for deduplication across syncs, and it is what removal compares: a document whose `source_path` a complete listing no longer names is removed
+- Return `complete=False` from a listing that stopped short, and never raise for one you can still partly use
+- Use `asyncio.to_thread()` to wrap blocking SDK calls so they don't block the event loop
+- Implement `validate_config()` to refuse a config the wizard can still fix — a `ConfigRefusal` naming a `field` is what makes it mark that input rather than show a sentence over four of them. It sees the config and not the credential, so "can this key reach the service" is a question for the first sync, not for this method
+- Declare `SECRET_KIND` and read the credential from the `credential` argument. A credential never goes in `CONFIG_MODEL`, and there is no deployment-wide fallback to fall back to
+- Settings in `app/core/config.py` and `.env` are for values that name no principal — where a store is, not who is asking (`S3_RAG_ENDPOINT` is the shape)
+- `_fetch()` writes to the `dest_path` it is handed and returns nothing — the base class answers where that is, and the ingestion pipeline handles everything from there

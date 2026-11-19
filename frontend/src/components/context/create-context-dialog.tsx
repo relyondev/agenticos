@@ -1,0 +1,238 @@
+"use client";
+
+import {
+  AudiencePicker,
+  EVERYONE,
+  audiencePayload,
+  type Audience,
+} from "@/components/sharing/audience-picker";
+import { useState } from "react";
+import { toast } from "sonner";
+
+import {
+  Button,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Input,
+  Label,
+} from "@/components/ui";
+import { FileEditor } from "@/components/files";
+import {
+  DEFAULT_FORMAT,
+  inferContextFormat,
+  displayName,
+  type ContextDraft,
+} from "@/components/context/file-name";
+import { useContextFiles } from "@/hooks/use-context";
+import { submitFailure } from "@/lib/api-error";
+import { cn } from "@/lib/utils";
+import { useTranslations } from "next-intl";
+import { DIALOG_COLUMN, DIALOG_FORM } from "@/lib/dialog-sizes";
+
+/** What the backend accepts, so an over-long value is refused before it is sent. */
+const MAX_NAME = 64;
+const MAX_DESCRIPTION = 500;
+
+type Field = "name" | "description" | "content";
+
+import type { ContextFile } from "@/types/providers";
+
+interface CreateContextDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /**
+   * A file somebody dropped, as the fields it becomes.
+   *
+   * Seeded into the state once, so the caller mounts this keyed by draft: the
+   * name, format and body are then somebody's to edit like any other, and the
+   * usage policy is chosen when the file is attached to an agent.
+   */
+  initial?: ContextDraft;
+  /** How many more dropped files follow this one, for the note in the footer. */
+  remaining?: number;
+  /**
+   * A file was created. The dialog does not close itself: whether that means
+   * "done" or "next one" is the caller's queue to answer.
+   */
+  onCreated: (file: ContextFile) => void;
+}
+
+/**
+ * New context file.
+ *
+ * A stacked form rather than the skills workbench, because a context file is one
+ * body and no attachments - there is no folder to lay out. The body itself is the
+ * same pane a skill's is written in, so what somebody types here looks like what
+ * they will read afterwards.
+ *
+ * This edits the library entry. Whether it is injected or read on demand is
+ * chosen separately when the file is attached to an agent.
+ */
+export function CreateContextDialog({
+  open,
+  onOpenChange,
+  initial,
+  remaining = 0,
+  onCreated,
+}: CreateContextDialogProps) {
+  const tErrors = useTranslations("errors");
+  const t = useTranslations("context");
+  const { create } = useContextFiles();
+  const [name, setName] = useState(initial?.name ?? "");
+  const [description, setDescription] = useState("");
+  const format = inferContextFormat(name, initial?.format ?? DEFAULT_FORMAT);
+  const [audience, setAudience] = useState<Audience>(EVERYONE);
+  const [content, setContent] = useState(initial?.content ?? "");
+  const [errors, setErrors] = useState<Readonly<Record<string, string>>>({});
+
+  const setters: Record<Field, (value: string) => void> = {
+    name: setName,
+    description: setDescription,
+    content: setContent,
+  };
+
+  function edit(field: Field, value: string) {
+    setters[field](value);
+    if (errors[field]) setErrors(({ [field]: _removed, ...rest }) => rest);
+  }
+
+  async function handleCreate() {
+    try {
+      const file = await create.mutateAsync({
+        name,
+        // Whitespace-only means "no description" - the column is nullable and a
+        // blank one says nothing to a reader of the link list.
+        description: description.trim() === "" ? null : description.trim(),
+        content,
+        format: format.trim() || DEFAULT_FORMAT,
+        mode: "inject",
+        ...audiencePayload(audience),
+      });
+      setName("");
+      setDescription("");
+      setContent("");
+      setAudience(EVERYONE);
+      setErrors({});
+      onCreated(file);
+    } catch (error) {
+      const failure = submitFailure(
+        error,
+        { fields: ["name", "description", "content"], identifiedBy: "name" },
+        tErrors,
+      );
+      setErrors(failure.fields);
+      if (failure.toast) toast.error(failure.toast);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {/* Wider gutters than the default 24px: this dialog is three columns of
+          form above a full editor, and at that width the content ran into the
+          edge of the sheet. */}
+      <DialogContent className={cn(DIALOG_COLUMN, DIALOG_FORM)}>
+        <DialogHeader>
+          <DialogTitle>{t("newContext")}</DialogTitle>
+          <DialogDescription>{t("availableEveryAgentOrganization")}</DialogDescription>
+        </DialogHeader>
+
+        {/* `overflow-auto` is a clipping box, and a focus ring is drawn outside
+            the control's own border - so the ring on the first field was sliced
+            off flush against the left edge of this container. The padding gives
+            it somewhere to land; the negative margin keeps the fields aligned
+            with the title and the footer either side of the scroller. */}
+        <div className="-mx-1.5 flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-1.5 py-1">
+          {/* A grid that fills the row rather than three fixed widths that stop
+              two thirds of the way across. The description under them is full
+              width, so a short row above it read as a dialog missing its right
+              hand side - and the wider the sheet, the bigger the hole. Name
+              takes the slack because a name is the field that can be long. */}
+          <div className="grid grid-cols-1 items-start gap-4">
+            <div className="min-w-0 space-y-1.5">
+              <Label htmlFor="new-context-name">{t("name")}</Label>
+              <Input
+                id="new-context-name"
+                value={name}
+                onChange={(event) => edit("name", event.target.value)}
+                placeholder={t("namePlaceholder")}
+                maxLength={MAX_NAME}
+                className="font-mono"
+                aria-invalid={errors.name ? true : undefined}
+              />
+              <FieldNote error={errors.name}>{t("howItIsReferredTo")}</FieldNote>
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="new-context-description">{t("description")}</Label>
+            <Input
+              id="new-context-description"
+              value={description}
+              onChange={(event) => edit("description", event.target.value)}
+              placeholder={t("whatIsInIt")}
+              maxLength={MAX_DESCRIPTION}
+              aria-invalid={errors.description ? true : undefined}
+            />
+            <FieldNote error={errors.description}>{t("shownWhenLinked")}</FieldNote>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>{t("whoCanUseIt")}</Label>
+            <AudiencePicker value={audience} onChange={setAudience} />
+          </div>
+
+          {/* The pane the file will be read in once it exists, rather than a
+              textarea that becomes one on save - the same one a skill's body is
+              written in. Named from what has been typed so far, so the preview
+              renders as the format the file is being given. */}
+          <FileEditor
+            initialMode="source"
+            // The placeholder until a name is typed, which is what the name
+            // field itself shows: `.md` alone reads as a broken filename, and
+            // the extension is what decides how the preview renders.
+            name={displayName(name.trim() || t("namePlaceholder"), format)}
+            content={content}
+            canEdit
+            placeholder={t("bodyPlaceholder")}
+            className="min-h-72"
+            onChange={(next) => edit("content", next)}
+            footer={
+              <p
+                className={cn(
+                  "text-xs",
+                  errors.content ? "text-destructive" : "text-muted-foreground",
+                )}
+              >
+                {errors.content ?? t("textOnlyBinaryElsewhere")}
+              </p>
+            }
+          />
+        </div>
+
+        <DialogFooter>
+          {remaining > 0 && (
+            <p className="text-muted-foreground mr-auto self-center text-xs">
+              {t("moreFilesWaiting", { count: remaining })}
+            </p>
+          )}
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            {t("cancel")}
+          </Button>
+          <Button onClick={handleCreate} loading={create.isPending} disabled={!name.trim()}>
+            {t("create")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** A field's helper line, or the refusal that replaced it. */
+function FieldNote({ error, children }: { error?: string; children?: React.ReactNode }) {
+  if (error) return <p className="text-destructive text-xs">{error}</p>;
+  return <p className="text-muted-foreground text-xs">{children}</p>;
+}

@@ -1,0 +1,90 @@
+# Publish the documentation to GitHub Pages.
+#
+# Separate from `ci.yml` on purpose: CI *builds* the docs with `--strict` on every
+# branch, because a dead link should fail a pull request. This deploys, and only
+# from `main` - a site that republished from every branch would show whatever was
+# most recently pushed rather than what is released.
+#
+# `workflow_dispatch` is there so the site can be published before `main` has the
+# code, which is the state a new repository is in.
+#
+# One-time setup: Settings -> Pages -> Source -> "GitHub Actions". Without it the
+# deploy step fails with a 404 on the Pages API.
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "backend/app/**"
+      - ".github/workflows/docs.yml"
+      # The build reads these too, and a filter that misses them publishes a
+      # stale site silently. `scripts/mkdocs_hooks.py` pulls `CHANGELOG.md` into
+      # the release-notes page, so a release cut - which touches nothing else
+      # here - used to leave the published page showing the new version's
+      # entries under "Unreleased" until some unrelated change happened to
+      # trigger a deploy. The hook and `scripts/docs_i18n.py` beside it also
+      # decide the stale-translation notice on every page.
+      - "CHANGELOG.md"
+      - "scripts/mkdocs_hooks.py"
+      - "scripts/docs_i18n.py"
+  workflow_dispatch:
+
+# Read-only by default. `pages: write` and `id-token: write` belong to the deploy
+# job alone: granting them at the workflow level hands them to the build job too,
+# which only needs to read the checkout and produce an artifact.
+permissions:
+  contents: read
+
+# A queued deploy replaces a running one rather than racing it; the site only
+# ever needs the newest build.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.15
+
+      # The runtime too, not just mkdocs: the reference pages are generated from
+      # the application's own docstrings, so a build without it would either fail
+      # to collect them or quietly render empty pages.
+      - name: Install dependencies
+        run: uv sync --directory backend --group docs
+
+      - name: Build the documentation
+        run: uv run --directory backend --group docs mkdocs build -f ../mkdocs.yml --strict
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    # The only job that needs to write anything.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

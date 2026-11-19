@@ -1,0 +1,132 @@
+"use client";
+
+import { useState } from "react";
+import Link from "next/link";
+import { useTranslations } from "next-intl";
+import { ArrowLeft, ArrowRight, Mail } from "lucide-react";
+
+import { Button, Input, Label } from "@/components/ui";
+import { apiClient, ApiError } from "@/lib/api-client";
+import { ROUTES } from "@/lib/constants";
+import { EMAIL_RE } from "@/lib/utils";
+
+export function ForgotPasswordForm() {
+  const t = useTranslations("auth");
+  const [email, setEmail] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!EMAIL_RE.test(email)) {
+      setError(t("pleaseEnterValidEmail"));
+      return;
+    }
+    setError("");
+    setIsLoading(true);
+
+    try {
+      await apiClient.post("/auth/password-reset/request", { email });
+    } catch (err) {
+      // Treat "not found" the same as success to avoid email enumeration.
+      if (!(err instanceof ApiError) || err.status !== 404) {
+        setError(t("somethingWentWrongPlease"));
+        setIsLoading(false);
+        return;
+      }
+    }
+    setSubmitted(true);
+    setIsLoading(false);
+  };
+
+  if (submitted) {
+    return (
+      <div className="space-y-7 text-center">
+        <div className="bg-muted text-muted-foreground mx-auto flex h-14 w-14 items-center justify-center rounded-2xl">
+          <Mail className="text-foreground h-6 w-6" />
+        </div>
+        <div className="space-y-2">
+          <span className="text-muted-foreground text-sm font-medium">{t("checkYourInbox")}</span>
+          <h1 className="text-foreground text-[2rem] leading-tight font-semibold tracking-tight text-balance [&_em]:not-italic">
+            {t.rich("linkSentHeading", { em: (chunks) => <em>{chunks}</em> })}
+          </h1>
+          <p className="text-foreground/70 text-sm">
+            {t.rich("resetLinkSent", {
+              email,
+              strong: (chunks) => <span className="text-foreground font-medium">{chunks}</span>,
+            })}
+          </p>
+        </div>
+        <Link
+          href={ROUTES.LOGIN}
+          className="text-foreground/65 hover:text-foreground inline-flex items-center gap-2 text-sm font-medium"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          {t("backSign")}
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-8">
+      <div className="space-y-2">
+        <span className="text-muted-foreground text-sm font-medium">
+          {t("forgotPasswordPrompt")}
+        </span>
+        <h1 className="text-foreground text-[2rem] leading-tight font-semibold tracking-tight text-balance [&_em]:not-italic">
+          {t.rich("forgotHeading", { em: (chunks) => <em>{chunks}</em> })}
+        </h1>
+        <p className="text-foreground/65 text-sm">{t("dropYourEmailBelow")}</p>
+      </div>
+
+      <form onSubmit={handleSubmit} className="space-y-5" aria-busy={isLoading}>
+        <div className="space-y-1.5">
+          <Label htmlFor="email" className="text-foreground text-sm font-medium">
+            {t("email")}
+          </Label>
+          <Input
+            id="email"
+            type="email"
+            placeholder={t("emailPlaceholder")}
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+            disabled={isLoading}
+            autoComplete="email"
+            className="h-11 rounded-lg text-base md:text-[15px]"
+          />
+        </div>
+
+        {error && (
+          <p
+            role="alert"
+            className="border-destructive/35 bg-destructive/[0.07] text-foreground rounded-lg border px-3 py-2 text-sm"
+          >
+            {error}
+          </p>
+        )}
+
+        <Button type="submit" disabled={isLoading} className="h-11 w-full text-[15px]">
+          {isLoading ? (
+            t("sending")
+          ) : (
+            <>
+              {t("sendResetLink")}
+              <ArrowRight className="ml-2 h-4 w-4" />
+            </>
+          )}
+        </Button>
+
+        <Link
+          href={ROUTES.LOGIN}
+          className="text-muted-foreground hover:text-foreground mt-2 inline-flex items-center gap-2 text-sm font-medium"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          {t("backSign2")}
+        </Link>
+      </form>
+    </div>
+  );
+}

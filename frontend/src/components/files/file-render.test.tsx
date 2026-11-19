@@ -1,0 +1,309 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+
+import { FileBytesView, FileTextView, FileUnavailable } from "./file-render";
+
+vi.mock("@/components/chat/markdown-content", () => ({
+  MarkdownContent: ({ content }: { content: string }) => (
+    <div data-testid="markdown">{content}</div>
+  ),
+}));
+
+/**
+ * A file made of characters, as whatever those characters are.
+ *
+ * Six kinds where the chat panel had a viewer per kind and the workspace dialog had
+ * two branches - Markdown or a `<pre>` - so a CSV an agent wrote rendered as a wall
+ * of commas and an HTML page as its own tags.
+ */
+describe("showing a file's characters", () => {
+  it("renders Markdown as Markdown", () => {
+    render(<FileTextView kind="markdown" name="notes.md" text="# Title" />);
+
+    expect(screen.getByTestId("markdown")).toHaveTextContent("# Title");
+  });
+
+  it("renders an HTML page, sandboxed so nothing in it can run", () => {
+    // The API refuses to serve HTML inline for exactly this reason: a document an
+    // agent wrote, served from this origin, is stored XSS. From `srcDoc` into an
+    // opaque origin it reaches no script, no cookie and no DOM.
+    render(<FileTextView kind="html" name="report.html" text="<p>hello</p>" />);
+
+    const frame = screen.getByTitle("report.html, rendered");
+    expect(frame).toHaveAttribute("sandbox", "");
+    expect(frame).toHaveAttribute("srcdoc", "<p>hello</p>");
+  });
+
+  it("renders a delimited file as a table", () => {
+    render(<FileTextView kind="csv" name="report.csv" text={"name,total\nAcme,42"} />);
+
+    expect(screen.getByRole("columnheader", { name: "name" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "Acme" })).toBeInTheDocument();
+  });
+
+  it("indents JSON, and shows it as it stands when it does not parse", () => {
+    const { unmount } = render(<FileTextView kind="json" name="a.json" text='{"a":1}' />);
+    expect(screen.getByText(/"a": 1/)).toBeInTheDocument();
+    unmount();
+
+    render(<FileTextView kind="json" name="a.json" text="{not json" />);
+    expect(screen.getByText("{not json")).toBeInTheDocument();
+  });
+
+  it("shows code as an editor does: numbered, and coloured in its own language", async () => {
+    // Not a chat's fenced block, which is a box the size of its content: in a
+    // tall viewer that left a short file in a small box over empty space.
+    render(<FileTextView kind="code" name="run.py" text={"def run():\n    return 1"} />);
+
+    expect(screen.queryByTestId("markdown")).toBeNull();
+    expect(document.querySelector("pre[aria-hidden]")!.textContent).toBe("1\n2");
+    await waitFor(() => expect(document.querySelector(".hljs-keyword")).not.toBeNull());
+  });
+
+  it("leaves a file whose language nobody mapped uncoloured", async () => {
+    render(<FileTextView kind="code" name="thing.unknownlang" text="def something" />);
+
+    expect(screen.getByText("def something")).toBeInTheDocument();
+    // Long enough for the grammars to have loaded, had they been asked for.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(document.querySelector("[class^=hljs-]")).toBeNull();
+  });
+
+  it("wraps plain text, keeping its whitespace and each line's number beside it", () => {
+    render(<FileTextView kind="text" name="a.log" text={"line one\n  line two\n\nend"} />);
+
+    // Prose and pastes are read down: one long line wraps instead of running off
+    // the side. Each line is its own row, so a number stays with its line.
+    expect(screen.getByText("line one")).toHaveClass("whitespace-pre-wrap");
+    expect(screen.getByText("4")).toBeInTheDocument();
+  });
+
+  it("keeps source unwrapped, because it is read by its indentation", () => {
+    render(<FileTextView kind="markdown" name="notes.md" text={"line one\n  line two"} asSource />);
+
+    expect(screen.getByText(/line one/)).toHaveClass("whitespace-pre");
+  });
+
+  it("wraps a file too long to number as one block", () => {
+    const text = Array.from({ length: 5001 }, (_, index) => `row ${index}`).join("\n");
+    const { container } = render(<FileTextView kind="text" name="big.txt" text={text} />);
+
+    expect(container.querySelector("pre.whitespace-pre-wrap")).not.toBeNull();
+  });
+
+  it("shows the characters when that is what was asked for", () => {
+    // Both are the file. A `#` that silently became large type is how somebody fails
+    // to notice their agent is writing Markdown into a file nothing reads as Markdown.
+    render(<FileTextView kind="markdown" name="notes.md" text="# Title" asSource />);
+
+    expect(screen.queryByTestId("markdown")).toBeNull();
+    expect(screen.getByText("# Title")).toBeInTheDocument();
+  });
+
+  it("says a file is empty rather than rendering nothing at all", () => {
+    render(<FileTextView kind="markdown" name="notes.md" text={"   \n "} />);
+
+    expect(screen.getByText("This file is empty.")).toBeInTheDocument();
+  });
+
+  it("shows a kind with no rendered form as its characters", () => {
+    // A skill's file is text already in hand, and its name can be anything.
+    render(<FileTextView kind="image" name="logo.png" text="not really a png" />);
+
+    expect(screen.getByText("not really a png")).toBeInTheDocument();
+  });
+});
+
+describe("the table a delimited file becomes", () => {
+  it("says an empty file is empty rather than showing an empty table", () => {
+    render(<FileTextView kind="csv" name="a.csv" text=" " />);
+
+    expect(screen.getByText("This file is empty.")).toBeInTheDocument();
+  });
+
+  it("shows the first five hundred rows and says how many there are", () => {
+    // A hundred thousand rows in the DOM is a dialog that never opens, and a table
+    // silently missing its tail is a table that lies about the file.
+    const rows = ["name", ...Array.from({ length: 600 }, (_, index) => `row-${index}`)].join("\n");
+    render(<FileTextView kind="csv" name="a.csv" text={rows} />);
+
+    expect(screen.getByText(/Showing 500 of 600 rows/)).toBeInTheDocument();
+    // 500 body rows plus the header.
+    expect(screen.getAllByRole("row")).toHaveLength(501);
+  });
+
+  it("says nothing about truncation for a file that fits", () => {
+    render(<FileTextView kind="csv" name="a.csv" text={"name\nAcme"} />);
+
+    expect(screen.queryByText(/Showing/)).toBeNull();
+  });
+
+  it("renders a header row a file has and no body it does not", () => {
+    render(<FileTextView kind="csv" name="a.csv" text="name,total" />);
+
+    expect(screen.getAllByRole("row")).toHaveLength(1);
+  });
+});
+
+/**
+ * A file made of bytes, as whatever the *server* agreed to call it.
+ *
+ * The branch is on the media type and never on the name, because what may be
+ * displayed is the API's decision: a short allowlist of raster images plus PDF, and
+ * everything else typed `application/octet-stream` precisely so a browser cannot
+ * decide a body is HTML after all.
+ */
+describe("showing a file's bytes", () => {
+  const props = { name: "chart.png", url: "blob:x", onDownload: () => {} };
+
+  it("shows an image with the filename as its alternative text", () => {
+    render(<FileBytesView {...props} mediaType="image/png" />);
+
+    expect(screen.getByRole("img", { name: "chart.png" })).toHaveAttribute("src", "blob:x");
+  });
+
+  it("offers a TIFF as a download, not a broken image", () => {
+    // The server sends a TIFF with `media_type=image/tiff`, so `startsWith("image/")`
+    // would have drawn a broken `<img>`; the render-safe allowlist sends it to the
+    // download card instead (#1591).
+    const onDownload = vi.fn();
+    render(
+      <FileBytesView
+        name="scan.tiff"
+        url="blob:x"
+        mediaType="image/tiff"
+        onDownload={onDownload}
+      />,
+    );
+
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(screen.getByRole("button", { name: /Download/ })).toBeInTheDocument();
+  });
+
+  it("renders a PDF in a frame the browser routes to its own viewer", () => {
+    render(<FileBytesView {...props} name="report.pdf" mediaType="application/pdf" />);
+
+    expect(screen.getByTitle("report.pdf")).toHaveAttribute("src", "blob:x");
+  });
+
+  it("plays video and audio with controls", () => {
+    const video = render(<FileBytesView {...props} name="demo.mp4" mediaType="video/mp4" />);
+    expect(video.container.querySelector("video")).toHaveAttribute("controls");
+    video.unmount();
+
+    const audio = render(<FileBytesView {...props} name="call.mp3" mediaType="audio/mpeg" />);
+    expect(audio.container.querySelector("audio")).toHaveAttribute("controls");
+  });
+
+  it("offers a download when the server did not serve it as anything showable", async () => {
+    // Whatever the name suggested. A broken `<img>` with nothing saying why is the
+    // worst of the three answers; the download is the one that works.
+    const onDownload = vi.fn();
+    render(
+      <FileBytesView
+        name="logo.svg"
+        url="blob:x"
+        mediaType="application/octet-stream"
+        onDownload={onDownload}
+      />,
+    );
+
+    expect(
+      screen.getByText("This one cannot be shown here - the server serves it as a file."),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Download/ }));
+    expect(onDownload).toHaveBeenCalled();
+  });
+});
+
+describe("a file that cannot be shown", () => {
+  it("says why, and offers the way to read it anyway", () => {
+    render(<FileUnavailable reason="404 Not Found" onDownload={() => {}} />);
+
+    expect(screen.getByText("404 Not Found")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Download/ })).toBeInTheDocument();
+  });
+
+  it("says when the offer itself failed", () => {
+    // A container-backed host refuses a binary either way, so the download can fail
+    // too - and silently, before this.
+    render(
+      <FileUnavailable
+        reason="404 Not Found"
+        onDownload={() => {}}
+        error="This host can only read text"
+      />,
+    );
+
+    expect(screen.getByText("This host can only read text")).toBeInTheDocument();
+  });
+});
+
+describe("the Source view", () => {
+  const CSV = ["run_id,cost", "a-1,0.04", "a-2,0.09"].join("\n");
+
+  it("numbers the lines, and keeps the numbers out of the text", () => {
+    // A bare `pre` of 4,000 columns of CSV says nothing about which line anything
+    // is on - and a reader dragging across the block must not pick up the gutter,
+    // or every paste needs cleaning by hand.
+    render(<FileTextView kind="csv" name="runs.csv" text={CSV} asSource />);
+
+    // Testing Library normalises whitespace, so the gutter is found by what it is
+    // rather than by its text.
+    const gutter = document.querySelector("pre[aria-hidden]")!;
+
+    expect(gutter.textContent).toBe("1\n2\n3");
+
+    expect(gutter).toHaveClass("select-none");
+  });
+
+  it("offers the whole file to the clipboard", () => {
+    render(<FileTextView kind="csv" name="runs.csv" text={CSV} asSource />);
+
+    expect(screen.getByRole("button", { name: /copy/i })).toBeInTheDocument();
+  });
+
+  it("draws no gutter for a file with more lines than one is worth", () => {
+    // One element per line, and a numbered gutter on fifty thousand of them costs
+    // more than it tells anybody.
+    const huge = Array.from({ length: 5001 }, (_, n) => `row-${n}`).join("\n");
+
+    render(<FileTextView kind="csv" name="runs.csv" text={huge} asSource />);
+
+    expect(document.querySelector("pre[aria-hidden]")).toBeNull();
+  });
+});
+
+/**
+ * Inside a pane that is already a frame - the folder page's reader - the text
+ * fills it rather than sitting in a second box inside it.
+ */
+describe("drawn bare", () => {
+  it("drops the box around the characters", () => {
+    const { container } = render(<FileTextView kind="code" name="run.py" text="print(1)" bare />);
+
+    expect(container.firstElementChild).not.toHaveClass("border");
+  });
+
+  it("gives prose, a table and an empty file a margin of their own instead", () => {
+    const { container, unmount } = render(
+      <FileTextView kind="markdown" name="notes.md" text="# Title" bare />,
+    );
+    expect(container.firstElementChild).toHaveClass("px-4", "sm:px-6");
+    unmount();
+
+    const table = render(<FileTextView kind="csv" name="a.csv" text={"a,b\n1,2"} bare />);
+    expect(table.container.firstElementChild).toHaveClass("p-3");
+    table.unmount();
+
+    const empty = render(<FileTextView kind="text" name="a.txt" text=" " bare />);
+    expect(empty.container.firstElementChild).toHaveClass("p-4");
+  });
+
+  it("draws a page with no frame of its own", () => {
+    render(<FileTextView kind="html" name="report.html" text="<p>hi</p>" bare />);
+
+    expect(screen.getByTitle("report.html, rendered")).not.toHaveClass("border");
+  });
+});

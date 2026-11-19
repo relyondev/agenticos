@@ -1,0 +1,484 @@
+"""Group service - named sets of an organization's members.
+
+Any member may see the groups and who is in them, the way any member may list
+the organization's members: a group is something they will be offered as a
+sharing target, and a picker that hides who it reaches is a picker nobody can
+use safely. Changing a group - creating, renaming, deleting, adding and removing
+people - is `members:manage`, because deciding who reaches what a group was
+granted is deciding membership, one level down.
+
+A group carries no role and grants nothing by itself. Its whole effect is the
+grants made to it, resolved in `resource_grant_repo`, so deleting one removes
+exactly the access that was shared with it (the grants cascade with the row).
+"""
+
+from uuid import UUID
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.audit import record_audit
+from app.core.exceptions import (
+    AlreadyExistsError,
+    AuthorizationError,
+    BadRequestError,
+    NotFoundError,
+)
+from app.core.permissions import AuthContext, Perm, assignable_roles, role_has
+from app.db.models.group import Group, GroupMember
+from app.db.models.organization import MembershipSource, OrganizationMember
+from app.repositories import (
+    agent_repo,
+    artifact_repo,
+    context_repo,
+    directory_mapping_repo,
+    group_repo,
+    knowledge_base_repo,
+    mcp_connection_repo,
+    member_repo,
+    resource_grant_repo,
+    skill_repo,
+)
+from app.schemas.group import GroupCreate, GroupResource, GroupUpdate
+from app.services.access import (
+    AGENT,
+    ARTIFACT,
+    COLLECTION,
+    CONTEXT,
+    MCP_CONNECTION,
+    SKILL,
+    accessible_ids,
+)
+
+
+class GroupService:
+    """List, create and change the groups of one organization."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def _membership(self, organization_id: UUID, requester_id: UUID) -> OrganizationMember:
+        """The requester's membership, or a refusal that reveals nothing.
+
+        An outsider is told the organization does not exist, the same answer
+        `MemberService.list_for_org` gives, so group routes cannot be used to
+        learn which organization ids are real.
+        """
+        membership = await member_repo.get(
+            self.db, organization_id=organization_id, user_id=requester_id
+        )
+        if membership is None:
+            raise NotFoundError(
+                message="Organization not found", details={"org_id": str(organization_id)}
+            )
+        return membership
+
+    async def _require_manage(
+        self,
+        organization_id: UUID,
+        requester_id: UUID,
+        *,
+        budget: bool = False,
+        key_scopes: frozenset[Perm] | None = None,
+    ) -> None:
+        """`members:manage` to shape a group, and `budgets:manage` to set its cap.
+
+        `key_scopes` are those of the API key the request came with, `None` for a
+        session: each permission must be one the key was issued for as well as
+        one the role holds, or a key narrowed to membership work would reach the
+        department's spending cap through its issuer's whole role.
+        """
+        membership = await self._membership(organization_id, requester_id)
+
+        def holds(perm: Perm) -> bool:
+            return role_has(membership.role, perm) and (key_scopes is None or perm in key_scopes)
+
+        if not holds(Perm.MEMBERS_MANAGE):
+            raise AuthorizationError(message="You cannot manage groups in this organization")
+        if budget and not holds(Perm.BUDGETS_MANAGE):
+            raise AuthorizationError(
+                message="Setting a department's spending cap requires 'budgets:manage'"
+            )
+
+    async def _require_member_manager(
+        self, organization_id: UUID, group_id: UUID, ctx: AuthContext
+    ) -> None:
+        """Who may change who is in a group: `members:manage`, or the group's own lead.
+
+        Read from the caller's context rather than re-derived from their role, so
+        an API key is held to the permissions it was issued with. Leading a group
+        is a person's standing, not a permission a key can carry: a key needs
+        `members:manage`.
+        """
+        await self._membership(organization_id, ctx.subject_id)
+        if ctx.has(Perm.MEMBERS_MANAGE):
+            return
+        if ctx.api_key_id is not None:
+            raise AuthorizationError(
+                message="An API key needs members:manage to change who is in a group"
+            )
+        lead = await group_repo.get_member(self.db, group_id=group_id, user_id=ctx.subject_id)
+        if lead is None or not lead.is_lead:
+            raise AuthorizationError(
+                message="Only an administrator or the group's lead can change who is in it"
+            )
+
+    async def _group(self, organization_id: UUID, group_id: UUID) -> Group:
+        group = await group_repo.get(self.db, organization_id=organization_id, group_id=group_id)
+        if group is None:
+            raise NotFoundError(message="Group not found", details={"group_id": str(group_id)})
+        return group
+
+    async def list_groups(
+        self, organization_id: UUID, requester_id: UUID
+    ) -> list[tuple[Group, int]]:
+        """Every group in the organization with its member count. Any member may call this."""
+        await self._membership(organization_id, requester_id)
+        return await group_repo.list_for_org(self.db, organization_id)
+
+    async def create(
+        self,
+        organization_id: UUID,
+        requester_id: UUID,
+        data: GroupCreate,
+        *,
+        key_scopes: frozenset[Perm] | None = None,
+    ) -> Group:
+        """Create a group.
+
+        Raises:
+            AlreadyExistsError: The organization already has a group of that name.
+                Checked first for the common case and enforced by
+                `uq_group_org_name` for the race, inside a savepoint so the loser
+                gets this 409 rather than an `IntegrityError` as a 500.
+        """
+        await self._require_manage(
+            organization_id,
+            requester_id,
+            budget=data.monthly_budget_usd is not None,
+            key_scopes=key_scopes,
+        )
+        await self._refuse_taken_name(organization_id, data.name)
+        try:
+            async with self.db.begin_nested():
+                group = await group_repo.create(
+                    self.db,
+                    organization_id=organization_id,
+                    name=data.name,
+                    description=data.description,
+                    icon=data.icon,
+                    monthly_budget_usd=data.monthly_budget_usd,
+                    created_by_user_id=requester_id,
+                )
+        except IntegrityError as exc:
+            raise AlreadyExistsError(
+                message="A group with this name already exists", details={"name": data.name}
+            ) from exc
+        await record_audit(
+            self.db,
+            actor_user_id=requester_id,
+            organization_id=organization_id,
+            action="group.created",
+            target_type="group",
+            target_id=str(group.id),
+            details={"name": group.name},
+        )
+        return group
+
+    async def update(
+        self,
+        organization_id: UUID,
+        group_id: UUID,
+        requester_id: UUID,
+        data: GroupUpdate,
+        *,
+        key_scopes: frozenset[Perm] | None = None,
+    ) -> tuple[Group, int]:
+        """Rename a group or change its description; returns it with its member count."""
+        await self._require_manage(
+            organization_id,
+            requester_id,
+            budget="monthly_budget_usd" in data.model_fields_set,
+            key_scopes=key_scopes,
+        )
+        group = await self._group(organization_id, group_id)
+        name = data.name if data.name is not None else group.name
+        # A description sent as null clears it; one not sent at all is left alone.
+        sent = data.model_fields_set
+        description = data.description if "description" in sent else group.description
+        icon = data.icon if "icon" in sent else group.icon
+        budget = (
+            data.monthly_budget_usd if "monthly_budget_usd" in sent else group.monthly_budget_usd
+        )
+        if name != group.name:
+            await self._refuse_taken_name(organization_id, name)
+        try:
+            async with self.db.begin_nested():
+                updated = await group_repo.update(
+                    self.db,
+                    group,
+                    name=name,
+                    description=description,
+                    icon=icon,
+                    monthly_budget_usd=budget,
+                )
+        except IntegrityError as exc:
+            raise AlreadyExistsError(
+                message="A group with this name already exists", details={"name": name}
+            ) from exc
+        await record_audit(
+            self.db,
+            actor_user_id=requester_id,
+            organization_id=organization_id,
+            action="group.updated",
+            target_type="group",
+            target_id=str(group.id),
+            details={"fields": sorted(sent)},
+        )
+        return updated, await group_repo.count_members(self.db, updated.id)
+
+    async def delete(self, organization_id: UUID, group_id: UUID, requester_id: UUID) -> None:
+        """Delete a group, and with it every grant made to it and every mapping naming it.
+
+        Raises:
+            AuthorizationError: A directory mapping naming the group maps to a
+                role the requester's does not outrank. The mapping cascades with
+                the group, and deleting it demotes everybody it placed - which
+                `DirectoryMappingService.delete` refuses this requester, so
+                deleting the group must not do it by the back door.
+        """
+        membership = await self._membership(organization_id, requester_id)
+        if not role_has(membership.role, Perm.MEMBERS_MANAGE):
+            raise AuthorizationError(message="You cannot manage groups in this organization")
+        group = await self._group(organization_id, group_id)
+        ceiling = assignable_roles(membership.role)
+        for mapping in await directory_mapping_repo.list_for_group(self.db, group_id=group.id):
+            if mapping.role not in ceiling:
+                raise AuthorizationError(
+                    message=(
+                        "A directory mapping to a role your own does not outrank places people "
+                        "in this group; it has to be removed by someone who outranks it first"
+                    ),
+                    details={"role": mapping.role},
+                )
+        name = group.name
+        await group_repo.delete_group(self.db, group)
+        await record_audit(
+            self.db,
+            actor_user_id=requester_id,
+            organization_id=organization_id,
+            action="group.deleted",
+            target_type="group",
+            target_id=str(group_id),
+            details={"name": name},
+        )
+
+    async def list_members(
+        self, organization_id: UUID, group_id: UUID, requester_id: UUID
+    ) -> list[tuple[GroupMember, str, str | None]]:
+        """Who is in one group. Any member of the organization may call this."""
+        await self._membership(organization_id, requester_id)
+        group = await self._group(organization_id, group_id)
+        return await group_repo.list_members(self.db, group.id)
+
+    async def resources(self, ctx: AuthContext, group_id: UUID) -> list[GroupResource]:
+        """What one group has been given, among what the caller may see (#2072).
+
+        Any member may ask, as with the group's members; each resource is narrowed
+        by the caller's own view permission, so a department's page never names
+        an agent or a collection its reader could not open.
+        """
+        await self._membership(ctx.organization_id, ctx.subject_id)
+        group = await self._group(ctx.organization_id, group_id)
+        grants = await resource_grant_repo.list_for_group(
+            self.db, organization_id=ctx.organization_id, group_id=group.id
+        )
+
+        def ids(kind: str) -> list[UUID]:
+            return [grant.resource_id for grant in grants if grant.resource_type == kind]
+
+        org = ctx.organization_id
+        agents = await agent_repo.get_many(self.db, ids(AGENT.key), organization_id=org)
+        collections = await knowledge_base_repo.get_by_ids(self.db, ids(COLLECTION.key))
+        skills = await skill_repo.get_many(self.db, ids(SKILL.key), organization_id=org)
+        files = await context_repo.get_many(self.db, ids(CONTEXT.key), organization_id=org)
+        apps = await artifact_repo.get_many(self.db, ids(ARTIFACT.key), organization_id=org)
+        names: dict[UUID, str] = {}
+        for rows, resource_type in (
+            (agents, AGENT),
+            (collections, COLLECTION),
+            (skills, SKILL),
+            (files, CONTEXT),
+        ):
+            reachable = await accessible_ids(
+                self.db, ctx, rows.values(), resource_type.view, resource_type=resource_type
+            )
+            names.update({key: row.name for key, row in rows.items() if key in reachable})
+        reachable_apps = await accessible_ids(
+            self.db, ctx, apps.values(), ARTIFACT.view, resource_type=ARTIFACT
+        )
+        names.update({key: app.title for key, app in apps.items() if key in reachable_apps})
+        servers = await mcp_connection_repo.get_org_scoped_by_ids(
+            self.db, connection_ids=ids(MCP_CONNECTION.key), organization_id=org
+        )
+        reachable_servers = await accessible_ids(
+            self.db, ctx, servers.values(), MCP_CONNECTION.view, resource_type=MCP_CONNECTION
+        )
+        names.update(
+            {
+                key: server.label or server.name
+                for key, server in servers.items()
+                if key in reachable_servers
+            }
+        )
+        return [
+            GroupResource.model_validate(
+                {
+                    "kind": grant.resource_type,
+                    "id": grant.resource_id,
+                    "name": names[grant.resource_id],
+                    "level": grant.level,
+                }
+            )
+            for grant in grants
+            if grant.resource_id in names
+        ]
+
+    async def add_member(
+        self, organization_id: UUID, group_id: UUID, user_id: UUID, ctx: AuthContext
+    ) -> tuple[GroupMember, str, str | None]:
+        """Put a member of the organization in a group, by hand.
+
+        Idempotent for someone already added by hand. Someone the directory put
+        there becomes a manual member: an administrator adding them is a
+        decision that should outlive the directory taking them out again.
+
+        Raises:
+            BadRequestError: The person is not a member of this organization. A
+                group reaches what was shared with it, and an outsider in one
+                would reach this organization's resources.
+        """
+        await self._require_member_manager(organization_id, group_id, ctx)
+        requester_id = ctx.subject_id
+        group = await self._group(organization_id, group_id)
+        if await member_repo.get(self.db, organization_id=organization_id, user_id=user_id) is None:
+            raise BadRequestError(
+                message="Only members of this organization can be added to a group",
+                details={"user_id": str(user_id)},
+            )
+        existing = await group_repo.get_member(self.db, group_id=group.id, user_id=user_id)
+        if existing is not None:
+            if existing.source != MembershipSource.MANUAL:
+                previous = existing.source
+                await group_repo.set_member_source(
+                    self.db, existing, source=MembershipSource.MANUAL
+                )
+                # A takeover is a decision - the access now outlives the
+                # directory taking the person out - so it is recorded as one.
+                await record_audit(
+                    self.db,
+                    actor_user_id=requester_id,
+                    organization_id=organization_id,
+                    action="group.member_taken_over",
+                    target_type="group",
+                    target_id=str(group.id),
+                    details={"user_id": str(user_id), "source_was": previous},
+                )
+            return await self._member_row(group.id, user_id)
+        try:
+            async with self.db.begin_nested():
+                await group_repo.add_member(
+                    self.db,
+                    group_id=group.id,
+                    user_id=user_id,
+                    source=MembershipSource.MANUAL,
+                    added_by_user_id=requester_id,
+                )
+        except IntegrityError as exc:
+            raise AlreadyExistsError(
+                message="Already a member of this group", details={"user_id": str(user_id)}
+            ) from exc
+        await record_audit(
+            self.db,
+            actor_user_id=requester_id,
+            organization_id=organization_id,
+            action="group.member_added",
+            target_type="group",
+            target_id=str(group.id),
+            details={"user_id": str(user_id)},
+        )
+        return await self._member_row(group.id, user_id)
+
+    async def remove_member(
+        self, organization_id: UUID, group_id: UUID, user_id: UUID, ctx: AuthContext
+    ) -> None:
+        """Take somebody out of a group, whoever put them there."""
+        await self._require_member_manager(organization_id, group_id, ctx)
+        requester_id = ctx.subject_id
+        group = await self._group(organization_id, group_id)
+        member = await group_repo.get_member(self.db, group_id=group.id, user_id=user_id)
+        if member is None:
+            raise NotFoundError(
+                message="Not a member of this group", details={"user_id": str(user_id)}
+            )
+        if member.is_lead and not ctx.has(Perm.MEMBERS_MANAGE):
+            # Removing a lead takes their lead with the row, and naming or
+            # removing a lead is `members:manage`'s - a lead may not unseat another.
+            raise AuthorizationError(message="Only someone who manages members can remove a lead")
+        await group_repo.remove_member(self.db, member)
+        await record_audit(
+            self.db,
+            actor_user_id=requester_id,
+            organization_id=organization_id,
+            action="group.member_removed",
+            target_type="group",
+            target_id=str(group.id),
+            details={"user_id": str(user_id)},
+        )
+
+    async def set_lead(
+        self,
+        organization_id: UUID,
+        group_id: UUID,
+        user_id: UUID,
+        requester_id: UUID,
+        *,
+        is_lead: bool,
+    ) -> tuple[GroupMember, str, str | None]:
+        """Make a member the group's lead, or not. Administrators only: a lead can
+        add members, so naming one is handing out part of `members:manage`."""
+        await self._require_manage(organization_id, requester_id)
+        group = await self._group(organization_id, group_id)
+        member = await group_repo.get_member(self.db, group_id=group.id, user_id=user_id)
+        if member is None:
+            raise NotFoundError(
+                message="Not a member of this group", details={"user_id": str(user_id)}
+            )
+        await group_repo.set_member_lead(self.db, member, is_lead=is_lead)
+        await record_audit(
+            self.db,
+            actor_user_id=requester_id,
+            organization_id=organization_id,
+            action="group.lead_changed",
+            target_type="group",
+            target_id=str(group.id),
+            details={"user_id": str(user_id), "is_lead": is_lead},
+        )
+        return await self._member_row(group.id, user_id)
+
+    async def _refuse_taken_name(self, organization_id: UUID, name: str) -> None:
+        if await group_repo.get_by_name(self.db, organization_id=organization_id, name=name):
+            raise AlreadyExistsError(
+                message="A group with this name already exists", details={"name": name}
+            )
+
+    async def _member_row(
+        self, group_id: UUID, user_id: UUID
+    ) -> tuple[GroupMember, str, str | None]:
+        """The membership as a listing shows it, read back after a write."""
+        row = await group_repo.get_member_row(self.db, group_id=group_id, user_id=user_id)
+        if row is None:
+            raise NotFoundError(
+                message="Not a member of this group", details={"user_id": str(user_id)}
+            )
+        return row

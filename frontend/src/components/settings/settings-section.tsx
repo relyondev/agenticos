@@ -1,0 +1,98 @@
+import { ContextHelp } from "@/components/ui/context-help";
+import type { ReactNode } from "react";
+
+import { cn } from "@/lib/utils";
+
+interface SectionCardProps {
+  title: string;
+  description?: string;
+  action?: ReactNode;
+  children?: ReactNode;
+  fill?: boolean;
+  tour?: string;
+}
+
+export function SectionCard({
+  title,
+  description,
+  action,
+  children,
+  fill = false,
+  tour,
+}: SectionCardProps) {
+  return (
+    <section
+      className={cn(
+        "border-border bg-card rounded-xl border",
+        fill && "flex min-h-0 flex-1 flex-col",
+      )}
+    >
+      <header
+        data-tour={tour}
+        className="border-border flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1">
+            <h2 className="text-foreground text-sm font-semibold">{title}</h2>
+            {description && <ContextHelp>{description}</ContextHelp>}
+          </div>
+        </div>
+        {action && <div className="shrink-0">{action}</div>}
+      </header>
+      {children && <div className="p-4">{children}</div>}
+    </section>
+  );
+}
+
+interface SettingsSectionProps {
+  title: string;
+  description?: string;
+  /** Right-aligned action (e.g. "Save changes" button). */
+  action?: ReactNode;
+  /** Subdued danger styling for destructive sections. */
+  danger?: boolean;
+  children: ReactNode;
+  className?: string;
+}
+
+export function SettingsSection({
+  title,
+  description,
+  action,
+  danger,
+  children,
+  className,
+}: SettingsSectionProps) {
+  return (
+    <section
+      className={cn(
+        "bg-card rounded-2xl border p-4 sm:p-5",
+        danger ? "border-destructive/30 bg-destructive/[0.03]" : "border-foreground/10",
+        className,
+      )}
+    >
+      <header
+        className={cn("flex flex-wrap items-start justify-between gap-3", children ? "mb-4" : "")}
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1">
+            <h2
+              className={cn(
+                "text-base font-semibold tracking-tight",
+                danger ? "text-destructive" : "text-foreground",
+              )}
+            >
+              {title}
+            </h2>
+            {description && !danger && <ContextHelp>{description}</ContextHelp>}
+          </div>
+          {description && danger && (
+            <p className="text-muted-foreground mt-1 text-sm leading-relaxed">{description}</p>
+          )}
+        </div>
+        {action && <div className="shrink-0">{action}</div>}
+      </header>
+      {children}
+    </section>
+  );
+}

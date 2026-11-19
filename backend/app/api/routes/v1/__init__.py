@@ -1,0 +1,301 @@
+"""API v1 router aggregation."""
+# ruff: noqa: I001 - Imports structured for Jinja2 template conditionals
+
+from fastapi import APIRouter
+
+from app.api.routes.v1 import (
+    api_keys,
+    assistant,
+    browse_live,
+    change_events,
+    device_hub,
+    diagnostics,
+    admin_updates,
+    health,
+    mcp_oauth,
+    public_openapi,
+)
+from app.api.routes.v1 import admin_users, auth, users
+from app.api.routes.v1 import admin_ratings
+from app.api.routes.v1 import oauth
+from app.api.routes.v1 import push
+from app.api.routes.v1 import sessions
+from app.api.routes.v1 import conversations
+from app.api.routes.v1 import admin_conversations
+from app.api.routes.v1 import me_channel_link
+from app.api.routes.v1 import me_mcp_connections
+from app.api.routes.v1 import me_suggestions
+from app.api.routes.v1 import me_watches
+from app.api.routes.v1 import org_mcp_connections
+from app.api.routes.v1 import local_services
+from app.api.routes.v1 import ml as ml_services
+from app.api.routes.v1 import sandbox_connections
+from app.api.routes.v1 import agent
+from app.api.routes.v1 import rag
+from app.api.routes.v1 import files
+from app.api.routes.v1 import generated_media
+from app.api.routes.v1 import channels
+from app.api.routes.v1 import audit
+from app.api.routes.v1 import sharing
+from app.api.routes.v1 import agent_embeds
+from app.api.routes.v1 import agent_environments, agent_exposures, agent_triggers
+from app.api.routes.v1 import trigger_webhooks
+from app.api.routes.v1 import agents as agent_registry
+from app.api.routes.v1 import model_providers
+from app.api.routes.v1 import secrets
+from app.api.routes.v1 import runs as agent_runs
+from app.api.routes.v1 import stats
+from app.api.routes.v1 import skill_changes
+from app.api.routes.v1 import workspaces as agent_workspaces
+from app.api.routes.v1 import skills as agent_skills
+from app.api.routes.v1 import artifacts
+from app.api.routes.v1 import visuals
+from app.api.routes.v1 import context as context_files
+from app.api.routes.v1 import virtual_tables
+from app.api.routes.v1 import (
+    workflow_approvals,
+    workflow_evals,
+    workflow_exposures,
+    workflow_log_alerts,
+    workflow_run_socket,
+    workflow_runs,
+    workflows,
+)
+from app.api.routes.v1 import table_views
+from app.api.routes.v1 import virtual_table_triggers
+from app.api.routes.v1 import memory as memory_files
+from app.api.routes.v1 import browser_sign_ins
+from app.api.routes.v1 import permissions
+from app.api.routes.v1 import telegram_webhook
+from app.api.routes.v1 import slack_webhook
+from app.api.routes.v1 import a2a, external_agents, mattermost_webhook, projects
+from app.api.routes.v1 import teams_webhook
+from app.api.routes.v1 import embed as embed_widget
+from app.api.routes.v1 import embed_generated_media
+from app.api.routes.v1 import members, organizations
+from app.api.routes.v1 import groups, directory_mappings, directory_auth
+from app.api.routes.v1.invitations import (
+    org_router as invitations_org_router,
+    token_router as invitations_token_router,
+)
+from app.api.routes.v1 import knowledge_bases
+from app.api.routes.v1 import me_slash_commands
+from app.api.routes.v1 import me_dashboard_layout
+from app.api.routes.v1 import me_personal_data
+from app.api.routes.v1 import admin_stats
+from app.api.routes.v1 import admin_deployment_settings
+from app.api.routes.v1 import branding
+from app.api.routes.v1 import catalog_icons
+from app.api.routes.v1 import org_integrations
+from app.api.routes.v1 import notifications
+from app.api.routes.v1 import admin_announcements
+from app.api.routes.v1 import voice
+from app.api.routes.v1 import admin_background_jobs
+from app.api.routes.v1 import run_requests
+
+v1_router = APIRouter()
+v1_router.include_router(admin_updates.router, prefix="/admin/updates", tags=["admin:updates"])
+v1_router.include_router(diagnostics.router, tags=["diagnostics"])
+
+v1_router.include_router(health.router, tags=["health"])
+v1_router.include_router(public_openapi.router)
+
+v1_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+v1_router.include_router(directory_auth.router, prefix="/auth", tags=["auth"])
+v1_router.include_router(users.router, prefix="/users", tags=["users"])
+v1_router.include_router(permissions.router, tags=["permissions"])
+v1_router.include_router(audit.router, tags=["audit"])
+v1_router.include_router(api_keys.router, prefix="/api-keys", tags=["api-keys"])
+v1_router.include_router(assistant.router, prefix="/assistant", tags=["assistant"])
+v1_router.include_router(mcp_oauth.router, prefix="/mcp-oauth", tags=["mcp-oauth"])
+v1_router.include_router(notifications.router, tags=["notifications"])
+v1_router.include_router(
+    admin_announcements.router, prefix="/admin/announcements", tags=["admin:announcements"]
+)
+v1_router.include_router(
+    admin_background_jobs.router, prefix="/admin/background-jobs", tags=["admin:background-jobs"]
+)
+v1_router.include_router(run_requests.router, tags=["agents"])
+v1_router.include_router(model_providers.router, prefix="/providers", tags=["providers"])
+v1_router.include_router(catalog_icons.router, prefix="/catalog", tags=["catalog"])
+v1_router.include_router(secrets.router, prefix="/secrets", tags=["secrets"])
+v1_router.include_router(ml_services.router, prefix="/ml", tags=["ml-services"])
+v1_router.include_router(agent_registry.router, prefix="/agents", tags=["agents"])
+v1_router.include_router(agent_environments.router, prefix="/agents", tags=["agents:environments"])
+v1_router.include_router(agent_exposures.router, prefix="/agents", tags=["agents:exposures"])
+v1_router.include_router(agent_triggers.router, prefix="/agents", tags=["agents:triggers"])
+v1_router.include_router(agent_triggers.org_router, tags=["agents:triggers"])
+v1_router.include_router(trigger_webhooks.router, prefix="/webhooks", tags=["triggers:webhooks"])
+v1_router.include_router(agent_embeds.router, prefix="/agents", tags=["agents:embeds"])
+v1_router.include_router(embed_widget.router, prefix="/embed", tags=["embed"])
+v1_router.include_router(embed_generated_media.router, prefix="/embed", tags=["embed"])
+v1_router.include_router(agent_runs.router, tags=["runs"])
+v1_router.include_router(stats.router, tags=["stats"])
+v1_router.include_router(agent_skills.router, prefix="/skills", tags=["skills"])
+v1_router.include_router(context_files.router, prefix="/context", tags=["context"])
+v1_router.include_router(virtual_tables.router, prefix="/tables", tags=["tables"])
+v1_router.include_router(workflows.router, prefix="/workflows", tags=["workflows"])
+v1_router.include_router(workflow_runs.router, prefix="/workflow-runs", tags=["workflow-runs"])
+v1_router.include_router(workflow_runs.logs_router, prefix="/workflows", tags=["workflows:logs"])
+v1_router.include_router(
+    workflow_runs.org_logs_router, prefix="/workflow-logs", tags=["workflows:logs"]
+)
+v1_router.include_router(
+    workflow_runs.resume_router, prefix="/workflow-resume", tags=["workflow-runs"]
+)
+v1_router.include_router(
+    workflow_approvals.router, prefix="/workflow-approvals", tags=["workflow-approvals"]
+)
+v1_router.include_router(workflow_evals.router, prefix="/workflows", tags=["workflows:evals"])
+v1_router.include_router(
+    workflow_log_alerts.router, prefix="/workflows", tags=["workflows:log-alerts"]
+)
+v1_router.include_router(
+    workflow_exposures.router, prefix="/workflows", tags=["workflows:exposures"]
+)
+v1_router.include_router(
+    workflow_exposures.webhook_router, prefix="/workflow-webhooks", tags=["workflows:webhooks"]
+)
+v1_router.include_router(
+    workflow_exposures.webhook_test_router,
+    prefix="/workflow-webhook-tests",
+    tags=["workflows:webhooks"],
+)
+v1_router.include_router(
+    workflow_exposures.github_router, prefix="/workflow-github", tags=["workflows:webhooks"]
+)
+v1_router.include_router(
+    workflow_exposures.form_router, prefix="/public/workflow-forms", tags=["workflows:forms"]
+)
+v1_router.include_router(table_views.router, prefix="/tables", tags=["tables:views"])
+v1_router.include_router(virtual_table_triggers.router, prefix="/tables", tags=["tables:triggers"])
+# Apps were called artifacts until #2071. The old paths stay as deprecated
+# aliases for the v1 policy's 90 days (docs/api.md), so a script written against
+# them keeps working while it is moved.
+v1_router.include_router(artifacts.router, prefix="/apps", tags=["apps"])
+v1_router.include_router(artifacts.public_router, prefix="/public/apps", tags=["apps:public"])
+v1_router.include_router(artifacts.router, prefix="/artifacts", tags=["apps"], deprecated=True)
+v1_router.include_router(visuals.router, prefix="/visuals", tags=["visuals"])
+v1_router.include_router(
+    artifacts.public_router, prefix="/public/artifacts", tags=["apps:public"], deprecated=True
+)
+v1_router.include_router(
+    artifacts.content_router, prefix="/artifact-content", tags=["artifacts:content"]
+)
+v1_router.include_router(artifacts.embed_router, prefix="/artifact-embed", tags=["artifacts:embed"])
+v1_router.include_router(memory_files.router, prefix="/memory", tags=["memory"])
+v1_router.include_router(
+    browser_sign_ins.router, prefix="/browser-sign-ins", tags=["browser-sign-ins"]
+)
+v1_router.include_router(skill_changes.router, prefix="/skill-changes", tags=["skills:changes"])
+v1_router.include_router(
+    sharing.collection_sharing_router, prefix="/kb", tags=["collections:sharing"]
+)
+v1_router.include_router(sharing.agent_sharing_router, prefix="/agents", tags=["agents:sharing"])
+v1_router.include_router(sharing.skill_sharing_router, prefix="/skills", tags=["skills:sharing"])
+v1_router.include_router(
+    sharing.context_sharing_router, prefix="/context", tags=["context:sharing"]
+)
+v1_router.include_router(sharing.table_sharing_router, prefix="/tables", tags=["tables:sharing"])
+v1_router.include_router(sharing.secret_sharing_router, prefix="/secrets", tags=["secrets:sharing"])
+v1_router.include_router(sharing.artifact_sharing_router, prefix="/apps", tags=["apps:sharing"])
+v1_router.include_router(
+    sharing.workflow_sharing_router, prefix="/workflows", tags=["workflows:sharing"]
+)
+v1_router.include_router(
+    sharing.mcp_connection_sharing_router, prefix="/mcp-connections", tags=["mcp:sharing"]
+)
+v1_router.include_router(
+    sharing.artifact_sharing_router, prefix="/artifacts", tags=["apps:sharing"], deprecated=True
+)
+
+v1_router.include_router(admin_ratings.router, prefix="/admin/ratings", tags=["admin:ratings"])
+
+v1_router.include_router(oauth.router, prefix="/oauth", tags=["oauth"])
+
+v1_router.include_router(sessions.router, prefix="/sessions", tags=["sessions"])
+v1_router.include_router(push.router, prefix="/push", tags=["push"])
+
+v1_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
+
+v1_router.include_router(
+    org_mcp_connections.router, prefix="/mcp-connections", tags=["mcp-connections"]
+)
+v1_router.include_router(
+    sandbox_connections.router, prefix="/sandbox-connections", tags=["sandbox-connections"]
+)
+v1_router.include_router(local_services.router, prefix="/local-services", tags=["local-services"])
+v1_router.include_router(
+    agent_workspaces.router, prefix="/sandbox-workspaces", tags=["sandbox-workspaces"]
+)
+
+v1_router.include_router(
+    me_mcp_connections.router, prefix="/me/mcp-connections", tags=["me:mcp-connections"]
+)
+v1_router.include_router(me_suggestions.router, prefix="/me/suggestions", tags=["me:suggestions"])
+v1_router.include_router(me_watches.router, prefix="/me/watches", tags=["me:watches"])
+
+v1_router.include_router(
+    me_channel_link.router, prefix="/me/channel-link", tags=["me:channel-link"]
+)
+
+v1_router.include_router(agent.router, tags=["agent"])
+v1_router.include_router(workflow_run_socket.router, tags=["workflow-runs"])
+v1_router.include_router(change_events.router, tags=["change-events"])
+v1_router.include_router(device_hub.router, tags=["devices"])
+v1_router.include_router(browse_live.router, tags=["browse-live"])
+
+v1_router.include_router(rag.router, prefix="/rag", tags=["rag"])
+
+v1_router.include_router(files.router, tags=["files"])
+
+v1_router.include_router(generated_media.router, prefix="/generated", tags=["generated"])
+
+v1_router.include_router(
+    admin_conversations.router, prefix="/admin/conversations", tags=["admin-conversations"]
+)
+
+v1_router.include_router(admin_users.router, prefix="/admin/users", tags=["admin:users"])
+
+v1_router.include_router(channels.router, prefix="/channels", tags=["channels"])
+
+v1_router.include_router(telegram_webhook.router, prefix="/telegram", tags=["telegram"])
+
+v1_router.include_router(slack_webhook.router, prefix="/slack", tags=["slack"])
+
+v1_router.include_router(mattermost_webhook.router, prefix="/mattermost", tags=["mattermost"])
+v1_router.include_router(a2a.card_router, prefix="/a2a", tags=["a2a"])
+v1_router.include_router(a2a.router, prefix="/a2a", tags=["a2a"])
+v1_router.include_router(
+    external_agents.router, prefix="/external-agents", tags=["external-agents"]
+)
+v1_router.include_router(projects.router, prefix="/projects", tags=["projects"])
+v1_router.include_router(
+    sharing.project_sharing_router, prefix="/projects", tags=["projects:sharing"]
+)
+v1_router.include_router(teams_webhook.router, prefix="/teams", tags=["teams"])
+
+v1_router.include_router(organizations.router, prefix="/orgs", tags=["organizations"])
+v1_router.include_router(members.router, prefix="/orgs", tags=["members"])
+v1_router.include_router(groups.router, prefix="/orgs", tags=["groups"])
+v1_router.include_router(directory_mappings.router, prefix="/orgs", tags=["directory"])
+v1_router.include_router(invitations_org_router, prefix="/orgs", tags=["invitations"])
+v1_router.include_router(invitations_token_router, tags=["invitations"])
+
+v1_router.include_router(knowledge_bases.router, prefix="/kb", tags=["knowledge-bases"])
+v1_router.include_router(
+    me_slash_commands.router, prefix="/me/slash-commands", tags=["me:slash-commands"]
+)
+v1_router.include_router(me_personal_data.router, prefix="/me/data", tags=["me:data"])
+v1_router.include_router(
+    me_dashboard_layout.router, prefix="/me/dashboard-layout", tags=["me:dashboard-layout"]
+)
+v1_router.include_router(admin_stats.router, prefix="/admin", tags=["admin:stats"])
+v1_router.include_router(branding.router, prefix="/branding", tags=["branding"])
+v1_router.include_router(
+    admin_deployment_settings.router, prefix="/admin/settings", tags=["admin:settings"]
+)
+v1_router.include_router(
+    org_integrations.router, prefix="/org/integrations", tags=["org:integrations"]
+)
+v1_router.include_router(voice.router, tags=["voice"])

@@ -1,0 +1,831 @@
+"""Building a live agent from a stored spec.
+
+The single place where configuration becomes an executable agent. Everything
+above deals in specs and ids; everything below is Pydantic AI.
+
+Keeping this a narrow, explicit funnel is the point: when the underlying agent
+library changes shape, one file changes. When a new capability is added to the
+platform, there is one obvious place it plugs in. And because the funnel is
+narrow, the same spec produces the same agent whether the run came from the web
+chat, a Slack mention or the public API - which is what makes "the Builder is
+just another client" true rather than aspirational.
+"""
+
+import json
+import logging
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Any
+from uuid import UUID
+
+from jsonschema import validators
+from pydantic_ai import Agent as PydanticAgent
+from pydantic_ai import ModelRetry, StructuredDict
+from pydantic_ai.capabilities import (
+    AbstractCapability,
+    HandleDeferredToolCalls,
+    ReinjectSystemPrompt,
+    ToolSearch,
+)
+from pydantic_ai.output import OutputSpec
+from pydantic_ai.settings import ModelSettings
+from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.toolsets import AbstractToolset
+from pydantic_ai.usage import UsageLimits
+from pydantic_ai_harness.guardrails import GuardrailResult
+
+from app.agents.audience import RunAudience
+from app.agents.cache_watch import CacheWatch
+from app.agents.capabilities import build as build_capabilities
+from app.agents.capabilities import get as capability_def
+from app.agents.capabilities._overrides import ToolOverrides
+from app.agents.capabilities.approval import (
+    ApprovalGate,
+    approval_describers,
+    approval_required_tools,
+    approval_tool_ids,
+    refuse_ungateable_approvals,
+)
+from app.agents.capabilities.artifacts import ARTIFACTS_CAPABILITY_ID
+from app.agents.capabilities.browser_use import BROWSER_CAPABILITY_ID, WebBrowser
+from app.agents.capabilities.budget import (
+    BudgetGuard,
+    BudgetScope,
+    PeriodSpendLookup,
+    SpendLedger,
+    SpendLimit,
+)
+from app.agents.capabilities.compaction import (
+    CONTEXT_GAUGE_RESOURCE,
+    MODEL_CONTEXT_WINDOW_RESOURCE,
+    ContextGauge,
+    build_gauge,
+)
+from app.agents.capabilities.conversation_search import CONVERSATION_SEARCH_CAPABILITY_ID
+from app.agents.capabilities.guardrails import GuardrailsConfig, input_screen
+from app.agents.capabilities.media import (
+    CONVERSATION_RESOURCE as MEDIA_CONVERSATION_RESOURCE,
+)
+from app.agents.capabilities.media import (
+    ORGANIZATION_RESOURCE as MEDIA_ORGANIZATION_RESOURCE,
+)
+from app.agents.capabilities.memory_files import MEMORY_FILES_CAPABILITY_ID
+from app.agents.capabilities.memory_mem0 import MEMORY_MEM0_CAPABILITY_ID
+from app.agents.capabilities.system_reminders import (
+    REMINDER_STATE_RESOURCE,
+    ReminderState,
+    SystemReminders,
+)
+from app.agents.capabilities.visuals import WEB_REACH_RESOURCE, web_reach
+from app.agents.code_mode import CodeCalls, code_mode
+from app.agents.connect_on_use import CONNECT_ACCOUNT, ConnectOnUse
+from app.agents.deps import AgentDeps, ApprovalCallback
+from app.agents.loop_guard import LoopGuard
+from app.agents.manifest import RecordingModel, RunRecorder
+from app.agents.model_resolver import PROMPT_CACHE, ModelRequestSpec
+from app.agents.observability import instrument_agent, suppress_content
+from app.agents.run_reviewer import RunReviewer
+from app.agents.setup_briefing import SetupBriefing
+from app.agents.spec import AgentSpec
+from app.agents.steering import Steering
+from app.agents.tool_call_ids import UniqueToolCallIds
+from app.agents.tool_repair import CountedRepair, RepairTally
+from app.agents.voice import (
+    AnswerUnknownTools,
+    VoiceOptions,
+    WithoutApprovalTools,
+    voice_configured,
+    voice_instructions,
+)
+from app.core.secret_kinds import ApiKeySecret, StorableSecret
+
+logger = logging.getLogger(__name__)
+
+# The capabilities that read `AgentDeps.audience`. Anything not here gets `None`,
+# so an agent that cannot act on who is listening never carries the fact - and a
+# capability added to this list without reading it would be the same defect in
+# reverse. Ids rather than a per-capability predicate: three near-identical
+# `*_requested` helpers said the same thing three times.
+_AUDIENCE_AWARE = frozenset(
+    {
+        ARTIFACTS_CAPABILITY_ID,
+        BROWSER_CAPABILITY_ID,
+        MEMORY_FILES_CAPABILITY_ID,
+        MEMORY_MEM0_CAPABILITY_ID,
+        CONVERSATION_SEARCH_CAPABILITY_ID,
+    }
+)
+
+# How many model requests a run may make when its spec does not say. Raised
+# from Pydantic AI's own 50: real agents with skills and MCP tools were hitting
+# the ceiling mid-task, and the budget caps are what guard cost - this guards
+# only the never-finishing loop, which 100 still catches.
+DEFAULT_MAX_STEPS = 100
+
+
+type AgentAnswer = str | dict[str, Any]
+"""What a finished run answers: prose, or an object of the spec's `output_schema`."""
+
+type AgentOutput = AgentAnswer | DeferredToolRequests
+"""What a run ends with: an answer, or the calls parked on a human."""
+
+
+def answer_text(answer: AgentAnswer) -> str:
+    """An answer as text for a surface that shows text.
+
+    Prose is itself. An object is shown as a fenced JSON block, which every
+    surface that renders an answer - the chat, the widget, Slack, Telegram -
+    draws as code; a caller that wants the object reads it where it is handed
+    over as one (`structured`) rather than parsing this back.
+    """
+    if isinstance(answer, str):
+        return answer
+    return "```json\n" + json.dumps(answer, ensure_ascii=False, indent=2) + "\n```"
+
+
+# How often the model may be sent back to fix an answer that does not fit the
+# spec's `output_schema` before the run fails on it.
+OUTPUT_RETRIES = 2
+
+
+@dataclass
+class BuiltAgent:
+    """A runnable agent plus what the caller needs to observe and account for it.
+
+    The ledger is returned rather than hidden inside the agent because the
+    caller is what persists a run: it writes the cost row, and it decides what
+    to show the user when a budget stops a run mid-conversation.
+    """
+
+    # The output is a union because a run can end without an answer: when a
+    # gated tool is parked, Pydantic AI ends the run with the calls waiting on a
+    # human instead. The caller must handle both, which is the point of making
+    # it visible in the type.
+    agent: PydanticAgent[AgentDeps, AgentOutput]
+    deps: AgentDeps
+    ledger: SpendLedger
+    # Exposed rather than buried in the agent's capability list: the caller
+    # needs the limits to explain a stopped run, and reaching into another
+    # library's internals to find them would break on its next release.
+    budget: BudgetGuard
+    # How full the context was before the last model request of this run. Read
+    # after the run, beside the ledger, and for the same reason: the surface that
+    # reports what a turn cost is the one that reports how close it came to the
+    # ceiling.
+    context: ContextGauge
+    # How far this conversation's system-reminders cadence has advanced. Seeded
+    # from the conversation before the run and read after it, beside the gauge and
+    # for the same reason: the surface that persists the turn is the one that
+    # writes the cadence back, so a reminder set to fire every N requests keeps
+    # counting across turns instead of resetting each one.
+    reminder_state: ReminderState
+    # The capabilities the spec asked for, without the two every agent gets.
+    # Callers introspect what an agent can actually do without knowing which
+    # entries the factory adds unconditionally.
+    capabilities: list[Any]
+    # What this agent handed its model, filled in as it runs. Read by whoever
+    # persists the run, for the same reason the ledger is: the surface that
+    # records what a run cost is the one that records what it was given.
+    recorder: RunRecorder
+    model_label: str
+    # What stops a tool loop. Pydantic AI applies its own default when a run is
+    # started without limits, so this is never None: leaving it off would make
+    # "the agent spec said 50" and "nobody passed anything" indistinguishable at
+    # the call sites, which is how one surface ends up uncapped.
+    usage_limits: UsageLimits
+    # Tool names, resolved from the spec once. A surface showing "this agent
+    # will ask before it does X" reads this rather than guessing from the
+    # capability list, where a capability with one gated tool and one ungated
+    # one has no single answer.
+    approval_required_tools: frozenset[str]
+    # How many of the run's tool calls arrived malformed and were repaired, read
+    # by whoever persists the run - see `app/agents/tool_repair.py`.
+    repairs: RepairTally = field(default_factory=RepairTally)
+
+
+def build_agent(
+    spec: AgentSpec,
+    model_spec: ModelRequestSpec,
+    *,
+    organization_id: UUID,
+    agent_id: UUID | None = None,
+    run_id: UUID | None = None,
+    conversation_id: UUID | None = None,
+    user_id: str | None = None,
+    user_name: str | None = None,
+    audience: RunAudience | None = None,
+    run_person: UUID | None = None,
+    impersonated: bool = False,
+    granted_scopes: frozenset[str] | None = None,
+    resources: dict[str, Any] | None = None,
+    secrets: Mapping[UUID, StorableSecret] | None = None,
+    reviewer_models: Mapping[UUID, ModelRequestSpec] | None = None,
+    extra_toolsets: list[AbstractToolset[Any]] | None = None,
+    extra_capabilities: Sequence[AbstractCapability[AgentDeps]] = (),
+    agent_period_spend: PeriodSpendLookup | None = None,
+    org_period_spend: PeriodSpendLookup | None = None,
+    org_monthly_budget_usd: Decimal | None = None,
+    run_limit_usd: Decimal | None = None,
+    group_limits: Sequence[SpendLimit] = (),
+    request_approval: ApprovalCallback | None = None,
+    gate_every_tool: bool = False,
+    shared_budget: BudgetGuard | None = None,
+    recorded_overhead: int | None = None,
+    recorded_reminder_state: dict[str, Any] | None = None,
+    voice: VoiceOptions | None = None,
+    answering_call: VoiceOptions | None = None,
+) -> BuiltAgent:
+    """Instantiate an agent from its spec.
+
+    Args:
+        spec: The published (or draft, when previewing) agent definition.
+        model_spec: Already-resolved model and credentials.
+        run_person: The member who answers for this run, or `None` when nobody
+            does - derived by the runner, which alone knows the request. Handed
+            to `AgentDeps` unchanged and never dropped, unlike `audience`: a
+            tool that needs a person refuses on `None`.
+        impersonated: The run was started while an administrator impersonated its
+            person. Handed to `AgentDeps` unchanged.
+        granted_scopes: Scopes the organization allows. Passing `None` skips
+            the check and is for internal runs only.
+        gate_every_tool: Ask about every tool the agent can reach, not only the
+            ones the spec gated - `ApprovalMode.ASK_ALL` on a chat session
+            (#925). It only ever tightens, so nothing checks a permission for
+            it; the spec's own gates stay where they are underneath.
+        conversation_id: The thread this run belongs to, where it belongs to
+            one. Read by the `media` capability, whose offloaded bytes live under
+            the thread's own prefix so that deleting the thread deletes them -
+            a content hash records nothing about who still references it (#55).
+        resources: Values resolved from the database for this run - collection
+            names, skills - which capabilities need but must never fetch
+            themselves.
+        secrets: The unsealed secrets this spec's bindings reference, keyed by
+            id. They reach the capability instance and stop there: nothing here
+            puts one in `AgentDeps`, in a tool argument or in the model's
+            context, and a spec carries only the id.
+        extra_toolsets: Toolsets resolved outside the registry, such as MCP
+            servers configured per organization.
+        extra_capabilities: Capabilities a surface adds for this run alone,
+            outside the spec - `connect_account` where somebody can connect a
+            service while the run waits. Their tools are never deferred behind
+            tool search: a tool the model has to find first is one it does not
+            know to look for.
+        agent_period_spend: How to read what *this agent* has booked this month,
+            for the cap in its own spec. Omitted where there is no database to
+            ask - a preview - in which case that cap meters only this run.
+        org_period_spend: The same for the organization as a whole. The two are
+            separate arguments because they are separate quantities; one lookup
+            serving both is precisely how an agent's cap came to be exhausted by
+            its neighbours' spending.
+        org_monthly_budget_usd: The organization-wide cap, which applies on top
+            of whatever the agent's own spec asks for.
+        group_limits: The monthly caps of the departments the person running
+            this is in (#2072), each metering its own members' spend. Built by
+            the caller, which knows who that person is; a spec does not.
+        request_approval: How to put a gated tool call to a human. Omitted on a
+            surface that cannot ask anyone, where the gate refuses instead.
+        shared_budget: The guard - and therefore the ledger - of the run this
+            agent is being built *inside*. Passed only when building a delegate
+            or an inline specialist, and it is what makes a delegation's cost
+            visible: the same guard wraps every child model request, so it checks
+            the same accumulated total before the request and records into it
+            afterwards. Without it a child gets a guard of its own, meters
+            nothing the parent can see, and the parent's cap stops binding at
+            precisely the moment delegation multiplies spend.
+
+            It also decides *whose* caps bind, and the answer is the parent's. A
+            delegate's own `budget.monthly_usd` is not enforced inside a parent
+            run: two guards metering one ledger would double-count every request,
+            and the ceiling that matters is the one on the run somebody started.
+            The delegate's own cap still governs runs of the delegate itself, and
+            its run rows still accumulate against it - see `docs/governance.md`.
+        voice: Build for a realtime call: see `app/agents/voice.py`. The
+            capabilities a call cannot carry are left out, approvals resolve
+            inline through `voice.on_deferred`, and the instructions go in as
+            `instructions=`. The caller sets usage limits itself - `usage_limits`
+            on the result is a text run's and must not be passed to a session.
+        answering_call: Build a text agent that works for a live call - the
+            agent's text twin the call hands a task to, and every delegate under
+            it (#54). A text run in every respect but two: a gated call is put to
+            the caller through `answering_call.on_deferred` rather than parked,
+            because nobody resumes a call, and a visitor's carries no gated tool.
+
+    Raises:
+        BadRequestError: If the spec references an unknown tool, an invalid tool
+            configuration, a scope the organization has not granted, a secret
+            the organization no longer has, or an approval the gate could not
+            enforce because the model provider executes the tool.
+    """
+    refuse_ungateable_approvals(spec)
+    # Function-local: `virtual_tables/_toolset.py` imports `app.services.virtual_tables` at
+    # module level, which loops back through the factory to this module.
+    from app.agents.capabilities.virtual_tables import TABLE_GRANTS_RESOURCE, table_grants_of
+    from app.agents.capabilities.workflows import WORKFLOW_IDS_RESOURCE, workflow_ids_of
+
+    bindings = spec.bindings()
+    if voice is not None:
+        # Only what runs on the realtime model. The runner strips what a call can
+        # never use; what it hands off stays on the spec for the text twin.
+        bindings = [
+            binding for binding in bindings if capability_def(binding.capability_id).voice == "live"
+        ]
+    # Built before the capabilities, not after: compaction reads it to decide
+    # whether this window has room for a summary at all, and the reading is
+    # filled by the capability appended at the end of the list below.
+    #
+    # Seeded with what an earlier turn of this conversation measured, because
+    # otherwise it is only filled by a *response* - so on a one-request chat
+    # turn, which is most of them, it is `None` for the whole turn and the
+    # refusal it guards never fires. The overhead is a property of the agent's
+    # instructions and tool schemas rather than of one run, so last turn's
+    # measurement is this turn's starting estimate, and the first response of
+    # this run replaces it (#49).
+    gauge = ContextGauge(overhead=recorded_overhead)
+    # Seeded from what an earlier turn of this conversation recorded, for the same
+    # reason the gauge is: the system-reminders cadence counts model requests, and
+    # a counter that reset each turn would never reach a reminder set to fire every
+    # N requests in a chat of one-request turns. The reminders capability mutates
+    # this during the run; the runner writes it back after.
+    reminder_state = ReminderState.seed(recorded_reminder_state)
+    configured = build_capabilities(
+        bindings,
+        granted_scopes=granted_scopes,
+        # Added here rather than by every caller: the model is resolved before an
+        # agent is built and nowhere above this knows the window it accepts, so a
+        # capability needing it would otherwise have to reach for the model - which
+        # is exactly what `resources` exists to stop.
+        resources={
+            **(resources or {}),
+            MODEL_CONTEXT_WINDOW_RESOURCE: model_spec.context_length,
+            CONTEXT_GAUGE_RESOURCE: gauge,
+            REMINDER_STATE_RESOURCE: reminder_state,
+            # Whose media store this run offloads to, and under which thread's
+            # prefix. Here rather than in the capability's configuration, because
+            # a builder that could choose the organization could point one
+            # tenant's media at another's - and because what will eventually
+            # delete the bytes is the conversation, not a setting.
+            MEDIA_ORGANIZATION_RESOURCE: organization_id,
+            MEDIA_CONVERSATION_RESOURCE: conversation_id,
+            TABLE_GRANTS_RESOURCE: table_grants_of(spec),
+            WORKFLOW_IDS_RESOURCE: frozenset(workflow_ids_of(spec)),
+            # Where the agent's web readers may go: a drawing fetches an image by
+            # address only from a host one of them would itself reach.
+            WEB_REACH_RESOURCE: web_reach(bindings),
+        },
+        secrets=secrets,
+    )
+    # Before hooks run in list order, and a compaction strategy rebuilds the
+    # request from the run's history in its own: reminders appended before it
+    # would be dropped (see `SystemReminders.before_model_request`).
+    # Browser tables must also be pruned after compaction rebuilds the request.
+    configured.sort(
+        key=lambda capability: (
+            isinstance(capability, SystemReminders),
+            isinstance(
+                capability.wrapped if isinstance(capability, ToolOverrides) else capability,
+                WebBrowser,
+            ),
+        )
+    )
+    if voice is not None:
+        configured = voice_configured(configured)
+
+    # Which tools a human must approve before they act. Computed here, while the
+    # registry metadata and the spec's overrides are both in hand, so a surface
+    # never has to re-derive it from two sources.
+    approval_required = approval_required_tools(spec)
+    # The call this agent answers to, as a realtime session or as text working for one.
+    call = voice or answering_call
+
+    # Derived (or restored) by the caller, because only the runner knows whether
+    # this is a fresh request or a resume - and a resume must not re-derive it from
+    # whoever is resuming (#788). Dropped unless a capability that reads it is
+    # bound, so a spec without one carries no audience at all.
+    bound_audience = (
+        audience
+        if any(binding.enabled and binding.capability_id in _AUDIENCE_AWARE for binding in bindings)
+        else None
+    )
+
+    deps = AgentDeps(
+        organization_id=organization_id,
+        agent_id=agent_id,
+        run_id=run_id,
+        conversation_id=conversation_id,
+        user_id=user_id,
+        user_name=user_name,
+        audience=bound_audience,
+        run_person=run_person,
+        impersonated=impersonated,
+        # Read from `resources` rather than a parameter of its own: two sources
+        # for one list is how they drift apart.
+        kb_collection_names=list((resources or {}).get("kb_collection_names") or []),
+        kb_vector_scopes=dict((resources or {}).get("kb_vector_scopes") or {}),
+        request_approval=request_approval,
+    )
+
+    # A child spends against the run's ledger and under the run's caps, but
+    # prices its own requests: `for_delegate` shares the first two and takes this
+    # agent's provider for the third. Sharing the parent's guard outright would
+    # price an Anthropic delegate against OpenAI's catalog.
+    budget = (
+        shared_budget.for_delegate(provider=model_spec.provider)
+        if shared_budget is not None
+        else BudgetGuard(
+            ledger=SpendLedger(run_id=run_id, agent_id=agent_id, organization_id=organization_id),
+            provider=model_spec.provider,
+            limits=_spend_limits(
+                spec,
+                agent_period_spend=agent_period_spend,
+                org_period_spend=org_period_spend,
+                org_monthly_budget_usd=org_monthly_budget_usd,
+                run_limit_usd=run_limit_usd,
+                group_limits=group_limits,
+            ),
+        )
+    )
+    ledger = budget.ledger
+
+    # Three capabilities every agent gets, regardless of its spec. Making them
+    # configurable would make "an agent with no spending limit" - or one that
+    # acts on the world unattended - something somebody could arrive at by
+    # accident. The gate is attached even when nothing is gated, so that adding
+    # a side-effecting capability to a spec is the only thing that has to be
+    # right for approval to apply.
+    repairs = RepairTally()
+    # Wrapped, so what the provider is handed is written down as it is handed
+    # over. Reconstructing the prompt and the tool schemas from the spec
+    # afterwards would be a second implementation of everything above this line.
+    # Made before the capabilities, because a run reviewer, code mode and
+    # `CacheWatch` write onto it.
+    recorder = RunRecorder()
+    asking = (
+        frozenset({CONNECT_ACCOUNT})
+        if any(isinstance(extra, ConnectOnUse) for extra in extra_capabilities)
+        else frozenset()
+    )
+    capabilities: list[Any] = [
+        # First, so every hook after it - the approval gate and the guardrails
+        # among them - sees the arguments the tool will actually be called with.
+        CountedRepair(tally=repairs),
+        # Long conversations drift away from their instructions; re-stating the
+        # system prompt is cheap insurance for an agent whose behaviour *is* its
+        # instructions.
+        ReinjectSystemPrompt(),
+        # Before every configured capability: it writes the person's mid-run
+        # words into the history, and a compaction strategy that rebuilds the
+        # request from that history must find them there.
+        Steering(),
+        budget,
+        ApprovalGate(
+            required_tool_names=approval_required,
+            gate_every_tool=gate_every_tool,
+            describers=approval_describers(spec),
+            tool_ids=approval_tool_ids(spec),
+            asking_tool_names=asking,
+        ),
+        *configured,
+        # Every agent, in text: what it can and cannot do here, from the spec
+        # rather than from a prompt that goes stale the moment a capability is
+        # switched (#2301). A call is told by its text twin instead.
+        *((SetupBriefing.for_spec(spec, agent_id=agent_id),) if voice is None else ()),
+        *extra_capabilities,
+        *(() if voice is None else (AnswerUnknownTools(),)),
+        *(
+            ()
+            if call is None
+            else (
+                HandleDeferredToolCalls(handler=call.on_deferred),
+                *((WithoutApprovalTools(names=approval_required),) if call.anonymous else ()),
+            )
+        ),
+        # After the configured ones, so a compaction that rebuilds the request in
+        # its own before hook cannot drop the loop warning.
+        *(
+            [LoopGuard(repeats=spec.loop_guard.repeats, cycles=spec.loop_guard.cycles)]
+            if spec.loop_guard.enabled
+            else []
+        ),
+        *_reviewers(spec, reviewer_models or {}, recorder),
+        # Off unless the spec asks, and never under a session that asks before
+        # every tool: nothing could be folded into a script there.
+        *(
+            [
+                code_mode(
+                    approval_required=approval_required,
+                    asking=asking,
+                    max_tool_calls=spec.code_mode.max_tool_calls,
+                ),
+                CodeCalls(recorder=recorder),
+            ]
+            if spec.code_mode.enabled and not gate_every_tool
+            else []
+        ),
+        # Every agent: a moved cache prefix costs the most on exactly the long,
+        # tool-heavy runs nobody is watching the invoice of (#2109).
+        CacheWatch(
+            recorder=recorder,
+            marks_key=(
+                None if conversation_id is None else f"{conversation_id}/{agent_id}/{spec.name}"
+            ),
+            agent_id=agent_id,
+        ),
+        # Every agent, not only one that compacts. The warning is most useful to
+        # exactly the agent that will not: it is the one that reaches the ceiling
+        # and gets refused by the provider.
+        build_gauge(gauge),
+        # Every agent: a provider that numbers its calls afresh on each response
+        # would otherwise give a later drawing or approval an earlier one's id.
+        UniqueToolCallIds(),
+    ]
+
+    # Profile settings first, agent overrides second - the agent is the more
+    # specific statement of intent. Under both, prompt caching, which a profile
+    # can still turn off with `cache: false`.
+    #
+    # A setting the author never chose is absent from the dump rather than
+    # present as `None`, which is what keeps this merge honest in both
+    # directions: it cannot blank out a value the model profile set, and it
+    # cannot send `temperature: null` to a reasoning model, which rejects the
+    # parameter however it is spelled. See `ModelSettingsSpec`.
+    model_settings = ModelSettings(
+        **{
+            **PROMPT_CACHE,
+            **model_spec.params,
+            **spec.model_settings.model_dump(),
+        }
+    )
+
+    agent = PydanticAgent[AgentDeps, AgentOutput](
+        model=RecordingModel(model_spec.build(), recorder),
+        model_settings=model_settings,
+        # A realtime session reads only `instructions=` (#54), so a call carries
+        # the spec's instructions there and no system prompt at all.
+        system_prompt="" if voice is not None else spec.instructions or "",
+        instructions=None if voice is None else voice_instructions(spec.instructions, voice),
+        # The answer first - text, or the spec's object - then
+        # `DeferredToolRequests`, which is not a shape the model can choose: it
+        # is what the run ends with when the approval gate parks a call.
+        output_type=_output_type(spec.output_schema),
+        retries={"output": OUTPUT_RETRIES},
+        capabilities=capabilities,
+        # Undeferred in a call: tools are fixed at connect, and a deferred one is rejected.
+        toolsets=(
+            (extra_toolsets or [])
+            if voice is not None
+            else _defer_for_tool_search(configured, extra_toolsets or [])
+        ),
+    )
+
+    if spec.output_schema is not None:
+        agent.output_validator(_fits_schema(spec.output_schema))
+    _instrument(agent, spec, secrets or {}, agent_id=agent_id)
+
+    return BuiltAgent(
+        agent=agent,
+        deps=deps,
+        ledger=ledger,
+        budget=budget,
+        context=gauge,
+        reminder_state=reminder_state,
+        capabilities=configured,
+        recorder=recorder,
+        model_label=model_spec.label,
+        approval_required_tools=approval_required,
+        usage_limits=UsageLimits(request_limit=spec.max_steps or DEFAULT_MAX_STEPS),
+        repairs=repairs,
+    )
+
+
+def _reviewers(
+    spec: AgentSpec, models: Mapping[UUID, ModelRequestSpec], recorder: RunRecorder
+) -> list[RunReviewer]:
+    """The spec's run reviewers, each on the model the runner resolved for it (#2106).
+
+    A reviewer still a draft - no model or nothing to look for - or whose model did
+    not resolve is left out with a warning rather than failing the run it was meant
+    to watch. Its window is held to what its own model can read, with room left for
+    its instructions and its answer, so a cheap model's smaller context does not
+    turn every review into a refused request.
+
+    Its corrections pass through the agent's input guardrail before they reach the
+    model, as a person's mid-run words do: past the first request the input edge no
+    longer looks, and a reviewer quotes the run it read.
+    """
+    screen = _input_screen(spec)
+    reviewers: list[RunReviewer] = []
+    for reviewer in spec.reviewers:
+        model = None if reviewer.model_profile_id is None else models.get(reviewer.model_profile_id)
+        if model is None or not reviewer.instructions.strip():
+            logger.warning(
+                "Run reviewer %s is incomplete or unresolved; not reviewing", reviewer.name
+            )
+            continue
+        window = reviewer.window
+        if model.context_length:
+            window = max(1_000, min(window, model.context_length * 3 // 4))
+        reviewers.append(
+            RunReviewer(
+                name=reviewer.name,
+                model=model.build(),
+                model_settings=ModelSettings(**model.params),
+                instructions=reviewer.instructions,
+                every=reviewer.every,
+                window=window,
+                recorder=recorder,
+                screen=screen,
+            )
+        )
+    return reviewers
+
+
+def _input_screen(spec: AgentSpec) -> Callable[[str], GuardrailResult] | None:
+    for binding in spec.capabilities:
+        if binding.id == "guardrails" and binding.enabled:
+            return input_screen(GuardrailsConfig.model_validate(binding.config))
+    return None
+
+
+def _defer_for_tool_search(
+    configured: list[AbstractCapability[Any]],
+    extra_toolsets: list[AbstractToolset[Any]],
+) -> list[AbstractToolset[Any]]:
+    """Hide the MCP toolsets behind tool search when the agent enabled it.
+
+    The two are paired here or not at all. `ToolSearch` is inert with nothing
+    deferred, and a deferred tool with no `ToolSearch` to find it is a tool the
+    model can never call - so deferring a toolset without the capability, or
+    binding the capability without deferring anything, is each half of a broken
+    agent. Binding `tool_search` is what asks for both.
+
+    MCP is the target the capability exists for. An agent may bind an arbitrary
+    number of servers, and every tool's schema is context the model pays for on
+    every request until it searches for one instead; `extra_toolsets` is exactly
+    those servers. The registry's own tools stay visible - they are few, chosen
+    per agent, and cheap to carry.
+
+    Deferring changes what the model *sees*, never a tool's identity: a
+    discovered MCP tool arrives under its real prefixed name, so the approval
+    gate still pairs on it and a binding's rename still reaches it. `ToolSearch`
+    also sits outermost, so it reads the names a rename already applied rather
+    than the ones underneath.
+    """
+    if not any(isinstance(capability, ToolSearch) for capability in configured):
+        return extra_toolsets
+    return [toolset.defer_loading() for toolset in extra_toolsets]
+
+
+def _as_decimal(value: float) -> Decimal:
+    """Convert a spec's float budget to Decimal for exact accumulation.
+
+    Money accumulated as float drifts; the spec uses float because JSON has no
+    decimal type, and this is the boundary where that ends. Via `str` rather
+    than `Decimal(value)`, which would carry the binary approximation across
+    intact - 0.1 becoming 0.1000000000000000055511151231257827.
+    """
+    return Decimal(str(value))
+
+
+def _spend_limits(
+    spec: AgentSpec,
+    *,
+    agent_period_spend: PeriodSpendLookup | None,
+    org_period_spend: PeriodSpendLookup | None,
+    org_monthly_budget_usd: Decimal | None,
+    run_limit_usd: Decimal | None = None,
+    group_limits: Sequence[SpendLimit] = (),
+) -> list[SpendLimit]:
+    """Every ceiling this run is under, narrowest first.
+
+    The agent's monthly cap and the organization's are two entries rather than
+    `min()` of the two, because they meter different spend: one agent's month
+    and the whole organization's. Taking the tighter of two numbers only says
+    something when both count the same thing, and the previous version of this
+    function did it against a single organization-wide total - which turned
+    `AgentSpec.budget.monthly_usd` into "stop this agent once *anyone* has
+    spent X" and refused an agent that had spent nothing all month.
+
+    Keeping them separate loses nothing the collapse provided. An agent still
+    cannot loosen the organization's ceiling: the organization's entry is present
+    at its own number whatever the spec asks for, and an agent's spend is part of
+    the organization's, so a $100 agent under a $10 organization is still stopped
+    at $10. It gains the case the collapse got wrong - a $5 agent under a $50
+    ceiling now binds when *it* has spent $5, not when its neighbours have - and
+    the refusal names the cap that actually bound instead of inferring it from
+    which of two numbers was smaller.
+
+    Order is narrowest first so a run under both exhausted ceilings reports
+    the one nearest the person reading it. The organization's is deliberately
+    last: it is the one an agent's author cannot raise, and hearing about it
+    first would send them to somebody else for a limit they could have fixed
+    themselves. A department's caps sit between the two: an author cannot
+    raise one either, but it binds fewer people than the organization's.
+    """
+    limits: list[SpendLimit] = []
+    # This run's own ceiling, the narrowest of all: no lookup, so it meters
+    # only what this run has spent.
+    if run_limit_usd is not None:
+        limits.append(SpendLimit(scope=BudgetScope.RUN, limit_usd=run_limit_usd))
+    if spec.budget is not None and spec.budget.monthly_usd is not None:
+        limits.append(
+            SpendLimit(
+                scope=BudgetScope.AGENT,
+                limit_usd=_as_decimal(spec.budget.monthly_usd),
+                period_spend=agent_period_spend,
+            )
+        )
+    limits.extend(group_limits)
+    if org_monthly_budget_usd is not None:
+        limits.append(
+            SpendLimit(
+                scope=BudgetScope.ORGANIZATION,
+                limit_usd=org_monthly_budget_usd,
+                period_spend=org_period_spend,
+            )
+        )
+    return limits
+
+
+def _output_type(schema: dict[str, Any] | None) -> OutputSpec[AgentOutput]:
+    """Text, or an object of `schema` handed back as one tool call's arguments."""
+    if schema is None:
+        return [str, DeferredToolRequests]
+    return [
+        StructuredDict(schema, name="answer", description="The answer, in the shape asked for"),
+        DeferredToolRequests,
+    ]
+
+
+def _fits_schema(schema: dict[str, Any]) -> Callable[[AgentOutput], AgentOutput]:
+    """An output validator sending the model back when its answer breaks `schema`.
+
+    Pydantic AI hands a structured answer on as a dict and checks only that it
+    is one; the schema's own rules - required fields, types, enums - are checked
+    here, so a surface that promises the shape never receives anything else.
+    The first problem is named, with where it is, because that is what the
+    model can fix on its next try.
+    """
+    checker = validators.validator_for(schema)(schema)
+
+    def fits(output: AgentOutput) -> AgentOutput:
+        if isinstance(output, dict):
+            problem = next(iter(sorted(checker.iter_errors(output), key=str)), None)
+            if problem is not None:
+                where = "/".join(str(part) for part in problem.absolute_path) or "the answer"
+                raise ModelRetry(
+                    f"The answer does not fit its schema at {where}: {problem.message}"
+                )
+        return output
+
+    return fits
+
+
+def _instrument(
+    agent: PydanticAgent[AgentDeps, AgentOutput],
+    spec: AgentSpec,
+    secrets: Mapping[UUID, StorableSecret],
+    *,
+    agent_id: UUID | None,
+) -> None:
+    """Send this agent's traces to its own Logfire project, if it asked for one.
+
+    Silent when the spec says nothing, which is every agent by default: the
+    deployment's own Logfire configuration already receives the run.
+
+    A configured block whose token is missing is *not* an error here. The secret
+    may have been deleted after publish, and the choice is between an agent that
+    runs untraced and an agent that does not run - publishing is where a missing
+    secret is refused, and a run is far too late.
+
+    `content="none"` is enforced even when no per-agent exporter attaches. The
+    deployment instruments Pydantic AI globally with content on, so an agent that
+    asked for no content but has no token - or whose token has gone, or whose
+    traces the environment routes - would otherwise leak its prompts to the
+    operator's project through that global default. `suppress_content` pins it to
+    a content-free instrumentation instead.
+    """
+    observability = spec.observability
+    if observability is None:
+        return
+
+    want_content = observability.content != "none"
+    attached = False
+    if observability.token_secret_id is not None:
+        secret = secrets.get(observability.token_secret_id)
+        if isinstance(secret, ApiKeySecret):
+            attached = instrument_agent(
+                agent,
+                token=secret.api_key.get_secret_value(),
+                service_name=observability.service_name or spec.name,
+                environment=observability.environment,
+                include_content=want_content,
+            )
+        else:
+            logger.warning(
+                "agent_logfire_token_unavailable",
+                extra={"agent_id": str(agent_id) if agent_id else None},
+            )
+
+    if not attached and not want_content:
+        suppress_content(agent)

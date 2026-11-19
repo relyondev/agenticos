@@ -1,0 +1,272 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import {
+  AlertCircle,
+  CalendarClock,
+  CheckCircle2,
+  Cpu,
+  Database,
+  HardDrive,
+  MapPinned,
+  RefreshCw,
+  Zap,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+
+import { getErrorMessage } from "@/lib/api-error";
+import { ErrorState } from "@/components/states";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Button, ListCard } from "@/components/ui";
+import { apiClient } from "@/lib/api-client";
+import { qk } from "@/lib/query-keys";
+import { cn } from "@/lib/utils";
+import type { CheckStatus, SystemHealth } from "@/types/admin";
+import { useTranslations } from "next-intl";
+
+const REFRESH_INTERVAL_MS = 30_000;
+
+/** Each service's words live in the catalog; `words` names the key. */
+const META: Record<string, { words: string; icon: LucideIcon }> = {
+  database: { words: "serviceDatabase", icon: Database },
+  redis: { words: "serviceRedis", icon: Zap },
+  vector_store: { words: "serviceVectorStore", icon: HardDrive },
+  model_access: { words: "serviceModelAccess", icon: Cpu },
+  scheduler: { words: "serviceScheduler", icon: CalendarClock },
+  map_tiles: { words: "serviceMapTiles", icon: MapPinned },
+};
+
+const STATUS_DOT: Record<CheckStatus, string> = {
+  healthy: "bg-success",
+  unhealthy: "bg-destructive",
+  unconfigured: "bg-muted-foreground",
+  not_checked: "bg-muted-foreground",
+};
+
+/** The catalog key for each state, not the word: the word is in `messages/en.json`. */
+const STATUS_WORDS: Record<CheckStatus, string> = {
+  healthy: "stateHealthy",
+  unhealthy: "stateUnhealthy",
+  unconfigured: "stateUnconfigured",
+  not_checked: "stateNotChecked",
+};
+
+const STATUS_TEXT: Record<CheckStatus, string> = {
+  healthy: "text-foreground",
+  unhealthy: "text-destructive",
+  unconfigured: "text-muted-foreground",
+  not_checked: "text-muted-foreground",
+};
+
+export default function SystemHealthPage() {
+  const tErrors = useTranslations("errors");
+  const ts = useTranslations("states");
+  const t = useTranslations("pages.admin");
+  const tc = useTranslations("common");
+  const [auto, setAuto] = useState(true);
+
+  // Through the query layer, where server data belongs. `refetchInterval` is
+  // the auto-refresh the second effect hand-rolled with `setInterval`, and it
+  // stops while the tab is hidden - which the interval did not, so a backgrounded
+  // dashboard was polling the health endpoint every thirty seconds all day.
+  const {
+    data: health = null,
+    isPending: loading,
+    isFetching,
+    error,
+    refetch,
+  } = useQuery({
+    queryKey: qk.admin.system(),
+    queryFn: () => apiClient.get<SystemHealth>("/admin/system"),
+    refetchInterval: auto ? REFRESH_INTERVAL_MS : false,
+  });
+
+  const load = () => void refetch();
+
+  const checks = health?.checks ?? [];
+
+  const summary = useMemo(() => {
+    if (!checks.length) return null;
+    const failing = checks.filter((check) => check.status === "unhealthy");
+    if (failing.length) {
+      const names = failing.map((check) =>
+        META[check.key] ? t(META[check.key]!.words) : check.key,
+      );
+      return { tone: "bad" as const, label: t("failingServices", { names: names.join(", ") }) };
+    }
+    const unconfigured = checks.filter((check) => check.status !== "healthy");
+    if (unconfigured.length) {
+      return {
+        tone: "mixed" as const,
+        label: t("someUnconfigured", { count: unconfigured.length }),
+      };
+    }
+    return { tone: "good" as const, label: t("everyCheckPassed") };
+  }, [checks]);
+
+  return (
+    <div className="flex flex-1 flex-col space-y-6" aria-busy={loading && !health}>
+      {loading && !health && (
+        <span role="status" className="sr-only">
+          {ts("loading")}
+        </span>
+      )}
+      {loading && !health ? (
+        <section
+          className="border-border bg-card flex flex-wrap items-center justify-between gap-4 rounded-xl border p-5"
+          aria-hidden
+        >
+          <div className="flex items-center gap-3">
+            <Skeleton className="h-10 w-10 rounded-lg" />
+            <div className="space-y-2">
+              <Skeleton className="h-3 w-24" />
+              <Skeleton className="h-6 w-48" />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Skeleton className="h-8 w-28" />
+            <Skeleton className="h-8 w-24" />
+          </div>
+        </section>
+      ) : (
+        summary && (
+          <section className="border-border bg-card rounded-xl border p-5">
+            {/* The controls live on this card rather than floating above it: they
+              are about the reading it holds - when it was taken and whether it
+              refreshes itself - and a strip of buttons over an empty page had
+              nothing to belong to. */}
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <span className="bg-muted text-foreground inline-flex h-10 w-10 items-center justify-center rounded-lg">
+                  {summary.tone === "bad" ? (
+                    <AlertCircle className="h-5 w-5" />
+                  ) : (
+                    <CheckCircle2 className="h-5 w-5" />
+                  )}
+                </span>
+                <div>
+                  <p className="text-muted-foreground text-xs">{t("overallStatus")}</p>
+                  <div className="mt-1 flex items-center gap-2">
+                    <span
+                      aria-hidden
+                      className={cn(
+                        "h-2 w-2 rounded-full",
+                        summary.tone === "bad"
+                          ? "bg-destructive"
+                          : summary.tone === "good"
+                            ? "bg-success"
+                            : "bg-warning",
+                      )}
+                    />
+                    <p className="text-foreground text-base font-semibold">{summary.label}</p>
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {health && (
+                  <span className="text-muted-foreground mr-1 text-xs">
+                    {t("checkedAt", { time: new Date(health.checked_at).toLocaleTimeString() })}
+                  </span>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setAuto((a) => !a)}
+                  aria-pressed={auto}
+                  className={cn(auto && "bg-muted")}
+                >
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "h-1.5 w-1.5 rounded-full",
+                      auto ? "bg-success" : "bg-muted-foreground",
+                    )}
+                  />
+                  {t(auto ? "autoRefreshOn" : "autoRefreshOff")}
+                </Button>
+                <Button size="sm" variant="outline" onClick={load} disabled={isFetching}>
+                  <RefreshCw
+                    className={cn("h-3.5 w-3.5", isFetching && "motion-safe:animate-spin")}
+                  />
+                  {t("refresh2")}
+                </Button>
+              </div>
+            </div>
+          </section>
+        )
+      )}
+
+      {error ? (
+        <ErrorState
+          title={t("couldnAposTFetch")}
+          description={getErrorMessage(error, tErrors, t("failedFetchHealth"))}
+          cta={{ label: tc("retry"), onClick: load }}
+        />
+      ) : (
+        <ListCard title={t("services")} counted={t("eachRowSaysWhat")} contentClassName="p-0">
+          <ul className="divide-border divide-y">
+            {loading &&
+              !health &&
+              Object.keys(META).map((key) => (
+                <li key={key} className="flex items-start gap-3 px-5 py-4" aria-hidden>
+                  <Skeleton className="mt-0.5 h-9 w-9 shrink-0 rounded-lg" />
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <Skeleton className="h-5 w-2/3" />
+                    <Skeleton className="h-4 w-1/2" />
+                  </div>
+                  <Skeleton className="h-4 w-16" />
+                </li>
+              ))}
+            {checks.map((check) => {
+              const meta = META[check.key];
+              const Icon = meta?.icon ?? Database;
+              return (
+                <li key={check.key} className="flex items-start gap-3 px-5 py-4">
+                  <span className="bg-muted text-muted-foreground mt-0.5 inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg">
+                    <Icon className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-foreground text-sm font-medium">
+                      {meta ? t(meta.words) : check.key}
+                      {meta && (
+                        <span className="text-muted-foreground font-normal">
+                          {" · "}
+                          {t(`${meta.words}Detail`)}
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-muted-foreground mt-0.5 text-xs">{check.detail}</p>
+                  </div>
+                  <div className="flex shrink-0 flex-col items-end gap-1 pl-1">
+                    <div className="flex items-center gap-2">
+                      <span
+                        aria-hidden
+                        className={cn("h-2 w-2 rounded-full", STATUS_DOT[check.status])}
+                      />
+                      <span
+                        className={cn(
+                          "text-xs font-medium whitespace-nowrap",
+                          STATUS_TEXT[check.status],
+                        )}
+                      >
+                        {t(STATUS_WORDS[check.status])}
+                      </span>
+                    </div>
+                    {check.latency_ms !== null && (
+                      <span className="text-muted-foreground text-xs tabular-nums">
+                        {t("latencyMs", { ms: check.latency_ms })}
+                      </span>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </ListCard>
+      )}
+
+      <p className="text-muted-foreground text-xs">{t("everyStatusHereComes")}</p>
+    </div>
+  );
+}

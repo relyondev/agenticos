@@ -1,0 +1,749 @@
+"""A capability declares that it needs a secret; a binding says which one.
+
+The whole design of the secret store is in this handshake, and every test here
+is one half of it. Code declares a *kind*; configuration names an *instance*;
+the plaintext is unsealed at build time, reaches the capability object, and goes
+no further - not into `AgentDeps`, not into a tool argument, not into the
+model's context, not into a log line.
+"""
+
+import logging
+import uuid
+from collections.abc import Iterator
+from typing import Any, get_args
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from pydantic import BaseModel
+from pydantic_ai.capabilities import AbstractCapability
+
+from app.agents.capabilities import (
+    REGISTRY,
+    CapabilityBinding,
+    CapabilityBuildContext,
+    build,
+    register,
+)
+from app.agents.capabilities.coding_agent import CodingAgentConfig
+from app.agents.spec import AgentSpec, CapabilityBindingSpec, ObservabilitySpec
+from app.core import secret_purposes
+from app.core.exceptions import BadRequestError
+from app.core.permissions import AuthContext, OrgRoleName
+from app.core.secret_kinds import (
+    ApiKeySecret,
+    AwsCredentialsSecret,
+    PurposesByValue,
+    SecretCondition,
+    SecretKind,
+    SecretRequirement,
+)
+from app.db.models.resource_grant import GrantLevel, Visibility
+from app.services.agent_registry import AgentRegistryService
+
+pytestmark = pytest.mark.security
+
+
+@pytest.fixture(autouse=True)
+def _no_model_runs_on_a_sign_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No profile here runs on a ChatGPT sign-in; `test_publish_sign_ins` has those.
+
+    Stubbed at the repository boundary, so the real check runs - and finds nothing
+    to refuse - on every publish, rollback and draft check below.
+    """
+    monkeypatch.setattr(
+        "app.services.agent_registry.credential_repo.get_profiles_by_ids",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_registry.organization_secret_repo.get_many",
+        AsyncMock(return_value={}),
+    )
+
+
+CAPABILITY_ID = "test_needs_a_key"
+
+
+class _Weather(AbstractCapability[None]):
+    """A stand-in for a client capability calling an authenticated third-party API."""
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
+
+@pytest.fixture
+def capability_needing_a_key() -> Iterator[None]:
+    """Register a capability that declares a secret, and take it away again.
+
+    A fixture rather than a builtin because no shipped capability needs a
+    credential yet - the store exists for the ones a client writes - and the
+    handshake has to be tested before the first one is written, not after.
+    """
+
+    @register(
+        id=CAPABILITY_ID,
+        name="Weather",
+        category="test",
+        description="Calls a weather API",
+        tools=(),
+        secret=SecretRequirement(kind=SecretKind.API_KEY, description="Weather API key"),
+    )
+    def _build(ctx: CapabilityBuildContext) -> _Weather:
+        assert isinstance(ctx.secret, ApiKeySecret)
+        return _Weather(api_key=ctx.secret.api_key.get_secret_value())
+
+    yield
+    REGISTRY.pop(CAPABILITY_ID, None)
+
+
+@pytest.mark.usefixtures("capability_needing_a_key")
+class TestInjection:
+    def test_the_referenced_secret_reaches_the_capability_instance(self):
+        secret_id = uuid.uuid4()
+
+        built = build(
+            [CapabilityBinding(capability_id=CAPABILITY_ID, secret_id=secret_id)],
+            secrets={secret_id: ApiKeySecret(api_key="wx-live-4242")},
+        )
+
+        assert isinstance(built[0], _Weather)
+        assert built[0].api_key == "wx-live-4242"
+
+    def test_a_secret_deleted_after_publish_refuses_the_build(self):
+        """Publish already refused a missing reference, so this is the later case.
+
+        Degrading instead would produce an agent that answers as though the API
+        had said no, which is worse than a run that stops and says why.
+        """
+        secret_id = uuid.uuid4()
+
+        with pytest.raises(BadRequestError) as refused:
+            build([CapabilityBinding(capability_id=CAPABILITY_ID, secret_id=secret_id)], secrets={})
+
+        assert refused.value.details == {
+            "capability_id": CAPABILITY_ID,
+            "secret_id": str(secret_id),
+            "required_kind": "api_key",
+        }
+
+    def test_a_binding_with_no_reference_at_all_is_refused(self):
+        with pytest.raises(BadRequestError) as refused:
+            build([CapabilityBinding(capability_id=CAPABILITY_ID)], secrets={})
+
+        assert refused.value.details is not None
+        assert refused.value.details["secret_id"] is None
+
+    def test_a_capability_that_needs_nothing_is_handed_nothing(self):
+        """`clock` declares no secret, so its context must not carry one."""
+        seen: list[CapabilityBuildContext] = []
+
+        @register(
+            id="test_needs_nothing",
+            name="Nothing",
+            category="test",
+            description="",
+            tools=(),
+        )
+        def _build(ctx: CapabilityBuildContext) -> None:
+            seen.append(ctx)
+            return
+
+        try:
+            build(
+                [CapabilityBinding(capability_id="test_needs_nothing", secret_id=uuid.uuid4())],
+                secrets={uuid.uuid4(): ApiKeySecret(api_key="wx-12345678")},
+            )
+        finally:
+            REGISTRY.pop("test_needs_nothing", None)
+
+        assert seen[0].secret is None
+
+    def test_a_build_context_masks_the_secret_in_a_repr(self):
+        """The way a plaintext escapes is a dataclass reaching a log line."""
+        context = CapabilityBuildContext(
+            binding=CapabilityBinding(capability_id=CAPABILITY_ID),
+            config=None,
+            secret=ApiKeySecret(api_key="wx-live-do-not-print"),
+        )
+        assert "wx-live-do-not-print" not in repr(context)
+
+    def test_nothing_about_the_secret_reaches_a_log_line(self, caplog):
+        secret_id = uuid.uuid4()
+        with caplog.at_level(logging.DEBUG):
+            build(
+                [CapabilityBinding(capability_id=CAPABILITY_ID, secret_id=secret_id)],
+                secrets={secret_id: ApiKeySecret(api_key="wx-live-4242")},
+            )
+        assert "wx-live-4242" not in caplog.text
+
+
+@pytest.fixture
+def secret_row() -> MagicMock:
+    """A stored secret of the kind the test capability asks for."""
+    row = MagicMock()
+    row.id = uuid.uuid4()
+    row.name = "Weather API"
+    row.kind = SecretKind.API_KEY.value
+    row.purpose = "custom"
+    return row
+
+
+async def _publish_problems(binding: CapabilityBindingSpec, *, secret: MagicMock | None) -> Any:
+    """Validate a spec carrying one binding, and report what publish refused.
+
+    Driven through the public entry point rather than the private helper: the
+    behaviour worth guarding is "publish refuses", and a spec that validates by
+    a different route later would still have to.
+    """
+    ctx = AuthContext(user_id=uuid.uuid4(), organization_id=uuid.uuid4(), role=OrgRoleName.OWNER)
+    if secret is not None:
+        # Stamped here rather than in the fixture: the lookup that produced this
+        # row is org-scoped, so anything it returns belongs to the caller's
+        # organization by construction. Publish now also asks whether the
+        # publisher may *reach* it, and that check starts with the tenant.
+        secret.organization_id = ctx.organization_id
+    spec = AgentSpec(name="Forecast", model_profile_id=uuid.uuid4(), capabilities=[binding])
+    lookup = AsyncMock(return_value=secret)
+    with (
+        patch(
+            "app.services.agent_registry.credential_repo.get_profile",
+            new=AsyncMock(return_value=MagicMock()),
+        ),
+        patch("app.services.agent_registry.organization_secret_repo.get", new=lookup),
+    ):
+        try:
+            await AgentRegistryService(MagicMock()).validate_spec(ctx, spec)
+        except BadRequestError as refused:
+            assert refused.details is not None
+            return refused.details["problems"], lookup, ctx
+    return [], lookup, ctx
+
+
+@pytest.mark.usefixtures("capability_needing_a_key")
+class TestPublishValidation:
+    """A broken reference is refused while somebody is looking at a form."""
+
+    @pytest.mark.anyio
+    async def test_a_capability_needing_a_secret_with_none_selected_is_refused(self):
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(id=CAPABILITY_ID), secret=None
+        )
+        assert problems == [
+            f"Capability '{CAPABILITY_ID}' needs a api_key secret "
+            "(Weather API key) and none is selected"
+        ]
+
+    @pytest.mark.anyio
+    async def test_a_reference_to_a_secret_this_organization_does_not_have_is_refused(self):
+        secret_id = uuid.uuid4()
+
+        problems, lookup, ctx = await _publish_problems(
+            CapabilityBindingSpec(id=CAPABILITY_ID, secret_id=secret_id), secret=None
+        )
+
+        assert problems == [
+            f"Capability '{CAPABILITY_ID}' points at a secret this organization does not "
+            f"have: {secret_id}"
+        ]
+        # Scoped, so a secret belonging to another tenant is indistinguishable
+        # from one that does not exist.
+        assert lookup.call_args.kwargs["organization_id"] == ctx.organization_id
+
+    @pytest.mark.anyio
+    async def test_a_secret_of_the_wrong_shape_is_refused(self, secret_row):
+        secret_row.kind = SecretKind.AWS_CREDENTIALS.value
+        secret_row.name = "Bedrock"
+
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(id=CAPABILITY_ID, secret_id=secret_row.id), secret=secret_row
+        )
+
+        assert problems == [
+            f"Capability '{CAPABILITY_ID}' needs a api_key secret, but "
+            "'Bedrock' holds a aws_credentials"
+        ]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(("harness", "refused"), [("claude_code", True), ("codex", False)])
+    async def test_a_chatgpt_sign_in_runs_only_codex(self, secret_row, harness, refused):
+        """Switched to Claude Code, a binding kept the sign-in and published; every
+        task then refused at run time."""
+        secret_row.kind = SecretKind.OPENAI_CODEX.value
+        secret_row.name = "My ChatGPT"
+
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(
+                id="coding_agent", secret_id=secret_row.id, config={"harness": harness}
+            ),
+            secret=secret_row,
+        )
+
+        said = any("ChatGPT sign-in, which only Codex runs on" in problem for problem in problems)
+        assert said is refused
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("capability", "config"),
+        [
+            ("image_generation", {"provider": "google", "model": "gemini-3-pro-image"}),
+            (
+                "text_to_speech",
+                {"provider": "google", "model": "gemini-3.8-flash-tts", "voice": "Kore"},
+            ),
+            ("video_generation", {"provider": "google"}),
+        ],
+    )
+    async def test_a_key_for_another_provider_is_refused(self, secret_row, capability, config):
+        """Same kind, wrong service: the key would be sent in Google's auth header
+        at every call (#2258)."""
+        secret_row.purpose = "openai"
+        secret_row.name = "OpenAI"
+
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(id=capability, secret_id=secret_row.id, config=config),
+            secret=secret_row,
+        )
+
+        assert problems == [
+            f"Capability '{capability}' is set to use google, but 'OpenAI' is a key for openai"
+        ]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("purpose", ["google", "custom"])
+    async def test_a_key_for_the_chosen_provider_or_a_custom_one_publishes(
+        self, secret_row, purpose
+    ):
+        """`custom` is every key stored before purposes existed; it stays accepted."""
+        secret_row.purpose = purpose
+
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(
+                id="video_generation", secret_id=secret_row.id, config={"provider": "google"}
+            ),
+            secret=secret_row,
+        )
+
+        assert problems == []
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("config", "kind", "purpose"),
+        [
+            ({"harness": "claude_code"}, SecretKind.API_KEY, "anthropic"),
+            ({"harness": "claude_code"}, SecretKind.API_KEY, "custom"),
+            ({}, SecretKind.API_KEY, "anthropic"),
+            ({"harness": "codex"}, SecretKind.API_KEY, "openai"),
+            ({"harness": "codex"}, SecretKind.API_KEY, "custom"),
+            ({"harness": "codex"}, SecretKind.OPENAI_CODEX, "openai_codex"),
+            # Behind a gateway the key is the gateway's, whichever it is - a
+            # spec stored before #2485 on a z.ai key keeps publishing.
+            (
+                {"harness": "claude_code", "base_url": "https://openrouter.ai/api"},
+                SecretKind.API_KEY,
+                "openrouter",
+            ),
+            (
+                {"harness": "claude_code", "base_url": "https://api.z.ai/api/anthropic"},
+                SecretKind.API_KEY,
+                "zai",
+            ),
+        ],
+        ids=[
+            "anthropic",
+            "claude-custom",
+            "default-harness",
+            "openai",
+            "codex-custom",
+            "chatgpt",
+            "openrouter-gateway",
+            "other-gateway",
+        ],
+    )
+    async def test_a_key_for_the_coding_agents_harness_publishes(
+        self, secret_row, config, kind, purpose
+    ):
+        """The harness names the provider; its key, a ChatGPT sign-in for Codex
+        and a `custom` key all fit, and any key behind `base_url` (#2485)."""
+        secret_row.kind = kind.value
+        secret_row.purpose = purpose
+        secret_row.name = "Mine"
+
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(id="coding_agent", secret_id=secret_row.id, config=config),
+            secret=secret_row,
+        )
+
+        # The coding agent also wants a sandbox, which this spec does not bind.
+        assert [problem for problem in problems if "'Mine'" in problem] == []
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("config", "purpose", "expected"),
+        [
+            ({"harness": "claude_code"}, "openai", "anthropic"),
+            ({}, "openai", "anthropic"),
+            ({"harness": "claude_code"}, "openrouter", "anthropic"),
+            ({"harness": "codex"}, "anthropic", "openai or openai_codex"),
+        ],
+        ids=[
+            "openai-for-claude",
+            "default-harness",
+            "gateway-key-no-gateway",
+            "anthropic-for-codex",
+        ],
+    )
+    async def test_a_key_for_the_other_harness_is_refused(
+        self, secret_row, config, purpose, expected
+    ):
+        """Claude Code with an OpenAI key published and then failed at run time
+        (#2485), as did a gateway's key with no `base_url` to send it to. The
+        refusal names the providers the harness takes."""
+        secret_row.purpose = purpose
+        secret_row.name = "Mine"
+
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(id="coding_agent", secret_id=secret_row.id, config=config),
+            secret=secret_row,
+        )
+
+        assert (
+            f"Capability 'coding_agent' is set to use {expected}, but 'Mine' is a key for {purpose}"
+        ) in problems
+
+    @pytest.mark.anyio
+    async def test_a_matching_secret_publishes(self, secret_row):
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(id=CAPABILITY_ID, secret_id=secret_row.id), secret=secret_row
+        )
+        assert problems == []
+
+    @pytest.mark.anyio
+    async def test_a_key_the_publisher_cannot_reach_is_refused(self, secret_row):
+        """Binding a key is lending it: the agent runs it for everyone who can
+        run the agent. The picker only offers what the publisher can see, but the
+        API takes an id - and an id is guessable in a way a list is not.
+
+        Refused in the same words as a missing one, so the difference between
+        "no such key" and "not yours" cannot be used to enumerate the vault.
+        """
+        ctx = AuthContext(
+            user_id=uuid.uuid4(), organization_id=uuid.uuid4(), role=OrgRoleName.MEMBER
+        )
+        secret_row.organization_id = ctx.organization_id
+        secret_row.owner_user_id = uuid.uuid4()
+        secret_row.visibility = Visibility.PRIVATE.value
+        spec = AgentSpec(
+            name="Forecast",
+            model_profile_id=uuid.uuid4(),
+            capabilities=[CapabilityBindingSpec(id=CAPABILITY_ID, secret_id=secret_row.id)],
+        )
+
+        with (
+            patch(
+                "app.services.agent_registry.credential_repo.get_profile",
+                new=AsyncMock(return_value=MagicMock()),
+            ),
+            patch(
+                "app.services.agent_registry.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret_row),
+            ),
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            pytest.raises(BadRequestError) as refused,
+        ):
+            await AgentRegistryService(MagicMock()).validate_spec(ctx, spec)
+
+        assert refused.value.details is not None
+        assert refused.value.details["problems"] == [
+            f"Capability '{CAPABILITY_ID}' points at a secret this organization does not "
+            f"have: {secret_row.id}"
+        ]
+
+    @pytest.mark.anyio
+    async def test_a_key_shared_with_the_publisher_publishes(self, secret_row):
+        """The other half: a grant is what sharing writes, and it has to be
+        enough - otherwise the sharing panel promises access publish refuses."""
+        ctx = AuthContext(
+            user_id=uuid.uuid4(), organization_id=uuid.uuid4(), role=OrgRoleName.MEMBER
+        )
+        secret_row.organization_id = ctx.organization_id
+        secret_row.owner_user_id = uuid.uuid4()
+        secret_row.visibility = Visibility.PRIVATE.value
+        spec = AgentSpec(
+            name="Forecast",
+            model_profile_id=uuid.uuid4(),
+            capabilities=[CapabilityBindingSpec(id=CAPABILITY_ID, secret_id=secret_row.id)],
+        )
+
+        with (
+            patch(
+                "app.services.agent_registry.credential_repo.get_profile",
+                new=AsyncMock(return_value=MagicMock()),
+            ),
+            patch(
+                "app.services.agent_registry.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret_row),
+            ),
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=GrantLevel.READ),
+            ),
+        ):
+            await AgentRegistryService(MagicMock()).validate_spec(ctx, spec)
+
+    @pytest.mark.anyio
+    async def test_a_reference_nothing_consumes_is_refused(self):
+        """The failure nobody would ever notice: configured, stored, never read.
+
+        `clock` takes no secret, so a secret chosen for it reads as protection
+        that is not there.
+        """
+        problems, _, _ = await _publish_problems(
+            CapabilityBindingSpec(id="clock", secret_id=uuid.uuid4()), secret=None
+        )
+        assert problems == [
+            "Capability 'clock' does not use a secret, so the one selected here "
+            "would be stored and never read"
+        ]
+
+
+async def _observability_publish_problems(
+    observability: ObservabilitySpec | None, *, secret: MagicMock | None
+) -> Any:
+    """Validate a spec whose only reference is a tracing token, through publish.
+
+    A tracing token is not a capability's secret, but it is checked the same
+    way and at the same moment - `factory._instrument` says a run is far too
+    late to learn the token is unusable.
+    """
+    ctx = AuthContext(user_id=uuid.uuid4(), organization_id=uuid.uuid4(), role=OrgRoleName.OWNER)
+    if secret is not None:
+        secret.organization_id = ctx.organization_id
+    spec = AgentSpec(name="Traced", model_profile_id=uuid.uuid4(), observability=observability)
+    lookup = AsyncMock(return_value=secret)
+    with (
+        patch(
+            "app.services.agent_registry.credential_repo.get_profile",
+            new=AsyncMock(return_value=MagicMock()),
+        ),
+        patch("app.services.agent_registry.organization_secret_repo.get", new=lookup),
+    ):
+        try:
+            await AgentRegistryService(MagicMock()).validate_spec(ctx, spec)
+        except BadRequestError as refused:
+            assert refused.details is not None
+            return refused.details["problems"], lookup, ctx
+    return [], lookup, ctx
+
+
+class TestObservabilityPublishValidation:
+    """A tracing token is refused at publish, not left to fail silently at run."""
+
+    @pytest.mark.anyio
+    async def test_publishing_refuses_a_tracing_token_this_organization_does_not_have(self):
+        token_id = uuid.uuid4()
+
+        problems, lookup, ctx = await _observability_publish_problems(
+            ObservabilitySpec(token_secret_id=token_id), secret=None
+        )
+
+        assert problems == [
+            f"The tracing token points at a secret this organization does not have: {token_id}"
+        ]
+        # Scoped, so another tenant's token is indistinguishable from a missing one.
+        assert lookup.call_args.kwargs["organization_id"] == ctx.organization_id
+
+    @pytest.mark.anyio
+    async def test_publishing_refuses_a_tracing_token_for_another_service(self, secret_row):
+        """The gap a kind-only check missed: a Tavily or OpenAI key is also an
+        `api_key`, so it passes on kind and is then handed to Logfire as its
+        token. The `logfire` purpose gate - the same one the environment path
+        applies - refuses it."""
+        secret_row.purpose = "tavily"
+        secret_row.name = "Tavily search"
+
+        problems, _, _ = await _observability_publish_problems(
+            ObservabilitySpec(token_secret_id=secret_row.id), secret=secret_row
+        )
+
+        assert problems == [
+            "The tracing token must be a Logfire key, but 'Tavily search' is for tavily"
+        ]
+
+    @pytest.mark.anyio
+    async def test_a_matching_tracing_token_publishes(self, secret_row):
+        secret_row.purpose = "logfire"
+        problems, _, _ = await _observability_publish_problems(
+            ObservabilitySpec(token_secret_id=secret_row.id), secret=secret_row
+        )
+        assert problems == []
+
+    @pytest.mark.anyio
+    async def test_publishing_refuses_a_tracing_token_the_publisher_cannot_reach(self, secret_row):
+        """Naming a tracing token is lending it, the same as a capability's key:
+        the publisher has to reach it themselves, and the refusal reads like a
+        miss so an id cannot enumerate the vault."""
+        ctx = AuthContext(
+            user_id=uuid.uuid4(), organization_id=uuid.uuid4(), role=OrgRoleName.MEMBER
+        )
+        secret_row.organization_id = ctx.organization_id
+        secret_row.owner_user_id = uuid.uuid4()
+        secret_row.visibility = Visibility.PRIVATE.value
+        secret_row.purpose = "logfire"
+        spec = AgentSpec(
+            name="Traced",
+            model_profile_id=uuid.uuid4(),
+            observability=ObservabilitySpec(token_secret_id=secret_row.id),
+        )
+
+        with (
+            patch(
+                "app.services.agent_registry.credential_repo.get_profile",
+                new=AsyncMock(return_value=MagicMock()),
+            ),
+            patch(
+                "app.services.agent_registry.organization_secret_repo.get",
+                new=AsyncMock(return_value=secret_row),
+            ),
+            patch(
+                "app.services.access.resource_grant_repo.get_level",
+                new=AsyncMock(return_value=None),
+            ),
+            pytest.raises(BadRequestError) as refused,
+        ):
+            await AgentRegistryService(MagicMock()).validate_spec(ctx, spec)
+
+        assert refused.value.details is not None
+        assert refused.value.details["problems"] == [
+            f"The tracing token points at a secret this organization does not have: {secret_row.id}"
+        ]
+
+    @pytest.mark.anyio
+    async def test_an_observability_block_without_a_token_needs_no_lookup(self):
+        problems, lookup, _ = await _observability_publish_problems(
+            ObservabilitySpec(environment="prod"), secret=None
+        )
+        assert problems == []
+        lookup.assert_not_awaited()
+
+
+class TestSpecCarriesOnlyAReference:
+    def test_a_binding_stores_an_id_and_nothing_else(self):
+        """A spec is exported to a client's git repository."""
+        secret_id = uuid.uuid4()
+        binding = CapabilityBindingSpec(id=CAPABILITY_ID, secret_id=secret_id)
+
+        assert binding.to_binding().secret_id == secret_id
+        assert "secret" not in binding.model_dump(exclude={"secret_id"})
+
+    def test_a_spec_written_before_secrets_existed_still_loads(self):
+        """Additive evolution: a version-4 binding has no key and means "none"."""
+        assert CapabilityBindingSpec(id="clock").secret_id is None
+
+    def test_a_value_cannot_be_smuggled_into_a_binding(self):
+        with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+            CapabilityBindingSpec(
+                id=CAPABILITY_ID,
+                secret=AwsCredentialsSecret,  # type: ignore[call-arg]
+            )
+
+
+class _Chosen(BaseModel):
+    provider: str | None = None
+
+
+@pytest.mark.parametrize(
+    ("config", "purposes"),
+    [
+        (_Chosen(provider="google"), ("google",)),
+        (_Chosen(provider=""), ("mem0",)),
+        (_Chosen(), ("mem0",)),
+        (None, ("mem0",)),
+    ],
+    ids=["chosen", "empty", "unset", "no-config"],
+)
+def test_a_keys_purpose_is_the_chosen_service_or_the_named_one(config, purposes):
+    """The order the Builder's `purposesOf` reads: the gating field, then the name."""
+    requirement = SecretRequirement(
+        kind=SecretKind.API_KEY,
+        description="A key",
+        purpose="mem0",
+        required_when=SecretCondition(field="provider", equals=("google",)),
+    )
+
+    assert requirement.purposes_for(config) == purposes
+
+
+def test_a_requirement_naming_no_service_narrows_nothing():
+    requirement = SecretRequirement(kind=SecretKind.API_KEY, description="A key")
+
+    assert requirement.purposes_for(_Chosen(provider="google")) is None
+
+
+class _Harness(BaseModel):
+    harness: str = "claude_code"
+    provider: str = "google"
+    base_url: str | None = None
+
+
+@pytest.mark.parametrize(
+    ("config", "purposes"),
+    [
+        (_Harness(), ("anthropic", "openrouter")),
+        (_Harness(harness="codex"), ("openai", "openai_codex")),
+        (_Harness(harness="aider"), ("google",)),
+        (_Harness(base_url="https://gateway.example"), None),
+        (_Harness(base_url=""), ("anthropic", "openrouter")),
+        (_Harness(harness="codex", base_url="https://gateway.example"), ("openai", "openai_codex")),
+        (None, ("fallback",)),
+    ],
+    ids=[
+        "mapped",
+        "other-value",
+        "unmapped",
+        "endpoint-set",
+        "endpoint-empty",
+        "endpoint-not-this-value",
+        "no-config",
+    ],
+)
+def test_a_mapped_field_decides_the_purposes_before_the_others(config, purposes):
+    """A field whose values are not service ids is translated first, and a set
+    endpoint field opens its value to any key; a value the map does not name
+    falls through to `required_when`, then `purpose` (#2485)."""
+    requirement = SecretRequirement(
+        kind=SecretKind.API_KEY,
+        description="A key",
+        purpose="fallback",
+        required_when=SecretCondition(field="provider", equals=("google",)),
+        purposes_by=PurposesByValue(
+            field="harness",
+            purposes={
+                "claude_code": ("anthropic", "openrouter"),
+                "codex": ("openai", "openai_codex"),
+            },
+            open_when_set={"claude_code": "base_url"},
+        ),
+    )
+
+    assert requirement.purposes_for(config) == purposes
+
+
+def test_the_coding_agent_maps_each_harness_to_purposes_the_vault_offers():
+    """Every harness is narrowed, and to purposes a key can actually be stored
+    under - a typo here would refuse every key but `custom` (#2485)."""
+    requirement = REGISTRY["coding_agent"].secret
+    assert requirement is not None
+    assert requirement.purposes_by is not None
+    assert requirement.purposes_by.field == "harness"
+    harnesses = get_args(CodingAgentConfig.model_fields["harness"].annotation)
+    assert set(requirement.purposes_by.purposes) == set(harnesses)
+    for purposes in requirement.purposes_by.purposes.values():
+        for purpose in purposes:
+            entry = secret_purposes.get(purpose)
+            assert entry is not None
+            assert requirement.accepts(entry.kind.value)
+    for harness, endpoint in requirement.purposes_by.open_when_set.items():
+        assert harness in harnesses
+        assert endpoint in CodingAgentConfig.model_fields

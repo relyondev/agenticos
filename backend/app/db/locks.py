@@ -1,0 +1,223 @@
+"""Serializing a check-then-write that no constraint can express.
+
+A ceiling read as `count(...) >= limit` and then acted on is two statements, and
+under the default isolation two requests can both pass the count before either
+inserts - so a deployment allowing five agents ends up with six, deterministically,
+by clicking twice. A unique constraint cannot say "at most five rows like this",
+and a table lock would serialize every organization against every other.
+
+So the subject of the ceiling is locked instead: an advisory lock keyed on the
+account or the organization the count is about. Two requests about the same subject
+queue; requests about different subjects do not meet. It is **transaction-scoped**,
+so it is released by the commit or the rollback and there is nothing to unlock -
+which matters here because these are held across a create that can raise.
+
+Advisory locks are Postgres-wide rather than per-table, which is why the key
+carries a namespace: two unrelated ceilings must not block each other because a
+UUID happened to hash the same way.
+"""
+
+from enum import IntEnum, unique
+from uuid import UUID
+
+from sqlalchemy import Integer, cast, func, select
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+
+
+@unique
+class LockScope(IntEnum):
+    """What a lock is about. The value is half of the advisory key."""
+
+    #: How many organizations one account may own.
+    ORGANIZATIONS_PER_USER = 1
+    #: How many agents one organization may hold.
+    AGENTS_PER_ORGANIZATION = 2
+    #: A collection name's claim-and-create against its vector-table drop (#1355).
+    COLLECTION_TEARDOWN = 3
+    #: Which of a member's accounts on one service is the default. The partial
+    #: unique index allows one, and the write is read-then-clear-then-set - so
+    #: two nominations racing each found no sibling to clear and both set it.
+    MCP_DEFAULT_ACCOUNT = 4
+    #: One organization's audit hash chain. `record_audit` reads the chain head
+    #: and appends under this lock, so two audited writes for the same org cannot
+    #: read the same head and fork the chain (#1622).
+    AUDIT_CHAIN_PER_ORG = 5
+    #: Everything held *about* one person, against their erasure. A note is keyed
+    #: by the string `person:<id>` with no foreign key, so a run writing one while
+    #: the account is being deleted commits after the purge has read the table and
+    #: recreates personal data about somebody who asked to be forgotten. The write
+    #: and the purge take this, so one waits for the other and the write that loses
+    #: finds no account to write about (#1421).
+    PERSONAL_DATA_PER_USER = 6
+    #: One sync source's run, from its listing to its last deletion. Two runs of
+    #: one source overlapping let the older listing delete what the newer run had
+    #: just ingested, because the older one never saw it (#987). Session-scoped,
+    #: unlike the rest: a sync spans many transactions.
+    SYNC_SOURCE_RUN = 7
+    #: One person's concurrent voice calls (#54). Two starts at once each counted
+    #: zero open calls and both connected - two billed sessions for one person.
+    VOICE_CALLS_PER_USER = 8
+    #: One embed's concurrent voice calls (#54): the same race, from visitors
+    #: who have no account to count against.
+    VOICE_CALLS_PER_EMBED = 9
+    #: One connection's reconnects (#54). Several sockets sending the same valid
+    #: `resume_of` and token at once each passed the checks and each continued the
+    #: call - one call's remaining time, spent several times over (Codex on #2204).
+    VOICE_RESUME = 10
+    #: The live table names of one organization. A name is unique among live
+    #: tables, and "is this name free" followed by an insert is two statements:
+    #: without this two creates of one name both pass the check and the second
+    #: dies on the unique index with a 500 instead of a 409 (#1782).
+    VIRTUAL_TABLE_NAMES_PER_ORG = 20
+    #: The record count of one table. A quota reads "how many records" and then
+    #: inserts, which two creates can do at once and both pass at limit - 1, so
+    #: creates into one table take turns for the length of the check (#1823).
+    VIRTUAL_TABLE_RECORD_COUNT = 21
+    #: The agent one workflow step configures in place. Its first run creates it and
+    #: a changed spec publishes a version, each read-then-write: two runs of the step
+    #: at once would otherwise create it twice or publish the same spec twice.
+    WORKFLOW_STEP_AGENT = 22
+    #: The stored file bytes of one organization. A quota sums what is stored and
+    #: then inserts, which two steps can do at once and both pass at the ceiling.
+    WORKFLOW_FILE_BYTES = 15
+    #: The runs of one workflow chain, from its root run. A table trigger counts the
+    #: chain's runs and then admits one; two passes over events of one chain read the
+    #: same count and both admit past the limit, so the count is taken under this.
+    WORKFLOW_RUN_CHAIN = 16
+    #: Record writes and their retained copies share one per-organization byte ceiling.
+    VIRTUAL_TABLE_STORAGE_PER_ORG = 17
+    #: One streaming table export per organization, held until its response ends.
+    VIRTUAL_TABLE_EXPORT_PER_ORG = 18
+    #: Cumulative inline results across retained runs, before run-row locks.
+    WORKFLOW_INLINE_RESULTS_PER_ORG = 19
+    #: One organization's generated-media quota (#2310). Each call read what was
+    #: used before its paid generation and recorded its file only after it, so
+    #: every call admitted at once passed the same check and together ran past it.
+    GENERATED_MEDIA_PER_ORG = 11
+    #: First-account admission and deployment-administrator bootstrap.
+    ACCOUNT_BOOTSTRAP = 12
+    #: One mailbox poll, independent of its separately committed OAuth refresh.
+    PORTAL_POLL = 13
+    #: One organization's model profiles against the agent specs that name them
+    #: (#2478). Deleting a profile checks that no draft, served or pinned version
+    #: names it and then deletes it; a draft save, a publish or a promotion
+    #: committing in between would name a profile that is gone. Every such write
+    #: takes this *shared*, so they never wait for each other; the delete takes it
+    #: exclusive, so it waits for those in flight and they wait for it.
+    MODEL_PROFILE_REFERENCES = 14
+
+
+def _key(subject: UUID) -> int:
+    """A UUID as the signed 32-bit integer `pg_advisory_xact_lock` takes.
+
+    A hash, so a collision is possible: two subjects sharing a key serialize
+    against each other, which costs a moment of waiting and cannot produce a wrong
+    answer. The low bits of a v4 UUID are random, which is what makes that rare.
+    """
+    return (subject.int & 0xFFFFFFFF) - 0x80000000
+
+
+async def hold_subject(db: AsyncSession, scope: LockScope, subject: UUID) -> None:
+    """Take the lock for one subject, until this transaction ends.
+
+    Blocks while another transaction holds the same one. Call it *before* reading
+    the count it protects: taken afterwards it serializes nothing, because the
+    count both callers read is already stale.
+
+    Both keys are cast to `Integer`, which is what selects the two-argument
+    `pg_advisory_xact_lock(int, int)` overload. Without it a key of exactly
+    `-2147483648` - the value `_key` returns for a subject whose low 32 bits are
+    zero, which the deployment-wide audit chain hits deterministically - binds as
+    `bigint`, and `(int, bigint)` matches no overload (#1622).
+    """
+    await db.execute(
+        select(func.pg_advisory_xact_lock(cast(scope.value, Integer), cast(_key(subject), Integer)))
+    )
+
+
+async def try_hold_subject(db: AsyncSession, scope: LockScope, subject: UUID) -> bool:
+    """Take a transaction lock without waiting; maintenance can skip a busy tenant."""
+    return bool(
+        await db.scalar(
+            select(
+                func.pg_try_advisory_xact_lock(
+                    cast(scope.value, Integer), cast(_key(subject), Integer)
+                )
+            )
+        )
+    )
+
+
+async def hold_subject_shared(db: AsyncSession, scope: LockScope, subject: UUID) -> None:
+    """Take the shared side of a subject's lock, until this transaction ends.
+
+    Shared holders never wait for each other; they wait only while a
+    transaction holds the same lock through :func:`hold_subject`, and that one
+    waits for every shared holder in flight. The key is the same two integers,
+    so the two sides meet.
+    """
+    await db.execute(
+        select(
+            func.pg_advisory_xact_lock_shared(
+                cast(scope.value, Integer), cast(_key(subject), Integer)
+            )
+        )
+    )
+
+
+async def try_hold_subject_on_connection(
+    connection: AsyncConnection, scope: LockScope, subject: UUID
+) -> bool:
+    """Take a lock for one subject that outlives the transaction, if it is free.
+
+    The one Postgres *session*-scoped lock here, for work that spans many
+    transactions on other sessions - a sync source's run. It is held until this
+    connection closes, which is also what releases it when a worker dies mid-run:
+    there is no unlock to forget. A connection rather than an `AsyncSession`,
+    because a session gives its connection back when it commits and the lock goes
+    with it (`get_worker_connection`). The transaction the check opened is
+    committed here, so the connection does not sit idle in a transaction for the
+    length of the work.
+
+    Never waits. True means this connection holds it; False means another one
+    does - or a subject whose key collides with it, which refuses one run of an
+    unrelated subject rather than serializing it.
+    """
+    result = await connection.execute(
+        select(func.pg_try_advisory_lock(cast(scope.value, Integer), cast(_key(subject), Integer)))
+    )
+    held = bool(result.scalar_one())
+    await connection.commit()
+    return held
+
+
+async def hold_name(db: AsyncSession, scope: LockScope, name: str) -> None:
+    """Take the lock for a string subject - a collection name - until this tx ends.
+
+    The subject here is not a row's id but a name in the deployment-global vector
+    namespace, so the key is `hashtext(name)` rather than a UUID's low bits. Same
+    contract as :func:`hold_subject`: call it *before* the check it protects, so a
+    claim that reads "this name is free" and a teardown that reads "no base holds
+    this name" cannot both act - one drops the table the other just created (#1355).
+    Collisions cost a moment of waiting against an unrelated name, never a wrong
+    answer, because `hashtext` and the scope are the whole key.
+    """
+    await db.execute(select(func.pg_advisory_xact_lock(scope.value, func.hashtext(name))))
+
+
+async def try_hold_name(db: AsyncSession, scope: LockScope, name: str) -> bool:
+    """Take the lock for a string subject if it is free, without ever waiting.
+
+    :func:`hold_name` for a caller that already holds a lock the other side takes
+    *second*. Waiting there is the ABBA deadlock the lock order exists to avoid,
+    so the only answer such a caller can act on is "free, and now mine" or "held
+    by somebody, right now" - never "held, and I will wait to find out".
+
+    True means this transaction holds it until it ends, exactly as `hold_name`
+    would. False means another transaction does, and the caller has to decide
+    what to do about that rather than block.
+    """
+    result = await db.execute(
+        select(func.pg_try_advisory_xact_lock(scope.value, func.hashtext(name)))
+    )
+    return bool(result.scalar_one())

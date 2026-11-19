@@ -1,0 +1,523 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import RunsPage from "./page";
+import { ApiError, apiClient } from "@/lib/api-client";
+import type { AgentRun } from "@/types/runs";
+
+/**
+ * Activity telling a delegated run from one somebody started.
+ *
+ * The reported bug is arithmetic, not decoration. A fan-out turn of three
+ * delegations wrote four `agent_runs` rows, all four listed identically, so the
+ * cost column read $1.00 + $0.40 + $0.40 + $0.40 down the page next to a
+ * month-to-date figure of $1.00 that correctly counts the parent once - and the
+ * "Runs" figure said 4 beside it. The page contradicted itself, and both halves
+ * were right about a different question.
+ *
+ * So the assertions here are about the numbers and about a delegated row's own
+ * identity. Every dashboard page draws its empty state when a query fails, which
+ * makes a test that asserts on a heading and a tab strip a test that passes
+ * against a backend nobody started.
+ */
+
+vi.mock("@/lib/api-client", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api-client")>("@/lib/api-client");
+  return { ...actual, apiClient: { ...actual.apiClient, get: vi.fn(), post: vi.fn() } };
+});
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock("@/hooks/use-permissions", () => ({ usePermissions: () => ({ can: () => true }) }));
+
+/**
+ * The run detail, which is a column beside the list rather than a dialog over it
+ * (#920's panel rework). Found by its label: an `aside` is `complementary`, and
+ * the label is what tells it from any other one on the page.
+ */
+function findPanel() {
+  return screen.findByRole("complementary", { name: "Run detail" });
+}
+function panel() {
+  return screen.getByRole("complementary", { name: "Run detail" });
+}
+function queryPanel() {
+  return screen.queryByRole("complementary", { name: "Run detail" });
+}
+
+const params = new URLSearchParams();
+vi.mock("next/navigation", () => ({
+  // The empty Activity window offers to ask an agent (#2075).
+  useRouter: () => ({ push: vi.fn() }),
+  useSearchParams: () => params,
+  // The header's "?" reads the path to decide whether this page has tips.
+  usePathname: () => "/runs",
+}));
+
+function wrapper({ children }: { children: ReactNode }) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+
+const SPEND = {
+  period_days: null,
+  // What the organization was actually billed for the turn below: the parent
+  // once, its three delegations already inside it. The figure sums the
+  // per-agent rows, which are top-level runs only.
+  month_to_date_usd: "1.00",
+  by_agent: [
+    {
+      agent_id: "agent-orchestrator",
+      agent_name: "Orchestrator",
+      cost_usd: "1.00",
+      run_count: 1,
+      partial_run_count: 0,
+      month_to_date_usd: "1.00",
+      monthly_cap_usd: null,
+    },
+  ],
+  by_provider: [],
+  by_key: [],
+  by_day: [],
+  cache_by_agent_model: [],
+};
+
+function run(overrides: Partial<AgentRun> = {}): AgentRun {
+  return {
+    id: "run-parent",
+    agent_id: "agent-orchestrator",
+    agent_version_id: "version-1",
+    user_id: "user-1",
+    surface: "web",
+    status: "completed",
+    model_label: "openai · gpt-5",
+    input_tokens: 1000,
+    output_tokens: 100,
+    cost_usd: "1.000000",
+    cost_is_partial: false,
+    logfire_trace_id: null,
+    error: null,
+    down_rated: false,
+    conversation_id: null,
+    provider: null,
+    started_at: "2026-08-04T09:00:00Z",
+    ended_at: "2026-08-04T09:00:30Z",
+    parent_run_id: null,
+    subagent_task_id: null,
+    modality: "text",
+    voice_chain: null,
+    ...overrides,
+  };
+}
+
+const DELEGATED = [
+  run({
+    id: "run-child-1",
+    agent_id: "agent-researcher",
+    model_label: "anthropic · claude-sonnet-4-5",
+    cost_usd: "0.400000",
+    parent_run_id: "run-parent",
+    subagent_task_id: "4f2a1b8c",
+  }),
+  run({
+    id: "run-child-2",
+    agent_id: "agent-researcher",
+    model_label: "anthropic · claude-sonnet-4-5",
+    cost_usd: "0.400000",
+    parent_run_id: "run-parent",
+    subagent_task_id: "9abbab49",
+  }),
+];
+
+/** The tab whose badge carries a figure - what the three stat cards became. */
+function tab(name: RegExp) {
+  return screen.getByRole("tab", { name });
+}
+
+async function openRunsTab() {
+  await userEvent.click(await screen.findByRole("tab", { name: /^Runs/ }));
+}
+
+beforeEach(() => {
+  params.delete("agent");
+  params.delete("run");
+  vi.mocked(apiClient.get).mockReset();
+});
+
+/** `/runs` answers the top level; `/runs/{id}` and `?parent_run_id=` answer the rest. */
+function backend(
+  options: {
+    total?: number;
+    runFails?: Error;
+    traceUrl?: string;
+    neighbors?: { prev?: string; next?: string };
+    status?: AgentRun["status"];
+  } = {},
+) {
+  vi.mocked(apiClient.get).mockImplementation((path: string, init?: unknown) => {
+    if (path === "/spend") return Promise.resolve(SPEND);
+    // The detail header resolves the agent's identity; the timeline reads the
+    // thread. Neither is this suite's subject, so both answer minimally.
+    if (path.startsWith("/agents/")) {
+      return Promise.resolve({
+        id: path.split("/").at(-1),
+        slug: "orchestrator",
+        name: "Orchestrator",
+      });
+    }
+    if (path.endsWith("/transcript")) {
+      return Promise.resolve({ run_id: "run-parent", conversation_id: null, items: [], total: 0 });
+    }
+    if (path === "/runs/run-child-1") {
+      return options.runFails === undefined
+        ? Promise.resolve(DELEGATED[0])
+        : Promise.reject(options.runFails);
+    }
+    if (path === "/runs/run-parent") {
+      // The trace link and the neighbour ids are the single-run read's own
+      // fields, so they are served here and nowhere else - as the API sends them.
+      return Promise.resolve(
+        run({
+          ...(options.traceUrl === undefined ? {} : { logfire_url: options.traceUrl }),
+          ...(options.status === undefined ? {} : { status: options.status }),
+          prev_run_id: options.neighbors?.prev ?? null,
+          next_run_id: options.neighbors?.next ?? null,
+        }),
+      );
+    }
+    if (path === "/runs") {
+      const params = (init as { params?: Record<string, string> } | undefined)?.params;
+      if (params?.parent_run_id === "run-parent") {
+        return Promise.resolve({ items: DELEGATED, total: DELEGATED.length });
+      }
+      if (params?.parent_run_id !== undefined) return Promise.resolve({ items: [], total: 0 });
+      return Promise.resolve({ items: [run()], total: options.total ?? 1 });
+    }
+    return Promise.resolve({ items: [], total: 0 });
+  });
+}
+
+describe("the run count and the spend beside it", () => {
+  it("counts what the bill counts, not the rows a fan-out wrote", async () => {
+    backend();
+
+    render(<RunsPage />, { wrapper });
+
+    // One run and $1.00: the two figures are now answers to the same question.
+    await waitFor(() => expect(tab(/^Runs/)).toHaveTextContent("1"));
+    expect(tab(/^Spend/)).toHaveTextContent("$1.00");
+  });
+
+  it("reports the whole history rather than the length of one page", async () => {
+    // The card used to render `runs.length`, which is capped at the page size,
+    // so an organization with two hundred runs read as fifty.
+    backend({ total: 213 });
+
+    render(<RunsPage />, { wrapper });
+
+    await waitFor(() => expect(tab(/^Runs/)).toHaveTextContent("213"));
+  });
+
+  it("asks only for top-level runs, leaving delegations to be asked for by parent", async () => {
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    // Run history is asked for when its tab is opened: each tab fetches its own
+    // rows and Radix mounts only the selected one, which is Approvals.
+    await openRunsTab();
+
+    await waitFor(() =>
+      expect(vi.mocked(apiClient.get).mock.calls.some(([path]) => path === "/runs")).toBe(true),
+    );
+    expect(apiClient.get).not.toHaveBeenCalledWith("/runs", {
+      params: expect.objectContaining({ parent_run_id: expect.anything() }),
+    });
+  });
+});
+
+describe("one run and what it delegated", () => {
+  it("shows the run named in the URL together with its delegations", async () => {
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    // Three rows: the run somebody started and the two it delegated - reached by
+    // the delegation handle each carries, which is what ties a row here to a
+    // panel in the transcript.
+    const drawer = await findPanel();
+    const table = await within(drawer).findByRole("table");
+    expect(within(table).getByText("Delegated · 4f2a1b8c")).toBeVisible();
+    expect(within(table).getByText("Delegated · 9abbab49")).toBeVisible();
+    expect(within(table).getAllByRole("row")).toHaveLength(4);
+    expect(
+      screen.getByText(/2 delegations, and their cost is already inside the run above/),
+    ).toBeVisible();
+  });
+
+  it("says the delegated rows do not add up, on the badge that marks them", async () => {
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    // One per delegated row, and none on the run somebody started.
+    expect(
+      await screen.findAllByTitle(/already inside the run it was delegated from/),
+    ).toHaveLength(2);
+  });
+
+  it("offers the way back up from a delegated run to the one that charged it", async () => {
+    // Arriving from a chat panel lands on the child. Its cost was charged to the
+    // parent, so a page about the child that cannot reach the parent is a page
+    // that cannot explain its own number.
+    params.set("run", "run-child-1");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    // An action, not a link: focusing the parent goes through the page's own
+    // run state, so the period and the agent narrowing survive the step up.
+    await userEvent.click(await screen.findByRole("button", { name: "Open the run it came from" }));
+
+    expect(await screen.findByText("Delegated · 4f2a1b8c")).toBeVisible();
+  });
+
+  it("keeps the list on screen beside the panel", async () => {
+    // The detail is a column next to the list, not a replacement for it: the
+    // list is the context a run is read against - the row before it, the ones at
+    // the same minute - and an overlay hid exactly that.
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    await findPanel();
+    // Two tables: the panel's delegations and the list beside it.
+    expect(screen.getAllByRole("table").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("starts the list and the panel at the same height", async () => {
+    // Reported twice from a screenshot. `TabsContent` carries its own `mt-2`,
+    // so a panel that is its sibling starts eight pixels above the card beside
+    // it; the row owns the gap now and each tab panel gives its own up. jsdom
+    // computes no layout, so the class is what can be asserted - and it is the
+    // whole of the fix.
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+    await findPanel();
+
+    // By its own anchor: the run detail has a tab strip of its own, so there is
+    // more than one `tabpanel` on screen once the panel is open.
+    const tabPanel = document.querySelector('[data-tour="activity-runs"]') as HTMLElement;
+    expect(tabPanel.className).toContain("mt-0");
+    expect(tabPanel.className).not.toMatch(/\bmt-2\b/);
+  });
+
+  it("marks the open run's row in the list beside it", async () => {
+    // Without it the list gives no answer to "which of these am I looking at",
+    // and stepping with the arrows moves a selection nothing on screen shows.
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+    await findPanel();
+
+    const selected = screen
+      .getAllByRole("row")
+      .filter((row) => row.getAttribute("aria-selected") === "true");
+    expect(selected).toHaveLength(1);
+  });
+
+  it("says a run could not be read instead of drawing an empty table", async () => {
+    // The trap this page is full of: a failed query and a run with nothing in it
+    // are the same pixels, and the first is the one somebody needs to know about.
+    params.set("run", "run-child-1");
+    backend({ runFails: new ApiError(403, "Missing required permission: runs:view") });
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    expect(await screen.findByText("That run could not be read")).toBeVisible();
+    // No table in the panel - the list's own table beside it is not the run.
+    expect(within(panel()).queryByRole("table")).toBeNull();
+  });
+
+  it("calls a run that is not there a run that is not there", async () => {
+    // 404 is also the answer for a run in another organization, deliberately -
+    // so "not in this organization, or has been deleted" is the honest sentence,
+    // and it is a different sentence from a refused permission.
+    params.set("run", "run-child-1");
+    backend({ runFails: new ApiError(404, "Run not found") });
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    expect(await screen.findByText("No such run")).toBeVisible();
+    expect(screen.getByText(/not in this organization, or has been deleted/)).toBeVisible();
+  });
+
+  it("does not call a network failure a missing run", async () => {
+    // A dropped connection is not an ApiError at all, and a page that answered
+    // "no such run" for one would send somebody looking for a run that is there.
+    params.set("run", "run-child-1");
+    backend({ runFails: new Error("Failed to fetch") });
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    expect(await screen.findByText("That run could not be read")).toBeVisible();
+  });
+});
+
+describe("walking the run's conversation from the detail", () => {
+  it("steps to the next run with the arrow", async () => {
+    params.set("run", "run-parent");
+    backend({ neighbors: { next: "run-child-1" } });
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Next run" }));
+
+    // Landed on the child, whose own view offers the way back up.
+    expect(await screen.findByRole("button", { name: "Open the run it came from" })).toBeVisible();
+  });
+
+  it("closes the drawer back onto the list", async () => {
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    await userEvent.click(
+      within(await findPanel()).getByRole("button", { name: "Close the run detail" }),
+    );
+
+    expect(queryPanel()).toBeNull();
+  });
+
+  it("Escape closes it too, which the dialog used to do for free", async () => {
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+    await findPanel();
+
+    await userEvent.keyboard("{Escape}");
+
+    expect(queryPanel()).toBeNull();
+  });
+
+  it("steps back to the previous run with the other arrow", async () => {
+    params.set("run", "run-parent");
+    backend({ neighbors: { prev: "run-child-1" } });
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Previous run" }));
+
+    expect(await screen.findByRole("button", { name: "Open the run it came from" })).toBeVisible();
+  });
+
+  it("disables the arrows at the history's edge rather than hiding them", async () => {
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    expect(await screen.findByRole("button", { name: "Previous run" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Next run" })).toBeDisabled();
+  });
+
+  it("answers the operator's first questions in the header, without a click", async () => {
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    // Tokens in → out, the cost, and the agent's name resolved from its id.
+    // The cost also sits in the delegations table below, so the header's copy
+    // is read as the first of the two rather than as the only one.
+    expect(
+      await screen.findByText(
+        (_, element) => element?.tagName === "DD" && element.textContent === "1,000 → 100",
+      ),
+    ).toBeVisible();
+    expect(screen.getAllByText("$1.0000").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("Orchestrator")).toBeVisible();
+  });
+});
+
+describe("resuming a parked run from its detail", () => {
+  it("offers Resume on a run awaiting approval, and posts the continuation", async () => {
+    // The queue resumes a run when its last call is decided - but a run decided
+    // before that wiring existed, or whose resume failed, stays parked with
+    // nothing outstanding. This button is how such a run gets unstuck.
+    params.set("run", "run-parent");
+    backend({ status: "awaiting_approval" });
+    vi.mocked(apiClient.post).mockResolvedValue({ run_id: "run-parent", status: "running" });
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Resume" }));
+
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalledWith("/runs/run-parent/resume"));
+  });
+
+  it("offers no Resume on a run that is not parked", async () => {
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    await within(await findPanel()).findByRole("table");
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+  });
+});
+
+describe("the trace behind a run", () => {
+  it("links to Logfire when the server resolved somewhere to land", async () => {
+    params.set("run", "run-parent");
+    backend({ traceUrl: "https://logfire.pydantic.dev/acme/agents/traces/abc123" });
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    const link = await screen.findByRole("link", { name: /Open the trace in Logfire/ });
+    expect(link).toHaveAttribute("href", "https://logfire.pydantic.dev/acme/agents/traces/abc123");
+    expect(link).toHaveAttribute("target", "_blank");
+  });
+
+  it("offers no trace link when nothing was tracing", async () => {
+    // Null means no LOGFIRE_TOKEN or nowhere configured to link to - a dead
+    // link dressed as observability would be worse than none.
+    params.set("run", "run-parent");
+    backend();
+
+    render(<RunsPage />, { wrapper });
+    await openRunsTab();
+
+    const drawer = await findPanel();
+    await within(drawer).findByRole("table");
+    expect(within(drawer).queryByRole("link", { name: /Open the trace in Logfire/ })).toBeNull();
+  });
+});

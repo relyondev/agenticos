@@ -1,0 +1,203 @@
+"use client";
+import { useState } from "react";
+import { ChevronDown, Search } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { FileIcon } from "@/components/files/file-icon";
+import { useTranslations } from "next-intl";
+
+interface RAGResultItem {
+  index: number;
+  source: string;
+  page?: string;
+  /** The heading the matched chunk opens with, for a source without pages (#2489). */
+  section?: string;
+  chunk?: string;
+  collection?: string;
+  score: string;
+  content: string;
+}
+
+export function parseRAGResults(result: string): RAGResultItem[] {
+  const items: RAGResultItem[] = [];
+  // Match: [1] Source: filename, page X | section "Heading", chunk Y [collection],
+  // with surrounding text (score: 0.xxx)\ncontent - every part after the name
+  // optional. The backend never puts a `"` inside the section's quotes.
+  const pattern =
+    /\[(\d+)\]\s*Source:\s*([^,\n]+?)(?:,\s*page\s*(\d+))?(?:,\s*section\s*"([^"\n]*)")?(?:,\s*chunk\s*(\d+))?(?:\s*\[([^\]]+)\])?(?:,\s*with surrounding text)?\s*\(score:\s*([\d.]+)\)\n([\s\S]*?)(?=\n\[\d+\]|$)/g;
+  let match;
+  while ((match = pattern.exec(result)) !== null) {
+    items.push({
+      index: parseInt(match[1] ?? "0"),
+      source: (match[2] ?? "").trim(),
+      page: match[3],
+      section: match[4] || undefined,
+      chunk: match[5],
+      collection: match[6],
+      score: match[7] ?? "",
+      content: (match[8] ?? "").trim(),
+    });
+  }
+  return items;
+}
+
+export function RAGSearchResults({ result }: { result: string }) {
+  const t = useTranslations("chat.tools");
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
+  const items = parseRAGResults(result);
+
+  if (items.length === 0) {
+    // i18n-exempt: matches the backend's own answer, which is not translated
+    if (result.includes("No relevant documents")) {
+      return (
+        <div className="text-muted-foreground flex items-center gap-2 py-2 text-sm">
+          <Search className="h-4 w-4" />
+          {t("noRelevantDocuments")}
+        </div>
+      );
+    }
+    return null; // fallback to default renderer
+  }
+
+  // Group chunks by source filename so the same file doesn't render as N
+  // duplicate cards. Preserve insertion order so the indices stay readable.
+  const grouped = items.reduce<Map<string, RAGResultItem[]>>((acc, item) => {
+    const key = item.source || "Unknown";
+    const list = acc.get(key) ?? [];
+    list.push(item);
+    acc.set(key, list);
+    return acc;
+  }, new Map());
+  const sourceCount = grouped.size;
+
+  return (
+    <div className="space-y-3 py-1">
+      <div className="text-muted-foreground flex items-center gap-2 font-mono text-xs tracking-wider uppercase">
+        <Search className="h-3 w-3" />
+        <span>{t("chunkCount", { count: items.length })}</span>
+        <span>·</span>
+        <span>{t("sourceCount", { count: sourceCount })}</span>
+      </div>
+
+      <div className="border-foreground/10 divide-foreground/8 divide-y overflow-hidden rounded-xl border">
+        {Array.from(grouped.entries()).map(([source, chunks]) => (
+          <RAGSourceGroup
+            key={source}
+            source={source}
+            chunks={chunks}
+            expandedIdx={expandedIdx}
+            onToggle={(idx) => setExpandedIdx(expandedIdx === idx ? null : idx)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RAGSourceGroup({
+  source,
+  chunks,
+  expandedIdx,
+  onToggle,
+}: {
+  source: string;
+  chunks: RAGResultItem[];
+  expandedIdx: number | null;
+  onToggle: (idx: number) => void;
+}) {
+  const t = useTranslations("chat.tools");
+  const collection = chunks[0]?.collection;
+  const bestScore = Math.max(...chunks.map((c) => parseFloat(c.score) || 0));
+  return (
+    <div>
+      <div className="bg-foreground/[0.02] flex items-center gap-2 px-3 py-2">
+        <FileIcon name={source} className="text-muted-foreground size-4 shrink-0" />
+        <span className="text-foreground truncate text-xs font-medium" title={source}>
+          {source}
+        </span>
+        <span className="text-muted-foreground ml-auto font-mono text-xs tracking-wider uppercase">
+          {t("chunkCount", { count: chunks.length })}
+        </span>
+        <ScoreDot score={bestScore} />
+        {collection && (
+          <span
+            className="border-foreground/15 text-muted-foreground hidden shrink-0 rounded-full border px-1.5 py-0.5 font-mono text-[10px] tracking-wider uppercase sm:inline"
+            title={t("collectionNamed", { name: collection })}
+          >
+            {collection}
+          </span>
+        )}
+      </div>
+      <ul>
+        {chunks.map((chunk) => {
+          const isOpen = expandedIdx === chunk.index;
+          return (
+            <li key={chunk.index} className="border-foreground/8 border-t first:border-t-0">
+              <button
+                type="button"
+                onClick={() => onToggle(chunk.index)}
+                className="hover:bg-foreground/[0.02] flex w-full items-start gap-2.5 px-3 py-2 text-left transition-colors"
+              >
+                <span className="bg-foreground/8 text-foreground/65 mt-0.5 inline-flex h-5 min-w-[1.5rem] shrink-0 items-center justify-center rounded px-1 font-mono text-xs tabular-nums">
+                  {chunk.index}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p
+                    className={cn(
+                      "text-foreground/80 text-xs leading-relaxed",
+                      !isOpen && "line-clamp-2",
+                    )}
+                  >
+                    {chunk.content}
+                  </p>
+                  {(chunk.page || chunk.section || chunk.chunk) && (
+                    <div className="text-muted-foreground mt-1 flex items-center gap-1.5 font-mono text-xs tracking-wider uppercase">
+                      {chunk.page && <span>p.{chunk.page}</span>}
+                      {chunk.section && (
+                        <span className="truncate normal-case" title={chunk.section}>
+                          {chunk.section}
+                        </span>
+                      )}
+                      {chunk.chunk && (
+                        <>
+                          {(chunk.page || chunk.section) && <span>·</span>}
+                          <span>{t("chunkNumber", { number: chunk.chunk })}</span>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <div className="mt-0.5 flex shrink-0 items-center gap-1.5">
+                  <span className="text-muted-foreground font-mono text-xs tabular-nums">
+                    {parseFloat(chunk.score).toFixed(2)}
+                  </span>
+                  <ScoreDot score={parseFloat(chunk.score) || 0} />
+                  <ChevronDown
+                    className={cn(
+                      "text-muted-foreground h-3.5 w-3.5 transition-transform",
+                      isOpen && "rotate-180",
+                    )}
+                  />
+                </div>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+/** Tiny dot indicating chunk relevance - neutral palette, no warning colors. */
+function ScoreDot({ score }: { score: number }) {
+  const t = useTranslations("chat.tools");
+  // Map score to brand-tone opacity instead of red/yellow/green so the UI
+  // reads as a quality signal, not an alert.
+  const tone =
+    score >= 0.7 ? "bg-foreground" : score >= 0.4 ? "bg-foreground/55" : "bg-foreground/25";
+  return (
+    <span
+      className={cn("h-1.5 w-1.5 shrink-0 rounded-full", tone)}
+      title={t("relevanceScore", { score: score.toFixed(2) })}
+    />
+  );
+}
