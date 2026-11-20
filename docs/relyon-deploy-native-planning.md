@@ -5,7 +5,7 @@ backend and the frontend image. Do the backup first.
 
 Images (both built by GitHub Actions on branch `relyon/native-planning`):
 
-- `ghcr.io/relyondev/agenticos-backend:1.38.2-planning.4`
+- `ghcr.io/relyondev/agenticos-backend:1.38.2-planning.5`
 - `ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.7`
 
 ## 1. Back up the database
@@ -31,7 +31,7 @@ Back up and edit the image of the `app`, `worker` and `migrate` services
 
 ```bash
 cp docker-compose-prod.yml docker-compose-prod.yml.bak
-sed -i -E 's#ghcr.io/(vstorm-co|relyondev)/agenticos-backend:[^[:space:]"]+#ghcr.io/relyondev/agenticos-backend:1.38.2-planning.4#' docker-compose-prod.yml
+sed -i -E 's#ghcr.io/(vstorm-co|relyondev)/agenticos-backend:[^[:space:]"]+#ghcr.io/relyondev/agenticos-backend:1.38.2-planning.5#' docker-compose-prod.yml
 grep -c 'relyondev/agenticos-backend' docker-compose-prod.yml   # expect 3
 ```
 
@@ -63,3 +63,19 @@ The migrations only add tables and one nullable column, so rolling the images ba
 touching the data. Restore the `.bak` compose files and `up -d` again with the same
 `-f` lists. Only if you must also drop the tables:
 `docker exec relios-agenticos-app-1 agenticos db downgrade` (run before swapping the image back).
+
+## Updating the backend only (no new migration)
+
+Agent planning tools (`1.38.2-planning.5`) change the backend only; the frontend and the database are untouched.
+
+```bash
+cd /opt/relios-agenticos
+cp docker-compose-prod.yml docker-compose-prod.yml.bak-prev
+sed -i -E 's#ghcr.io/(vstorm-co|relyondev)/agenticos-backend:[^[:space:]"]+#ghcr.io/relyondev/agenticos-backend:1.38.2-planning.5#' docker-compose-prod.yml
+grep -c 'relyondev/agenticos-backend:1.38.2-planning.5' docker-compose-prod.yml   # expect 3
+docker compose -p relios-agenticos --env-file backend/.env -f docker-compose-prod.yml pull
+docker compose -p relios-agenticos --env-file backend/.env -f docker-compose-prod.yml up -d
+```
+
+The VPS has 2 CPUs: keep the `app` service's `cpus` limit at `"2"` or lower in this file.
+Then, in a project chat, ask an agent to "list the work items" or "create a work item called …".

@@ -183,6 +183,7 @@ from app.agents.mcp import PLATFORM_MCP_PREFIX, unreachable_briefing
 from app.agents.model_resolver import ModelRequestSpec
 from app.agents.observability import current_trace_id
 from app.agents.person_briefing import Person, with_person
+from app.agents.project_planning import project_planning_toolset
 from app.agents.spec import (
     AgentSpec,
     CapabilityBindingSpec,
@@ -1878,6 +1879,14 @@ def _in_project(spec: AgentSpec, project: Project) -> AgentSpec:
         'name ("Anna: ..."): that is who is speaking, not part of what they said. Address '
         "people by name, keep track of who asked for what, and when you answer one "
         "person in a busy chat, say whom."
+    )
+    briefing += (
+        "\n\nThe project also keeps its planning, and you have tools for it (the "
+        "`project_*` tools): work items, cycles, modules, intake requests and pages. "
+        "Use them when the person asks about or for tasks, plans or documents, and "
+        "say which work item (#number) or page you read or changed. Intake is for "
+        "proposing work: you can file a request but not accept or decline one. Before "
+        "editing a page, read it and pass the revision you read."
     )
     if project.description:
         briefing += f"\n\n{project.description}"
@@ -3705,6 +3714,8 @@ class AgentRunnerService:
         project = await ProjectService(self.db).for_run(ctx, conversation_id)
         if project is not None:
             spec = _in_project(spec, project)
+            # The project's planning, as tools: acting as the person this run is for.
+            spec_toolsets.append(project_planning_toolset(project.id, ctx))
 
         # Opened after the run row, because a run-scoped workspace keys on it,
         # and before the agent, because the capability reads the backend out of

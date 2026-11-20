@@ -27,6 +27,14 @@ async def get(db: AsyncSession, project_id: UUID, item_id: UUID) -> WorkItem | N
     return result.scalar_one_or_none()
 
 
+async def get_by_sequence(db: AsyncSession, project_id: UUID, number: int) -> WorkItem | None:
+    """The item people call `#number` in a project."""
+    result = await db.execute(
+        select(WorkItem).where(WorkItem.project_id == project_id, WorkItem.sequence_id == number)
+    )
+    return result.scalar_one_or_none()
+
+
 async def list_items(
     db: AsyncSession,
     project_id: UUID,
