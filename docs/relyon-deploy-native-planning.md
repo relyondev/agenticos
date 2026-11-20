@@ -31,7 +31,7 @@ Back up and edit the image of the `app`, `worker` and `migrate` services
 
 ```bash
 cp docker-compose-prod.yml docker-compose-prod.yml.bak
-sed -i 's#ghcr.io/vstorm-co/agenticos-backend:${AGENTICOS_VERSION:-latest}#ghcr.io/relyondev/agenticos-backend:1.38.2-planning.4#' docker-compose-prod.yml
+sed -i -E 's#ghcr.io/(vstorm-co|relyondev)/agenticos-backend:[^[:space:]"]+#ghcr.io/relyondev/agenticos-backend:1.38.2-planning.4#' docker-compose-prod.yml
 grep -c 'relyondev/agenticos-backend' docker-compose-prod.yml   # expect 3
 ```
 
@@ -45,7 +45,8 @@ docker logs relios-agenticos-migrate-1 2>&1 | tail -3   # expect "Running upgrad
 
 ```bash
 cp docker-compose-prod.frontend.yml docker-compose-prod.frontend.yml.bak2
-sed -i 's#agenticos-frontend:1.38.2-planning.[0-9]*#agenticos-frontend:1.38.2-planning.7#' docker-compose-prod.frontend.yml
+sed -i -E 's#ghcr.io/(vstorm-co|relyondev)/agenticos-frontend:[^[:space:]"]+#ghcr.io/relyondev/agenticos-frontend:1.38.2-planning.7#' docker-compose-prod.frontend.yml
+grep image: docker-compose-prod.frontend.yml
 docker compose -p relios-agenticos-frontend --env-file backend/.env \
   -f docker-compose-prod.frontend.yml -f docker-compose-prod.frontend.traefik.yml pull
 docker compose -p relios-agenticos-frontend --env-file backend/.env \
