@@ -92,12 +92,7 @@ export function cspDirectives(
     // agent-authored script, which is why it is framed from another origin under
     // a `sandbox` policy of its own rather than minted into a blob here. The route,
     // not the origin: the origin is the API's unless `ARTIFACT_ORIGIN` moved it.
-    "frame-src": [
-      "'self'",
-      "blob:",
-      artifactContentSource(config),
-      ...(config.planeUrl ? [originOf(config.planeUrl)] : []),
-    ],
+    "frame-src": ["'self'", "blob:", artifactContentSource(config)],
     "font-src": ["'self'", "data:"],
     // This origin's own BFF routes, the API the browser calls directly - OAuth,
     // the hosted chat's uploads - and the chat's WebSocket. Named from the

@@ -145,13 +145,3 @@ it("does not allow collector connections when diagnostics is disabled", () => {
   const directives = cspDirectives({ ...SPLIT_ORIGIN, diagnosticsUrl: undefined }, NONCE);
   expect(directives["connect-src"]).not.toContain("https://analytics-agenticos.testapp.ovh");
 });
-
-describe("Plane embed", () => {
-  it("allows framing the configured Plane origin and nothing else new", () => {
-    const withPlane = { ...DEFAULT_PUBLIC_CONFIG, planeUrl: "https://plane.example.com" };
-    expect(cspDirectives(withPlane, NONCE)["frame-src"]).toContain("https://plane.example.com");
-    expect(cspDirectives(DEFAULT_PUBLIC_CONFIG, NONCE)["frame-src"]).not.toContain(
-      "https://plane.example.com",
-    );
-  });
-});

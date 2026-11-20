@@ -170,3 +170,64 @@ export const duplicateIntake = (project: string, id: string, workItemId: string)
   apiClient.post<IntakeRequest>(`${root(project)}/intake/${id}/duplicate`, {
     work_item_id: workItemId,
   });
+
+// -- pages ------------------------------------------------------------------
+
+export interface PageSummary {
+  id: string;
+  project_id: string;
+  name: string;
+  revision: number;
+  is_locked: boolean;
+  archived_at: string | null;
+  owned_by_user_id: string | null;
+  last_edited_by_user_id: string | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface Page extends PageSummary {
+  content: string;
+}
+
+export interface PageVersionSummary {
+  id: string;
+  revision: number;
+  name: string;
+  edited_by_user_id: string | null;
+  created_at: string;
+}
+
+export interface PageVersion extends PageVersionSummary {
+  content: string;
+}
+
+export const listPages = (project: string, opts: { archived?: boolean; q?: string } = {}) => {
+  const query = new URLSearchParams({ limit: "200" });
+  if (opts.archived) query.set("archived", "true");
+  if (opts.q?.trim()) query.set("q", opts.q.trim());
+  return apiClient
+    .get<{ items: PageSummary[]; total: number }>(`${root(project)}/pages?${query}`)
+    .then((r) => r.items);
+};
+export const getPage = (project: string, id: string) =>
+  apiClient.get<Page>(`${root(project)}/pages/${id}`);
+export const createPage = (project: string, input: { name: string; content?: string }) =>
+  apiClient.post<Page>(`${root(project)}/pages`, input);
+export const updatePage = (
+  project: string,
+  id: string,
+  input: { revision: number; name?: string; content?: string },
+) => apiClient.patch<Page>(`${root(project)}/pages/${id}`, input);
+export const deletePage = (project: string, id: string) =>
+  apiClient.delete<void>(`${root(project)}/pages/${id}`);
+export const setPageLock = (project: string, id: string, locked: boolean) =>
+  apiClient.post<Page>(`${root(project)}/pages/${id}/${locked ? "lock" : "unlock"}`, {});
+export const setPageArchived = (project: string, id: string, archived: boolean) =>
+  apiClient.post<Page>(`${root(project)}/pages/${id}/${archived ? "archive" : "unarchive"}`, {});
+export const listPageVersions = (project: string, id: string) =>
+  apiClient.get<PageVersionSummary[]>(`${root(project)}/pages/${id}/versions`);
+export const getPageVersion = (project: string, id: string, version: string) =>
+  apiClient.get<PageVersion>(`${root(project)}/pages/${id}/versions/${version}`);
+export const restorePageVersion = (project: string, id: string, version: string) =>
+  apiClient.post<Page>(`${root(project)}/pages/${id}/versions/${version}/restore`, {});
